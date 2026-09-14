@@ -3250,3 +3250,10 @@ mask brushes. Still open:
 - One-off crash seen on the user's desktop (GL renderer, once):
   `WUCBrushManager::GetNineGridBrush+0xdd` reading a NULL nine-grid brush vtable; not reproduced on
   :98 with the Vulkan renderer.
+- Keyboard input works (click 9, type `12+3=` → "912 + 3 = 915", expression line included). The first
+  key press had WinUI's ScrollPresenter create an InteractionTracker: with the class unregistered the
+  app raised an unhandled language exception; with a recording tracker WinUI overwrote the object
+  (expressions like `tracker.Position` and private interfaces); with statics that fail (E_NOTIMPL)
+  WinUI reports one unhandled error and carries on. Found on the way: recording objects must answer
+  IInspectable's three methods properly (the default slot wrote a fake object over GetIids' count),
+  and WinUI asks composition animations for IDependencyObject, which must be refused.
