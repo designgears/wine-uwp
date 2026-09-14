@@ -3257,3 +3257,9 @@ mask brushes. Still open:
   WinUI reports one unhandled error and carries on. Found on the way: recording objects must answer
   IInspectable's three methods properly (the default slot wrote a fake object over GetIids' count),
   and WinUI asks composition animations for IDependencyObject, which must be refused.
+- The desktop-only crash (`WUCBrushManager::GetNineGridBrush+0xdd`) reproduces headlessly with a
+  stream of pointer moves over the keypad (the user's real mouse; 17 moves were enough). XAML called
+  a nine-grid brush through its recording table and the default slot answered the out-pointer with
+  a "clone" carrying the nine-grid vtable over a plain recording struct, which the next use read as
+  a brush with a NULL vtable. The default slot now clones only the two recording tables and answers
+  every other typed object with a plain recording object. 600 pointer moves plus a click are clean.
