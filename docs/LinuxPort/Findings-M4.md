@@ -3154,7 +3154,14 @@ mask brushes. Still open:
 - Pressed buttons lose their fill: XAML's pressed/pointer-over visual states swap the button
   background brush, and the replacement (a theme resource brush) is not resolved by the painter.
   Not yet looked at.
-- Intermittent (about 2 in 10 runs): the click is processed (RemovePointerInteractionContext,
-  PropertyChangedEventArgs) but no tick follows, so the frame never updates; the UI thread keeps
-  waiting in CoMsgWaitInProcessEvents with 16 ms timeouts. Being reproduced with the CoreMessaging
-  timer hooks (WINE_UWP_DIAG_CM) to see whether XAML re-arms the tick timer after the click.
+- **Intermittent tick loss (about 2 in 10 runs) explained.** The click is processed but no tick
+  follows and `UIThreadScheduler` stays in state 1 (queued) forever, so every later
+  `RequestAdditionalFrame` is a no-op. The reproduced log shows the last `QueueTick` → `SetRelative(0,0)`
+  coming from a worker thread (02c0, the DManip/compositor thread; about a fifth of all QueueTicks come
+  from it) right after the UI thread's `EndTick`. The island108 CoreMessaging patch hands due-now
+  timeouts to the UI thread through one BSS slot (0x10d000): the enqueue cave does `xchg`, but the
+  dequeue cave (0xd49e0) did `mov rbx,[slot]; test; and [slot],0`, so a timeout stored between the
+  read and the clear was wiped without ever reaching `OnTimerSignaled`. The dequeue now takes the slot
+  with `xor ebx,ebx; xchg [slot],rbx` (`CoreMessaging.dll.bak-drain-race` is the previous state).
+  Note the enqueue still overwrites an undelivered entry; that only costs a tick when two different
+  timers are due at once.
