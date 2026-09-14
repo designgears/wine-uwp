@@ -35,6 +35,10 @@ export WINE_UWP_PACKAGE_FULL_NAME=${WINE_UWP_PACKAGE_FULL_NAME:-Microsoft.Window
 export WINE_UWP_PACKAGE_FAMILY_NAME=${WINE_UWP_PACKAGE_FAMILY_NAME:-Microsoft.WindowsCalculator.Dev_8wekyb3d8bbwe}
 export WINE_UWP_PACKAGE_PATH=${WINE_UWP_PACKAGE_PATH:-"Z:$(echo "$S" | sed 's|/|\\|g')"}
 export WINE_UWP_AUMID=${WINE_UWP_AUMID:-Microsoft.WindowsCalculator.Dev_8wekyb3d8bbwe!App}
+# Frame title for the hosted CoreWindow (its own text is the entry id, "App"), and the launch size;
+# a window covering the whole screen cannot be resized through the frame.
+export WINE_UWP_WINDOW_TITLE=${WINE_UWP_WINDOW_TITLE:-Calculator}
+export WINE_UWP_WINDOW_SIZE=${WINE_UWP_WINDOW_SIZE:-1280x800}
 # Framework dependencies: "fullname|family|path;..." (GetCurrentPackageInfo returns them after the main package)
 if [ -z "${WINE_UWP_PACKAGE_DEPENDENCIES:-}" ] && [ -d "$HOME/uwp-bin/stage/frameworks" ]; then
   deps=""

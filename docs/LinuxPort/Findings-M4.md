@@ -3263,3 +3263,14 @@ mask brushes. Still open:
   a "clone" carrying the nine-grid vtable over a plain recording struct, which the next use read as
   a brush with a NULL vtable. The default slot now clones only the two recording tables and answers
   every other typed object with a plain recording object. 600 pointer moves plus a click are clean.
+
+## Window frame: move and resize (2026-09-14)
+
+- wineuwp now gives the CoreWindow WS_OVERLAPPEDWINDOW when it shows it, and the navigation
+  client's view bounds (`GetViewBounds`, `VisibleBounds`) follow the client rect, so a resize
+  reaches XAML through windows.ui's WM_SIZE → `SendWindowSizeEvent` → CoreWindow.SizeChanged and the
+  page re-lays out (History panel beside the keypad at 800x560). Two testing traps: without a
+  window manager Wine ignores external ConfigureNotify (unmanaged window), and win32u marks a window
+  that covers the whole monitor non-resizable (min = max size hints), so on the 1280x800 test
+  display the tests run under kwin_x11 with WINE_UWP_WINDOW_SIZE=1000x680. run.sh defaults the frame
+  title to "Calculator".
