@@ -3136,3 +3136,25 @@ mask brushes. Still open:
   (`WindowServer::add_PointerPressed`), and a #UD/stack dump in dcomp's vectored handler. Trampolines must
   be allocated within rel32 reach of the module (probe downwards from the module base), and copied prologue
   bytes containing a rel32 call need the displacement retargeted.
+
+## After the first click: what is left on screen (2026-09-14)
+
+- The square image over the display was the title bar's 16x16 app icon: `paint_public_visual` copied a
+  sprite's surface brush at the texture's size (256x256 asset) with SRCCOPY, so it was huge and its
+  transparent area was black. dcomp now scales the premultiplied BGRA texture to the sprite's size and
+  alpha-blends it (`blit_surface_rect`). Only that one surface goes through this path in Calculator;
+  all text is drawn as alpha masks through `paint_mask_brush`.
+- The result/expression text sits at the left edge because `CalculationResult` right-aligns by
+  scrolling its ScrollViewer to the end (`ChangeView(ExtentWidth - ViewportWidth)`). XAML drives that
+  through DirectManipulation (`ZoomToRect`, a no-op here) and moves the visual through the shared
+  content transform / `CreateManipulationTransform` object bound with a composition expression
+  animation; dcomp accepts but never runs animations, and `viewport_GetPrimaryContent` still creates a
+  fresh content object per call. Fixing this means real DManip offsets plus animated transforms in
+  dcomp; deferred.
+- Pressed buttons lose their fill: XAML's pressed/pointer-over visual states swap the button
+  background brush, and the replacement (a theme resource brush) is not resolved by the painter.
+  Not yet looked at.
+- Intermittent (about 2 in 10 runs): the click is processed (RemovePointerInteractionContext,
+  PropertyChangedEventArgs) but no tick follows, so the frame never updates; the UI thread keeps
+  waiting in CoMsgWaitInProcessEvents with 16 ms timeouts. Being reproduced with the CoreMessaging
+  timer hooks (WINE_UWP_DIAG_CM) to see whether XAML re-arms the tick timer after the click.
