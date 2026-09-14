@@ -1,0 +1,19 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{E3C22B30-8502-4B2F-9133-559674587E51}\InprocServer32]
+@="C:\\windows\\system32\\mrmcorer.dll"
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Windows.ApplicationModel.Resources.Core.Internal.SystemResourceManager]
+"DllPath"="C:\\windows\\system32\\mrmcorer.dll"
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Windows.ApplicationModel.Resources.Core.ResourceContext]
+"DllPath"="C:\\windows\\system32\\mrmcorer.dll"
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Windows.ApplicationModel.Resources.Core.ResourceManager]
+"DllPath"="C:\\windows\\system32\\mrmcorer.dll"
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Windows.ApplicationModel.Resources.ResourceLoader]
+"DllPath"="C:\\windows\\system32\\mrmcorer.dll"
+
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{DBCE7E40-7345-439D-B12C-114A11819A09}\InprocServer32]
+@="C:\\windows\\system32\\mrmcorer.dll"

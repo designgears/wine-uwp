@@ -1,0 +1,49 @@
+Windows Registry Editor Version 5.00
+
+; Shell brokers that Windows runs out of process, provided in-process by wineuwp.dll (see Wine patches).
+; ActivatableApplicationRegistrar: the app hands the shell its activation object; the shell activates it.
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{dea794e0-1c1d-4363-b171-98d0b1703586}]
+@="ActivatableApplicationRegistrar (wine-uwp)"
+
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{dea794e0-1c1d-4363-b171-98d0b1703586}\InprocServer32]
+@="C:\\windows\\system32\\wineuwp.dll"
+"ThreadingModel"="Both"
+
+; PSM broker CoCreated by CoreApplication::RegisterWithPSM (in-proc on Windows via psm.dll)
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{02844640-e37c-4322-a3b8-4c61a2e58879}]
+@="PsmBroker (wine-uwp)"
+
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{02844640-e37c-4322-a3b8-4c61a2e58879}\InprocServer32]
+@="C:\\windows\\system32\\wineuwp.dll"
+"ThreadingModel"="Both"
+
+; CoreWindow factory broker (Windows is a local server; wine-uwp serves it in-process)
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{3480a401-bde9-4407-bc02-798a866ac051}]
+@="CoreWindowBroker (wine-uwp)"
+
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{3480a401-bde9-4407-bc02-798a866ac051}\InprocServer32]
+@="C:\\windows\\system32\\wineuwp.dll"
+"ThreadingModel"="Both"
+
+; Windows.System.Threading helper class (threadpoolwinrt.dll, Wine's builtin implements the WinRT side)
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{96c7a5ef-0e2c-46d7-9bc1-6445c2444d7a}\InprocServer32]
+@="Z:\\home\\bobby\\uwp-bin\\win11\\Windows\\System32\\threadpoolwinrt.dll"
+"ThreadingModel"="Both"
+
+; MrtResourceManager (MRT resource loader used by Windows.UI.Xaml for pri lookups), native MrmCoreR.dll
+[HKEY_CLASSES_ROOT\CLSID\{DBCE7E40-7345-439D-B12C-114A11819A09}]
+@="MrtResourceManager Class"
+
+[HKEY_CLASSES_ROOT\CLSID\{DBCE7E40-7345-439D-B12C-114A11819A09}\InProcServer32]
+@="C:\\windows\\system32\\mrmcorer.dll"
+"ThreadingModel"="Both"
+
+; UAP splash screen events, CoCreated by the CoreWindow activation path in windows.ui.dll.
+; Windows serves this from CoreUIComponents.dll in-process; the extracted copy is installed in
+; the prefix system32 so only one physical module is ever mapped (see Findings-M4.md).
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{3ec569dc-6fb5-45d1-8b46-e122d27962e9}]
+@="CLSID_UAPSplashScreenEvents"
+
+[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{3ec569dc-6fb5-45d1-8b46-e122d27962e9}\InprocServer32]
+@="C:\\windows\\system32\\coreuicomponents.dll"
+"ThreadingModel"="Both"

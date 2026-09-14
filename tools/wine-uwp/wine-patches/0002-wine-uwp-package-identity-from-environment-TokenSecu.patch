@@ -1,0 +1,518 @@
+From 3be176d21d897c04223ef0ccf83d8b9d8a492218 Mon Sep 17 00:00:00 2001
+From: designgears <bobby@designgears.com>
+Date: Wed, 9 Sep 2026 17:15:07 -0600
+Subject: [PATCH 2/3] wine-uwp: package identity from environment,
+ TokenSecurityAttributes, GetCurrentPackageInfo2,
+ CoGetSystemSecurityPermissions stub
+
+- kernelbase: GetCurrentPackage{FullName,FamilyName,Path,Id}, GetCurrentApplicationUserModelId,
+  GetPackageFullName/FamilyName, GetPackagePathByFullName, GetCurrentPackageInfo/Info2 read
+  WINE_UWP_PACKAGE_* variables set by the wine-uwp launcher.
+- kernelbase: AppPolicyGetWindowingModel reports Universal for packaged processes.
+- ntdll: RtlQueryPackageIdentity/RtlQueryPackageClaims from the same variables.
+- ntdll: NtQueryInformationToken(TokenSecurityAttributes) returns WIN://SYSAPPID and WIN://PKG.
+- combase: CoGetSystemSecurityPermissions stub.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ dlls/combase/combase.c          |  10 ++
+ dlls/combase/combase.spec       |   2 +-
+ dlls/kernelbase/kernelbase.spec |   1 +
+ dlls/kernelbase/main.c          |   3 +-
+ dlls/kernelbase/version.c       | 193 +++++++++++++++++++++++++++++---
+ dlls/ntdll/rtl.c                |  59 ++++++++--
+ dlls/ntdll/unix/security.c      |  69 ++++++++++++
+ 7 files changed, 310 insertions(+), 27 deletions(-)
+
+diff --git a/dlls/combase/combase.c b/dlls/combase/combase.c
+index 94e256f..62d9f49 100644
+--- a/dlls/combase/combase.c
++++ b/dlls/combase/combase.c
+@@ -3638,3 +3638,13 @@ HRESULT WINAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void **obj)
+ 
+     return CLASS_E_CLASSNOTAVAILABLE;
+ }
++
++/***********************************************************************
++ *           CoGetSystemSecurityPermissions    (combase.@)
++ */
++HRESULT WINAPI CoGetSystemSecurityPermissions( DWORD type, PSECURITY_DESCRIPTOR *sd )
++{
++    FIXME( "%#lx, %p: stub\n", type, sd );
++    if (sd) *sd = NULL;
++    return E_NOTIMPL;
++}
+diff --git a/dlls/combase/combase.spec b/dlls/combase/combase.spec
+index 19249e1..c9df81a 100644
+--- a/dlls/combase/combase.spec
++++ b/dlls/combase/combase.spec
+@@ -119,7 +119,7 @@
+ @ stub CoGetProcessIdentifier
+ @ stdcall CoGetStandardMarshal(ptr ptr long ptr long ptr)
+ @ stub CoGetStdMarshalEx
+-@ stub CoGetSystemSecurityPermissions
++@ stdcall CoGetSystemSecurityPermissions(long ptr)
+ @ stdcall CoGetTreatAsClass(ptr ptr)
+ @ stdcall CoImpersonateClient()
+ @ stdcall CoIncrementMTAUsage(ptr)
+diff --git a/dlls/kernelbase/kernelbase.spec b/dlls/kernelbase/kernelbase.spec
+index 99305c9..af46c6c 100644
+--- a/dlls/kernelbase/kernelbase.spec
++++ b/dlls/kernelbase/kernelbase.spec
+@@ -494,6 +494,7 @@
+ @ stdcall GetCurrentPackageFullName(ptr ptr)
+ @ stdcall GetCurrentPackageId(ptr ptr)
+ @ stdcall GetCurrentPackageInfo(long ptr ptr ptr)
++@ stdcall GetCurrentPackageInfo2(long long ptr ptr ptr)
+ @ stdcall GetCurrentPackagePath(ptr ptr)
+ # @ stub GetCurrentPackageResourcesContext
+ # @ stub GetCurrentPackageSecurityContext
+diff --git a/dlls/kernelbase/main.c b/dlls/kernelbase/main.c
+index 8c37e5d..f62b472 100644
+--- a/dlls/kernelbase/main.c
++++ b/dlls/kernelbase/main.c
+@@ -144,7 +144,8 @@ LONG WINAPI AppPolicyGetWindowingModel(HANDLE token, AppPolicyWindowingModel *po
+         FIXME("%p, %p\n", token, policy);
+ 
+     if(policy)
+-        *policy = AppPolicyWindowingModel_ClassicDesktop;
++        *policy = GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", NULL, 0 )
++                  ? AppPolicyWindowingModel_Universal : AppPolicyWindowingModel_ClassicDesktop;
+ 
+     return ERROR_SUCCESS;
+ }
+diff --git a/dlls/kernelbase/version.c b/dlls/kernelbase/version.c
+index 108b786..f4b29a4 100644
+--- a/dlls/kernelbase/version.c
++++ b/dlls/kernelbase/version.c
+@@ -1546,13 +1546,43 @@ BOOL WINAPI GetVersionExW( OSVERSIONINFOW *info )
+     return TRUE;
+ }
+ 
++/* Package identity for hosted UWP apps. The wine-uwp launcher sets these variables:
++ *   WINE_UWP_PACKAGE_FULL_NAME    e.g. Microsoft.WindowsCalculator_11.2607.0.0_x64__8wekyb3d8bbwe
++ *   WINE_UWP_PACKAGE_FAMILY_NAME  e.g. Microsoft.WindowsCalculator_8wekyb3d8bbwe
++ *   WINE_UWP_PACKAGE_PATH         Windows path of the unpacked package
++ *   WINE_UWP_AUMID                e.g. Microsoft.WindowsCalculator_8wekyb3d8bbwe!App
++ */
++static LONG get_package_string( const WCHAR *var, UINT32 *length, WCHAR *buffer, LONG no_package_error )
++{
++    WCHAR value[1024];
++    DWORD len;
++
++    if (!length) return ERROR_INVALID_PARAMETER;
++    len = GetEnvironmentVariableW( var, value, ARRAY_SIZE(value) );
++    if (!len || len >= ARRAY_SIZE(value)) return no_package_error;
++    len++;  /* include terminator */
++    if (*length < len || !buffer)
++    {
++        *length = len;
++        return ERROR_INSUFFICIENT_BUFFER;
++    }
++    *length = len;
++    lstrcpyW( buffer, value );
++    return ERROR_SUCCESS;
++}
++
++static BOOL is_packaged_process(void)
++{
++    return GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", NULL, 0 ) != 0;
++}
++
+ /***********************************************************************
+  *         GetCurrentApplicationUserModelId   (kernelbase.@)
+  */
+ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentApplicationUserModelId( UINT32 *length, WCHAR *id )
+ {
+-    FIXME( "(%p %p): stub\n", length, id );
+-    return APPMODEL_ERROR_NO_APPLICATION;
++    TRACE( "(%p %p)\n", length, id );
++    return get_package_string( L"WINE_UWP_AUMID", length, id, APPMODEL_ERROR_NO_APPLICATION );
+ }
+ 
+ /***********************************************************************
+@@ -1560,8 +1590,8 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentApplicationUserModelId( UINT32 *le
+  */
+ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFamilyName( UINT32 *length, WCHAR *name )
+ {
+-    FIXME( "(%p %p): stub\n", length, name );
+-    return APPMODEL_ERROR_NO_PACKAGE;
++    TRACE( "(%p %p)\n", length, name );
++    return get_package_string( L"WINE_UWP_PACKAGE_FAMILY_NAME", length, name, APPMODEL_ERROR_NO_PACKAGE );
+ }
+ 
+ 
+@@ -1570,8 +1600,8 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFamilyName( UINT32 *length,
+  */
+ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFullName( UINT32 *length, WCHAR *name )
+ {
+-    FIXME( "(%p %p): stub\n", length, name );
+-    return APPMODEL_ERROR_NO_PACKAGE;
++    TRACE( "(%p %p)\n", length, name );
++    return get_package_string( L"WINE_UWP_PACKAGE_FULL_NAME", length, name, APPMODEL_ERROR_NO_PACKAGE );
+ }
+ 
+ 
+@@ -1580,8 +1610,125 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageFullName( UINT32 *length, W
+  */
+ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageId( UINT32 *len, BYTE *buffer )
+ {
+-    FIXME( "(%p %p): stub\n", len, buffer );
+-    return APPMODEL_ERROR_NO_PACKAGE;
++    WCHAR full_name[1024];
++
++    TRACE( "(%p %p)\n", len, buffer );
++    if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", full_name, ARRAY_SIZE(full_name) ))
++        return APPMODEL_ERROR_NO_PACKAGE;
++    return PackageIdFromFullName( full_name, 0, len, buffer );
++}
++
++#define PACKAGE_FILTER_HEAD       0x00000010
++#define PACKAGE_FILTER_DIRECT     0x00000020
++#define PACKAGE_FILTER_STATIC     0x00080000
++#define PACKAGE_PROPERTY_FRAMEWORK 0x00000001
++
++struct package_info
++{
++    UINT32 reserved;
++    UINT32 flags;
++    WCHAR *path;
++    WCHAR *packageFullName;
++    WCHAR *packageFamilyName;
++    PACKAGE_ID packageId;
++};
++
++/* Copy a string into the tail of the PACKAGE_INFO buffer, or just account for it. */
++static WCHAR *pkg_put_string( const WCHAR *str, BYTE *buffer, UINT32 *offset, UINT32 size )
++{
++    UINT32 len = (lstrlenW( str ) + 1) * sizeof(WCHAR);
++    WCHAR *ret = NULL;
++    if (buffer && *offset + len <= size)
++    {
++        ret = (WCHAR *)(buffer + *offset);
++        memcpy( ret, str, len );
++    }
++    *offset += len;
++    return ret;
++}
++
++/***********************************************************************
++ *         GetCurrentPackageInfo2   (kernelbase.@)
++ *
++ * Package graph for hosted UWP apps: the main package from WINE_UWP_PACKAGE_*, plus framework
++ * dependencies listed in WINE_UWP_PACKAGE_DEPENDENCIES as "fullname|family|path;fullname|family|path".
++ */
++LONG WINAPI GetCurrentPackageInfo2( UINT32 flags, UINT32 path_type, UINT32 *buffer_size, BYTE *buffer, UINT32 *count )
++{
++    WCHAR full[1024], family[1024], path[1024], deps[4096];
++    struct { const WCHAR *full, *family, *path; UINT32 flags; } pkgs[16];
++    UINT32 n = 0, i, needed, offset, ids_size, want_head, want_deps;
++    struct package_info *infos = (struct package_info *)buffer;
++    WCHAR *p;
++
++    TRACE( "(%#x %u %p %p %p)\n", flags, path_type, buffer_size, buffer, count );
++
++    if (!buffer_size || !count) return ERROR_INVALID_PARAMETER;
++    if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", full, ARRAY_SIZE(full) ))
++        return APPMODEL_ERROR_NO_PACKAGE;
++    if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FAMILY_NAME", family, ARRAY_SIZE(family) )) family[0] = 0;
++    if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_PATH", path, ARRAY_SIZE(path) )) path[0] = 0;
++
++    want_head = !(flags & (PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT)) || (flags & PACKAGE_FILTER_HEAD);
++    want_deps = !(flags & (PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT)) || (flags & PACKAGE_FILTER_DIRECT);
++
++    if (want_head)
++    {
++        pkgs[n].full = full; pkgs[n].family = family; pkgs[n].path = path;
++        pkgs[n].flags = PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT | PACKAGE_FILTER_STATIC;
++        n++;
++    }
++    if (want_deps && GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_DEPENDENCIES", deps, ARRAY_SIZE(deps) ))
++    {
++        for (p = deps; *p && n < ARRAY_SIZE(pkgs); )
++        {
++            WCHAR *end = wcschr( p, ';' ), *f, *pa;
++            if (end) *end++ = 0;
++            if ((f = wcschr( p, '|' )) && (pa = wcschr( f + 1, '|' )))
++            {
++                *f++ = 0; *pa++ = 0;
++                pkgs[n].full = p; pkgs[n].family = f; pkgs[n].path = pa;
++                pkgs[n].flags = PACKAGE_FILTER_DIRECT | PACKAGE_FILTER_STATIC;
++                n++;
++            }
++            p = end ? end : p + lstrlenW( p );
++        }
++    }
++
++    /* size pass */
++    needed = n * sizeof(*infos);
++    for (i = 0; i < n; i++)
++    {
++        UINT32 id_size = 0;
++        needed += (lstrlenW( pkgs[i].full ) + 1 + lstrlenW( pkgs[i].family ) + 1 + lstrlenW( pkgs[i].path ) + 1) * sizeof(WCHAR);
++        PackageIdFromFullName( pkgs[i].full, 0, &id_size, NULL );
++        needed += id_size;
++    }
++    if (!buffer || *buffer_size < needed)
++    {
++        *buffer_size = needed;
++        *count = 0;
++        return ERROR_INSUFFICIENT_BUFFER;
++    }
++
++    offset = n * sizeof(*infos);
++    for (i = 0; i < n; i++)
++    {
++        memset( &infos[i], 0, sizeof(infos[i]) );
++        infos[i].flags = pkgs[i].flags;
++        infos[i].path = pkg_put_string( pkgs[i].path, buffer, &offset, *buffer_size );
++        infos[i].packageFullName = pkg_put_string( pkgs[i].full, buffer, &offset, *buffer_size );
++        infos[i].packageFamilyName = pkg_put_string( pkgs[i].family, buffer, &offset, *buffer_size );
++        ids_size = *buffer_size - offset;
++        if (PackageIdFromFullName( pkgs[i].full, 0, &ids_size, buffer + offset ) == ERROR_SUCCESS)
++        {
++            infos[i].packageId = *(PACKAGE_ID *)(buffer + offset);
++            offset += ids_size;
++        }
++    }
++    *buffer_size = needed;
++    *count = n;
++    return ERROR_SUCCESS;
+ }
+ 
+ /***********************************************************************
+@@ -1589,8 +1736,7 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackageId( UINT32 *len, BYTE *buff
+  */
+ LONG WINAPI GetCurrentPackageInfo( const UINT32 flags, UINT32 *buffer_size, BYTE *buffer, UINT32 *count )
+ {
+-    FIXME( "(%#x %p %p %p): stub\n", flags, buffer_size, buffer, count );
+-    return APPMODEL_ERROR_NO_PACKAGE;
++    return GetCurrentPackageInfo2( flags, 0 /* PackagePathType_Install */, buffer_size, buffer, count );
+ }
+ 
+ /***********************************************************************
+@@ -1598,8 +1744,8 @@ LONG WINAPI GetCurrentPackageInfo( const UINT32 flags, UINT32 *buffer_size, BYTE
+  */
+ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackagePath( UINT32 *length, WCHAR *path )
+ {
+-    FIXME( "(%p %p): stub\n", length, path );
+-    return APPMODEL_ERROR_NO_PACKAGE;
++    TRACE( "(%p %p)\n", length, path );
++    return get_package_string( L"WINE_UWP_PACKAGE_PATH", length, path, APPMODEL_ERROR_NO_PACKAGE );
+ }
+ 
+ 
+@@ -1608,8 +1754,10 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetCurrentPackagePath( UINT32 *length, WCHAR
+  */
+ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetPackageFullName( HANDLE process, UINT32 *length, WCHAR *name )
+ {
+-    FIXME( "(%p %p %p): stub\n", process, length, name );
+-    return APPMODEL_ERROR_NO_PACKAGE;
++    TRACE( "(%p %p %p)\n", process, length, name );
++    if (process != GetCurrentProcess() && GetProcessId( process ) != GetCurrentProcessId())
++        FIXME( "other process %p, answering for the current one\n", process );
++    return get_package_string( L"WINE_UWP_PACKAGE_FULL_NAME", length, name, APPMODEL_ERROR_NO_PACKAGE );
+ }
+ 
+ 
+@@ -1618,8 +1766,10 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetPackageFullName( HANDLE process, UINT32 *
+  */
+ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetPackageFamilyName( HANDLE process, UINT32 *length, WCHAR *name )
+ {
+-    FIXME( "(%p %p %p): stub\n", process, length, name );
+-    return APPMODEL_ERROR_NO_PACKAGE;
++    TRACE( "(%p %p %p)\n", process, length, name );
++    if (process != GetCurrentProcess() && GetProcessId( process ) != GetCurrentProcessId())
++        FIXME( "other process %p, answering for the current one\n", process );
++    return get_package_string( L"WINE_UWP_PACKAGE_FAMILY_NAME", length, name, APPMODEL_ERROR_NO_PACKAGE );
+ }
+ 
+ /***********************************************************************
+@@ -1646,8 +1796,15 @@ LONG WINAPI GetPackagePathByFullName(const WCHAR *name, UINT32 *len, WCHAR *path
+     if (!len || !name)
+         return ERROR_INVALID_PARAMETER;
+ 
+-    FIXME( "(%s %p %p): stub\n", debugstr_w(name), len, path );
+-
++    {
++        WCHAR full_name[1024];
++        TRACE( "(%s %p %p)\n", debugstr_w(name), len, path );
++        if (is_packaged_process() &&
++            GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", full_name, ARRAY_SIZE(full_name) ) &&
++            !wcsicmp( full_name, name ))
++            return get_package_string( L"WINE_UWP_PACKAGE_PATH", len, path, APPMODEL_ERROR_NO_PACKAGE );
++    }
++    FIXME( "(%s %p %p): unknown package\n", debugstr_w(name), len, path );
+     return APPMODEL_ERROR_NO_PACKAGE;
+ }
+ 
+diff --git a/dlls/ntdll/rtl.c b/dlls/ntdll/rtl.c
+index 1cd9c19..0ea9055 100644
+--- a/dlls/ntdll/rtl.c
++++ b/dlls/ntdll/rtl.c
+@@ -1620,30 +1620,75 @@ void * WINAPI RtlLookupElementGenericTableAvl(PRTL_AVL_TABLE table, void *buffer
+     return NULL;
+ }
+ 
++/* Package identity for hosted UWP apps, see kernelbase/version.c for the variables. */
++static NTSTATUS get_package_env( const WCHAR *var, WCHAR *buffer, SIZE_T *size )
++{
++    UNICODE_STRING name, value;
++    WCHAR tmp[1024];
++    NTSTATUS status;
++    SIZE_T len;
++
++    RtlInitUnicodeString( &name, var );
++    value.Buffer = tmp;
++    value.MaximumLength = sizeof(tmp);
++    if ((status = RtlQueryEnvironmentVariable_U( NULL, &name, &value ))) return STATUS_NOT_FOUND;
++    len = value.Length / sizeof(WCHAR) + 1;
++    if (!size) return STATUS_SUCCESS;
++    if (!buffer || *size < len)
++    {
++        *size = len;
++        return STATUS_BUFFER_TOO_SMALL;
++    }
++    *size = len;
++    memcpy( buffer, tmp, len * sizeof(WCHAR) );
++    return STATUS_SUCCESS;
++}
++
+ /*********************************************************************
+  *           RtlQueryPackageIdentity [NTDLL.@]
+  */
+ NTSTATUS WINAPI RtlQueryPackageIdentity(HANDLE token, WCHAR *fullname, SIZE_T *fullname_size,
+                                         WCHAR *appid, SIZE_T *appid_size, BOOLEAN *packaged)
+ {
+-    FIXME("(%p, %p, %p, %p, %p, %p): stub\n", token, fullname, fullname_size, appid, appid_size, packaged);
+-    return STATUS_NOT_FOUND;
++    NTSTATUS status;
++
++    TRACE("(%p, %p, %p, %p, %p, %p)\n", token, fullname, fullname_size, appid, appid_size, packaged);
++
++    if ((status = get_package_env( L"WINE_UWP_PACKAGE_FULL_NAME", fullname, fullname_size ))) return status;
++    if (appid_size && (status = get_package_env( L"WINE_UWP_AUMID", appid, appid_size ))) return status;
++    if (packaged) *packaged = TRUE;
++    return STATUS_SUCCESS;
+ }
+ 
++#define PSM_ACTIVATION_TOKEN_PACKAGED_APPLICATION 0x01
++#define PSM_ACTIVATION_TOKEN_DEVELOPMENT_APP      0x10
++#define PACKAGE_ORIGIN_DEVELOPER_UNSIGNED 4
++
+ /*********************************************************************
+  *           RtlQueryPackageClaims [NTDLL.@]
+  *
+- * Queried by Windows.UI.Xaml.dll during Application init. Windows returns
+- * STATUS_NOT_FOUND for processes without package identity.
++ * Queried by Windows.UI.Xaml.dll during Application init: it fail-fasts unless
++ * this succeeds with the PACKAGED_APPLICATION flag set.
+  */
+ NTSTATUS WINAPI RtlQueryPackageClaims(HANDLE token, WCHAR *fullname, SIZE_T *fullname_size,
+                                       WCHAR *appid, SIZE_T *appid_size, GUID *dynamic_id,
+-                                      void *pkg_claim, ULONG64 *attributes_present)
++                                      ULONG64 *pkg_claim, ULONG64 *attributes_present)
+ {
+-    FIXME("(%p, %p, %p, %p, %p, %p, %p, %p): stub\n", token, fullname, fullname_size,
++    NTSTATUS status;
++
++    TRACE("(%p, %p, %p, %p, %p, %p, %p, %p)\n", token, fullname, fullname_size,
+           appid, appid_size, dynamic_id, pkg_claim, attributes_present);
++
++    if ((status = get_package_env( L"WINE_UWP_PACKAGE_FULL_NAME", fullname, fullname_size ))) return status;
++    if (appid_size && (status = get_package_env( L"WINE_UWP_AUMID", appid, appid_size ))) return status;
++    if (dynamic_id) memset( dynamic_id, 0, sizeof(*dynamic_id) );
++    if (pkg_claim)
++    {
++        pkg_claim[0] = PSM_ACTIVATION_TOKEN_PACKAGED_APPLICATION | PSM_ACTIVATION_TOKEN_DEVELOPMENT_APP; /* Flags */
++        pkg_claim[1] = PACKAGE_ORIGIN_DEVELOPER_UNSIGNED;                                                 /* Origin */
++    }
+     if (attributes_present) *attributes_present = 0;
+-    return STATUS_NOT_FOUND;
++    return STATUS_SUCCESS;
+ }
+ 
+ /*********************************************************************
+diff --git a/dlls/ntdll/unix/security.c b/dlls/ntdll/unix/security.c
+index 70dfe21..f104fb0 100644
+--- a/dlls/ntdll/unix/security.c
++++ b/dlls/ntdll/unix/security.c
+@@ -643,6 +643,75 @@ NTSTATUS WINAPI NtQueryInformationToken( HANDLE token, TOKEN_INFORMATION_CLASS c
+             break;
+         }
+ 
++    case TokenSecurityAttributes:
++        {
++            /* Package identity claims for hosted UWP apps (see kernelbase/version.c). Layout follows the
++             * kernel-mode TOKEN_SECURITY_ATTRIBUTES_INFORMATION: names and string values are UNICODE_STRINGs
++             * pointing inside the returned buffer. twinapi.appcore and kernel.appcore read WIN://SYSAPPID. */
++            struct attr_info { USHORT Version; USHORT Reserved; ULONG AttributeCount; void *pAttributeV1; };
++            struct attr_v1 { UNICODE_STRING Name; USHORT ValueType; USHORT Reserved; ULONG Flags; ULONG ValueCount; void *Values; };
++            static const WCHAR sysappid[] = {'W','I','N',':','/','/','S','Y','S','A','P','P','I','D',0};
++            static const WCHAR pkgname[]  = {'W','I','N',':','/','/','P','K','G',0};
++            const char *aumid = getenv( "WINE_UWP_AUMID" ), *family = getenv( "WINE_UWP_PACKAGE_FAMILY_NAME" ),
++                       *full = getenv( "WINE_UWP_PACKAGE_FULL_NAME" );
++            const char *strs[3] = { aumid, family, full };
++            WCHAR *wstrs[3];
++            struct attr_info *hdr;
++            struct attr_v1 *attrs;
++            UNICODE_STRING *values;
++            ULONG64 *pkg;
++            char *ptr;
++            ULONG i, needed, count = 0;
++            DWORD lens[3];
++
++            if (!full) { status = STATUS_NOT_FOUND; break; }
++            for (i = 0; i < 3; i++) if (strs[i]) count++;
++            needed = sizeof(*hdr) + 2 * sizeof(*attrs) + sizeof(sysappid) + sizeof(pkgname) + sizeof(ULONG64)
++                     + count * sizeof(UNICODE_STRING);
++            for (i = 0; i < 3; i++)
++            {
++                if (!strs[i]) continue;
++                lens[i] = ntdll_umbstowcs( strs[i], strlen(strs[i]), NULL, 0 );
++                needed += (lens[i] + 1) * sizeof(WCHAR);
++            }
++            if (retlen) *retlen = needed;
++            if (length < needed) { status = STATUS_BUFFER_TOO_SMALL; break; }
++
++            hdr = info;
++            hdr->Version = 1; hdr->Reserved = 0; hdr->AttributeCount = 2;
++            attrs = (struct attr_v1 *)(hdr + 1);
++            hdr->pAttributeV1 = attrs;
++            values = (UNICODE_STRING *)(attrs + 2);
++            pkg = (ULONG64 *)(values + count);
++            ptr = (char *)(pkg + 1);
++
++            /* WIN://SYSAPPID: string values AUMID, package family name, package full name */
++            attrs[0].Name.Buffer = (WCHAR *)ptr; memcpy( ptr, sysappid, sizeof(sysappid) ); ptr += sizeof(sysappid);
++            attrs[0].Name.Length = sizeof(sysappid) - sizeof(WCHAR); attrs[0].Name.MaximumLength = sizeof(sysappid);
++            attrs[0].ValueType = 3 /* TOKEN_SECURITY_ATTRIBUTE_TYPE_STRING */; attrs[0].Reserved = 0;
++            attrs[0].Flags = 0x0001 /* NON_INHERITABLE */; attrs[0].ValueCount = count; attrs[0].Values = values;
++            for (i = 0, count = 0; i < 3; i++)
++            {
++                if (!strs[i]) continue;
++                wstrs[i] = (WCHAR *)ptr;
++                ntdll_umbstowcs( strs[i], strlen(strs[i]), wstrs[i], lens[i] );
++                wstrs[i][lens[i]] = 0;
++                values[count].Buffer = wstrs[i];
++                values[count].Length = lens[i] * sizeof(WCHAR);
++                values[count].MaximumLength = (lens[i] + 1) * sizeof(WCHAR);
++                ptr += (lens[i] + 1) * sizeof(WCHAR);
++                count++;
++            }
++            /* WIN://PKG: packaged-application claim */
++            attrs[1].Name.Buffer = (WCHAR *)ptr; memcpy( ptr, pkgname, sizeof(pkgname) ); ptr += sizeof(pkgname);
++            attrs[1].Name.Length = sizeof(pkgname) - sizeof(WCHAR); attrs[1].Name.MaximumLength = sizeof(pkgname);
++            attrs[1].ValueType = 2 /* TOKEN_SECURITY_ATTRIBUTE_TYPE_UINT64 */; attrs[1].Reserved = 0;
++            attrs[1].Flags = 0x0001; attrs[1].ValueCount = 1; attrs[1].Values = pkg;
++            *pkg = 0x1 /* PSM_ACTIVATION_TOKEN_PACKAGED_APPLICATION */ | 0x10 /* DEVELOPMENT_APP */;
++            TRACE( "TokenSecurityAttributes: %s\n", full );
++            break;
++        }
++
+     case TokenLinkedToken:
+         SERVER_START_REQ( create_linked_token )
+         {
+-- 
+2.55.0
+
