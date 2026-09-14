@@ -3174,3 +3174,11 @@ mask brushes. Still open:
   (`0xd49e0` jumps there) and only takes the slot when `gs:[0x48]` (the current thread id) equals the
   id wineuwp stores at +0x10d010 from `wf_CreateCoreWindow` (the XAML UI thread); zero means any
   thread, for the pre-CoreWindow startup ticks.
+- With the thread-bound dequeue, 9 of 9 surviving runs in a batch of 10 ticked after the click. The
+  one loss was a startup crash on tick #3: `CTransform::MakeWinRTExpressionWithOrigin` reads the
+  property set it asked an expression animation for (`ICompositionObject::get_Properties`, slot 8 of
+  dcomp's generic recording object) and got nothing. `is_out_pointer` refused to fill the caller's
+  out-pointer because the stack address (0x7f98c018dfc0-style) matched its "low dword looks like a
+  float" heuristic; thread stack placement varies per run, hence the intermittence. The packed-float
+  case that heuristic was for (a Size in a register) is already non-canonical and rejected earlier,
+  so the float test is gone.
