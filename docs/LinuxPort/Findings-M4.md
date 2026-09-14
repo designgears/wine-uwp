@@ -3165,3 +3165,12 @@ mask brushes. Still open:
   with `xor ebx,ebx; xchg [slot],rbx` (`CoreMessaging.dll.bak-drain-race` is the previous state).
   Note the enqueue still overwrites an undelivered entry; that only costs a tick when two different
   timers are due at once.
+- That was not the whole story: with the atomic dequeue the stall still hit 2 of 8 runs, and hooks on
+  the OnTimerSignaled thunk showed the real loss. The slot is global, but every dispatcher's
+  `DrainSignaledWaits` drained it, and the main thread (028c, twinapi's view host) runs one too. When
+  it got there first, `TimeoutManager::OnTimerSignaled` ran on the main thread, activated the dispatch
+  item on the wrong dispatcher, and XAML's `MessageTimerCallbackStatic` never ran; the scheduler stayed
+  in state 1 for good. The dequeue routine now lives in free space at CoreMessaging+0xd4a60
+  (`0xd49e0` jumps there) and only takes the slot when `gs:[0x48]` (the current thread id) equals the
+  id wineuwp stores at +0x10d010 from `wf_CreateCoreWindow` (the XAML UI thread); zero means any
+  thread, for the pre-CoreWindow startup ticks.
