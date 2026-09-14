@@ -3303,3 +3303,39 @@ mask brushes. Still open:
   and Wine's semi-stub returned the base colour for every type. It now returns the Windows 11 default
   palette (99EBFF 4CC2FF 0091F8 0078D4 005EB7 003D92 001A68), with alpha, which XAML byte-swaps
   itself. AccentButtonBackground in the dark theme is Light2, hence the match.
+
+## The hamburger menu: selection, scrolling, the pane fill (2026-09-14)
+
+- **Nothing could be selected.** WinUI's NavigationView invokes items from the Tapped event, and XAML
+  raises Tapped from ninput's InteractionContext output callback, which Wine's stub never called
+  (hover works because it is plain pointer input). ninput now recognises a tap: pointer down and up
+  within 10 px and 500 ms, reported as INTERACTION_ID_TAP in the context's units (HIMETRIC by
+  default), with double-tap counting; GetStateInteractionContext reports IN_INTERACTION between the
+  two. Manipulations, holds, drags and cross-slides are still not recognised.
+- **The wheel did nothing.** XAML's ScrollViewer hands wheel input to DirectManipulation only when
+  the viewport reports READY; Wine's viewport stayed ENABLED after Enable, so
+  IDirectManipulationManager::ProcessInput was never called (and was E_NOTIMPL anyway). An enabled
+  idle viewport now reports READY, and ProcessInput moves the primary content of the innermost READY
+  viewport under the pointer by 48 px per notch, clamped to the content, then raises
+  OnViewportStatusChanged (RUNNING, READY), OnContentUpdated and OnViewportUpdated; XAML reads the
+  content transform back and its visuals follow the shared content transform. Traced with
+  WINEDEBUG=+manipulation (the channel is "manipulation", not "directmanipulation").
+- **Scrolled content spilled out of the pane.** XAML clips ScrollViewer content with an InsetClip on
+  its interop visual; dcomp recorded the clip object but never applied it, and CreateInsetClip
+  returned a generic recording object whose inset setters were swallowed. InsetClip is now typed (its
+  default interface is IInsetClip, which XAML uses without a QI) and the painter clips the subtree of
+  public and interop visuals to it.
+- **The pane had no background.** It is an acrylic brush: CompositionEffectBrush over XAML's effect
+  graph (blurred Backdrop, tint flood, Noise). XAML creates it even though CompositionCapabilities
+  says effects are neither supported nor fast. The effect factory now keeps the IGraphicsEffect and
+  the painter walks it through IGraphicsEffectD2D1Interop for the most opaque D2D1Flood colour and
+  paints that, opaque. Two traps: the Backdrop/Noise sources are our own recording objects that
+  answer every interface (walking them wrote fake values into the source count), and XAML's flood
+  effect faults inside Windows.UI.Xaml.Controls.dll when GetProperty is called without a
+  GetPropertyCount check; the walk checks the count and runs under __TRY.
+- **Not fixed.** The Settings gear (an AnimatedIcon) is drawn at its 48 px design size: its root
+  visual never gets the Scale(1/3) the hamburger's root gets, cause not found. Making
+  BooleanKeyFrameAnimation typed (so IsVisible key frames apply) changed the hamburger into a
+  different Lottie layer, since which layer shows depends on the icon's Progress state, so boolean
+  key frames stay ignored. The pane does not close after picking a mode. Graphing mode fails on
+  dxgi's CreateSwapChainForComposition stub.
