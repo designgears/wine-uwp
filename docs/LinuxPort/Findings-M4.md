@@ -3194,3 +3194,29 @@ mask brushes. Still open:
   typed objects now (generic recording vtable plus the IColor/IScalar/IBooleanKeyFrameAnimation view)
   that keep the last key frame, and StartAnimation jumps the target property to that end value. The
   stepwise pointer experiment shows the hovered button darker and the rest restored.
+
+## The result display is right-aligned (2026-09-14)
+
+- `CalculationResult`'s right alignment is a DirectManipulation content alignment
+  (`primary_SetHorizontalAlignment(RIGHT)` on a 936x117 viewport holding 39x87 of text), not a layout
+  one. Two pieces were missing:
+  - directmanipulation: one primary content per viewport (XAML configured the first object and read
+    transforms from later ones), and `GetContentTransform`/`GetOutputTransform` return the alignment
+    translation (viewport width minus content width) when the content is smaller than the viewport.
+    The same matrix is pushed into the shared content transform (`CreateSharedContentTransform`),
+    which now comes from dcomp's `__wine_dcomp_create_matrix_transform` because the "device" XAML
+    passes is the flattened desktop-partner table, where the IDCompositionDevice slot for
+    CreateMatrixTransform lands on CreateTranslateTransform3D.
+  - dcomp: the position reaches the visual only through composition expressions:
+    `InteropCompositor::CreateManipulationTransform(shared)` → `PS.DManip` animated by
+    `"transform*manipTransform.Matrix"` → the visual's TransformMatrix animated by
+    `"Matrix4x4(LOCAL.Render) * ... * LOCAL.DManip * ..."`. The matrix transform, manipulation
+    transform and expression animation are typed objects now (expression animations record
+    `SetReferenceParameter`; StartAnimation receives the ICompositionAnimation view, references the
+    generic pointer or a property set's ICompositionObject view), and the painter adds the linked
+    matrix's translation. Two traps on the way: the expression's ICompositionObject must stay the
+    generic table (XAML walks Properties and a private partner {83112a11} from it and fail-fasts on
+    E_NOINTERFACE), and the generic default slot clones objects by vtable, which must route typed
+    vtables through their own constructors or the clone is a truncated struct.
+- Still wrong on that screen: the expression line at the top left is drawn large and unaligned, and
+  the memory buttons' row is fine. History/Memory panel and the title bar are as before.
