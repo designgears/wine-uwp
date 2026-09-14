@@ -3228,3 +3228,25 @@ mask brushes. Still open:
   remembers its parent collection, and an insert into another collection detaches it from the old
   one. With that the Standard view renders as on Windows except for the hamburger glyph (top left,
   next to the app icon), which is missing.
+
+## Polish: startup time, log noise, the hamburger (2026-09-14)
+
+- Startup: 10 s to a full UI with run.sh's old default tracing (+loaddll,+combase,+winrt), 4 s with
+  Wine's normal channels. run.sh now defaults to `fixme+all,err+all`; set WINEDEBUG to trace again.
+  The per-tick FIXMEs (compositor probe answers, QuirkIsEnabled for 75 distinct ids, the dwrite
+  download queue) are reported once each.
+- The hamburger is WinUI's AnimatedIcon: a ShapeVisual (48x48, under a container scaled 0.333)
+  holding container shapes of sprite shapes over path geometries (IGeometrySource2DInterop gives the
+  ID2D1Geometry), filled with a colour brush whose Color is the expression
+  `ColorRGB(_theme.Foreground.W,_theme.Foreground.X,_theme.Foreground.Y,_theme.Foreground.Z)` over a
+  Vector4 in the theme property set. dcomp now has typed shape objects, rasterises the shapes with
+  D2D into a texture of the visual's size (Wine's ID2D1DCRenderTarget was tried first: its present
+  is a whole-rect SRCCOPY from a DXGI surface whose GetDC fails here), keeps property-set values and
+  expression text, resolves those two colour expression forms at StartAnimation, applies a visual's
+  Scale about its CenterPoint to its content and children, and skips invisible subtrees (the back
+  button's AnimatedIcon, also 48x48 at the same spot, is IsVisible=false). The icon's other
+  animation states stay hidden without evaluating the Progress-driven animations, since their
+  containers have no offset and land outside the 48x48 texture.
+- One-off crash seen on the user's desktop (GL renderer, once):
+  `WUCBrushManager::GetNineGridBrush+0xdd` reading a NULL nine-grid brush vtable; not reproduced on
+  :98 with the Vulkan renderer.
