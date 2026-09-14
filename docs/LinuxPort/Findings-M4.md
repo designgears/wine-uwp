@@ -3188,3 +3188,9 @@ mask brushes. Still open:
   a compatible bitmap and BitBlts once. What remains after that: buttons that were hovered or pressed
   keep the faint pressed fill, because XAML animates the state change and dcomp does not run
   composition animations.
+- Button hover/pressed fills now return to normal: XAML animates the state change with
+  ColorKeyFrameAnimations on the button background's colour brush (also ScalarKeyFrameAnimation
+  "Opacity" and BooleanKeyFrameAnimation "IsVisible" on visuals). dcomp's key-frame animations are
+  typed objects now (generic recording vtable plus the IColor/IScalar/IBooleanKeyFrameAnimation view)
+  that keep the last key frame, and StartAnimation jumps the target property to that end value. The
+  stepwise pointer experiment shows the hovered button darker and the rest restored.
