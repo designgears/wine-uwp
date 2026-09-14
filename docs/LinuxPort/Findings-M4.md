@@ -3220,3 +3220,11 @@ mask brushes. Still open:
     vtables through their own constructors or the clone is a truncated struct.
 - Still wrong on that screen: the expression line at the top left is drawn large and unaligned, and
   the memory buttons' row is fine. History/Memory panel and the title bar are as before.
+- The second "78" at the top left was the same digit sprites painted twice: the tree-walk trace
+  (now part of the painter's TRACE output, "child N of ... is ...") showed sprite X as child 0 of the
+  DManip content container and still as child 8 of its previous parent. `collection_Remove`
+  compared children by interface pointer, so XAML's Remove on the old collection did not match.
+  Children are now compared by object (QI for the private InteropVisual view), each public visual
+  remembers its parent collection, and an insert into another collection detaches it from the old
+  one. With that the Standard view renders as on Windows except for the hamburger glyph (top left,
+  next to the app icon), which is missing.
