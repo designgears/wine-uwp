@@ -3274,3 +3274,32 @@ mask brushes. Still open:
   that covers the whole monitor non-resizable (min = max size hints), so on the 1280x800 test
   display the tests run under kwin_x11 with WINE_UWP_WINDOW_SIZE=1000x680. run.sh defaults the frame
   title to "Calculator".
+
+## The focus rectangle and the equals button (2026-09-14)
+
+- The white rectangle around the display was XAML's keyboard focus visual: Calculator focuses the
+  result programmatically, and XAML converts a programmatic focus into a keyboard one when its "last
+  input device" is the keyboard. That value is set by `CContentRoot::UpdateLastInputDeviceTypeFromSystem`
+  during `FrameworkView::SetWindow`, which sends WM_CHANGEUISTATE(UIS_INITIALIZE) and WM_QUERYUISTATE
+  to `GetOwnerWindow()`. At that moment the CJupiterWindow is not attached yet, so the hwnd is NULL,
+  the query returns 0 (no UISF_HIDEFOCUS) and XAML records "keyboard". Windows gets the right answer
+  later: win32k initialises a top-level window's UI state on its first activation and DefWindowProc
+  broadcasts WM_UPDATEUISTATE(UIS_SET, HIDEFOCUS|HIDEACCEL) down the tree, which XAML's subclass
+  procedure (`CJupiterControl::HandleWindowMessage`) turns back into "no input device". Wine's
+  DefWindowProc ignored all three messages (traced with winedbg breakpoints: `SetLastInputDeviceType`
+  was never called, the "keyboard" write at xaml+0x3bd2f9 was, with rbx = hwnd = 0).
+- win32u now keeps a per-window `ui_state`: WM_CHANGEUISTATE forwards to the top-level window,
+  UIS_INITIALIZE hides cues unless SPI_GETKEYBOARDCUES is on (like Windows, minus the "last input
+  event was a key" refinement, which Wine does not track), a change sends WM_UPDATEUISTATE to the
+  window and its descendants, and WM_QUERYUISTATE answers it. `set_active_window` initialises a
+  window on its first activation. Because wineuwp shows the CoreWindow before XAML subclasses it,
+  that first activation is too early; the navigation client's `OnActivateWindow` (the app's
+  `Window.Activate`, when the shell would activate on Windows) re-initialises the state. Keyboard
+  input then still works (typed 912+3= and got 915), and focus visuals will appear after real key
+  presses as they do on Windows.
+- The equals button was the base accent #0078D4 instead of Windows 11's #4CC2FF: XAML's
+  `SystemThemingInterop::GetSystemVariantAccentColor` maps its seven variants to uxtheme
+  `GetColorFromPreference` colour types 1..7 (Light3, Light2, Light1, accent, Dark1, Dark2, Dark3)
+  and Wine's semi-stub returned the base colour for every type. It now returns the Windows 11 default
+  palette (99EBFF 4CC2FF 0091F8 0078D4 005EB7 003D92 001A68), with alpha, which XAML byte-swaps
+  itself. AccentButtonBackground in the dark theme is Light2, hence the match.
