@@ -3182,3 +3182,9 @@ mask brushes. Still open:
   float" heuristic; thread stack placement varies per run, hence the intermittence. The packed-float
   case that heuristic was for (a Size in a register) is already non-canonical and rejected earlier,
   so the float test is gone.
+- "Vanishing buttons" were not a rendering-state problem: the fallback presenter painted straight
+  into the window DC, backdrop first, so screenshots sampled mid-frame showed half-painted frames
+  (a stepwise pointer experiment caught one with only MC/MR/M+ drawn). The presenter now paints into
+  a compatible bitmap and BitBlts once. What remains after that: buttons that were hovered or pressed
+  keep the faint pressed fill, because XAML animates the state change and dcomp does not run
+  composition animations.
