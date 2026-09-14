@@ -3,7 +3,9 @@
 # Usage: tools/wine-uwp/run.sh [exe] [args...]     default exe: CalculatorApp.exe in the stage dir
 set -uo pipefail
 export WINEPREFIX=$HOME/.wine-uwp
-export WINEDEBUG=${WINEDEBUG:-+loaddll,+combase,+winrt}
+# Wine's normal channels by default: the +loaddll,+combase,+winrt tracing that debugging needs costs
+# about 6 s of the 10 s startup (4 s without it). Set WINEDEBUG to get it back.
+export WINEDEBUG=${WINEDEBUG:-fixme+all,err+all}
 # Patched Wine build (see docs/LinuxPort/Findings-M1.md), falls back to system wine.
 WINE_BUILD=${WINE_BUILD:-$HOME/src/wine-build}
 if [ -x "$WINE_BUILD/wine" ]; then export PATH="$WINE_BUILD:$PATH"; fi
