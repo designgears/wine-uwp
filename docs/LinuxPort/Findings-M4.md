@@ -3354,3 +3354,31 @@ mask brushes. Still open:
   redraws it). Tracing note: `echo >> $UWP_LOG` marks get overwritten because wine writes at its
   own offset; record `wc -l` instead. Alt+2 (mode shortcuts) hits a separate AccessKeys fail-fast
   (`MakeAccessKeyUppercase` E_FAIL), not fixed.
+
+## Every menu entry, and the Settings gear (2026-09-15)
+
+- A sweep script (`/tmp/links.sh`: open the pane, pick each entry, screenshot, count crashes,
+  aborts, fail-fasts) found four killers, each one page deeper than the last:
+  Programmer aborted (XAML's reveal lights need Windows.UI.Composition.Effects.SceneLightingEffect,
+  a missing class throws in a noexcept function; then the light's ICompositionObject view had no
+  compositor so the light dereferenced an animation it never built); Programmer then Currency crashed
+  (ThemeShadowScene wants ICompositorWithProjectedShadow); leaving Settings fail-fasted on
+  DirectManipulation's RemoveContent; and any page that trims memory aborted on a failed delay load
+  of ext-ms-win-sysmain-pfsapi-l1-1-0 (XAML's OfferableHeap), now served by wineuwp as a plain heap.
+  The Settings page itself came up blank with input dead because its variable-font text goes through
+  IDWriteFontFallback1::MapCharacters, a Wine stub, and XAML fail-fasts on the layout error.
+- The gear: XAML's Viewbox scales the AnimatedIcon by putting a 1/3 scale into the interop visual's
+  TransformMatrix (XAML evaluates the "Matrix3x2.CreateFromScale(vector2(PS.ScaleX, PS.ScaleY))"
+  expression itself through its animator partner); the painter only used the matrix's translation.
+  Interop visuals now propagate matrix scale, and a small evaluator handles the TransformMatrix
+  expressions XAML does hand to dcomp.
+- Result: all 19 entries open without a crash, abort or fail-fast, apart from the Programmer page's
+  ignored E_NOINTERFACE from ElementCompositionPreview::GetPointerPositionPropertySet (the reveal
+  light's pointer tracking, cosmetic). Not working: Date calculation needs ILanguageStatics from
+  windows.globalization (E_NOINTERFACE); every converter needs
+  Windows.Globalization.NumberFormatting.CurrencyFormatter (class not found); both are in another
+  session's uncommitted windows.globalization work. Graphing needs dxgi's
+  CreateSwapChainForComposition. Cosmetic: the page title overlaps the previous one after a
+  navigation (the old title's fade-out is a composition animation), expanding a Settings section
+  leaves stale copies of the text below it, and the Alt+number shortcuts hit an AccessKeys
+  fail-fast.
