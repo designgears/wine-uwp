@@ -3456,3 +3456,27 @@ mask brushes. Still open:
 - Still native-DLL-proof: Graphing (dxgi CreateSwapChainForComposition needs Wine's own swap chain
   code; the genuine dxgi.dll needs the kernel-mode driver interface), the reveal-light pointer
   tracking (dcomp), the light-theme About icon (MRT asset qualifiers), Alt+number AccessKeys.
+
+### Graphing mode: composition swap chains (Wine, see `git log` for "Composition swap chains")
+
+- `CreateSwapChainForComposition` is now an offscreen chain in dxgi (`compswapchain.c`): buffers are
+  ordinary D3D11 render-target textures on the app's device, Present flushes and counts. The app's
+  DeviceResources needed `ID3D11Texture2D1` from GetBuffer plus `CreateTexture2D1` and
+  `CreateRenderTargetView1`, all stubs before; the texture/view vtables grew the GetDesc1 slot.
+- XAML's `SwapChainPanel::SetSwapChain` queries IUnknown, IDXGISwapChain1 and an undocumented
+  `{b02d7a1a-05e0-4a71-8ef4-5c5bbf475086}`; a missing third answer is XAML error 0x88001b00
+  (disassembled at Windows.UI.Xaml+0x654e8f). It only releases the result, so the chain answers
+  it with itself. XAML then hands the chain to `IDCompositionVisual::SetContent`, not to
+  `ICompositorInterop::CreateCompositionSurfaceForSwapChain`; dcomp wraps either in a drawing
+  surface that pulls buffer 0 through a staging copy on the texture's own device when the present
+  count changes, and a 33 ms timer repaints the window because the app presents without commits.
+- `DisplayInformation::DisplayContentsInvalidated` returned E_NOTIMPL from Wine's stub and the
+  C++/CX DeviceResources treated that as fatal; it now accepts the handler. Note the other
+  session's windows.graphics tree does not link (duplicate runtime-class strings between main.c
+  and the untracked displayinformation.c); for testing the DLL was linked by hand with
+  `-Wl,--allow-multiple-definition` and copied over the prefix's stale Sep 9 system32 copy, which
+  the loader had been picking instead of the build tree.
+- Result: the Graphing page opens with its toolbar, zoom buttons and mode toggle, and the graph
+  area shows the swap chain: white, which is right for this build (IsMatchAppTheme defaults to
+  the always-light graph theme, and the open-source GraphingImpl is a mock renderer that draws
+  nothing over the cleared background). Sweep of all 19 entries still clean.
