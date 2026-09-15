@@ -3427,3 +3427,32 @@ mask brushes. Still open:
   PointerSourceWrapper) with a probe removed the Programmer page's 16 ignored fail-fasts but made
   XAML's reveal light code crash the process; the refusal stays. Light theme verified end to end
   (Settings, back to the Standard page: dark-blue accent equals button as on Windows).
+
+### Native Windows.Globalization: Date calculation and every converter (Wine 8d2d3db)
+
+- Re-evaluated the remaining gaps against genuine Windows DLLs. Date calculation and the converters
+  only needed `Windows.Globalization` (ILanguageStatics, CurrencyFormatter, Calendar,
+  DateTimeFormatter); the genuine DLL is in the dump, so it is now overridden native (`run.sh`
+  default list, `install-overrides.sh`). Findings along the way:
+  - `Language.CurrentInputMethodLanguageTag` returned E_NOTIMPL because the DLL calls
+    `ApiSetQueryApiSetPresence("ext-ms-win-globalization-input-l1-1-0")` first; the apiset is now
+    mapped to `globinputhost.dll` (copied from the partition). Only the version-less name may be
+    listed in apisetschema.spec, the loader hashes it without the version suffix.
+  - `icu.dll` (Windows' combined ICU) returned E_FAIL from Calendar creation until
+    `C:\windows\globalization\icu\icudtl.dat` and the `.res` time-zone files existed. The prefix
+    already had a lowercase `globalization` directory (Sorting), Wine matches case exactly when both
+    spellings exist, so the data goes under the lowercase name.
+  - `WinLangdb.dll` is imported but is not in the live System32 any more; the WinSxS copy of the
+    matching build works.
+  - The converter pages then crashed in Microsoft.UI.Xaml (WinUI 2.8 AnimatedVisualPlayer behind
+    the currency ProgressRing): it asks its progress CompositionPropertySet for ICompositionObject4
+    and its root SpriteVisual for IContainerVisual (SpriteVisual derives from ContainerVisual),
+    and dereferences the NULL out pointers. dcomp answers both now.
+- Result: all 19 entries open cleanly (Programmer's 16 ignored fail-fasts unchanged); Date shows
+  today's dates and "Same dates"; Temperature converts 73 °C to 163.4 °F and 346.1 K; Currency
+  renders with the offline "Couldn't get new rates" message. The native DLL replaces the other
+  session's uncommitted builtin work for this app; Wine's builtin stays the fallback if the override
+  is removed.
+- Still native-DLL-proof: Graphing (dxgi CreateSwapChainForComposition needs Wine's own swap chain
+  code; the genuine dxgi.dll needs the kernel-mode driver interface), the reveal-light pointer
+  tracking (dcomp), the light-theme About icon (MRT asset qualifiers), Alt+number AccessKeys.

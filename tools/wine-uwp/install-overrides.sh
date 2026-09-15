@@ -9,7 +9,7 @@ export WINEPREFIX=$HOME/.wine-uwp
 SYS32=$WINEPREFIX/drive_c/windows/system32
 WINE_BIN=${WINE_BIN_DIR:-$HOME/src/wine-build/}
 SRC=$HOME/uwp-bin/win11/Windows/System32
-LIST=${1:-windows.ui.xaml windows.ui twinapi.appcore coremessaging windows.applicationmodel wintypes threadpoolwinrt msvcp_win mrmcorer bcp47mrm bcp47langs profapi rometadata}
+LIST=${1:-windows.ui.xaml windows.ui twinapi.appcore coremessaging windows.applicationmodel wintypes threadpoolwinrt msvcp_win mrmcorer bcp47mrm bcp47langs profapi rometadata windows.globalization icu icuuc icuin winlangdb globinputhost}
 for n in $LIST; do
   f=$(ls "$SRC" | grep -i "^$n\.dll$" | head -1)
   [ -n "$f" ] || { echo "missing $n"; continue; }
@@ -106,4 +106,19 @@ if [ -f "$CLASSES_REG" ] && [ -x "$PY" ]; then
   if ! cmp -s "$SINGLE_REG" "$SINGLE_REG.imported"; then
     "${WINE_BIN}wine" reg import "$SINGLE_REG" >/dev/null 2>&1 && cp -f "$SINGLE_REG" "$SINGLE_REG.imported"
   fi
+fi
+
+# ICU data: the genuine icu.dll (used by the native windows.globalization.dll) loads
+# Windows\Globalization\ICU\icudtl.dat and the time-zone .res files next to it, and fails with
+# E_FAIL without them.
+GLOB_SRC=$HOME/uwp-bin/win11/Windows/Globalization
+if [ -d "$GLOB_SRC/ICU" ]; then
+  for sub in ICU "Time Zone"; do
+    lsub=$(echo "$sub" | tr "A-Z" "a-z"); mkdir -p "$WINEPREFIX/drive_c/windows/globalization/$lsub"
+    for f in "$GLOB_SRC/$sub"/*; do
+      b=$(basename "$f"); d="$WINEPREFIX/drive_c/windows/globalization/$lsub/$b"
+      [ -f "$d" ] && cmp -s "$f" "$d" || cp -f "$f" "$d"
+    done
+  done
+  echo "installed: Globalization data"
 fi

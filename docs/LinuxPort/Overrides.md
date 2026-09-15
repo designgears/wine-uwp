@@ -62,3 +62,13 @@ See Findings-M0.md: Microsoft.UI.Xaml 2.8, .NET Native Runtime + Framework 2.2, 
 needed for the CoreWindow / activation path, see Findings-M4.md. Same
 personal-research boundary as everything else listed here: these files
 are not redistributable and are not committed to this repository.
+
+## Added 2026-09-15 (same build, read-only ntfs3 mount of nvme0n1p2 inside a container)
+`Windows.Globalization.dll` (already in the dump) is now used natively instead of Wine's
+builtin, with its companions `icu.dll`, `icuuc.dll`, `icuin.dll`, `globinputhost.dll`,
+`WinLangdb.dll` (System32 no longer has a copy; taken from
+`WinSxS\amd64_microsoft-windows-languagesdb-onecore_..._10.0.26100.8972_...`),
+`en-US\Windows.Globalization.dll.mui`, and the data files `Windows\Globalization\ICU\*`
+(icudtl.dat and the time-zone .res files) plus `Windows\Globalization\Time Zone\*`.
+install-overrides.sh copies the data into `C:\windows\globalization\icu` (lowercase: the prefix
+already had a lowercase `globalization` directory and Wine takes the exact-case match).
