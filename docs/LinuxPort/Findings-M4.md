@@ -3382,3 +3382,8 @@ mask brushes. Still open:
   navigation (the old title's fade-out is a composition animation), expanding a Settings section
   leaves stale copies of the text below it, and the Alt+number shortcuts hit an AccessKeys
   fail-fast.
+- Changing the app theme (Settings, App theme, Light/Dark) crashed: XAML starts the theme's colour
+  animations through the brushes' private composition object partner ({83112a11}), which the colour
+  brush refused; it now answers with a partner view that applies the animation. Light and Dark both
+  render. The old radio selection and the previous page title still linger (fade-outs are composition
+  animations the painter does not run).
