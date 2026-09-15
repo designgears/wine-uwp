@@ -3339,3 +3339,18 @@ mask brushes. Still open:
   different Lottie layer, since which layer shows depends on the icon's Progress state, so boolean
   key frames stay ignored. The pane does not close after picking a mode. Graphing mode fails on
   dxgi's CreateSwapChainForComposition stub.
+
+## Picking a mode from the menu (2026-09-15)
+
+- After picking "Scientific" the pane stayed open and nothing responded. Under it, in order:
+  composition batches never raised Completed (XAML finishes SplitView's pane-closing storyboard on
+  it; scoped and commit batches are typed now and complete from a timer on the ending thread);
+  the visual collections were fixed arrays of 32/64 children and the Scientific keypad overflowed
+  them, so XAML fail-fasted on every tick (15,000 stowed E_OUTOFMEMORY exceptions per run, ignored
+  by wineuwp, leaving a half-built tree); a parent-link write into interop visuals (which answer
+  the same private interface as public visuals) that the old inline arrays had hidden; and a
+  painter that copied every sprite's texture GPU-to-CPU every frame, which with the keypad and the
+  pane up took seconds per frame and starved input (each surface now caches its pixels until XAML
+  redraws it). Tracing note: `echo >> $UWP_LOG` marks get overwritten because wine writes at its
+  own offset; record `wc -l` instead. Alt+2 (mode shortcuts) hits a separate AccessKeys fail-fast
+  (`MakeAccessKeyUppercase` E_FAIL), not fixed.
