@@ -3423,3 +3423,7 @@ mask brushes. Still open:
   property set was evaluated once; it is re-read at every use now. Left: the About section's app icon
   is a blank box in the light theme (theme-qualified image asset), and the Programmer page's reveal
   lights still log 16 ignored E_NOINTERFACE fail-fasts for pointer tracking.
+- Tried and reverted: answering the compositor's {36af3eb2} pointer-source interface (XAML's
+  PointerSourceWrapper) with a probe removed the Programmer page's 16 ignored fail-fasts but made
+  XAML's reveal light code crash the process; the refusal stays. Light theme verified end to end
+  (Settings, back to the Standard page: dark-blue accent equals button as on Windows).
