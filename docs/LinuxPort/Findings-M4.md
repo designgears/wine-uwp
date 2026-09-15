@@ -3387,3 +3387,20 @@ mask brushes. Still open:
   brush refused; it now answers with a partner view that applies the animation. Light and Dark both
   render. The old radio selection and the previous page title still linger (fade-outs are composition
   animations the painter does not run).
+
+## Settings page render issues (2026-09-15)
+
+- Every radio button looked selected: WinUI scales the check glyph to 0 with a Vector3 key-frame
+  animation, which dcomp only recorded. Vector2/Vector3 key frames are typed now and their end value
+  lands on Offset/Scale/CenterPoint/Size. That broke the hamburger (its Lottie layers use the same
+  animations, driven by Progress), fixed by undoing the end value when XAML fetches an animation
+  controller for the property, which is what an AnimatedIcon does.
+- Still open, with what is known: the previous page title shows through the Settings page, and
+  "There's no history yet" stays after a calculation. In both cases the app collapses an element
+  (x:Bind with a converter) and XAML treats it as collapsed (a click on the covered keypad does not
+  register), yet no composition call ever hides or removes its sprites; the mechanism XAML uses for
+  Visible -> Collapsed of an existing node was not found in the traces (no IsVisible, Opacity, Clip,
+  Remove, or Size change). For the history text there is also an unhandled exception from
+  SwipeControl's VisualInteractionSource (the deliberately failing Interactions statics) in the same
+  update; recording objects for them crash later on a released view. Expanding a Settings section
+  leaves stale copies of the text below it, presumably the same class of problem.
