@@ -3404,3 +3404,22 @@ mask brushes. Still open:
   SwipeControl's VisualInteractionSource (the deliberately failing Interactions statics) in the same
   update; recording objects for them crash later on a released view. Expanding a Settings section
   leaves stale copies of the text below it, presumably the same class of problem.
+
+## Collapsed elements and AnimatedIcon states (2026-09-15)
+
+- Visible -> Collapsed reaches the compositor through CUIElement::ClearPCRenderData, which asks each
+  of the element's sprites for IVisual::get_Parent and removes it from that parent's children. dcomp's
+  get_Parent answered NULL, so sprites of collapsed text stayed: the old page title under Settings,
+  "There's no history yet" after a calculation, stale copies of text an expanding section moved.
+  get_Parent now answers the collection link; all three are gone.
+- AnimatedIcons (hamburger, Settings gear, Expander chevrons) are Lottie compositions whose key-frame
+  animations are driven by a controller whose Progress follows "_.Progress" on the icon's property
+  set. dcomp now keeps every key frame, hands out real controllers bound to the animated property, and
+  samples the animations at the icon's Progress when painting (nothing before the first key, last key
+  for booleans and colours, interpolation otherwise). Two traps: animations whose key frames XAML
+  inserted as expressions have no keys (sampling them shrank the hamburger to dots), and a value
+  before the first key must leave the static property alone (otherwise hidden layers show).
+- Theme switching left the chevrons white on white: a brush's colour expression over the theme
+  property set was evaluated once; it is re-read at every use now. Left: the About section's app icon
+  is a blank box in the light theme (theme-qualified image asset), and the Programmer page's reveal
+  lights still log 16 ignored E_NOINTERFACE fail-fasts for pointer tracking.
