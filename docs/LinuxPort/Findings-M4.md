@@ -3539,3 +3539,30 @@ mask brushes. Still open:
 - Result: the flyout opens (month header, weekday row) and closes; the day grid is empty, a separate
   rendering issue. The other session's windows.graphics tree still needs `-Wl,--allow-multiple-definition`
   to link and the DLL copied over the prefix's system32 copy.
+
+### CalendarView: the empty day grid (Wine, "Programmatic content offsets")
+
+- The day cells were drawn (a `+dcomp` trace shows the 9x12..17x12 text surfaces and mask brushes)
+  but at Y ≈ 932,900: the month panel is virtualized from year 1601 and XAML expects the scroll
+  offset to come from DirectManipulation, through the visual's TransformMatrix expression
+  `Translation(V.Offset) * LOCAL.DManip * Translation(-V.Offset)`, LOCAL.DManip being bound to
+  `PS.Matrix`, itself `transform*manipTransform.Matrix` over the DManip shared transform.
+- XAML's ChangeView path (winedbg breakpoints on `ScrollViewer::BringIntoViewportInternal`,
+  `CInputServices::BringIntoViewport`, `CDirectManipulationService::*`) never reached
+  `ZoomToRect`; it calls `CDirectManipulationService::SetPrimaryContentTransform(x, y, zoom)`,
+  which hands (zoom,0,0,zoom,x,y) to slot 12 of the private primary-content interface
+  `{d8042f40-a051-4fee-875e-243b7b38d66e}` (args: unknown pointer, float matrix[6], count 6).
+  Wine's stub ignored it; it now behaves like SyncContentTransform and updates the shared
+  transform, so the compositor-side DManip matrix carries -932820 and the days land in the flyout.
+- Two more things were needed on the way: XAML tracks viewport status from
+  `OnViewportStatusChanged`, and `CDirectManipulationService::EnableViewport` re-enters
+  (Disable, Enable) when the change arrives synchronously inside `Enable`; the notifications are now
+  posted through a timer, as the engine delivers them. And dcomp's expression evaluator learned
+  Set*Parameter values (bare identifiers such as `transform`), `manipTransform.Matrix`, and to
+  evaluate a bound LOCAL.DManip before falling back to the manipulation transform.
+- Result: the picker shows the month with today highlighted; picking the 22nd sets From to
+  9/22/2026 and the difference reads "1 week / 7 days". Sweep of all 19 entries clean.
+- Debugging notes: `winedbg` `break *addr` works when the module base comes from the right
+  process (the log can contain another process's load line); memory dumps need `\$rcx` inside
+  scripts; first-chance C++ exceptions do not stop it; a temporary
+  `RtlCaptureStackBackTrace` dump in ntdll's `dispatch_exception` named the AcrylicBrush thrower.
