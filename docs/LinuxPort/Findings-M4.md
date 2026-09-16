@@ -3677,3 +3677,33 @@ Xvfb window, and `date` stamps around the launch:
   help because wined3d's Map waits for everything queued before it).
 - Verified: 19-entry sweep clean, Graphing at 1280x800: plot, trace, wheel, pan, zoom buttons,
   reset, KGF toggle, sliders, inequality, trig, settings flyout.
+
+### Graphing: the wheel-then-drag stall (Wine 2846796, de774ec) and the readback thread (Wine c... "pool thread")
+
+- **Symptom.** After a wheel zoom the graph stopped updating and drags delivered only pointer
+  down/up; the log showed `RtlpWaitForCriticalSection ... loader_section wait timed out in
+  thread <UI>, blocked by <new thread>` a minute later. Timing-dependent: adding relay traces
+  usually hid it; the reproduction was `/tmp/ghang.sh` (screenshot, three notches, drag).
+- **Cause.** A zoom makes GraphControl's DeviceResources rebuild its D3D11 device, XAML then
+  starts a `CompositorScheduler` render thread, and that thread's DLL_THREAD_ATTACH callouts
+  (under the loader lock) reach native msftedit's DllMain, whose `UseRichEditCore()` WIL
+  feature check does a once-initialisation. The UI thread was inside the same initialisation
+  and went to the loader (feature-staging API set lookup) for the lock the new thread held.
+  ptrace is off (yama scope 1) and winedbg cannot attach during a loader-lock deadlock (its
+  break-in thread needs the same lock), so the identification came from `+relay` with
+  `RelayInclude=ntdll.NtCreateThreadEx`: relay also logs every `Call PE DLL (... THREAD_ATTACH)`
+  per thread, and the blocker's last unreturned one was msftedit's.
+- **Fixes.** wined3d creates its command-stream and budget-notification threads with
+  `THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH` (they run wined3d code only); the wineuwp host
+  preloads msftedit and calls `DisableThreadLibraryCalls` on it, so XAML's thread never runs
+  that handler (it only manages a lazily created TLS block). Two reproductions then ran clean;
+  wheel, drag and reset verified by screenshot diffs.
+- **Readback off the UI thread.** The swap chain readback (CopyResource + Map, which in wined3d
+  waits for everything queued before it, so double-buffering the staging copy did not help)
+  now runs as a thread-pool job into a second cache buffer that the UI thread swaps in at its
+  next sync. Drag frames: 7.7 ms -> 3.8 ms; hover/wheel/drag all ~3.7 ms at a steady 16 ms
+  cadence; idle stays at 0 presents. Not a new thread: its DLL_THREAD_ATTACH needed the loader
+  lock and deadlocked the same way. Remaining per-frame cost is the full-window repaint of the
+  keypad and panels (mask-brush sprites); a dirty-region painter is the next step if needed.
+- Cosmetic: after a drag the trace popup sits at the top-left reading (0, 0.0) until the pointer
+  moves again.
