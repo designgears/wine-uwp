@@ -3518,3 +3518,24 @@ mask brushes. Still open:
   own set was a different, throw-away object. Effect brushes now own one property set that all their
   views share, and the painter takes "TintColor.Color" (then "FallbackColor.Color") from it before
   falling back to the description's flood. Light pane verified open and scrolled; dark unchanged.
+
+### Date calculation: clicking a date killed the app (Wine, "ICompositor3 with CreateHostBackdropBrush")
+
+- The CalendarDatePicker flyout aborted the process with `err:seh:check_noexcept noexcept function
+  propagating exception`: a C++ exception (`winrt::hresult_no_interface`) thrown inside
+  Windows.UI.Xaml.Controls' `AcrylicBrush::OnElementConnected`, which is noexcept. The raising stack
+  (a temporary `RtlCaptureStackBackTrace` dump in ntdll's `dispatch_exception`, named with
+  `pdbsyms.py --rva` after fetching Windows.UI.Xaml.Controls.pdb) was
+  `CreateAcrylicBrushWorker` → `consume_ICompositor3::CreateHostBackdropBrush` → `check_hresult`:
+  dcomp's compositor had no ICompositor3 `{c9dd8ef0-6eb1-4e3c-a658-675d9c64d4ab}`. It now answers it
+  and records a backdrop brush. Before that the same code path threw on the DisplayInformation
+  factory refusing IAgileObject (windows.graphics main.c, HEAD code, staged as its own hunk).
+- winedbg was no help this time: `break *addr` in windows.ui.xaml / kernelbase reported "Invalid
+  address" and the process died, and first-chance C++ exceptions do not stop it. The `+seh` channel
+  only names the last (noexcept) frame through its ipmap line. A one-off stack dump in
+  `dispatch_exception` gated by an env var was the reliable tool; it is not committed.
+- Tried and reverted: patching XAML's `GetIslandFromElementImpl` (RVA 0x355c68) to skip the island
+  peer lookup; that was a wrong guess about the thrower.
+- Result: the flyout opens (month header, weekday row) and closes; the day grid is empty, a separate
+  rendering issue. The other session's windows.graphics tree still needs `-Wl,--allow-multiple-definition`
+  to link and the DLL copied over the prefix's system32 copy.
