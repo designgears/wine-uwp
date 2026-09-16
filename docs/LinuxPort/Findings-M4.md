@@ -3678,7 +3678,7 @@ Xvfb window, and `date` stamps around the launch:
 - Verified: 19-entry sweep clean, Graphing at 1280x800: plot, trace, wheel, pan, zoom buttons,
   reset, KGF toggle, sliders, inequality, trig, settings flyout.
 
-### Graphing: the wheel-then-drag stall (Wine 2846796, de774ec) and the readback thread (Wine c... "pool thread")
+### Graphing: the wheel-then-drag stall (Wine 2846796, de774ec) and the readback thread (Wine f0aa3c5)
 
 - **Symptom.** After a wheel zoom the graph stopped updating and drags delivered only pointer
   down/up; the log showed `RtlpWaitForCriticalSection ... loader_section wait timed out in
