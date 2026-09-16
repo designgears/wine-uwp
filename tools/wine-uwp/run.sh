@@ -9,6 +9,8 @@ export WINEDEBUG=${WINEDEBUG:-fixme+all,err+all}
 # wined3d's OpenGL path stalls XAML's first frame on the NVIDIA desktop (Mesa EGL cannot open the DRI
 # device, the CS thread falls back to a "compatible pixel format"); the Vulkan renderer works on both
 # the desktop and the Xvfb test display.
+# Skip DLL_THREAD_ATTACH/DETACH into native DLLs: see Findings-M4.md, loader-lock deadlocks.
+export WINE_SKIP_NATIVE_THREAD_CALLS=${WINE_SKIP_NATIVE_THREAD_CALLS:-1}
 export WINE_D3D_CONFIG=${WINE_D3D_CONFIG:-renderer=vulkan}
 # Patched Wine build (see docs/LinuxPort/Findings-M1.md), falls back to system wine.
 WINE_BUILD=${WINE_BUILD:-$HOME/src/wine-build}

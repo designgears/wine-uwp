@@ -3716,3 +3716,18 @@ Xvfb window, and `date` stamps around the launch:
   the DllMain-serialising lock for module and export lookups too, so any native DllMain that
   once-initialises through the loader on DLL_THREAD_ATTACH can deadlock a UI thread doing the
   same lookup; avoiding fresh threads while such DLLs are loaded is the workaround.
+- **Third and fourth variants, and the general switch (Wine 971c5d6, 3aec3a0).** The new
+  loader-lock timeout report (Wine 5bdb0fd: the owner's current DllMain is printed) showed the
+  idle desktop freeze was still msftedit's thread attach: `DisableThreadLibraryCalls` refuses
+  modules with static TLS (msftedit has a .tls directory; Windows behaves the same), so the host's
+  call had failed silently. The host now sets `LDR_NO_DLL_CALLS` on the loader entry directly.
+  The next freeze was `Windows.Energy.dll`'s thread attach, the same WIL pattern. Rather than a
+  list, ntdll now honours `WINE_SKIP_NATIVE_THREAD_CALLS=1` (set by run.sh): no
+  DLL_THREAD_ATTACH/DETACH callouts into native modules at all (TLS slots and callbacks still
+  run). Focus rounds, graph wheel/drag/trace and the 19-entry sweep are clean with it.
+  Trigger for the desktop freezes: regaining focus by clicking inside the window makes XAML
+  restart its render thread.
+- Note: an edit script of mine truncated `dlls/ntdll/loader.c` on 2026-09-16 (evaluating
+  `open(p,'w')` before reading). The committed version was restored and the one edit the other
+  session had recorded there (the `uwp_rearm_breaks()` call in LdrLoadDll) re-applied from its
+  transcript; any other uncommitted loader.c work from that session is lost.
