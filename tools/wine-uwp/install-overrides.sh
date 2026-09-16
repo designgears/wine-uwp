@@ -9,6 +9,16 @@ export WINEPREFIX=$HOME/.wine-uwp
 SYS32=$WINEPREFIX/drive_c/windows/system32
 WINE_BIN=${WINE_BIN_DIR:-$HOME/src/wine-build/}
 SRC=$HOME/uwp-bin/win11/Windows/System32
+# Nothing to do when neither the source tree, the Wine build, this script nor the prefix's system32
+# listing changed since the last run: the file-by-file comparison below costs about three seconds
+# of every launch. WINE_UWP_FORCE_OVERRIDES=1 skips the check.
+STAMP=$WINEPREFIX/.install-overrides.stamp
+stamp=$( { find "$SRC" "$(dirname "$SRC")/Globalization" -printf '%p %s %T@\n' 2>/dev/null; stat -c '%Y' "$SYS32" "$WINE_BIN/dlls/ntdll/x86_64-windows/ntdll.dll" "$0" "$(dirname "$0")/globalization.reg" 2>/dev/null; echo "${1:-}"; } | md5sum | cut -d' ' -f1 )
+if [ -z "${WINE_UWP_FORCE_OVERRIDES:-}" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$stamp" ]; then
+  echo "overrides unchanged"
+  exit 0
+fi
+
 LIST=${1:-windows.ui.xaml windows.ui twinapi.appcore coremessaging windows.applicationmodel wintypes threadpoolwinrt msvcp_win mrmcorer bcp47mrm bcp47langs profapi rometadata windows.globalization icu icuuc icuin winlangdb globinputhost}
 for n in $LIST; do
   f=$(ls "$SRC" | grep -i "^$n\.dll$" | head -1)
@@ -122,3 +132,5 @@ if [ -d "$GLOB_SRC/ICU" ]; then
   done
   echo "installed: Globalization data"
 fi
+
+echo "$stamp" > "$STAMP"
