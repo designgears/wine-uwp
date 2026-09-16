@@ -3574,3 +3574,36 @@ mask brushes. Still open:
   shader logs on the CS thread) and XAML's first frame never came; the same build on Xvfb :98
   rendered. The test scripts had always passed `WINE_D3D_CONFIG=renderer=vulkan`; `run.sh` now
   defaults to it.
+
+## Performance pass (2026-09-16)
+
+Measured with a temporary frame timer in `present_desktop_hwnd` (not committed) on the 700x800
+Xvfb window, and `date` stamps around the launch:
+
+| | before | after |
+|---|---|---|
+| idle | 62 repaints/s, 3.3 ms each | none (XAML stops ticking too) |
+| Standard page frame | 3.3 ms | 1.4 ms |
+| pane open | 7.3 ms | 2.2 ms |
+| launch to first frame | 9.8 s | 3.0 s |
+
+- **Idle loop.** dcomp called XAML's partner `NotifyDirty` after every commit, and XAML schedules
+  its next frame on that, so the two ticked each other forever. Every state-changing dcomp entry
+  point (131 setters, inserts, EndDraw, StartAnimation, ...) now bumps a scene generation; a
+  commit repaints only when the generation moved or moved within the last two seconds
+  (time-driven animations and expressions change without any call), and NotifyDirty is only
+  raised in that window. `matrix_transform_SetMatrix` is called from the DManip read path every
+  frame, which is why the generation has to come from real setters and not from "any call".
+- **Mask brushes.** Every glyph run and button fill is a mask brush; each paint copied the mask
+  pixels, allocated a DIB, composed it and freed it. The composed bitmap is now kept on the brush,
+  keyed on the mask surface (a generation counter bumped when its CPU copy is refreshed), the
+  colour/source and the nine-grid values.
+- **Presenter.** The back buffer and the blend scratch DC persist across frames; the back buffer is
+  a DIB and unscaled blends/fills under a rectangular clip are done by dcomp itself (`soft_blend`,
+  `soft_fill`, exact `DIV255`); GDI is the fallback for scaling and complex clips. The first
+  version without opaque fast paths was slower than GDI (5 ms); the fast paths matter.
+- **Startup.** `install-overrides.sh` compared ~1800 files on every launch (3.5 s); it now keeps a
+  stamp of the source tree, the Wine build, the script and the prefix's system32 listing and exits
+  in 6 ms when nothing changed (`WINE_UWP_FORCE_OVERRIDES=1` forces it). wineuwp's view pump
+  after CreateCoreWindow always ran its full 5 s; it ends once the queue has been idle for 0.5 s.
+- Verified: 19-entry sweep, keyboard (812+3 Enter), date picker, light-theme pane, Scientific.
