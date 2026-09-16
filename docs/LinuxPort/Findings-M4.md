@@ -3731,3 +3731,13 @@ Xvfb window, and `date` stamps around the launch:
   `open(p,'w')` before reading). The committed version was restored and the one edit the other
   session had recorded there (the `uwp_rearm_breaks()` call in LdrLoadDll) re-applied from its
   transcript; any other uncommitted loader.c work from that session is lost.
+- **Black window after focus games (Wine aea22e9).** Not a hang: the process was idle. Two
+  parts. (1) XAML paints on its own commits only; an expose (minimize/restore, another window
+  dragged across, `xdotool windowminimize`+`windowactivate` on :98) left the CoreWindow black until
+  the next commit. wineuwp now subclasses the CoreWindow and has dcomp re-present its back buffer
+  on WM_PAINT (`__wine_dcomp_repaint_window`). (2) The first restore then drew the whole UI at
+  640,389: while minimized XAML sets the root ScrollViewer's DManip content rect to 0x0, the
+  centring offset computed against that leaked into the transform XAML syncs back, and content
+  that fits its viewport kept the stale pan. The resting transform now gives such content the
+  alignment offset only. The freezes with `WINE_SKIP_NATIVE_THREAD_CALLS` had already stopped;
+  the black window was the leftover symptom.
