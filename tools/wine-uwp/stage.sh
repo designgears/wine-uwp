@@ -36,4 +36,13 @@ fi
 # (0x802b000a). Without the file, XamlControlsResources resolves out of the framework package's
 # PRI and the app's XAML parses clean. See Findings-M4.md.
 
+# The repo's GraphingImpl is a mock (draws nothing, parses nothing). The Store package ships the
+# real engine as GraphingImpl.dll + omsautimmss.dll; when a copy of the package is at
+# ~/uwp-bin/store-calc (see docs/LinuxPort/Overrides.md) use it so Graphing actually plots.
+SC=$HOME/uwp-bin/store-calc
+if [ -f "$SC/GraphingImpl.dll" ] && [ -f "$SC/omsautimmss.dll" ]; then
+  cp "$SC"/GraphingImpl.dll "$SC"/omsautimmss.dll "$S"/
+  echo "staged the Store graphing engine"
+fi
+
 echo "staged -> $S"

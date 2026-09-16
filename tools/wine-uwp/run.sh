@@ -14,7 +14,7 @@ export WINE_D3D_CONFIG=${WINE_D3D_CONFIG:-renderer=vulkan}
 WINE_BUILD=${WINE_BUILD:-$HOME/src/wine-build}
 if [ -x "$WINE_BUILD/wine" ]; then export PATH="$WINE_BUILD:$PATH"; fi
 # DLLs where Wine's builtin must yield to the extracted Windows copy. Wine also ships these names.
-export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-windows.ui.xaml=n;windows.ui=n;twinapi.appcore=n;coremessaging=n;windows.applicationmodel=n;wintypes=n;threadpoolwinrt=n;msvcp_win=n;bcp47mrm=n;bcp47langs=n;profapi=n;rometadata=n;windows.globalization=n;msftedit=n}"
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-windows.ui.xaml=n;windows.ui=n;twinapi.appcore=n;coremessaging=n;windows.applicationmodel=n;wintypes=n;threadpoolwinrt=n;msvcp_win=n;bcp47mrm=n;bcp47langs=n;profapi=n;rometadata=n;windows.globalization=n;msftedit=n;msxml6=n}"
 # A run killed by a timeout leaves this prefix's explorer.exe /desktop and the svchost.exe hosting
 # CoreMessagingRegistrar behind; they accumulate across runs and quietly wreck every later
 # measurement, because the activation is a race and a loaded machine loses it. Clear them with

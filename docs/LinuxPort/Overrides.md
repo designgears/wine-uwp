@@ -78,3 +78,13 @@ already had a lowercase `globalization` directory and Wine takes the exact-case 
 RichEditBox drives the text-services object through undocumented interfaces
 (`{6bda2cdc-d9b3-4310-8fcb-5690308c2e7c}` and more), and Wine's riched20 only reaches the second
 query; see Findings-M4.md. It needs `ntdll.SbSelectProcedure`, which Wine now stubs.
+
+## Added 2026-09-16, later: the Store graphing engine and msxml6
+- `~/uwp-bin/store-calc/`: a copy of the installed Store package
+  `Microsoft.WindowsCalculator_11.2607.0.0_x64__8wekyb3d8bbwe` (from the same drive). The
+  repo's `GraphingImpl` is a mock that parses and draws nothing; the Store package carries the
+  real engine as `GraphingImpl.dll` + `omsautimmss.dll` (the OneNote math solver). `stage.sh`
+  copies both over the mock when the directory exists. Same non-redistributable status.
+- `msxml6.dll` + `msxml6r.dll` (System32) are used natively: the engine parses MathML through
+  the SAX reader and the app's `Windows.Data.Xml.Dom.XmlDocument` also lives in msxml6 on
+  Windows; Wine's msxml6 has neither the WinRT factory nor a SAX reader that satisfied it.

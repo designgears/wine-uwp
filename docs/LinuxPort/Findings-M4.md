@@ -3638,3 +3638,42 @@ Xvfb window, and `date` stamps around the launch:
   function entry (plot area stays white: mock renderer, see above). Remaining noise: XAML also
   queries `{398aac15-c99c-4025-8015-ce834633c4fc}` on the edit context and activates
   `CoreTextServicesConstants` / `CoreFrameworkInputView`; all tolerated.
+
+### Graphing: the real engine, pointer input, tracing (Wine 7ab4386, 36f3730, 078cfa9, c588dfd)
+
+- **Engine.** The repo's GraphingImpl is a mock; the Store package ships the real engine as
+  `GraphingImpl.dll` + `omsautimmss.dll` (see Overrides.md). With it, every equation errored
+  (error type Syntax, code 12: read `Grapher::m_errorType/m_errorCode` at this+512/516 with a
+  breakpoint on `SetEquationErrors`). The MathML request was fine; the engine parses through
+  msxml6's SAX reader and the app's `Windows.Data.Xml.Dom.XmlDocument` also resolves to
+  msxml6.dll, which Wine's builtin cannot activate (`DllGetActivationFactory` missing). Native
+  msxml6 needs combase ordinals 2-25 (`ObjectStublessClient3..26`, now forwarded to rpcrt4's
+  thunks), `ntdll.NtQuerySecurityPolicy` (stub) and its resource DLL `msxml6r.dll`. Result: lines,
+  parabolas, trig, inequalities (shaded), variable sliders all plot.
+- **Wheel zoom did nothing.** `WM_POINTERWHEEL` carries the delta in the high word of wParam;
+  win32u stored it as pointer flags and left `InputData` zero, so `PointerPoint.Properties.
+  MouseWheelDelta` (which windows.ui copies from `POINTER_INFO.InputData` when the WHEEL flag is
+  set) was 0. Note win32u's `input.c` is in the unix part (`win32u.so`), not the PE dll.
+- **Drag pan did nothing.** XAML's ElementGestureTracker feeds manipulations through ninput's
+  Interaction Context, which only reported taps. It now reports single-pointer MANIPULATION
+  begin/delta/end once the pointer moves past the tap slop. Deltas are in pixels: XAML never
+  sets the measurement-unit property and used the (HIMETRIC) values as DIPs, so a 160 px drag
+  panned by 26 screens.
+- **Trace toggle fail-fasted.** `AddTracePointerShadow` builds a DropShadow with
+  `CursorPath.GetAlphaMask()` and hangs it on a sprite. Four dcomp problems: the typed brush
+  tables answered `GetRuntimeClassName` with a recording-object pointer (.NET Native picks the
+  RCW type from it); sprites lacked `ISpriteVisual2` (put_Shadow, "Unable to cast"); the
+  recording DropShadow wrote 8-byte pointers into 4-byte float out-parameters when XAML read the
+  shadow back (a sprite's Size.X became -1e37); and every generic object answered
+  `IReferenceTracker` {11d3b13a-...}, so .NET Native drove the tracker protocol through slots
+  that now held IInspectable methods (writes through callback pointers, finalizer-thread
+  fail-fast E_FAIL). All fixed; the trace pointer glyph, the nearest-point dot and the coordinate
+  popup render and the arrow keys move it.
+- **Pacing.** A drag repainted the window ~100 times a second (XAML commits per input event plus
+  the app's presents). Presents closer than 15 ms are deferred to a one-shot timer, giving a
+  steady 16 ms cadence. Per-frame cost on the graph page (frame trace, `WINEDEBUG=+dcomp`):
+  hover 3.5 ms, wheel 4.4 ms, drag 7.7 ms of which 4.7 ms is the swap chain readback
+  (CopyResource + Map wait for the app's GPU work; double-buffering the staging copy did not
+  help because wined3d's Map waits for everything queued before it).
+- Verified: 19-entry sweep clean, Graphing at 1280x800: plot, trace, wheel, pan, zoom buttons,
+  reset, KGF toggle, sliders, inequality, trig, settings flyout.
