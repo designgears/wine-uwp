@@ -72,3 +72,9 @@ builtin, with its companions `icu.dll`, `icuuc.dll`, `icuin.dll`, `globinputhost
 (icudtl.dat and the time-zone .res files) plus `Windows\Globalization\Time Zone\*`.
 install-overrides.sh copies the data into `C:\windows\globalization\icu` (lowercase: the prefix
 already had a lowercase `globalization` directory and Wine takes the exact-case match).
+
+## Added 2026-09-16
+`msftedit.dll` (from the same 26100 dump, already in the directory) is now used natively. XAML's
+RichEditBox drives the text-services object through undocumented interfaces
+(`{6bda2cdc-d9b3-4310-8fcb-5690308c2e7c}` and more), and Wine's riched20 only reaches the second
+query; see Findings-M4.md. It needs `ntdll.SbSelectProcedure`, which Wine now stubs.

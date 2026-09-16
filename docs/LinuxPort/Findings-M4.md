@@ -3607,3 +3607,34 @@ Xvfb window, and `date` stamps around the launch:
   in 6 ms when nothing changed (`WINE_UWP_FORCE_OVERRIDES=1` forces it). wineuwp's view pump
   after CreateCoreWindow always ran its full 5 s; it ends once the queue has been idle for 0.5 s.
 - Verified: 19-entry sweep, keyboard (812+3 Enter), date picker, light-theme pane, Scientific.
+
+### Graphing at desktop width: RichEditBox (Wine 4c17c6a, 05f27bc; native msftedit)
+
+- On the 1280-wide desktop window the Graphing page shows its equation panel, and creating
+  `CalculatorApp.Controls.MathRichEditBox` failed with 0x802b000a ("Cannot create instance").
+  The 700-wide Xvfb tests never hit it because the narrow layout hides the panel. After the
+  failed navigation the app sat on a blank page with an idle UI thread, which is the "locks up
+  when I click it" symptom.
+- `CTextBoxBase::InitializeTextServices` loads msftedit dynamically, resolves
+  `CreateTextServices` *and* `ShutdownTextServices` (Wine's msftedit lacked the export), queries
+  `ITextServices2` {8d33f741-...} and then a private `{6bda2cdc-d9b3-4310-8fcb-5690308c2e7c}`
+  (fatal when missing; it is in native msftedit's IID table, not in any SDK header). Wine's
+  riched20 now exports ShutdownTextServices and answers ITextServices2 (`TxGetNaturalSize2`,
+  `TxDrawD2D` via the GDI path), which gets past the first two, but the third is unknown, so
+  the native msftedit.dll is used instead (override list + install-overrides.sh). It imports
+  `ntdll.SbSelectProcedure` (switchback quirks; NULL = no quirk), now a stub.
+- With native msftedit the failure moved into Wine's `windows.ui.core.textinput`:
+  `CoreTextServicesManager.CreateEditContext` was E_NOTIMPL. The new `CoreTextEditContext`
+  (editcontext.c) stores the properties and accepts all events without ever raising them.
+  `CTextInputPrivateSettings::GetPrivateEditContext` (Windows.UI.Xaml+0x3cee4) then sends
+  msg 0x557 to the text services to get the edit context back and queries
+  `{2f292ff4-823c-4a17-9fd5-188c56e252f8}` = `IPrivateEditContext` (unnamed GUID in both
+  binaries; identified from Windows.UI.Core.TextInput's `CEditContext` vtable order:
+  put_InputSettings(DWORD), get/put_IsEmbeddedHandwritingViewEnabled, ...Visible,
+  get/put_IsMultiLine, FocusLeaveCompleted, ReplaceTextEx, SetSmartLink). Finally the app read
+  `CoreTextServicesManager.InputLanguage` (E_NOTIMPL → .NET fail-fast); it now returns a
+  `Windows.Globalization.Language` for the user locale.
+- Result: Graphing opens at 1280x800 with the equation panel, typing `y=x^2` + Enter adds the
+  function entry (plot area stays white: mock renderer, see above). Remaining noise: XAML also
+  queries `{398aac15-c99c-4025-8015-ce834633c4fc}` on the edit context and activates
+  `CoreTextServicesConstants` / `CoreFrameworkInputView`; all tolerated.
