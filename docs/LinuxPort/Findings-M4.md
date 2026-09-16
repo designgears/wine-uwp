@@ -3507,3 +3507,14 @@ mask brushes. Still open:
 - Tooling: `tools/wine-uwp/pdbsyms.py --rva` and `xrefs.py` (run with `~/uwp-bin/venv/bin/python`)
   name Windows.UI / Windows.UI.Xaml addresses from the cached PDBs; a `RelayInclude` of one function
   in `HKCU\Software\Wine\Debug` is a much cheaper trace than `+relay`.
+
+### Light theme: the NavigationView pane stayed dark (Wine 102413c)
+
+- The pane is an acrylic (CompositionEffectBrush) and dcomp painted it from the flood colour in the
+  effect description, which is the tint the brush was created with in the dark theme. XAML's acrylic
+  keeps the live colours in `brush.Properties` ("TintColor.Color", "LuminosityColor.Color",
+  "FallbackColor.Color", `propset_InsertColor` in a `+dcomp` trace) and rewrites them on a theme
+  change, reaching the property set through a fresh ICompositionObject view every time, so each view's
+  own set was a different, throw-away object. Effect brushes now own one property set that all their
+  views share, and the painter takes "TintColor.Color" (then "FallbackColor.Color") from it before
+  falling back to the description's flood. Light pane verified open and scrolled; dark unchanged.
