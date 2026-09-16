@@ -3707,3 +3707,12 @@ Xvfb window, and `date` stamps around the launch:
   keypad and panels (mask-brush sprites); a dirty-region painter is the next step if needed.
 - Cosmetic: after a drag the trace popup sits at the top-left reading (0, 0.0) until the pointer
   moves again.
+- **Second variant (Wine 5650753).** On the desktop the window froze after focusing the
+  equation box: same `loader_section` timeout, blocker a silent new thread created by Wine's
+  shcore `SHTaskPoolQueueTask` (one thread per task). The UI thread was inside the RichEdit
+  language setup (Windows.Globalization.Language activations) when it needed the loader. Tasks
+  now go to the thread pool instead of a fresh thread. Six focus/type/zoom rounds and the
+  19-entry sweep ran clean. The underlying difference from Windows remains: Wine's loader takes
+  the DllMain-serialising lock for module and export lookups too, so any native DllMain that
+  once-initialises through the loader on DLL_THREAD_ATTACH can deadlock a UI thread doing the
+  same lookup; avoiding fresh threads while such DLLs are loaded is the workaround.
