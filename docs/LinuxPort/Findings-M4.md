@@ -3480,3 +3480,30 @@ mask brushes. Still open:
   area shows the swap chain: white, which is right for this build (IsMatchAppTheme defaults to
   the always-light graph theme, and the open-source GraphingImpl is a mock renderer that draws
   nothing over the cleared background). Sweep of all 19 entries still clean.
+
+### Keyboard: Enter, Backspace, Escape, Ctrl+E and the Alt fail-fast (Wine 547195f, Windows.UI.dll patch)
+
+- Alt+2 fail-fasted in XAML's `AccessKeys::AKAccessKey::MakeAccessKeyUppercase`: it upper-cases the
+  key in place with `LCMapStringEx(locale, LCMAP_UPPERCASE | LCMAP_LINGUISTIC_CASING, key, 6, key, 6,
+  ...)`, and Wine refused `src == dst` with any flag beyond plain LOWER/UPPERCASE (ERROR_INVALID_FLAGS).
+  Windows accepts in-place linguistic casing; kernelbase now does too.
+- With that out of the way none of the app's `CoreWindow.KeyDown` shortcuts worked (Enter did not
+  compute, Backspace and Escape did nothing, Ctrl+E did not switch to Date), while typed characters
+  did. Breakpoints (winedbg attach, `x /16b $rcx+0x20`, note `\$` in scripts) showed the app's handler
+  reading `args.Handled == TRUE` and returning at once. On this WndProc input path
+  (`WindowServer::OnKeyDownEvent`, used because there is no InputHost site, see the pointer notes)
+  windows.ui creates the args with `Make<CKeyEventArgs>` and `CKeyEventArgs::Initialize(vk, status)`,
+  and Initialize (RVA 0x97480) ends with `mov byte [this+0x38], 1`; `ICoreWindowEventArgs::get_Handled`
+  (secondary vtable at this+0x10, reads +0x28 = this+0x38) hands that byte out, and nothing clears it
+  before `InvokeAll`. Byte patch in the win11 source copy: RVA 0x97493 `c6 41 38 01` → `c6 41 38 00`
+  (`Windows.UI.dll.bak-keyargs-handled` is the previous state). Windows apps do not see this because
+  their input arrives through InputHost's KeyboardInputWinRT, not this path.
+- Result: `1 2 + 3 Enter` shows 815, Backspace and Escape edit/clear, Ctrl+E opens Date calculation.
+  Alt+number still does not switch modes: the accelerator event fires (the handler's
+  `GetKeyState(Control)`/`(Shift)` pair shows up in a `RelayInclude=user32.GetKeyState` trace) and the
+  Ctrl+E path proves `NavigateModeByShortcut` works, so the difference is inside the Alt branch
+  (XAML's own AccessKeys handling of `AccessKey="2"` on the NavigationViewItem is the likely
+  competitor); not fixed.
+- Tooling: `tools/wine-uwp/pdbsyms.py --rva` and `xrefs.py` (run with `~/uwp-bin/venv/bin/python`)
+  name Windows.UI / Windows.UI.Xaml addresses from the cached PDBs; a `RelayInclude` of one function
+  in `HKCU\Software\Wine\Debug` is a much cheaper trace than `+relay`.
