@@ -3566,3 +3566,11 @@ mask brushes. Still open:
   process (the log can contain another process's load line); memory dumps need `\$rcx` inside
   scripts; first-chance C++ exceptions do not stop it; a temporary
   `RtlCaptureStackBackTrace` dump in ntdll's `dispatch_exception` named the AcrylicBrush thrower.
+
+### Blue window on the desktop (:0): the OpenGL renderer
+
+- A plain `run.sh` launch on the NVIDIA desktop showed only the blue placeholder: wined3d took its
+  OpenGL path (Mesa EGL "could not get DRI3 device", `context_choose_pixel_format` fallback, GLSL
+  shader logs on the CS thread) and XAML's first frame never came; the same build on Xvfb :98
+  rendered. The test scripts had always passed `WINE_D3D_CONFIG=renderer=vulkan`; `run.sh` now
+  defaults to it.
