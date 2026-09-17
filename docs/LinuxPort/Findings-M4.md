@@ -3768,3 +3768,69 @@ Xvfb window, and `date` stamps around the launch:
   graph swap chain's back buffer; DXGI refuses `ResizeBuffers` while one is outstanding, so the
   graph kept rendering at its old width, past the new canvas edge and under the translucent keypad
   buttons. Swap chain surfaces now keep no back buffer reference between frames.
+
+## Performance rework (2026-09-16)
+
+Measured with `tools/wine-uwp/perf` (below) on the RTX 5090 / Xvfb setup, 1280x800 window. CPU is the share of
+one core used by the app's processes during each scripted phase.
+
+| phase | before | after |
+|---|---|---|
+| typing (a digit every 150 ms) | 22% | 6% |
+| hovering across the keypad | 21% | 3-4% |
+| graph drag | 43% at ~15 graph frames/s shown | 15-21% with every frame the app presents shown |
+| graph wheel zoom | 27% | 4-5% |
+| resize | 18% | 4% |
+| idle | 1-2% | 1% |
+
+Key press to digit on screen: 7 ms median. Menu pick to the graphing page drawn: ~250 ms (from ~307 ms).
+Launch to a drawn keypad: ~1.8 s. Standard <-> Graphing rounds keep RSS flat after the first graphing visit.
+
+What changed (Wine commits 25484f0, ce6e242, cb5636c, c205c53, 5424dcf, 27db824f):
+- **No work without change.** Repainting an unchanged scene reproduced the previous frame bit for bit (hashed
+  over every scenario), yet dcomp repainted for two seconds after any change and told XAML the composition was
+  dirty for as long, so XAML committed ~120 times a second. Only a new scene generation or window size paints now,
+  and only a commit that changed the scene asks XAML for the next frame.
+- **Display list + damage.** The painter records fills and blends (software clip, content generations unique
+  across objects) and diffs against the previous frame; only the union of what changed operations cover is
+  rasterized and copied to the window. `WINE_DCOMP_VERIFY_DAMAGE=1` rasterizes every frame in full as well and
+  reports differing pixels (none over the history, mode, graph and menu scripts; screenshots of those states match
+  the old painter pixel for pixel). Opaque sources copy rows, and an area is rasterized from the last opaque
+  operation that covers it.
+- **Readback.** Surfaces XAML drew since the last frame are copied into one staging atlas per format and mapped
+  once (one wined3d round trip instead of 20-30 per typed digit). wined3d gives CPU-read textures cached host
+  memory: NVIDIA's first host-visible type is write-combined and reading a mapped 860x716 graph frame from it took
+  17 ms (0.1 ms now). Composition swap chains report presents to dcomp instead of a 33 ms poll that showed about
+  half the graph's frames.
+- **Shape icons** are redrawn only when their resolved drawing inputs change (was ~1 ms every frame).
+- **D3D device creation** no longer creates a Vulkan swapchain for DXGI's hidden implicit swapchain (~20 ms of
+  every graphing page visit).
+- Uncommitted, inside the other session's uncommitted `dlls/ntdll/rtl.c` work: `RtlQueryFeatureConfiguration` and
+  `arm_uwp_breaks` looked up environment variables on every call (WIL feature checks run constantly; 14% of the UI
+  thread during a graph drag). Both cache the lookup now; the change is also saved as a patch outside the tree.
+
+Found, not changed (other layers):
+- Idle, the UI and CoreMessaging threads wake ~2000 times a second: `ScheduleCoreMessagingDispatch` (user32) posts
+  a WM_NULL on every request, ~270 requests a second. Coalescing requests the way Windows' queue does would fix it;
+  CPU cost is ~1%.
+- Each D3D11 device creates a Vulkan instance and device (`vkCreateDevice` ~50 ms of a graphing page visit).
+- Graph axis labels are rasterized by Wine's dwrite on every frame (no glyph bitmap cache), ~4% of the UI thread
+  during a drag.
+- wined3d maps host-visible Vulkan memory in 64 MB chunks per memory type and device; the graphing page's second
+  device accounts for most of its +430 MB RSS.
+
+### tools/wine-uwp/perf
+
+All scripts drive the app on `$PERF_DISPLAY` (:98) and write to `$PERF_OUT` (/tmp/wine-uwp-perf).
+- `bench.sh [tag]`: CPU per phase and painted frames (above table).
+- `latency.sh`: key, hover and page switch latency, polling the screen through XTEST/XGetImage (`latency.py`).
+- `startup.sh`: launch to first keypad pixel and to a settled window.
+- `profile.sh [tag]`: sampling profile of typing, switching to Graphing and dragging the graph. wineuwp's
+  `WINE_UWP_PROFILE=<prefix>` sampler suspends threads every `WINE_UWP_PROFILE_MS` ms; `<prefix>.reset` and
+  `<prefix>.dump` clear and write the counts; `profsym.py` symbolizes with `$UWP_PDB_DIR/*.pdb.syms` for Windows
+  DLLs and `nm` for Wine builtins, listing each busy thread's top functions with their likely callers.
+- `leak.sh [rounds]`: RSS, threads and handles over Standard <-> Graphing rounds.
+- `winresize.c`: resizes the window from inside Wine (`SetWindowPos`); Xvfb has no window manager and Wine ignores
+  external resizes of its unmanaged windows, so `xdotool windowsize` never reaches the app.
+- `WINEDEBUG=+dcompperf` prints one line per second: commits, swap chain presents/readbacks, paints, walk and raster
+  time, damaged pixels, batched readbacks.
