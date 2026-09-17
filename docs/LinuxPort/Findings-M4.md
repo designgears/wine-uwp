@@ -3741,3 +3741,27 @@ Xvfb window, and `date` stamps around the launch:
   that fits its viewport kept the stale pan. The resting transform now gives such content the
   alignment offset only. The freezes with `WINE_SKIP_NATIVE_THREAD_CALLS` had already stopped;
   the black window was the leftover symptom.
+- **History/memory pane missing, resize crash (Wine 71dd57f).** The pane is a Pivot whose
+  SwipeControl items need `Windows.UI.Composition.Interactions`; the failing statics aborted the
+  list, and the recording fallback crashed WinUI on resize (a visual answered XAML's
+  `IDependencyObject` {5c526665} with itself, then `dcv_SetClipRect` ran on garbage). Four layers:
+  1. dcomp: typed InteractionTracker (owner ValuesChanged/IdleStateEntered callbacks),
+     VisualInteractionSource, InertiaRestingValue, `ICompositionPropertySet2` booleans; the XAML
+     identity interfaces are refused.
+  2. The Pivot scrolls its 320000 px extent to 160000 through a programmatic content transform.
+     XAML adopts it only from `OnContentUpdated`, now raised from the message loop.
+  3. The header panel is a DManip *secondary content*: XAML builds curves through the private
+     {820c0b62} interface (slot 3 GetCurve, curve slot 6 adds `{start in, start out, c1, c2, c3}`
+     segments, slot 8 empties the curve, content slot 4 applies it to X or Y). The header uses
+     slope -1 (it stays put), the items slope +1.
+  4. The items panel sits at 160000 through its RenderTransform: `Render = PS.Expr0 * PS.Expr1`,
+     `Expr0 = translate(PS.X, PS.Y)`, where PS is the expression's own Properties and XAML passes
+     `LOCAL` as an explicit reference. The evaluator used the visual's own property set for LOCAL,
+     so Render was never read. With Render evaluated, storyboard values started to matter: the
+     NavigationView pane stayed at its closed X and dialogs at scale 0.92. XAML starts those through
+     the property set's {83112a11} partner, slot 3 `CreateAnimatorPartner(name, key-frame
+     animation, out)`, which now settles scalar animations at their end value.
+  Headless resizes need `SetWindowPos` from inside Wine (a small helper): Xvfb has no window
+  manager, and Wine ignores external resizes of unmanaged windows, so earlier `xdotool
+  windowsize` "resize" checks never reached the app. Open: after resizing Graphing to 1000x700,
+  a translucent light layer covers the keypad (also with the old evaluator behaviour).
