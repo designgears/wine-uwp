@@ -3763,5 +3763,8 @@ Xvfb window, and `date` stamps around the launch:
      animation, out)`, which now settles scalar animations at their end value.
   Headless resizes need `SetWindowPos` from inside Wine (a small helper): Xvfb has no window
   manager, and Wine ignores external resizes of unmanaged windows, so earlier `xdotool
-  windowsize` "resize" checks never reached the app. Open: after resizing Graphing to 1000x700,
-  a translucent light layer covers the keypad (also with the old evaluator behaviour).
+  windowsize` "resize" checks never reached the app.
+- **Graphing resize left a light layer over the keypad (Wine b984b0a).** dcomp kept a reference to the
+  graph swap chain's back buffer; DXGI refuses `ResizeBuffers` while one is outstanding, so the
+  graph kept rendering at its old width, past the new canvas edge and under the translucent keypad
+  buttons. Swap chain surfaces now keep no back buffer reference between frames.
