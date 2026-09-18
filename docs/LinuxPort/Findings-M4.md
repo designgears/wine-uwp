@@ -3868,6 +3868,14 @@ remembered, and the island root's other dcomp children are painted with that off
 land on the row under the pointer; the visual suite (history, modes, graph resize, hover/press, menu) shows no
 change with `WINE_DCOMP_VERIFY_DAMAGE=1`.
 
+The CalendarDatePicker flyout is the other kind: XAML places it in window coordinates (its own offset, 12,128,
+is absolute), so the same shift moved it a title bar row down and its days hit-tested a row above where they were
+painted. The two are told apart by the tree XAML builds: a flyout placed in window coordinates is hosted in its own
+window-sized visual (the layer that dims the window behind it), a ComboBox popup's subtree has nothing window sized
+in it, so the presenter walks the popup's subtree before applying the offset (Wine 946c1b5). Checked: the Currency
+and "Difference between dates" ComboBox popups and the From/To calendars all highlight and select what is under the
+pointer.
+
 `WINEDEBUG=+dcompanim` (committed) traces every animation started on a visual or a property set and the value it
 settles at - full `+dcomp` tracing now stalls startup, so the narrow channel is the way to read the popup's
 transform chain (the popup opens with `Y -> -53.5`, `ScaleY 0.5@0 -> 1.30398@1` and `Opacity <- "PS.POpacity *
