@@ -3834,3 +3834,41 @@ All scripts drive the app on `$PERF_DISPLAY` (:98) and write to `$PERF_OUT` (/tm
   external resizes of its unmanaged windows, so `xdotool windowsize` never reaches the app.
 - `WINEDEBUG=+dcompperf` prints one line per second: commits, swap chain presents/readbacks, paints, walk and raster
   time, damaged pixels, batched readbacks.
+
+## ComboBox dropdowns: hover offset by the title bar row (2026-09-18, Wine b48f393)
+
+On the Currency page the dropdown highlighted the wrong row: with the pointer on "Mercury - Sun Notes" XAML
+highlighted "Mars - The Martian Dollar", one row (35 px) up, and a click selected that wrong row.
+
+The presenter painted exactly what XAML asked for. A one-shot visual tree dump (a temporary `+dcompanim` dump,
+triggered by a marker file so it could be taken while the popup was open) showed the popup chain hanging next to
+the page content under the island root container, not inside it:
+
+```
+container <island root>                      at 0,0
+  dcomp   <page content>          1280x800   at 0,0
+    ...
+      dcomp <content root>        1280x768   at 0,32   (offset 0,32: the app's title bar row)
+        ...     sprite  161x44 at 12,286               <- the ComboBox
+  dcomp   <popup root>            0x0        at 0,0
+    dcomp <popup host>            129x44     at 12,254 (TransformMatrix translate 12,254)
+      dcomp <popup>               349x354    at 12,154 (Offset 0,-100)
+        sprite 1280x800 at -12,-286                    <- the light-dismiss layer
+```
+
+The popup host's y (254) is the ComboBox's position *relative to the content root* (it paints at 286), and the
+popup's own full-window light-dismiss sprite asks for a parent at 286 too. So XAML computes a popup's position in
+the XamlRoot content root's space but parents the popup's visuals where that offset does not apply. Probing the
+hit-test region with the pointer (hover the row, dump the tree, read which row got the hover sprite) put XAML's
+row A at client 222..254 against the painted 192..223: a constant +32, the content root's offset, not a scale.
+
+The presenter now carries the content root's offset over to popup roots: the content root is recognized while
+painting (a non-zero offset, covering the rest of the window), the branch of the island root that leads to it is
+remembered, and the island root's other dcomp children are painted with that offset. Hovering and clicking now
+land on the row under the pointer; the visual suite (history, modes, graph resize, hover/press, menu) shows no
+change with `WINE_DCOMP_VERIFY_DAMAGE=1`.
+
+`WINEDEBUG=+dcompanim` (committed) traces every animation started on a visual or a property set and the value it
+settles at - full `+dcomp` tracing now stalls startup, so the narrow channel is the way to read the popup's
+transform chain (the popup opens with `Y -> -53.5`, `ScaleY 0.5@0 -> 1.30398@1` and `Opacity <- "PS.POpacity *
+PS.TTOpacity"`; none of it was the cause).
