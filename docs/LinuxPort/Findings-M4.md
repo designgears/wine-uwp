@@ -3809,13 +3809,25 @@ What changed (Wine commits 25484f0, ce6e242, cb5636c, c205c53, 5424dcf, 27db824f
   `arm_uwp_breaks` looked up environment variables on every call (WIL feature checks run constantly; 14% of the UI
   thread during a graph drag). Both cache the lookup now; the change is also saved as a patch outside the tree.
 
+## More performance (2026-09-18)
+
+- `RoGetActivationFactory` resolved the class and loaded its module on every call: four registry lookups, a
+  LoadLibrary and a DllGetActivationFactory. XAML activates Windows.UI.Input.PointerPoint on every pointer
+  message, so a two second graph drag did 616 reads of the `DllPath` value, ~3% of the UI thread. combase now
+  keeps the factory for a class, the way Windows does (Wine 24df22b); the drag's busy UI-thread samples went
+  from 224 to 206 and the registry reads disappeared.
+- Wine's dwrite bypassed its glyph cache whenever a transform was set, and XAML draws all its text through one
+  (the window's DPI scale), so every glyph of every frame was re-rasterized through the unix side (~8% of the
+  UI thread on the graphing page). The 2x2 matrix is part of the cache key now, and bitmaps are keyed by their
+  rendering mode as well - two rendering modes of one glyph used to share an entry, so the second got the
+  first's bitmap (Wine e4a555a). A graph drag costs 4.5 ms of CPU per frame instead of 5.4 and shows 273 frames
+  where it managed 209; page screenshots compare equal pixel for pixel.
+
 Found, not changed (other layers):
 - Idle, the UI and CoreMessaging threads wake ~2000 times a second: `ScheduleCoreMessagingDispatch` (user32) posts
   a WM_NULL on every request, ~270 requests a second. Coalescing requests the way Windows' queue does would fix it;
   CPU cost is ~1%.
 - Each D3D11 device creates a Vulkan instance and device (`vkCreateDevice` ~50 ms of a graphing page visit).
-- Graph axis labels are rasterized by Wine's dwrite on every frame (no glyph bitmap cache), ~4% of the UI thread
-  during a drag.
 - wined3d maps host-visible Vulkan memory in 64 MB chunks per memory type and device; the graphing page's second
   device accounts for most of its +430 MB RSS.
 
