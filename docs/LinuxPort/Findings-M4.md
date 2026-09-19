@@ -4536,3 +4536,59 @@ are normal - .NET Native's RCW asks every WinRT object for them and handles the 
 For Camera: `DirectUI::XBFXamlTypeWrapper::GetMember` (`0x8f45c0`) just forwards to the wrapped
 `IXamlType`'s slot 20, so the app's own generated XamlTypeInfo is what fails to find `Title`. That
 points at an earlier lookup returning the wrong `IXamlType`, not at a missing API.
+
+## Media Player's fail-fast: a fake object written into an HSTRING out-parameter
+
+The abort after the UIContext fix was not managed code throwing. `mrt100_app.pdb` (public symbol
+server) names the frames: `RhpPInvokeExceptionGuard` -> `RhpFailFastForPInvokeExceptionPreemp`. That
+guard is the SEH handler on a CoreRT P/Invoke transition frame - **any** native exception during a
+P/Invoke is a fail-fast, because it cannot be unwound through managed frames.
+
+`WINEDEBUG=+seh` gives the exception: `EXCEPTION_ACCESS_VIOLATION`, `info[0]=0 info[1]=1`, i.e. a read
+of address `1`, at `VCRUNTIME140_APP.dll+0x10c4b`, which disassembles to `rep movsb`. Resolving the
+P/Invoke's IAT slot in `SharedLibrary.dll` (`0x55c190`) names the callee: `mrt100_app.dll!memmove`.
+At the fault `rdx` (the source) is `1` and `rcx` (the count) is `0xdffe`. So managed code called
+`memmove(dst, (void *)1, 57342)`.
+
+Note the two apps are the same stack - Feedback Hub is also WinUI 2.8 on .NET Native 2.2 and works -
+so this was Media Player specific, and `WINEDEBUG=+dcomp` says what it does differently: implicit
+animations. The trace before the abort is
+
+```
+compositor_CreateVector3KeyFrameAnimation
+kf_animation_QueryInterface ... {c8039daa-...}   IVector3KeyFrameAnimation
+kf_animation_QueryInterface ... {bcb4ad45-...}   ICompositionObject
+kf_animation_QueryInterface ... {845bf0b4-...}   (IKeyFrameAnimation / ICompositionAnimation)
+comp_object_default_slot Vector3KeyFrameAnimation ... a 0x1 b 0x0: ignored
+comp_object_default_slot Vector3KeyFrameAnimation ... a 0x0 b <stack>: ignored
+```
+
+Only the typed interface has a real vtable (`kf_vector3_vtbl`); every other interface gets the
+generic `kf_animation_vtbl`, whose slots 6+ are all `comp_object_default_slot`. That helper probes
+each argument with `is_out_pointer()` - which is what the 23 caught access violations inside
+`dcomp!is_out_pointer` in an `+seh` log are, they are deliberate - and writes **a pointer to a fake
+recording object** into the first one it finds.
+
+For a key frame animation those out-parameters are not objects. They are the `IKeyFrameAnimation`
+accessors: `HSTRING *` (`get_Target`), `TimeSpan *` (`get_Duration`, and note the `0x2dc6c0` = 3 000 000
+= 0.3 s passed to the setter), `UINT32 *` (`get_KeyFrameCount`). Writing a fake object pointer into
+an `HSTRING *` hands .NET Native a bogus HSTRING; marshalling it to a `string` reads a garbage buffer
+pointer and length out of it and `memmove`s them - `(1, 57342)`.
+
+`NULL` is a valid empty HSTRING, a zero TimeSpan and a zero count, so `comp_object_default_slot` now
+writes NULL rather than a fake object when the receiver is a key frame animation. The
+`comp_object_vtbl` / `expression_animation_vtbl` clone path that XAML depends on is untouched.
+
+**Media Player no longer fail-fasts.** It now reports a plain XAML error instead:
+`Cannot add instance of type 'Microsoft.Toolkit.Uwp.UI.Animations.Vector3Animation' to a collection
+of type 'Microsoft.Toolkit.Uwp.UI.Animations.ImplicitAnimationSet'` - the Windows Community Toolkit's
+implicit-animation types, and an app-metadata type check rather than a missing API. That is the same
+shape as Camera's `The property 'Title' was not found in type 'Microsoft.CameraApp.TitleBar'`: both
+are lookups in the app's own generated XamlTypeInfo.
+
+Regression checks after the change: Calculator screenshot byte-identical to baseline, Feedback Hub
+clean, Solitaire unchanged (no fail-fast, no app error).
+
+Also taught `comp_object_caller_slot` the `call <reg>` form so non-MSVC callers can be decoded; the
+callers here still do not match any pattern and report slot 0, so the method is identified from the
+QI that precedes it rather than from the slot.
