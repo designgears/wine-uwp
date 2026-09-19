@@ -4301,3 +4301,27 @@ DllOverrides value outlives the list it came from; check the registry, not the s
 
 Also fixed on the way: `shcore.RegisterWindowMonitorChangeListener` and its Unregister were spec
 stubs, so the native windows.graphics aborted the process on them. They are refusals now.
+
+### AutoSuggestBox and the UIContext slot both callers want differently
+
+With DisplayInformation working, Media Player's AutoSuggestBox failure turned out to hinge on the same
+place as before: the second private method of `Windows.UI.UIContext`, vtable slot 7, in
+`dlls/dcomp/device.c`. The three behaviours are now measured, not guessed:
+
+| slot 7 returns | result |
+| --- | --- |
+| `E_NOTIMPL` | AutoSuggestBox creation fails; MRM handles the error fine |
+| `S_OK` with a NULL out | AutoSuggestBox is **created**, then MRM faults |
+| `S_OK` with the context itself | AutoSuggestBox creation fails again |
+
+The fault is `Microsoft::Resources::CoreWindowContainer::Initialize+0x106` in MrmCoreR.dll
+(symbolized from `MrmCoreR.pdb.syms`). Disassembling it: MRM takes the CoreWindow, QIs it for
+`ICoreWindowWithContext` (`9ac40241-3575-4c3b-af66-e8c529d4d06c`), walks from there to the UIContext,
+calls slot 7 for an object and then QIs *that* for `84acbbfe-649c-5ac7-8130-7b6b76db463c` - a
+parameterized IID that is in no SDK header - without null-checking. Every other call in that function
+is `test eax,eax; js <error>`, so a failing HRESULT is handled and a successful-but-empty one is not.
+
+So the slot has to hand back a real object of a type we cannot yet name. Left returning `E_NOTIMPL`,
+which is the behaviour the calculator and Feedback Hub need; the alternative trades a working
+reference app for one more control in one app, which is not a trade worth making. The three
+measurements and the MRM call chain are the concrete handle for next time.
