@@ -3951,3 +3951,24 @@ diagnostic rather than a crash: everything up to and including its XAML, text an
 Worth noting for the Shapr3D target: the two fixed gaps were both in the app's first seconds, both fatal, and
 neither was visible from the calculator. The failure modes are the expensive part - an aborted process whose stack
 points at a privacy DLL, and a managed type-initializer exception that names nothing.
+
+### Where five more packages land
+
+With staging generic, running another package costs a minute, so here is the spread (all on :98, 45 s each):
+
+| package | how far it gets |
+| --- | --- |
+| Calculator | fully working |
+| Media Player | renders its own UI, stops at `Windows.Media.Playback.MediaPlaybackList` |
+| Windows Security | window up, content still blank, no error |
+| Camera | XAML parse error: "The property 'Title' was not found in type 'Microsoft.CameraApp.TitleBar'" |
+| Feedback Hub | `0x80070032` ERROR_NOT_SUPPORTED, thrown just after `Windows.Globalization.ApplicationLanguages` |
+| Solitaire | needs `Windows.System.UserPicker` and shell32's `CreateStorageItemFromShellItem_FullTrustCaller_ForPackage` |
+
+Windows Security only needed `wincorlib.dll` - the C++/CX language projection - staged into the prefix; without it
+the loader cannot even resolve the exe's imports (`c0000135`), which reads as a total failure and is a one-line
+fix. It is in the override list now.
+
+The Camera failure is the interesting one for Shapr3D: nothing is missing from Wine: XAML cannot find a property on
+one of the app's *own* types, which means the app's `IXamlMetadataProvider` type table is not being consulted the
+way it is on Windows. Any app with custom controls will hit that, and Shapr3D certainly has custom controls.
