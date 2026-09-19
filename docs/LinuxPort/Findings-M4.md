@@ -4247,3 +4247,47 @@ while failing to confirm that one:
 Neither is confirmed to be the cause of the copyright box - the fonts that do resolve have the glyph, and
 the page's text visibly renders in a Segoe face rather than Tahoma, so the run is not falling back the
 way the probe's unknown-family case does. Recorded as measured facts, not as the diagnosis.
+
+## I broke the calculator with wineboot, and what it taught us (2026-09-19)
+
+While testing the font staging I ran `wine wineboot -u` to force a font rescan. **That rewrote 719
+DLLs in the prefix's system32**, replacing the set the prefix had been running since 09-09 with
+freshly built ones. `install-overrides.sh` only restores the ~30 native modules on its list, so the
+rest stayed at their new versions. The calculator has failed ever since with
+`Cannot create instance of type 'Windows.UI.Xaml.Controls.Pivot'`.
+
+**Do not run `wineboot` against this prefix.** There is nothing in the tree that restores it.
+
+### What the regression actually is
+
+`windows.graphics.dll` is the DLL behind `Windows.Graphics.Display.DisplayInformation`. Before
+wineboot the prefix had a copy that worked; wineboot replaced it with a build of the current tree, in
+which `DisplayInformation` is not compiled at all - `displayinformation.c` exists but is not in
+`Makefile.in`'s `SOURCES`, so `GetForCurrentView` is the `E_NOTIMPL` stub in `main.c`. The comment at
+the top of `displayinformation.c` says exactly what follows: *"XAML asks for it while it lays out (a
+Pivot cannot be created without it)"*.
+
+The evidence, from `WINE_UWP_TRACE_ORIGINATE=802b000a` plus the XAML symbols:
+
+- The failing stack is identical to Media Player's AutoSuggestBox: `ObjectWriterRuntime::CreateTypeImpl`.
+- In the working log `Windows.Graphics.Display.DisplayInformation` is activated **once** and the run
+  continues; in the broken log it is activated **nine times**, XAML retrying as each one fails.
+
+So the AutoSuggestBox failure is very likely the same shape - a control whose initialisation needs
+something Wine answers with `E_NOTIMPL` - which is a much better lead than "something inside XAML".
+
+### What was tried, and why none of it is a fix
+
+| attempt | result |
+| --- | --- |
+| Compile `displayinformation.c` into the builtin | links only with `-Wl,--allow-multiple-definition`; the resulting DLL will not load |
+| Build the HEAD version and install it | loads, but `GetForCurrentView` is the stub, so `Pivot` still fails |
+| Stage the native Windows `windows.graphics.dll` | no `Pivot` error, but the app never gets a window: `CoMarshalInterface` fails for `{5c21c742-...}`. Needed `shcore.RegisterWindowMonitorChangeListener`, which was a spec stub and aborted |
+
+The prefix is left in the post-wineboot state, with the Wine builtin in place, so that the next build
+of `windows.graphics` simply takes effect. **The fix belongs to whoever owns `displayinformation.c`:
+add it and `weakref.c` to `SOURCES` and sort out the duplicate-symbol link error** (`main.c` and
+`displayinformation.c` both emit the selectany `RuntimeClass_Windows_Foundation_*` strings; adding
+`initguid.h` to the second file trades those for duplicate `IID_*`). Their tree was restored to exactly
+the state it was in - verified by md5 on `main.c` and by `git status` showing the same three modified
+and three untracked files as before.
