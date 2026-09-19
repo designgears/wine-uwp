@@ -4592,3 +4592,54 @@ clean, Solitaire unchanged (no fail-fast, no app error).
 Also taught `comp_object_caller_slot` the `call <reg>` form so non-MSVC callers can be decoded; the
 callers here still do not match any pattern and report slot 0, so the method is identified from the
 QI that precedes it rather than from the slot.
+
+### Naming the slots: one thunk per slot
+
+`comp_object_caller_slot()` decodes the caller's `call [reg+disp]` to work out which method was
+called. That cannot work for .NET Native: its interop stub takes the slot index as an *argument*.
+The call site in `Microsoft.Media.Player.dll` is
+
+```
+movsxd rdi, r8d              ; r8d = slot index, passed in
+mov    rdx, [rax]            ; vtable
+mov    rdi, [rdx+rdi*8]      ; method
+...                          ; P/Invoke transition frame + GC poll
+call   rax
+```
+
+so every Composition call from the app shares one return address (one of them accounts for 175 of
+the calls in a run) and decodes as slot 0. `dlls/dcomp/composition.c` now generates 256 one-line
+thunks, `comp_object_slot_00` .. `comp_object_slot_ff`, and the vtable fills take
+`comp_object_slot_fn( i )`; slots past 255 keep the old decoder. Calculator stays byte-identical and
+Feedback Hub stays clean with the thunks in.
+
+With real slot numbers the tail of the Media Player run reads as `IMap<HSTRING, ICompositionAnimationBase>`
+on the `ImplicitAnimationCollection` (slot 6 `Lookup`, 7 `get_Size`, 8 `HasKey`, 10 `Insert`):
+
+```
+slot 8  a 0x0            b <stack>     HasKey(NULL, &found)
+slot 10 a 0x0            b <animation> Insert(NULL, animation, &replaced)
+slot 6  a 0x0            b <stack>     Lookup(NULL, &value)
+```
+
+**The key is NULL.** The Community Toolkit keys the implicit-animation map by the Composition
+animation's `Target`, and we never stored the `Target` the app set - `put_Target` is swallowed by the
+generic slot handler and the matching getter now answers NULL (before the fix it answered a fake
+object pointer, which is what produced the `memmove` fail-fast). Hence
+`Cannot add instance of type 'Vector3Animation' to a collection of type 'ImplicitAnimationSet'`.
+
+The underlying design problem is visible now: `kf_animation_QueryInterface` hands the *same* generic
+vtable back for every interface it is asked for, so slot 7 in the trace is a different method
+depending on which IID the app most recently queried - the app asks this one animation for
+`{c8039daa}` (IVector3KeyFrameAnimation), `{bcb4ad45}` (ICompositionObject), `{126e7f22}`,
+`{845bf0b4}` and `{369b603e}`, and none of the last three are in Wine's
+`include/windows.ui.composition.idl` or in the public `.winmd` set. Until QI returns a distinct
+vtable per IID, a slot number alone cannot be mapped to a method, and the handler cannot know whether
+an out-parameter is an `HSTRING *`, a `boolean *` or an `IInspectable **`.
+
+A concrete latent bug of the same kind, now visible in the trace: `HasKey(key, boolean *found)` on a
+non-animation object still takes the `create_comp_object` path, which writes **eight bytes** - a
+pointer - through a `boolean *`.
+
+Next step for Media Player: give the composition objects a per-IID vtable, starting with storing and
+returning `CompositionAnimation.Target` so the Toolkit's map gets a real key.
