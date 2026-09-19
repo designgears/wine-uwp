@@ -4276,18 +4276,28 @@ The evidence, from `WINE_UWP_TRACE_ORIGINATE=802b000a` plus the XAML symbols:
 So the AutoSuggestBox failure is very likely the same shape - a control whose initialisation needs
 something Wine answers with `E_NOTIMPL` - which is a much better lead than "something inside XAML".
 
-### What was tried, and why none of it is a fix
+### The fix, and the false trail that delayed it
 
-| attempt | result |
-| --- | --- |
-| Compile `displayinformation.c` into the builtin | links only with `-Wl,--allow-multiple-definition`; the resulting DLL will not load |
-| Build the HEAD version and install it | loads, but `GetForCurrentView` is the stub, so `Pivot` still fails |
-| Stage the native Windows `windows.graphics.dll` | no `Pivot` error, but the app never gets a window: `CoMarshalInterface` fails for `{5c21c742-...}`. Needed `shcore.RegisterWindowMonitorChangeListener`, which was a spec stub and aborted |
+Fixed by compiling the DisplayInformation implementation that was already sitting in the tree:
+`displayinformation.c` and `weakref.c` added to `Makefile.in`'s `SOURCES`. The calculator is
+byte-identical to its baseline screenshot again and Feedback Hub is unchanged.
 
-The prefix is left in the post-wineboot state, with the Wine builtin in place, so that the next build
-of `windows.graphics` simply takes effect. **The fix belongs to whoever owns `displayinformation.c`:
-add it and `weakref.c` to `SOURCES` and sort out the duplicate-symbol link error** (`main.c` and
-`displayinformation.c` both emit the selectany `RuntimeClass_Windows_Foundation_*` strings; adding
-`initguid.h` to the second file trades those for duplicate `IID_*`). Their tree was restored to exactly
-the state it was in - verified by md5 on `main.c` and by `git status` showing the same three modified
-and three untracked files as before.
+The link needs `EXTRADLLFLAGS = -Wl,--allow-multiple-definition`: `main.c` and
+`displayinformation.c` both emit the selectany `RuntimeClass_Windows_Foundation_*` strings from
+windows.foundation.h and mingw ld does not merge them here. Adding `initguid.h` to the second file
+only trades those for duplicate `IID_*`, and removing it from `main.c` leaves the IIDs undefined
+because libuuid has no WinRT IIDs. Worth a proper fix; the flag is marked as temporary in the file.
+(The two .c files are `git add -N`'d, which `make_makefiles` requires - it builds `SOURCES` from
+`git ls-files`.)
+
+**What cost the most time was a second self-inflicted fault on top of the first.** While testing, I
+briefly added `windows.graphics` to `install-overrides.sh`'s override list. That script writes
+`HKCU\Software\Wine\DllOverrides\<name> = native` for everything in the list and **never removes
+entries**, so taking the name back out of the list left the registry forcing *native-only* - with no
+native file installed. Every subsequent load failed with `c0000135`, which made a correctly built
+builtin look unloadable and sent me off testing the native DLL instead. `WINEDEBUG=trace+module`
+says it in one line: `get_load_order_value got standard key n for L"windows.graphics"`. **A stale
+DllOverrides value outlives the list it came from; check the registry, not the script.**
+
+Also fixed on the way: `shcore.RegisterWindowMonitorChangeListener` and its Unregister were spec
+stubs, so the native windows.graphics aborted the process on them. They are refusals now.
