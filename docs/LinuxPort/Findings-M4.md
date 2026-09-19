@@ -4384,3 +4384,41 @@ which tail-jumps to `CAutoSuggestBox::Create` -> `CDependencyObject::ValidateAnd
 Slot 24 of `CAutoSuggestBox`, `CItemsControl` and `CControl` is the *same* trivial `xor eax,eax; ret`,
 so initialisation succeeds and the failure is in what `CreateInstance` does **after** the activator
 returns - the type-info lookup and flag checks at `0x18020a03b` onwards.
+
+### AutoSuggestBox: the failure is the provider-kind dispatch, proved by patching
+
+Tracing `ObjectWriterRuntime::CreateTypeImpl` properly (`0x30af70`) rather than guessing:
+
+```
+mov (%r8),%r14                  ; r14 = the XamlType
+mov $0x80004005,%edi            ; default hr = E_FAIL
+lea 0xb0(%r14),%r15             ; r15 = the XamlTypeToken inside it
+mov (%r15),%ecx ; shr $0x1c,%ecx ; sub $1,%ecx
+jne 0x18030b218                 ; kind != 1 (native)
+  0x18030b218: cmp $1,%ecx ; jne 0x18030b42b   ; kind != 2 (managed)
+    0x18030b42b: <record edi> -> returns the default E_FAIL
+```
+
+Both the native and the managed branch fetch a cached runtime out of the schema context (slots +0x30/+0x38
+and +0x40/+0x48) and converge on the *same* call site, whose slot 1 is `CreateInstance` - confirmed by
+dumping `??_7XamlNativeRuntime@@6B@` and `??_7XamlManagedRuntime@@6B@`. So a token whose provider kind
+is neither 1 nor 2 never calls anything: it falls straight out with the E_FAIL that was loaded before the
+dispatch, and that becomes parser error 0x9e7, "Cannot create instance of type".
+
+Confirmed by patching our copy of the DLL, one branch at a time:
+
+| patch | result |
+| --- | --- |
+| force the **native** path (`jne` at `0x30b00b` -> nops) | the parse error is **gone**; the app then throws a managed `ArgumentOutOfRangeException` (0x80131502, "Parameter name: index") |
+| force the **managed** path (`jne` at `0x30b21b` -> nops) | same "Cannot create instance" error - the app's managed activation genuinely fails for this type |
+| unpatched | E_FAIL from the dispatch itself |
+
+So: the token for `Windows.UI.Xaml.Controls.AutoSuggestBox` in this app's XBF carries a provider kind
+that is neither native nor managed, the native activator *can* build the control (index 811 in the table
+at `0xc904e0`), and the app's own managed activation cannot. The remaining question is what sets that
+token - it is type *resolution*, not type *creation*, that is wrong, which is the same conclusion the
+Camera trace reached from the other end ("the property was not found in type" while resolving a name
+against a target type).
+
+Both patches are reverted; the staged `Windows.UI.Xaml.dll` is byte-identical to the original (verified
+against two separate copies taken earlier in the day) and the calculator baseline is intact.
