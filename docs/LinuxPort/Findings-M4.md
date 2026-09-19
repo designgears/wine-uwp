@@ -4212,3 +4212,38 @@ otherwise:
 
 So Camera's failure is specific to that type or that property, not a class of failure that Shapr3D would inherit.
 Good news for the target, and it redirects the effort: there is no general metadata gap to close.
+
+## Feedback Hub is properly interactive, and two font findings (2026-09-19)
+
+Exercising the working app: clicking **Settings** renders a full page - radio group with the selection
+drawn, a checkbox, a button, four hyperlinks with their external-link glyphs, version text - and
+clicking **Light** repaints the entire app from dark to light theme. Nothing about it is a static
+screenshot; the app is live.
+
+The three WinRT classes still unresolved for it (`Windows.System.User`,
+`Microsoft.UI.Private.Controls.CBSPackageDetector`) cost nothing visible, which is worth knowing before
+spending effort on them. `Windows.System.User` is not fixable by registering a DLL anyway: in the real
+Windows registry it has **no `DllPath`** - it is `ActivationType=1, Server=UserManager`, an out-of-process
+class hosted by a Windows service, as are `Windows.System.UserPicker` and
+`Windows.Internal.StateRepository.Application`. (Read out of the partition's SOFTWARE hive with
+`tools/wine-uwp/fasthive.py`.) `CBSPackageDetector` is not in the Windows registry at all.
+
+One cosmetic defect is visible: the copyright sign in "(c) 2026 Microsoft Corp." draws as a
+missing-glyph box. `probes/probe-glyph.cpp` asks DWrite what it can resolve, and found two real gaps
+while failing to confirm that one:
+
+- **Segoe UI Variable's optical-size families are missing.** Wine's font collection has 380 families
+  including `Segoe UI` and `Segoe UI Variable`, both of which have U+00A9 and U+2122 with real glyph
+  ids. But `Segoe UI Variable Text`, `Segoe UI Variable Small` and `Segoe UI Variable Display` - three
+  separate families on Windows 11, and the default UI font for Windows 11-era XAML - are **not found**.
+  Wine's freetype backend exposes `SegUIVar.ttf` as the single family `Segoe UI Variable` rather than its
+  named optical-size instances. Copying the real font files from the partition into the prefix changes
+  nothing, because fontconfig was already serving them; the gap is in how Wine enumerates a variable
+  font's named instances.
+- **`MapCharacters` can return S_OK with a NULL font.** For an unknown base family the whole run falls
+  back to Tahoma, and for U+2122 it returns `hr 0, mappedLength 1, font NULL` - a caller that does not
+  treat a NULL font as "cannot render" will draw nothing or a box.
+
+Neither is confirmed to be the cause of the copyright box - the fonts that do resolve have the glyph, and
+the page's text visibly renders in a Segoe face rather than Tahoma, so the run is not falling back the
+way the probe's unknown-family case does. Recorded as measured facts, not as the diagnosis.
