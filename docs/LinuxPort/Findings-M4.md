@@ -4325,3 +4325,31 @@ So the slot has to hand back a real object of a type we cannot yet name. Left re
 which is the behaviour the calculator and Feedback Hub need; the alternative trades a working
 reference app for one more control in one app, which is not a trade worth making. The three
 measurements and the MRM call chain are the concrete handle for next time.
+
+## End-to-end check of the reference app, and CoreTextServicesConstants (2026-09-19)
+
+After a day of DLL churn, a first-frame screenshot is not enough evidence, so the calculator was
+driven rather than just launched: 1234 + 876 = **2,110** with the history panel populated, the
+navigation menu opens with all sixteen entries and icons, Programmer and Graphing both switch and
+render, and typing `x` into the Graphing expression and committing it with the keypad's enter key
+**plots the line**, with the axes rescaling to ±8 and a second equation row appearing. The graphing
+engine, the D2D path and the history/memory panes all still work.
+
+One thing worth remembering about driving this app: `xdotool key Return` does **not** commit a
+graphing expression, and a typed `*` does not register. Only the keypad's enter button commits. I
+briefly took "no curve" as a regression from the day's changes when it was just an uncommitted
+expression.
+
+That run's log showed two classes registered to `windows.ui.core.textinput.dll` but not implemented.
+The first is now done:
+
+**`Windows.UI.Text.Core.CoreTextServicesConstants`** is a statics-only class with a single property,
+`HiddenCharacter`. Rather than guess the constant, it came out of the shipping
+`Windows.UI.Core.TextInput.dll`: scanning for `mov word ptr [rdx], imm16` finds exactly one
+plausible getter, at file offset 0x61d20, and its whole body is
+`66 c7 02 fd f8 / 33 c0 / c3` - `*value = 0xF8FD; return S_OK;`, surrounded by int3 padding. So the
+answer is U+F8FD, read off the real implementation rather than inferred.
+
+`Windows.UI.ViewManagement.Core.CoreFrameworkInputView` is still missing; it needs the
+`ICoreFrameworkInputView` surface (occluded rects and their changed event), which is more than a
+constant.
