@@ -4134,3 +4134,26 @@ kind is `0xe` - so I byte-patched the `cmp $0xe,%al` to `cmp $0xff,%al` in our o
 rule it out. The parse error was unchanged, so the failure is in `CDependencyObject::ValidateAndInit`,
 i.e. inside AutoSuggestBox's own initialization. (The patch is reverted; the staged DLL is byte-identical
 to the original again.)
+
+### Solitaire's access violation: one missing interface revision
+
+`Activate failed, hr 0xc0000005` came three lines after
+`coreinputview:edit_context_QueryInterface {b1867dbb-083b-49e1-b281-2b35d62bf466}` returning
+E_NOINTERFACE. That IID is `ICoreTextEditContext2`, which adds exactly one event -
+`NotifyFocusLeaveCompleted`. Solitaire QI's for it while building its first page and faults on the null
+it gets back rather than checking the HRESULT.
+
+Declared it in `windows.ui.text.core.idl` and implemented it on the existing edit context in
+`windows.ui.core.textinput`: registration succeeds with a zero token and the event never fires, because
+Wine's edit context has no asynchronous focus handshake to complete. The crash is gone and the app now
+runs steadily and gets as far as initialising D3D and a `Windows.UI.Composition.Compositor`; it still
+draws nothing, which is a separate problem (it is a game that renders through the compositor rather than
+XAML, and it wants to be signed in).
+
+This is the third variant of the same theme: **the fatal thing is usually the refusal, not the missing
+feature.** `E_NOTIMPL` from an event registration, a spec stub instead of a failing function, a delay-load
+that cannot resolve, and an interface revision answered with E_NOINTERFACE all kill an app that would
+have run happily with a do-nothing implementation.
+
+It did not help Media Player's AutoSuggestBox, which was worth checking - AutoSuggestBox contains a
+TextBox and so reaches the same edit context.
