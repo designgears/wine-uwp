@@ -314,7 +314,9 @@ static const void *factory_vtbl[7] =
  * writing nothing.
  */
 
-/* An empty IVectorView<T>. Several of the Find* statics return one, and a null collection is fatal:
+static HRESULT create_generic(const WCHAR *cls, void **out);
+
+/* A one-element IVectorView<T>. Several of the Find* statics return one, and a null collection is fatal:
  * Windows.Internal.StateRepository.Application slot 55
  * (IApplicationStatics::FindByUserAndPackageFamilyNameAndAppListEntry, named from
  * Windows.StateRepository.pdb) handed back null fail-fasts Media Player forty-odd times. An empty
@@ -323,6 +325,7 @@ struct vectorview_object
 {
     const void **vtbl;
     LONG ref;
+    WCHAR element[128];   /* runtime class of the single row, empty for an empty view */
 };
 static HRESULT WINAPI vv_QueryInterface(void *iface, REFIID iid, void **out)
 {
@@ -348,13 +351,20 @@ static HRESULT WINAPI vv_GetRuntimeClassName(void *iface, HSTRING *name)
 static HRESULT WINAPI vv_GetTrustLevel(void *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
 static HRESULT WINAPI vv_GetAt(void *iface, UINT32 index, void **item)
 {
-    if (item) *item = nullptr;
-    return E_BOUNDS;
+    vectorview_object *impl = (vectorview_object *)iface;
+
+    if (!item) return E_POINTER;
+    *item = nullptr;
+    if (!impl->element[0] || index) return E_BOUNDS;
+    trace("GetAt(0) -> %ls", impl->element);
+    return create_generic(impl->element, item);
 }
 static HRESULT WINAPI vv_get_Size(void *iface, UINT32 *size)
 {
+    vectorview_object *impl = (vectorview_object *)iface;
+
     if (!size) return E_POINTER;
-    *size = 0;
+    *size = impl->element[0] ? 1 : 0;
     return S_OK;
 }
 static HRESULT WINAPI vv_IndexOf(void *iface, void *item, UINT32 *index, boolean *found)
@@ -365,7 +375,12 @@ static HRESULT WINAPI vv_IndexOf(void *iface, void *item, UINT32 *index, boolean
 }
 static HRESULT WINAPI vv_GetMany(void *iface, UINT32 start, UINT32 capacity, void **items, UINT32 *actual)
 {
-    if (actual) *actual = 0;
+    vectorview_object *impl = (vectorview_object *)iface;
+    UINT32 n = 0;
+
+    if (impl->element[0] && !start && capacity && items && SUCCEEDED(create_generic(impl->element, &items[0])))
+        n = 1;
+    if (actual) *actual = n;
     return S_OK;
 }
 /* The collection is handed back for whatever interface the caller asks for - IVectorView,
@@ -393,22 +408,25 @@ static const void *vectorview_vtbl[32] =
     (void *)vv_unused, (void *)vv_unused,
     VV_PAD8, VV_PAD8, (void *)vv_unused, (void *)vv_unused, (void *)vv_unused, (void *)vv_unused,
 };
-static HRESULT create_vectorview(void **out)
+static HRESULT create_vectorview(const WCHAR *element, void **out)
 {
     vectorview_object *impl;
     if (!out) return E_POINTER;
     if (!(impl = (vectorview_object *)calloc(1, sizeof(*impl)))) return E_OUTOFMEMORY;
     impl->vtbl = vectorview_vtbl;
     impl->ref = 1;
+    if (element) lstrcpynW(impl->element, element, ARRAYSIZE(impl->element));
     *out = impl;
     return S_OK;
 }
 
 /* (class, slot) pairs whose out-parameter must be a collection rather than nothing. Slots are read
  * off the statics vtables in Windows.StateRepository.dll with its public PDB. */
-static bool sr_returns_collection(const WCHAR *cls, unsigned slot)
+static const WCHAR *sr_collection_element(const WCHAR *cls, unsigned slot)
 {
-    return !lstrcmpW(cls, L"Windows.Internal.StateRepository.Application") && slot == 55;
+    if (!lstrcmpW(cls, L"Windows.Internal.StateRepository.Application") && slot == 55)
+        return L"Windows.Internal.StateRepository.Application";
+    return nullptr;
 }
 
 #define SR_GENERIC_SLOTS 64
@@ -418,6 +436,7 @@ struct generic_object
     const void **vtbl;
     WCHAR cls[128];
     LONG ref;
+    bool instance;   /* a row out of a collection, not the class's statics */
 };
 
 
@@ -452,29 +471,81 @@ static HRESULT WINAPI generic_GetRuntimeClassName(void *iface, HSTRING *name)
 }
 static HRESULT WINAPI generic_GetTrustLevel(void *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
 
-static HRESULT generic_slot_call(unsigned slot, void *iface, void *a, void *b, void *c, void *d)
+/* What to write through a slot's out-parameter, and where. Generated from the server vtables and
+ * the public PDB by tools/wine-uwp/gen-staterepository.py; the out-parameter is the last one, so
+ * the arity is what says which argument it is. Getting that wrong is not a small error - writing
+ * the eight bytes at the wrong index leaves the real out-parameter holding whatever the caller's
+ * stack had, and for an HSTRING that is a fail-fast. */
+enum
+{
+    SR_OUT_NONE, SR_OUT_ZERO1, SR_OUT_ZERO4, SR_OUT_ZERO8,
+    SR_OUT_HSTRING, SR_OUT_IFACE, SR_OUT_COLLECTION,
+};
+#include "staterepository_slots.h"
+
+static const struct sr_slot *sr_find(const WCHAR *cls, bool statics, unsigned slot)
+{
+    for (size_t i = 0; i < ARRAYSIZE(sr_slots); i++)
+    {
+        if (sr_slots[i].slot != slot || sr_slots[i].statics != (statics ? 1 : 0)) continue;
+        if (!lstrcmpW(sr_slots[i].cls, cls)) return &sr_slots[i];
+    }
+    return nullptr;
+}
+
+static HRESULT generic_slot_call(unsigned slot, void *iface, void *args[6])
 {
     generic_object *impl = (generic_object *)iface;
+    const struct sr_slot *desc = sr_find(impl->cls, !impl->instance, slot);
+    void *out;
 
-    trace("%ls slot %u a %p b %p c %p d %p", impl->cls, slot, a, b, c, d);
-    /* Zero the last argument that looks like a writable pointer to a null-or-garbage slot. Eight
-     * bytes is the widest out-parameter these interfaces use (HSTRING *, an interface pointer, an
-     * INT64); a narrower one is zeroed along with its neighbour, which is why this is a diagnostic
-     * default and not a destination. */
-    void *args[4] = { a, b, c, d };
-    for (int i = 3; i >= 0; i--)
+    trace("%ls[%s] slot %u %s argc %d", impl->cls, impl->instance ? "row" : "statics", slot,
+          desc ? desc->name : "(not in table)", desc ? desc->argc : -1);
+
+    if (!desc || !desc->argc) return S_OK;
+    out = args[desc->argc - 1];
+    if (!out || IsBadWritePtr(out, sizeof(void *))) return S_OK;
+
+    /* The row has to have an identity: the app reads _ApplicationID straight back into
+     * IApplicationStatics::GetByUserAnd_ApplicationId, so zero looks up nothing. One row, id 1. */
+    if (impl->instance && desc->kind == SR_OUT_ZERO8 && !strcmp(desc->name, "get__ApplicationID"))
     {
-        if (!args[i]) continue;
-        if (IsBadWritePtr(args[i], sizeof(void *))) continue;
-        if (sr_returns_collection(impl->cls, slot)) return create_vectorview((void **)args[i]);
-        *(void **)args[i] = nullptr;
-        break;
+        *(INT64 *)out = 1;
+        return S_OK;
+    }
+    /* An empty display name is not survivable either. run.sh already knows the package's, out of
+     * the AppxManifest via stage-app.sh, and MRT hands back anything that is not an ms-resource
+     * URI unchanged. */
+    if (impl->instance && desc->kind == SR_OUT_HSTRING && !strcmp(desc->name, "get_DisplayNameReference"))
+    {
+        WCHAR name[128];
+        if (!GetEnvironmentVariableW(L"WINE_UWP_WINDOW_TITLE", name, ARRAYSIZE(name))) lstrcpyW(name, L"App");
+        trace("  -> %ls", name);
+        return WindowsCreateString(name, lstrlenW(name), (HSTRING *)out);
+    }
+
+    switch (desc->kind)
+    {
+    case SR_OUT_ZERO1: *(BYTE *)out = 0; break;
+    case SR_OUT_ZERO4: *(UINT32 *)out = 0; break;
+    case SR_OUT_ZERO8: *(INT64 *)out = 0; break;
+    case SR_OUT_HSTRING: *(HSTRING *)out = nullptr; break;  /* a null HSTRING is the empty string */
+    case SR_OUT_IFACE:
+        trace("  -> %ls row", desc->element ? desc->element : impl->cls);
+        return create_generic(desc->element ? desc->element : impl->cls, (void **)out);
+    case SR_OUT_COLLECTION:
+        /* One row, not none: the caller is the app looking itself up, and an empty result is a
+         * state it treats as fatal. */
+        trace("  -> collection of %ls", desc->element ? desc->element : L"(unknown)");
+        return create_vectorview(desc->element, (void **)out);
+    default: break;
     }
     return S_OK;
 }
 
-#define SR_THUNK(n) static HRESULT WINAPI generic_slot_##n(void *iface, void *a, void *b, void *c, void *d) \
-    { return generic_slot_call(0x##n, iface, a, b, c, d); }
+#define SR_THUNK(n) static HRESULT WINAPI generic_slot_##n(void *iface, void *a, void *b, void *c, \
+                                                           void *e, void *f, void *g) \
+    { void *args[6] = { a, b, c, e, f, g }; return generic_slot_call(0x##n, iface, args); }
 #define SR_ROW(p) SR_THUNK(p##0) SR_THUNK(p##1) SR_THUNK(p##2) SR_THUNK(p##3) \
                   SR_THUNK(p##4) SR_THUNK(p##5) SR_THUNK(p##6) SR_THUNK(p##7) \
                   SR_THUNK(p##8) SR_THUNK(p##9) SR_THUNK(p##a) SR_THUNK(p##b) \
@@ -501,7 +572,7 @@ static void generic_vtbl_init(void)
     generic_vtbl[5] = (void *)generic_GetTrustLevel;
 }
 
-static HRESULT create_generic(const WCHAR *cls, void **out)
+static HRESULT create_generic_ex(const WCHAR *cls, bool instance, void **out)
 {
     generic_object *impl;
 
@@ -511,9 +582,15 @@ static HRESULT create_generic(const WCHAR *cls, void **out)
     impl->vtbl = generic_vtbl;
     impl->ref = 1;
     lstrcpynW(impl->cls, cls, ARRAYSIZE(impl->cls));
+    impl->instance = instance;
     /* IUnknown and IInspectable are real; the rest of the table is thunks. */
     *out = impl;
     return S_OK;
+}
+
+static HRESULT create_generic(const WCHAR *cls, void **out)
+{
+    return create_generic_ex(cls, true, out);   /* collection rows are instances */
 }
 
 extern "C" __declspec(dllexport)
@@ -531,7 +608,7 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING name, IActivationFactory **out)
     if (lstrcmpW(str, L"Windows.Internal.StateRepository.User"))
     {
         trace("serving %ls with the generic traced table", str);
-        return create_generic(str, (void **)out);
+        return create_generic_ex(str, false, (void **)out);
     }
     statics.vtbl = statics_vtbl;
     factory.vtbl = factory_vtbl;

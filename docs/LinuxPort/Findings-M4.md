@@ -4762,3 +4762,53 @@ underneath it. `Windows.Internal.CapabilityAccess.CapabilityAccess` is the next 
 in the log and is the obvious thing to serve next.
 
 Regression checks: Calculator byte-identical, Feedback Hub clean, Solitaire clean.
+
+### Driving the stand-in from the real signatures
+
+Serving one class was not enough: the app walks the model. `User.GetCurrent` leads to
+`Application.FindByUserAndPackageFamilyNameAndAppListEntry`, then `get__ApplicationID` straight back
+into `GetByUserAnd_ApplicationId`, then `MrtApplication.GetByApplication`, `get_DisplayNameReference`,
+`Application.get_ApplicationUserModelId`, `GetPackage`, and on into `Package`. Two rules fell out of
+doing it by hand, both of which had to be got right before anything progressed:
+
+- **An empty result is fatal.** The caller is the app looking *itself* up, and a null row or an
+  empty `IVectorView` is a state it treats as unrecoverable - the empty collection cost 46 fail-fasts,
+  a null `IMrtApplication` another 52. One row is the truthful answer: this package is installed and
+  it is the one running. Its `_ApplicationID` has to be non-zero too, because the app reads it and
+  immediately looks it up again.
+- **Guessing which argument is the out-parameter corrupts things**, exactly as it did in the
+  composition default slot. `get_DescriptionReference(HSTRING **)` takes its out-parameter *first*;
+  the hand-written rule wrote to the last writable-looking register instead, left the real
+  out-parameter holding whatever the caller's stack had, and the app fail-fasted on the garbage
+  HSTRING.
+
+So the shim no longer guesses. `tools/wine-uwp/gen-staterepository.py` generates
+`staterepository_slots.h` from the server vtables plus the public PDB, demangled with
+`llvm-undname`: for every slot of every class it records the arity, what the last parameter is, and
+for interface and collection out-parameters which class the row must be. In this family the
+out-parameter is always the last one, so arity is enough to write to the right place. 416 slots
+across six classes, all demangled.
+
+Two bugs in the generator worth recording, because both fail *silently* and produce a table that is
+confidently wrong:
+
+- `llvm-undname` prints three lines per symbol (echo, result, blank) and only two for a symbol it
+  cannot demangle. Batching and pairing the lines up shifts every prototype after the first failure
+  onto the wrong slot - i.e. the wrong arity, i.e. writing through the wrong argument. It now
+  demangles one name per call.
+- Walking a vtable until a slot "looks like" the end does not work: identical-code folding makes a
+  slot resolve to a same-shaped method of an unrelated class (`ApplicationServer` slot 14 resolves
+  to `SecondaryTileViewServer::put_VisibleInAppList`). That truncated three of the four tables, and
+  silently dropped the one slot the app actually called. Vtables are bounded by the next `??_7`
+  symbol instead. Picking the statics vtable also needs care - several selector vtables mention
+  `I<Class>Statics` in their template arguments, and the FtmBase one is `IMarshal`.
+
+With six classes served (`User`, `Application`, `MrtApplication`, `Package`, `PackageFamily`,
+`MrtPackage`), Media Player runs the whole state-repository walk with **no fail-fasts and nothing
+off-table**, and its window stays up for the length of the run. The error is no longer a missing
+registration: it is `0x8001010e`, `RPC_E_WRONG_THREAD`. Still unregistered and worth serving next:
+`Windows.Internal.CapabilityAccess.CapabilityAccess` and
+`Microsoft.UI.Private.Controls.CBSPackageDetector`.
+
+The window is still blank. Regression checks: Calculator byte-identical, Feedback Hub unchanged
+(822 colours, no fail-fast, no app error).
