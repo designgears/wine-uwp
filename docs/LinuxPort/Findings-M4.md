@@ -4094,3 +4094,43 @@ XamlType (`0x30b0a5`), stores the HRESULT in `%edi`, and branches to the error r
 Nothing originates the inner HRESULT, so it never reaches the log. `Windows.UI.Xaml.Controls.AutoSuggestBox`
 *is* registered as an activatable class pointing at windows.ui.xaml.dll, so this is not the registry.
 Finding the inner HRESULT needs a breakpoint at `0x30b0a5` or a shim on that vtable slot.
+
+### Two more aborts removed, and the delay-load trap
+
+Re-running the whole set after the global fixes surfaced two more of the same kind, both found by
+grepping every log for `DelayLoadFailureHook`:
+
+- **Windows Security** aborted on `RMCLIENT.dll.HamQueryCallerTerminateReason`. The staged
+  `rmclient.dll` exports it perfectly well - the DLL simply was not in the prefix's system32, so the
+  bare-name delay load never found it. Added to the override list.
+- **Solitaire** aborted on `ext-ms-win-shell-shell32-l1-2-0.dll.CreateStorageItemFromShellItem_FullTrustCaller_ForPackage`.
+  The apiset maps to shell32 and shell32 does not export it; implemented as a refusal in `shellord.c`.
+
+Worth knowing: **Wine's `DelayLoadFailureHook` aborts the process.** A delay-load import is the one
+kind of missing export that an app has no chance to handle, so `grep DelayLoadFailureHook` over a log is
+the cheapest way to find the next fatal gap - it fires before the "unimplemented function" message.
+
+Neither app has an unhandled error or an abort any more. Neither draws content yet:
+
+| app | state |
+| --- | --- |
+| Calculator | working |
+| Feedback Hub | working, navigates |
+| Windows Security | window and title, content blank; waiting on COM class `{e041c90b-68ba-42c9-991e-477b73a75c90}`, which is a Windows service we do not have |
+| Solitaire | `Activate failed, hr 0xc0000005` - an access violation, needs its own investigation |
+| Media Player | data layer complete, dies creating `AutoSuggestBox` |
+| Camera | XAML cannot find `Title` on the app's own `Microsoft.CameraApp.TitleBar` |
+
+### AutoSuggestBox: what it is not
+
+Following the disassembly down from `ObjectWriterRuntime::CreateTypeImpl`: the indirect call is
+`XamlNativeRuntime::CreateInstance`, which looks up a per-type activator in a 16-byte-stride table at
+RVA `0xc904e0`. Reading that table out of the DLL image and symbolizing every entry gives
+`OnCoreCreateAutoSuggestBox` at index 811, which is nothing but a RuntimeProfiler call and a tail-jump
+to `CAutoSuggestBox::Create`.
+
+`CAutoSuggestBox::Create` has exactly one early-out - it returns `E_NOTIMPL` when the CREATEPARAMETERS
+kind is `0xe` - so I byte-patched the `cmp $0xe,%al` to `cmp $0xff,%al` in our own copy of the DLL to
+rule it out. The parse error was unchanged, so the failure is in `CDependencyObject::ValidateAndInit`,
+i.e. inside AutoSuggestBox's own initialization. (The patch is reverted; the staged DLL is byte-identical
+to the original again.)
