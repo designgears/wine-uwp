@@ -4057,3 +4057,40 @@ AutoSuggestBox failure look exactly like the cause. They are not - the calculato
 times per run and works. Making the slot return S_OK with a null out parameter did get past AutoSuggestBox
 but crashed the activation with `0xc0000005`, and returning the context itself put the parse error back.
 **Check whether a suspicious FIXME also fires in the app that works before chasing it.**
+
+## Feedback Hub works (2026-09-19)
+
+A second app is up and interactive: the NavigationView renders with its icons, clicking **Feedback**
+moves the selection and navigates to a real page (title, body text, accent button). No unhandled errors
+in the run.
+
+What it took, after the `PrimaryLanguageOverride` registry key and the five DLL/apiset fixes above, was
+the `LsaLookup*` family that `sechost` exports for name resolution - undocumented, and all `@ stub`:
+
+- `LsaLookupOpenLocalPolicy` is `LsaOpenPolicy` against the local machine with `POLICY_LOOKUP_NAMES`;
+  implemented in `advapi32/lsa.c` and forwarded from sechost the way `LsaOpenPolicy` already is.
+- `LsaLookupGetDomainInfo`, `LsaLookupTranslateNames`, `LsaLookupTranslateSids`,
+  `LsaLookupUserAccountType`, `LsaLookupSids2`, `LsaLookupFreeMemory` and `LsaLookupClose` return
+  `STATUS_NOT_SUPPORTED` (or succeed, for the two that free and close).
+
+The point is not that the implementations do anything - most of them refuse - it is that **a spec stub
+aborts the process and a failing call does not**. `@ stub` in a .spec means Wine's loader prints
+"Call from ... to unimplemented function" and kills the app; the same function returning
+`STATUS_NOT_SUPPORTED` is something the caller handles and walks past. Seven one-line refusals were the
+difference between no UI at all and a working app.
+
+### Where Media Player's AutoSuggestBox failure actually is
+
+Not solved, but pinned precisely. `WINE_UWP_TRACE_ORIGINATE=802b000a` (the existing hook in
+`combase/roerror.c`) plus `windows.ui.xaml.pdb.syms` gives the chain:
+
+```
+CParser::LoadXamlCore -> BinaryFormatObjectWriter::WriteNode -> CreateInstanceFromType
+  -> ObjectWriterRuntime::CreateTypeImpl +0x60a  <- reports parser error 0x9e7, returns E_FAIL
+```
+
+In the disassembly, `CreateTypeImpl` fails at `+0x135` on an indirect call through vtable slot 1 of the
+XamlType (`0x30b0a5`), stores the HRESULT in `%edi`, and branches to the error report at `0x30b546`.
+Nothing originates the inner HRESULT, so it never reaches the log. `Windows.UI.Xaml.Controls.AutoSuggestBox`
+*is* registered as an activatable class pointing at windows.ui.xaml.dll, so this is not the registry.
+Finding the inner HRESULT needs a breakpoint at `0x30b0a5` or a shim on that vtable slot.
