@@ -4519,3 +4519,20 @@ It now fail-fasts (WIL, code `0x1007`) further in: `CCollection::Add` ->
 `iertutil:uri_QueryInterface` refuses `{659a8956-ef29-4f50-8724-7e3207d23076}` and
 `{4bd682dd-7554-40e9-9a9b-82654ede7e62}` repeatedly - the next thing to look at, and the same shape
 of bug as this one.
+
+### Regression check after the dcomp change
+
+`Calculator` screenshot byte-identical to the pre-change baseline; Feedback Hub still starts clean
+(no app error, no fail-fast); Camera still fails on its own unrelated
+`The property 'Title' was not found in type 'Microsoft.CameraApp.TitleBar'`.
+
+Media Player's remaining abort is in *its own* managed code: the package is .NET Native
+(the PDB path in `Microsoft.Media.Player.dll` is `...\ilc\Microsoft.Media.Player.pdb`, and
+`SharedLibrary.dll` is the ProjectN shared runtime), and neither PDB is on the public symbol server,
+so the unwind past `TrackerEventSource<VectorChangedEventHandler>::Raise` cannot be named. The
+`IReferenceTracker` (`{11d3b13a-...}`) and `IPropertyValue` (`{4bd682dd-...}`) QIs refused around it
+are normal - .NET Native's RCW asks every WinRT object for them and handles the refusal.
+
+For Camera: `DirectUI::XBFXamlTypeWrapper::GetMember` (`0x8f45c0`) just forwards to the wrapped
+`IXamlType`'s slot 20, so the app's own generated XamlTypeInfo is what fails to find `Title`. That
+points at an earlier lookup returning the wrong `IXamlType`, not at a missing API.
