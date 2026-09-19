@@ -4026,3 +4026,34 @@ Two lessons that generalize past Media Player:
   IDL finds it. Worth diffing method-by-method whenever an interface is transcribed by hand.
 
 The calculator is byte-identical through all of it.
+
+### The folder-query stack, and where it lands
+
+`IStorageFolderQueryOperations` turned out to be the last of the data plumbing. Implemented in
+`dlls/windows.storage`:
+
+- `Windows.Storage.Search` in the IDL: the `CommonFileQuery`/`CommonFolderQuery`/`IndexedState` enums,
+  `IStorageFolderQueryOperations`, `IStorageQueryResultBase`, `IStorageItemQueryResult`, and `IQueryOptions`
+  plus the two other result interfaces as shapes. It has to be *defined* in `windows.storage.idl` rather than
+  `windows.storage.search.idl`: search cannot import storage (storage already imports search), so the
+  search types cannot name `StorageFile`. The definitions go after the `Windows.Storage` namespace closes,
+  with forward declarations before it.
+- Three read-only `IVectorView` implementations (StorageFile, StorageFolder, IStorageItem), three matching
+  `IAsyncOperation<IVectorView<T>>`, plus `IAsyncOperation<UINT32>` and `IAsyncAction`, all cloned from the
+  existing `async_bool` pattern.
+- A query **is** a directory listing: `GetFilesAsync`/`GetFoldersAsync`/`GetItemsAsync` walk the directory
+  with `FindFirstFileW` and hand back a snapshot. The `CommonFileQuery` orderings are ignored and
+  `IsCommonFileQuerySupported` admits to only `DefaultQuery` and `OrderByName`; there is no indexer, so
+  `StorageItemQueryResult` re-lists on every call and `ContentsChanged` never fires.
+- `StorageFile.DeleteAsync` is real now (it was the first thing Media Player asked a file to do).
+
+With that, Media Player gets out of the data layer entirely and starts building its UI. It now fails
+constructing `Windows.UI.Xaml.Controls.AutoSuggestBox` - an `E_XAMLPARSEFAILED` from inside
+windows.ui.xaml.dll, with no failed activation in front of it, so the reason is internal to XAML rather
+than another missing class.
+
+One wrong turn worth recording: the two `dcomp:uicontext_method stub` FIXMEs immediately before the
+AutoSuggestBox failure look exactly like the cause. They are not - the calculator hits the same stub three
+times per run and works. Making the slot return S_OK with a null out parameter did get past AutoSuggestBox
+but crashed the activation with `0xc0000005`, and returning the context itself put the parse error back.
+**Check whether a suspicious FIXME also fires in the app that works before chasing it.**
