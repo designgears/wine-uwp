@@ -4486,3 +4486,36 @@ Two separate gaps there, one ours and one Wine's:
   reversed rather than looked up.
 
 Next: find the QI site in `twinapi.dll` and work out what `GetForUIContext` wants from the UIContext.
+
+### The UIContext walk is only looking for an HWND
+
+`twinapi.pdb` off the public symbol server names the caller:
+`CInputPaneEventSourceFactory::GetForUIContext(IUIContext *, IInputPane **)` at RVA `0x18da0`. It
+does not read a single field of the UIContext. It walks:
+
+```
+QI(uicontext, {f21e14c1-...} IUIContext)      -> V1
+V1->slot7(&V2)                                 -> V2   (get_WindowContext - already implemented)
+QI(V2, {84acbbfe-...})                         -> V3   <- returned E_NOINTERFACE, ending the walk
+V3->slot7(&V4)                                 -> V4
+V4->slot7(&hwnd)                               -> an HWND, not an interface
+CInputPaneEventSource_GetInstance(hwnd, {640ada70-06f3-4c87-a678-9829c9127c28}, out)
+```
+
+Every hop is IInspectable plus one unused method with the getter at slot 7, and the whole chain
+exists to turn a UIContext into the window handle that the public
+`IInputPaneInterop::GetForWindow` takes directly. So `dlls/dcomp/device.c` now carries an HWND down
+the chain: `create_uicontext` takes the view and asks it for `ICoreWindowInterop::get_WindowHandle`
+(`{45d64a29-a63e-4cb6-b498-5781d298cb4f}`), the window context keeps it, and the two `window_host`
+hops hand it over. Failing that, `GetActiveWindow()`.
+
+**Media Player now gets past XAML entirely.** No parse error, no `Cannot create instance of type`;
+the log shows it building its real UI - `NavigationViewItemSeparator`, `ToggleButton`,
+`SolidColorBrush`, `ElementCompositionPreview`, `Windows.UI.Colors`.
+
+It now fail-fasts (WIL, code `0x1007`) further in: `CCollection::Add` ->
+`DependencyObjectCollection::Append` -> `RaiseVectorChanged` -> `TrackerEventSource<VectorChangedEventHandler>::Raise`
+-> the app's own handler in `Microsoft.Media.Player.dll`. Immediately before it,
+`iertutil:uri_QueryInterface` refuses `{659a8956-ef29-4f50-8724-7e3207d23076}` and
+`{4bd682dd-7554-40e9-9a9b-82654ede7e62}` repeatedly - the next thing to look at, and the same shape
+of bug as this one.
