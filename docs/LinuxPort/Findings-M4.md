@@ -3935,8 +3935,18 @@ Three gaps, none of them calculator-shaped:
    `E_NOTIMPL`, or the managed wrapper cannot be built. The exact interface definitions came out of the Windows SDK
    headers on the same partition (`Include/10.0.26100.0/winrt/windows.storage.h`).
 
-3. Now blocked on `ApplicationData.LocalFolder`, a stub in `windows.storage.applicationdata`, which needs a real
-   `IStorageFolder`. The app gets as far as a painted window with its splash colour and the XAML tree up.
+3. `ApplicationData.LocalFolder` was a stub, and a stub is enough to abort the same type initializer. Implemented
+   `StorageFolder` for an existing directory - `IStorageFolder` + `IStorageItem`, with `Name`/`Path`/`Attributes`/
+   `DateCreated`/`IsOfType` real and the async methods still `E_NOTIMPL` - and pointed `LocalFolder`,
+   `RoamingFolder` and `TemporaryFolder` at `%LOCALAPPDATA%\Packages\<family>\{Local,Roaming,Temp}State`,
+   creating the directory on first use. It lives in `windows.storage.applicationdata` rather than
+   `windows.storage`, where the class belongs, because Wine's build cannot make an import library for a module
+   with a dotted name, so the two cannot share one implementation.
+
+With those three, Media Player starts, lays out and renders its own UI. It then puts up its own error page -
+"Media Player does not work due to a lack of media framework" - which is the app reacting to
+`Windows.Media.Playback.MediaPlaybackList` missing from Wine's `windows.media.dll`. That is the app's own
+diagnostic rather than a crash: everything up to and including its XAML, text and app logic works.
 
 Worth noting for the Shapr3D target: the two fixed gaps were both in the app's first seconds, both fatal, and
 neither was visible from the calculator. The failure modes are the expensive part - an aborted process whose stack
