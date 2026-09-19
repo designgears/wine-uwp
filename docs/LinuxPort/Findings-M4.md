@@ -3962,7 +3962,7 @@ With staging generic, running another package costs a minute, so here is the spr
 | Media Player | renders its own UI, stops at `Windows.Media.Playback.MediaPlaybackList` |
 | Windows Security | window up, content still blank, no error |
 | Camera | XAML parse error: "The property 'Title' was not found in type 'Microsoft.CameraApp.TitleBar'" |
-| Feedback Hub | `0x80070032` ERROR_NOT_SUPPORTED, thrown just after `Windows.Globalization.ApplicationLanguages` |
+| Feedback Hub | `ApplicationLanguages.PrimaryLanguageOverride` setter returns `0x80070032` (see below) |
 | Solitaire | needs `Windows.System.UserPicker` and shell32's `CreateStorageItemFromShellItem_FullTrustCaller_ForPackage` |
 
 Windows Security only needed `wincorlib.dll` - the C++/CX language projection - staged into the prefix; without it
@@ -3972,3 +3972,18 @@ fix. It is in the override list now.
 The Camera failure is the interesting one for Shapr3D: nothing is missing from Wine: XAML cannot find a property on
 one of the app's *own* types, which means the app's `IXamlMetadataProvider` type table is not being consulted the
 way it is on Windows. Any app with custom controls will hit that, and Shapr3D certainly has custom controls.
+
+### Feedback Hub: the PrimaryLanguageOverride setter
+
+The app dies on an unhandled `0x80070032` right after taking the `Windows.Globalization.ApplicationLanguages`
+factory, and `+seh` shows a single C++ throw, out of `Bcp47Langs.dll`. `probes/probe-langs.cpp` walks the class
+member by member and pins it down: the three getters are fine (`Languages` -> en-US, `ManifestLanguages` -> en-US,
+en), and it is the **`put_PrimaryLanguageOverride`** setter that returns `0x80070032` - for any value, including
+an empty string, so it is not about the language being unavailable.
+
+Under `+reg` the setter makes no registry write at all before failing, so it bails out early; the last thing it
+does is a run of failed opens of
+`HKCU\...\AppContainer\Storage\Microsoft.WindowsFeedbackHub_8wekyb3d8bbwe\...`, the per-package hive Wine
+does not create. Not proven to be the cause yet. What is ruled out: `GetPersistedRegistryLocationW`, an
+undocumented `api-ms-win-stateseparation-helpers` export Wine lacks and `Bcp47Langs` imports - a FIXME stub added
+at the right export never printed, so it is not on this path.
