@@ -4422,3 +4422,67 @@ against a target type).
 
 Both patches are reverted; the staged `Windows.UI.Xaml.dll` is byte-identical to the original (verified
 against two separate copies taken earlier in the day) and the calculator baseline is intact.
+
+## AutoSuggestBox: the failure is InputPane, not type resolution (correcting the entry above)
+
+The previous entry concluded that "the token for `Windows.UI.Xaml.Controls.AutoSuggestBox` in this
+app's XBF carries a provider kind that is neither native nor managed ... it is type *resolution*, not
+type *creation*, that is wrong". **That is wrong**, and the way it was wrong is worth keeping: it was
+inferred from two byte-patch experiments (force-native removed the parse error, force-managed
+reproduced it) that are equally consistent with the token simply *being* managed. An inference from
+two data points that a third reading also explains is not a result.
+
+Re-done with a probe that answers yes/no per basic block instead: overwrite the first two bytes of a
+candidate block with `0f 0b` (`ud2`) in our copy of `Windows.UI.Xaml.dll` and see whether the run
+dies. A hit shows up as `err:seh:NtRaiseException Unhandled exception code 1007`; the address in that
+line is the Wine-side rethrow and is the same for every probe, so it carries no information - only
+the presence of the line does. Always run a *control* probe (`ud2` at the entry of a function that
+must be called) before trusting a negative; three negatives in a row are much more likely to mean the
+patched file is not the file being loaded.
+
+Probe results, in order (`Windows.UI.Xaml.dll` RVAs):
+
+| RVA | meaning | fired |
+| --- | --- | --- |
+| `0x30af70` | `ObjectWriterRuntime::CreateTypeImpl` entry (control) | yes |
+| `0x30b42b` | provider kind neither native nor managed -> preloaded `E_FAIL` | **no** |
+| `0x30b2a2` | `XamlType`'s runtime shared_ptr is null -> preloaded `E_FAIL` | **no** |
+| `0x30b4e3` | the runtime's `CreateInstance` returned a failure | yes |
+| `0x23b450` | `XamlManagedRuntime::CreateInstance` entry | yes |
+| `0x23b53c` | `XamlManagedRuntimeRPInvokes_CreateInstance` returned a failure | yes |
+| `0x23ac0d` | token handle below `0x10000000` | no |
+| `0x23ac52` | the app's own `IXamlType::ActivateInstance` failed | no |
+| `0x23ac72` | `DXamlCore::GetPeerPrivate` failed | yes |
+| `0x14e313/31f/8cc/974/9fa` | all five of `GetPeerPrivate`'s own refusals | no |
+| `0x14e6eb` | the peer's vtable slot 13 returned a failure | yes |
+
+So the provider kind is fine, the type resolves, the native activator
+(`OnCoreCreateAutoSuggestBox`, index 811 in the table at `0xc904e0`) runs, and the DirectUI peer is
+allocated (`ctl::CreateComObjectInstanceNoInit<DirectUI::AutoSuggestBox>`, index 811 in the *second*
+table at `0xc904e8` - the two tables are the same 16-byte entries, activator at +0 and peer creator
+at +8). The peer's vtable lives at object+0x10 (`0xdf3748`); slot 13 of it is
+**`DirectUI::AutoSuggestBox::PrepareState`**, and that is what fails.
+
+`PrepareState` calls `ItemsControl::PrepareState`, then gets the activation factory for
+`Windows.UI.ViewManagement.InputPane`, then `VisualTree::GetContentRootForElement` ->
+`CContentRoot::GetUIContext` -> `IInputPaneStatics2::GetForUIContext`, and registers Showing/Hiding
+handlers. A control that fails to construct because it could not subscribe to the on-screen keyboard
+is the same shape as every other blocker in this file: the refusal is fatal, the missing feature is
+not.
+
+Two separate gaps there, one ours and one Wine's:
+
+- **Wine's** `dlls/windows.ui/inputpane.c` answered `add_Showing`/`add_Hiding` with `E_NOTIMPL` and
+  `OccludedRect` likewise. Implemented for real (handlers stored in the instance under a critical
+  section, real tokens, `OccludedRect` returns an empty rect). This does *not* fix Media Player,
+  because `run.sh` sets `windows.ui=n` and the class is registered to the extracted
+  `twinapi.dll` - but it is a real fix for any app that does reach Wine's copy.
+- **Ours**: the line immediately after the InputPane factory in the log is
+  `fixme:dcomp:window_context_QueryInterface window context: no interface
+  {84acbbfe-649c-5ac7-8130-7b6b76db463c}`. That is the empty `window_context` added for the UIContext
+  slot (`get_WindowContext`, see the entry above) being asked by twinapi for a private interface it
+  does not have. The IID is in `twinapi.dll`, `Windows.UI.dll`, `Windows.Graphics.dll`, `MrmCoreR.dll`
+  and six others, and in **none** of the public `.winmd` files, so it is internal and has to be
+  reversed rather than looked up.
+
+Next: find the QI site in `twinapi.dll` and work out what `GetForUIContext` wants from the UIContext.
