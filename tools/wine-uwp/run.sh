@@ -34,8 +34,12 @@ if ! wine sc query CoreMessagingRegistrar 2>/dev/null | grep -q RUNNING; then
     sleep 1
   done
 fi
-S=$HOME/uwp-bin/stage/calculator
+# UWP_STAGE names a directory under ~/uwp-bin/stage (see stage-app.sh); the identity defaults below
+# only make sense for the calculator, so a different stage carries its own identity file.
+S=$HOME/uwp-bin/stage/${UWP_STAGE:-calculator}
 cd "$S"
+# stage-app.sh writes identity.env for packages staged straight out of a Windows install.
+if [ -f "$S/identity.env" ]; then . "$S/identity.env"; fi
 # Package identity consumed by the patched Wine (ntdll/kernelbase read these).
 export WINE_UWP_PACKAGE_FULL_NAME=${WINE_UWP_PACKAGE_FULL_NAME:-Microsoft.WindowsCalculator.Dev_0.365.1.0_x64__8wekyb3d8bbwe}
 export WINE_UWP_PACKAGE_FAMILY_NAME=${WINE_UWP_PACKAGE_FAMILY_NAME:-Microsoft.WindowsCalculator.Dev_8wekyb3d8bbwe}
@@ -61,7 +65,7 @@ if [ -d "$HOME/uwp-bin/stage/frameworks" ]; then
   for d in "$HOME"/uwp-bin/stage/frameworks/*/; do fwpath="$fwpath${fwpath:+:}${d%/}"; done
   export WINEPATH="${WINEPATH:+$WINEPATH:}$fwpath"
 fi
-exe=${1:-CalculatorApp.exe}; shift || true
+exe=${1:-${UWP_EXE:-CalculatorApp.exe}}; shift || true
 # Full unfiltered log always goes to $UWP_LOG for post-mortem (module map, SEH context).
 UWP_LOG=${UWP_LOG:-/tmp/wine-uwp-last.log}
 # UWP_VDESKTOP=WxH runs the app inside a Wine virtual desktop of that size (e.g. under Xvfb, where

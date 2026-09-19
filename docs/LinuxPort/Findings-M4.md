@@ -3906,3 +3906,38 @@ pointer.
 settles at - full `+dcomp` tracing now stalls startup, so the narrow channel is the way to read the popup's
 transform chain (the popup opens with `Y -> -53.5`, `ScaleY 0.5@0 -> 1.30398@1` and `Opacity <- "PS.POpacity *
 PS.TTOpacity"`; none of it was the cause).
+
+## A second app: Media Player (2026-09-19)
+
+Calculator is one data point, so the question is what an app we have never looked at hits. The Windows install on
+`/dev/nvme0n1p2` carries 55 installed packages; `Microsoft.ZuneMusic` (Media Player) is the closest match to the
+calculator's stack - the same `Microsoft.UI.Xaml.2.8` + `Microsoft.NET.Native.2.2` + `VCLibs` dependency set, no
+WebView2 - while being a much larger XAML app. `tools/wine-uwp/stage-app.sh` stages any installed package the way
+`stage.sh` stages the calculator: it reads the executable, the application id and the display name out of
+`AppxManifest.xml` and writes an `identity.env` that `run.sh` sources, so nothing app-specific is hard-coded any
+more (`UWP_STAGE=media-player tools/wine-uwp/run.sh`).
+
+Three gaps, none of them calculator-shaped:
+
+1. `ParseApplicationUserModelId` was `# @ stub` in kernelbase. `twinapi.appcore` calls it while the app publishes
+   its window, the delay-load hook aborts the process, and the fail-fast unwind ends in `ploptin.dll` - nothing in
+   the stack says "AUMID parsing". It is a string split on the single `!` separating the package family name from
+   the PRAID; implemented it and `FormatApplicationUserModelId` next to
+   `PackageNameAndPublisherIdFromFamilyName`, which has exactly the same two-output shape.
+
+2. `Windows.Storage.AppDataPaths` was not implemented. The app's startup path asks for it, the activation fails,
+   and the whole thing comes back as .NET Native's "a type initializer threw an exception" with no hint of what
+   threw. The class is stateless - nine known folders of the calling user - so the statics, the activation factory
+   and the instance are one object in `dlls/windows.storage/appdatapaths.c`, with the properties going to
+   `SHGetKnownFolderPath`. Two things the projection needs that a bare getter implementation does not obviously
+   imply: the instance must be its own COM identity (delegating `QueryInterface` to the factory hands managed code
+   an object whose `IUnknown` is the factory), and `GetRuntimeClassName` must return the class name rather than
+   `E_NOTIMPL`, or the managed wrapper cannot be built. The exact interface definitions came out of the Windows SDK
+   headers on the same partition (`Include/10.0.26100.0/winrt/windows.storage.h`).
+
+3. Now blocked on `ApplicationData.LocalFolder`, a stub in `windows.storage.applicationdata`, which needs a real
+   `IStorageFolder`. The app gets as far as a painted window with its splash colour and the XAML tree up.
+
+Worth noting for the Shapr3D target: the two fixed gaps were both in the app's first seconds, both fatal, and
+neither was visible from the calculator. The failure modes are the expensive part - an aborted process whose stack
+points at a privacy DLL, and a managed type-initializer exception that names nothing.
