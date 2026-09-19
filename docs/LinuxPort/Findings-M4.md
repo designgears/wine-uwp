@@ -3987,3 +3987,42 @@ does is a run of failed opens of
 does not create. Not proven to be the cause yet. What is ruled out: `GetPersistedRegistryLocationW`, an
 undocumented `api-ms-win-stateseparation-helpers` export Wine lacks and `Bcp47Langs` imports - a FIXME stub added
 at the right export never printed, so it is not on this path.
+
+## Media Player: fourteen layers deep, still short of the UI (2026-09-19)
+
+The "lack of media framework" page was one missing class; past it the app walks a long chain, and each
+link is fatal. In order, with what each needed:
+
+| # | what stopped it | what it took |
+| --- | --- | --- |
+| 1 | `Windows.Media.Playback.MediaPlaybackList` missing | the class, with a real `IObservableVector<MediaPlaybackItem>` behind `Items`; `MediaPlaybackItem`, the three event-arg classes and the `Windows.Media.Core` track types declared for their shape |
+| 2 | `Windows.Storage.StorageFile` missing | `StorageFile` (`IStorageFile` + `IStorageItem` + the two stream references), `IStorageFileStatics.GetFileFromPathAsync`, and an `IAsyncOperation<StorageFile>` |
+| 3 | `Windows.Storage.StorageFolder` missing | `IStorageFolderStatics.GetFolderFromPathAsync` plus `IAsyncOperation<StorageFolder>`; the folder implementation moved from `windows.storage.applicationdata` into `windows.storage` where the class belongs, and applicationdata now resolves `__wine_storage_folder_create` with `GetProcAddress` (see the dotted-import-library problem above) |
+| 4 | `IApplicationData2` not answered | `LocalCacheFolder`, next to the other three folders |
+| 5 | `MediaPlayer.AudioCategory` setter `E_NOTIMPL` | it and `AudioDeviceType` round-trip now |
+| 6 | `IMediaPlayer5` not answered | the video-frame-server interface: the flag round-trips, the copies are stubs |
+| 7 | `IMediaPlayer3` not answered | implemented; the first attempt had a **vtable one-slot-short bug** - I missed `TimelineControllerPositionOffset` and added a `SetSurfaceSize` that belongs to a later revision, so the app's `get_PlaybackSession` landed on `StepBackwardOneFrame`. A wrong method order does not fail to compile and does not look like a vtable bug in the log |
+| 8 | `MediaPlayer` event registration `E_NOTIMPL` | every `add_*`/`remove_*` returns S_OK with a zero token; a handler that can never be registered is fatal, one that never fires is not |
+| 9 | `MediaPlayer` scalar properties `E_NOTIMPL` | Volume, IsMuted, AutoPlay, IsLoopingEnabled, PlaybackRate, Position now stored; CanSeek/CanPause/CurrentState answer for a stopped player |
+| 10 | `get_PlaybackSession` stub | `MediaPlaybackSession`, 38 members |
+| 11 | `IMediaPlaybackSession2` not answered | events, `IsMirroring`; the time-range vectors typed as `IInspectable` since Wine has no `MediaTimeRange` |
+| 12 | `get_SphericalVideoProjection` stub | `MediaPlaybackSphericalVideoProjection`, all ten properties |
+| 13 | `IMediaPlayerSource2` not answered | `Source` round-trips |
+| 14 | `Items` not enumerable | `IIterable`/`IIterator<MediaPlaybackItem>`. The app QI'd for `IIterable` and **fail-fasted** (code 0x1001) rather than taking an error: a WinRT collection that cannot be enumerated kills the process |
+| 15 | `Windows.Storage.KnownFolders` missing | `IKnownFoldersStatics`: Music/Pictures/Videos/Documents from `SHGetKnownFolderPath`, and HomeGroup/RemovableDevices/MediaServerDevices as empty folders - returning ERROR_NOT_FOUND for RemovableDevices, which is the truthful answer, is fatal |
+
+It now stops at `IStorageFolderQueryOperations` on the Music library folder - the folder-query stack
+(`QueryOptions`, `StorageFileQueryResult` and friends). That is the subsystem a media library app is built
+on, so it is the last big piece rather than another small gap, and it is where this run stops.
+
+Two lessons that generalize past Media Player:
+
+- **The fatal/non-fatal split is not where you would guess.** `E_NOTIMPL` from an event registration, from a
+  scalar property setter, or from a collection's `IIterable` kills a .NET Native app outright. Answering
+  those with S_OK and a do-nothing implementation is what buys forward progress; being honest about a
+  missing capability (`ERROR_NOT_FOUND` from `RemovableDevices`) is what stops it.
+- **Getting a vtable one slot wrong is invisible.** Item 7 cost the most time of anything here: the build is
+  clean, the log shows a plausible method being called, and only counting the SDK's method list against the
+  IDL finds it. Worth diffing method-by-method whenever an interface is transcribed by hand.
+
+The calculator is byte-identical through all of it.
