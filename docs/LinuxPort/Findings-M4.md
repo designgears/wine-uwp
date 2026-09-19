@@ -3823,6 +3823,20 @@ What changed (Wine commits 25484f0, ce6e242, cb5636c, c205c53, 5424dcf, 27db824f
   first's bitmap (Wine e4a555a). A graph drag costs 4.5 ms of CPU per frame instead of 5.4 and shows 273 frames
   where it managed 209; page screenshots compare equal pixel for pixel.
 
+### Programmer page froze on the desktop (Wine 742d523)
+
+`IDirectManipulationManager::Deactivate` returned E_NOTIMPL while `Activate` succeeded. XAML tears a page's
+manipulation down when navigating away and throws on that failure: the desktop session's log has
+`unhandled error details: hr 0x80004001` one line after `direct_manip_Deactivate`, and the window never painted
+again - the same fail-fast-inside-the-tick that `CreateContent` was already fixed for. Deactivate now undoes what
+Activate recorded and returns S_OK; `RegisterHitTestTarget`, which has nothing to register either, does the same.
+
+The call never happens on the headless display (no window manager, so the window is never deactivated), which is
+why 16 page switches, focus cycling and narrow-window runs did not reproduce it. For the next hang there is
+`tools/wine-uwp/perf/stacks.sh`: with the app launched under `WINE_UWP_PROFILE=<prefix>` it asks the in-process
+sampler for a dump and symbolizes it, which works where eu-stack and gdb do not (ptrace is limited to
+descendants unless `kernel.yama.ptrace_scope` is 0).
+
 Found, not changed (other layers):
 - Idle, the UI and CoreMessaging threads wake ~2000 times a second: `ScheduleCoreMessagingDispatch` (user32) posts
   a WM_NULL on every request, ~270 requests a second. Coalescing requests the way Windows' queue does would fix it;
