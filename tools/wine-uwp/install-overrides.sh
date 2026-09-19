@@ -118,6 +118,23 @@ if [ -f "$CLASSES_REG" ] && [ -x "$PY" ]; then
   fi
 fi
 
+# Windows.Internal.StateRepository.* stand-in. Those classes are service-activated in the Windows
+# hive (ActivationType=1, Server=StateRepository) with no DllPath, so gen-classes-reg.py skips them
+# and RoGetActivationFactory returns REGDB_E_CLASSNOTREG. See shims/staterepository.
+SR_SHIM=$HOME/uwp-bin/build-probes/wineuwp_staterepository.dll
+if [ -f "$SR_SHIM" ]; then
+  SR_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_staterepository.dll
+  if ! cmp -s "$SR_SHIM" "$SR_DST"; then cp -f "$SR_SHIM" "$SR_DST"; fi
+  for cls in User Application; do
+    K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Internal.StateRepository.$cls"
+    "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_staterepository.dll' /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  done
+  echo "installed: Windows.Internal.StateRepository stand-in"
+fi
+
 # ICU data: the genuine icu.dll (used by the native windows.globalization.dll) loads
 # Windows\Globalization\ICU\icudtl.dat and the time-zone .res files next to it, and fails with
 # E_FAIL without them.

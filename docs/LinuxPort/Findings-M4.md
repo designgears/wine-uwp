@@ -4707,3 +4707,58 @@ backed out.
 
 Regression checks with all of the above in: Calculator byte-identical, Feedback Hub clean, Solitaire
 clean (no fail-fast, no page fault, no app error).
+
+## Serving a service-activated class: Windows.Internal.StateRepository
+
+`Windows.Internal.StateRepository.User` is `ActivationType=1, Server=StateRepository` in the Windows
+hive, so `gen-classes-reg.py` skips it and `RoGetActivationFactory` answers `REGDB_E_CLASSNOTREG`.
+It cannot be registered in-process: `Windows.StateRepository.dll` exports only `ServiceMain` and the
+`StateRepository_*` service entry points, and the client and broker DLLs answer
+`CLASS_E_CLASSNOTAVAILABLE` for the class even though they contain its name.
+
+It can, however, be **reimplemented**, because the layouts are all recoverable:
+
+- `HKCR\Interface\{iid}` in the Windows hive maps IID to interface name.
+  `{84103ccb-2fd7-4d6c-962e-5d8582b4c720}` is
+  `__x_Windows_CInternal_CStateRepository_CIUserStatics`; `{5232f8ea-...}` is `...CIUser`. A scan of
+  that key found 173 interfaces in this family.
+- `Windows.StateRepository.pdb` from the public symbol server
+  (https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/microsoft-public-symbols)
+  names the WRL server classes, and their **vtables** give the exact method order:
+  `??_7UserFactoryServer@...` at RVA `0x290730` is `IUserStatics`, `??_7UserServer@...` at
+  `0x28bfe0` is `IUser`. The mangled names give the signatures - `?Exists@...@UEAAJ_JPEAE@Z` is
+  `HRESULT Exists(INT64, boolean *)`.
+
+`tools/wine-uwp/shims/staterepository/` implements both interfaces from those vtables, answering for
+the one user a Wine prefix has (real SID from the process token). `install-overrides.sh` copies it
+into the prefix and registers the classes. The trace confirms the layout was right: the app calls
+`IUserStatics::GetCurrent`, which is slot 13.
+
+Anything else in the family gets a **generic traced table** - 64 one-per-slot thunks, the same
+technique as the composition slots - so a run names the method instead of guessing at it. That
+immediately paid off: Media Player asks `Windows.Internal.StateRepository.Application` for
+`IApplicationStatics` `{07adcc9a-...}` and calls slot 55, which the PDB names
+`FindByUserAndPackageFamilyNameAndAppListEntry`. Its out-parameter is an `IVectorView`, and
+answering `S_OK` with null fail-fasted the app 46 times; an empty view is the honest answer and is
+what the shim returns.
+
+### is_out_pointer must not fault
+
+With the state repository served, the app's *managed* code started calling composition methods
+directly, and `dcomp`'s `is_out_pointer()` began killing the process. Its probe was a dereference
+inside `__TRY`, which raises a real access violation for every argument that is not a pointer -
+about twenty per run, and the `+seh` logs above show them. That was survivable while only XAML
+called in. It is not survivable underneath .NET Native: `RhpPInvokeExceptionGuard` sits on every
+P/Invoke transition frame and turns **any** native exception taken below it into a fail-fast, which
+is the same mechanism as the `memmove` abort earlier in this file.
+
+It now asks `VirtualQuery` instead - committed, readable, and the whole pointer inside one region -
+and reads only then. A run went from 23 access violations to **zero**.
+
+Media Player still ends on a fail-fast, but a different one: `RaiseFailFastException` called
+directly from its own managed code (`Microsoft.Media.Player.dll` frames through `SharedLibrary.dll`,
+not through the P/Invoke guard), i.e. an unhandled managed exception rather than anything faulting
+underneath it. `Windows.Internal.CapabilityAccess.CapabilityAccess` is the next unregistered class
+in the log and is the obvious thing to serve next.
+
+Regression checks: Calculator byte-identical, Feedback Hub clean, Solitaire clean.
