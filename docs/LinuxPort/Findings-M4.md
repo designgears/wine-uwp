@@ -3969,9 +3969,10 @@ Windows Security only needed `wincorlib.dll` - the C++/CX language projection - 
 the loader cannot even resolve the exe's imports (`c0000135`), which reads as a total failure and is a one-line
 fix. It is in the override list now.
 
-The Camera failure is the interesting one for Shapr3D: nothing is missing from Wine: XAML cannot find a property on
-one of the app's *own* types, which means the app's `IXamlMetadataProvider` type table is not being consulted the
-way it is on Windows. Any app with custom controls will hit that, and Shapr3D certainly has custom controls.
+The Camera failure looked like the interesting one for Shapr3D - XAML cannot find a property on one of the app's
+*own* types, which would suggest the app's `IXamlMetadataProvider` table is not consulted the way it is on Windows,
+and would then hit any app with custom controls. **That generalisation turned out to be wrong; see the correction
+below.**
 
 ### Feedback Hub: the PrimaryLanguageOverride setter
 
@@ -4193,3 +4194,21 @@ The triage I kept doing by hand, in one script: it reads a run log and reports t
 *how* they kill the app - delay-load aborts first, then .spec stub aborts, then missing modules, then
 unresolved WinRT classes, and the app's own unhandled error last, because that one is usually a
 consequence of the others. `tools/wine-uwp/next-gap.sh /tmp/*.log` summarises a whole sweep.
+
+
+### Correction: the custom-type metadata path is not broken
+
+I wrote earlier that Camera's "property 'Title' was not found in type 'Microsoft.CameraApp.TitleBar'" implied the
+app-provided XAML metadata path was broken, and that any app with custom controls would hit it. Two checks say
+otherwise:
+
+- **Calculator** resolves custom property setters against its own type through exactly this path. `App.xaml` has
+  `<Style TargetType="local:TitleBar">` with eight setters for custom dependency properties
+  (`ButtonBackground`, `ButtonHoverForeground`, ...), and `CalculatorApp.TitleBar` is not in any winmd in the
+  package - it is resolved through the app's generated metadata provider, same as Camera's.
+- **Feedback Hub** is a .NET Native app (`mrt100_app.dll`, the `Microsoft.NET.Native.*.2.2` dependencies) and
+  renders a full custom XAML UI that navigates between pages. So the *managed* provider works too, not just the
+  C++/CX one.
+
+So Camera's failure is specific to that type or that property, not a class of failure that Shapr3D would inherit.
+Good news for the target, and it redirects the effort: there is no general metadata gap to close.
