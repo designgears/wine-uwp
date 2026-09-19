@@ -15,7 +15,8 @@ for line in open(path, errors='replace'):
     if p[0] == 'M': modules.append((int(p[1], 16), int(p[2], 16), p[3]))
     elif p[0] == 'S':
         q = line.split()
-        samples.append((int(q[1], 16), int(q[2], 16), int(q[3]), int(q[4], 16) if len(q) > 4 else 0))
+        samples.append((int(q[1], 16), int(q[2], 16), int(q[3]),
+                        tuple(int(x, 16) for x in q[4:8]) if len(q) > 4 else (0,)))
 modules.sort()
 starts = [m[0] for m in modules]
 symcache = {}
@@ -82,9 +83,22 @@ for tid, rip, n, caller in samples:
     if waits.search(s) or 'vkWaitForFences' in s: wait_n[tid] += n
     else:
         busy[tid] += n; bysym[tid][s] += n
-        callers[(tid, s)][symbolize(caller) if caller else '?'] += n
+        callers[(tid, s)][' <- '.join(symbolize(c) for c in caller if c) or '?'] += n
 total_busy = sum(busy.values())
 print("busy samples %d of %d" % (total_busy, sum(per_thread.values())))
+# a thread parked in a wait for the whole profile is what a hang looks like: show where it waits
+for tid, n in wait_n.most_common(0 if os.environ.get('WAITS') is None else 12):
+    top = collections.Counter()
+    for stid, rip, cnt, caller in samples:
+        if stid != tid: continue
+        s = symbolize(rip)
+        if waits.search(s) or 'vkWaitForFences' in s:
+            top[(s,) + tuple(symbolize(c) for c in caller if c)] += cnt
+    print("\nthread %x: waiting, %d samples" % (tid, n))
+    for chain, c in top.most_common(3):
+        print("  %5d  %s" % (c, chain[0]))
+        for f in chain[1:]: print("           <- %s" % f)
+
 for tid, n in busy.most_common(6):
     print("\nthread %x: %d busy, %d waiting" % (tid, n, wait_n[tid]))
     for s, c in bysym[tid].most_common(topn):
