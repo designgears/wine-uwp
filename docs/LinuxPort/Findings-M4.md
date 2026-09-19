@@ -4157,3 +4157,39 @@ have run happily with a do-nothing implementation.
 
 It did not help Media Player's AutoSuggestBox, which was worth checking - AutoSuggestBox contains a
 TextBox and so reaches the same edit context.
+
+### Camera's failure is template property resolution, not type resolution
+
+Same originate trace, symbolized:
+
+```
+CFrameworkElement::InvokeApplyTemplate -> CContentControl::ApplyTemplate -> CFrameworkElement::ApplyTemplate
+  -> CControlTemplate::LoadContent -> CTemplateContent::LoadXbfVersion2
+  -> BinaryFormatObjectWriter::WriteNode -> ObjectWriterRuntime::TypeConvertValueImpl
+```
+
+So it is not the app's type that XAML cannot find - it found `Microsoft.CameraApp.TitleBar` fine - it is
+a *member* of that type, while **type-converting a value inside a ControlTemplate** (the shape of
+`<Setter Property="Title"/>` or a `TemplateBinding`, where the property name is a string that has to be
+resolved against the target type). For a managed type that resolution goes out to the app's generated
+`IXamlMetadataProvider` and asks `IXamlType::GetMember`.
+
+That narrows the Shapr3D-relevant question usefully: **types from an app's own metadata provider resolve,
+and so do their properties in ordinary markup** - Calculator's custom controls with custom properties
+work - so what fails is specifically the string-keyed member lookup done while loading a template. Worth
+checking next whether the member lookup works for a custom property on a custom type *outside* a
+template, which would separate "provider member lookup is broken" from "template-time resolution takes a
+different path".
+
+### Windows Security's blank content is a missing service, not a missing API
+
+The unregistered COM class `{e041c90b-68ba-42c9-991e-477b73a75c90}` lives in `SecurityHealthAgent.dll` /
+`SecurityHealthCore.dll` (found by searching the partition's System32 for the GUID bytes) - the Defender
+Security Health service. There is no API gap to close here; the app is correct to show nothing.
+
+### tools/wine-uwp/next-gap.sh
+
+The triage I kept doing by hand, in one script: it reads a run log and reports the fatal gaps ordered by
+*how* they kill the app - delay-load aborts first, then .spec stub aborts, then missing modules, then
+unresolved WinRT classes, and the app's own unhandled error last, because that one is usually a
+consequence of the others. `tools/wine-uwp/next-gap.sh /tmp/*.log` summarises a whole sweep.
