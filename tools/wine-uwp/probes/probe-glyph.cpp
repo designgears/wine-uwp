@@ -92,6 +92,24 @@ int wmain( void )
              sysfonts ? sysfonts->GetFontFamilyCount() : 0 );
     if (!sysfonts || !fallback) return 1;
 
+    /* PROBE_GLYPH_LIST=1 dumps every family DWrite can see, which is how you find out whether Wine
+     * picked up a font file at all. */
+    WCHAR var[8];
+    if (GetEnvironmentVariableW( L"PROBE_GLYPH_LIST", var, ARRAYSIZE(var) ))
+    {
+        UINT32 count = sysfonts->GetFontFamilyCount();
+        for (UINT32 i = 0; i < count; i++)
+        {
+            IDWriteFontFamily *fam = nullptr; IDWriteLocalizedStrings *names = nullptr;
+            WCHAR name[128] = L"?";
+            if (SUCCEEDED(sysfonts->GetFontFamily( i, &fam )) && SUCCEEDED(fam->GetFamilyNames( &names )))
+                names->GetString( 0, name, ARRAYSIZE(name) );
+            wprintf( L"family %u: %ls\n", i, name );
+            if (names) names->Release();
+            if (fam) fam->Release();
+        }
+    }
+
     static const WCHAR *families[] = { L"Segoe UI", L"Segoe UI Variable", L"Segoe UI Variable Text",
                                        L"Segoe UI Variable Small", L"Segoe UI Variable Display" };
     static const UINT32 chars[] = { 0x00a9 /* copyright */, 0x0041 /* A */, 0x2122 /* trademark */ };
