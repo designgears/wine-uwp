@@ -4643,3 +4643,67 @@ pointer - through a `boolean *`.
 
 Next step for Media Player: give the composition objects a per-IID vtable, starting with storing and
 returning `CompositionAnimation.Target` so the Toolkit's map gets a real key.
+
+## Reading the metadata: tools/wine-uwp/winmd.py
+
+Naming an interface from its IID, and getting its method order, is what turns a dcomp slot number
+into something actionable, and nothing in the tree could read a `.winmd`. `tools/wine-uwp/winmd.py`
+is a minimal ECMA-335 reader (no dependencies) that does exactly that:
+
+```
+winmd.py Windows.UI.winmd --guid 369b603e-a80f-4948-93e3-ed23fb38c6cb
+winmd.py Windows.UI.winmd --type Windows.UI.Composition.IKeyFrameAnimation
+winmd.py Windows.UI.winmd --grep Animation
+```
+
+It prints slots starting at 6, i.e. already offset past IUnknown and IInspectable. Checked against
+`IVector3KeyFrameAnimation`, which Wine's `include/windows.ui.composition.idl` also declares: both
+say `InsertKeyFrame`, `InsertKeyFrameWithEasingFunction`.
+
+The three interfaces Media Player asks a key frame animation for, which are in the metadata but not
+in Wine's IDL:
+
+| IID | interface | slots |
+| --- | --- | --- |
+| `126e7f22-...` | `IKeyFrameAnimation` | 6 get_DelayTime, 7 put_DelayTime, 8 get_Duration, 9 put_Duration, 10/11 IterationBehavior, 12/13 IterationCount, 14 get_KeyFrameCount, 15/16 StopBehavior, 17/18 InsertExpressionKeyFrame |
+| `845bf0b4-...` | `IKeyFrameAnimation3` | 6 get_DelayBehavior, 7 put_DelayBehavior |
+| `369b603e-...` | `ICompositionAnimation2` | 6 SetBooleanParameter, 7 get_Target, 8 put_Target |
+
+That confirms the reading of the trace: `slot 9 a 0x2dc6c0` is `put_Duration(3 000 000)` = 0.3 s, and
+it also shows why one vtable cannot serve every interface - slot 7 is `put_DelayTime` on
+`IKeyFrameAnimation` and `get_Target` on `ICompositionAnimation2`.
+
+## Media Player builds its UI
+
+Two implementations, both per-IID views rather than the generic slot handler:
+
+- **`ICompositionAnimation2` on key frame animations**, storing `Target`. The Community Toolkit keys
+  its implicit-animation map by it. `put_Target` now records `"Opacity"`, `"Translation"`, `"Offset"`.
+- **`IMap<HSTRING, ICompositionAnimationBase>` (`4ba9aa1d-...`) on composition objects**, with real
+  storage: an `ImplicitAnimationCollection` is a map and the Toolkit round-trips through it
+  (`HasKey`, `Insert`, `Lookup`). Under the generic handler `Insert` recorded nothing and `Lookup`
+  returned `S_OK` without writing an animation.
+
+**A first attempt at the map put its storage in `struct comp_object` and broke Calculator**, which
+is worth recording: those three fields (`vtbl`, `kind`, `ref`) are the shared prefix of every
+recording object in the file - `kf_animation`, `comp_shape` and the typed brushes all begin with them
+and reuse `comp_object_AddRef` / `comp_object_Release`. The new `entry_count` landed on
+`kf_animation`'s `target[]`, so releasing an animation iterated `0x664f` entries of garbage; the
+fault report shows `rdx 007300660066004f`, which is `"Offs"` from `"Offset"`. The map now lives in
+its own allocation, found by owner through a small table.
+
+With both in, Media Player gets through the whole visual tree - the log shows it activating
+`Slider`, `ToggleSwitch`, `AppBarToggleButton`, `ToggleMenuFlyoutItem`, `RangeBase` and
+`Microsoft.UI.Xaml.Controls.ProgressRing` - and **creates a 1280x800 `ZuneMusic` window**. It paints
+nothing yet and ends on `REGDB_E_CLASSNOTREG` for `Windows.Internal.StateRepository.User`.
+
+That class is `ActivationType=1, Server=StateRepository` in the Windows hive - service-activated,
+no `DllPath`, which is why `gen-classes-reg.py` skips it. Registering it in-process does not work:
+`Windows.StateRepositoryClient.dll` and `Windows.StateRepositoryBroker.dll` both export
+`DllGetActivationFactory` and both contain the class name, but both answer
+`CLASS_E_CLASSNOTAVAILABLE` for it (and the client DLL's failure path fail-fasts the app 24 times).
+The name is only a reference in those binaries; the implementation is in the service. Registration
+backed out.
+
+Regression checks with all of the above in: Calculator byte-identical, Feedback Hub clean, Solitaire
+clean (no fail-fast, no page fault, no app error).
