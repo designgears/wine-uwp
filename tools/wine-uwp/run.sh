@@ -65,6 +65,16 @@ if [ -d "$HOME/uwp-bin/stage/frameworks" ]; then
   for d in "$HOME"/uwp-bin/stage/frameworks/*/; do fwpath="$fwpath${fwpath:+:}${d%/}"; done
   export WINEPATH="${WINEPATH:+$WINEPATH:}$fwpath"
 fi
+# Windows creates a per-package key under the user's AppContainer storage when the package is
+# registered, and that is where Windows.Globalization writes ApplicationLanguages.PrimaryLanguageOverride:
+# without it the setter fails with 0x80070032 and Feedback Hub dies on the unhandled error (Findings-M4).
+# Staging a package is our registration step, so create it here - grep user.reg rather than shelling out
+# to reg.exe on every launch.
+APPC='Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Storage'
+if ! grep -qF "[$APPC\\\\$WINE_UWP_PACKAGE_FAMILY_NAME\\\\ResourcesConfig]" "$WINEPREFIX/user.reg" 2>/dev/null; then
+  wine reg add "HKCU\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Storage\\$WINE_UWP_PACKAGE_FAMILY_NAME\\ResourcesConfig" /f >/dev/null 2>&1
+fi
+
 exe=${1:-${UWP_EXE:-CalculatorApp.exe}}; shift || true
 # Full unfiltered log always goes to $UWP_LOG for post-mortem (module map, SEH context).
 UWP_LOG=${UWP_LOG:-/tmp/wine-uwp-last.log}

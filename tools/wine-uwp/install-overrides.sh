@@ -19,7 +19,7 @@ if [ -z "${WINE_UWP_FORCE_OVERRIDES:-}" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP
   exit 0
 fi
 
-LIST=${1:-windows.ui.xaml windows.ui twinapi.appcore coremessaging windows.applicationmodel wintypes threadpoolwinrt msvcp_win mrmcorer bcp47mrm bcp47langs profapi rometadata windows.globalization icu icuuc icuin winlangdb globinputhost msftedit msxml6 msxml6r wincorlib}
+LIST=${1:-windows.ui.xaml windows.ui twinapi.appcore coremessaging windows.applicationmodel wintypes threadpoolwinrt msvcp_win mrmcorer bcp47mrm bcp47langs profapi rometadata windows.globalization icu icuuc icuin winlangdb globinputhost msftedit msxml6 msxml6r wincorlib userdatatypehelperutil fontgroupsoverride diagnosticdatasettings coreprivacysettingsstore}
 for n in $LIST; do
   f=$(ls "$SRC" | grep -i "^$n\.dll$" | head -1)
   [ -n "$f" ] || { echo "missing $n"; continue; }
