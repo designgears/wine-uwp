@@ -4353,3 +4353,34 @@ answer is U+F8FD, read off the real implementation rather than inferred.
 `Windows.UI.ViewManagement.Core.CoreFrameworkInputView` is still missing; it needs the
 `ICoreFrameworkInputView` surface (occluded rects and their changed event), which is more than a
 constant.
+
+### The UIContext slot, read off the shipping dcomp.dll
+
+The interface our dcomp hands out as "UIContext" is not the empty public `IUIContext` - it is
+`IUIContextPartner`. Read out of the shipping `dcomp.dll` with `dcomp.pdb.syms`: `UIContext` is a WRL
+`RuntimeClass<IUIContext, CloakedIid<IUIContextPartner>, CloakedIid<IUIContextInternal>>`, and the
+partner vtable (`??_7UIContext@UI@Windows@@6B<partner>`) is IInspectable followed by exactly two
+methods - `get_UIContentRoot(IUIContentRoot **)` and `get_WindowContext(IWindowContextPartner **)`.
+So the slot everything was calling, vtable index 7, is **`get_WindowContext`**.
+
+It now returns a real (empty) object instead of `E_NOTIMPL`. MrmCoreR's `CoreWindowContainer::Initialize`
+QIs it for `84acbbfe-649c-5ac7-8130-7b6b76db463c` and **does** check the result - the disassembly at
+`0x1800239e1` is `test eax,eax; jns <success>` with a logging call on the failure path - so refusing
+that IID is handled. The calculator and Feedback Hub are unchanged by it.
+
+**A correction to the earlier entry:** I recorded that returning `S_OK` with a null out parameter
+"created the AutoSuggestBox and then faulted MRM". That was wrong. MRM's `CoreWindowContainer::Initialize`
+runs *early*, so the null faulted it before XAML ever reached the AutoSuggestBox page - the control was
+never created, the app just died sooner. The three-row table in that entry should be read as "what
+happened to the run", not "what happened to AutoSuggestBox".
+
+With the slot implemented, AutoSuggestBox still fails, and the UIContext work turns out to be
+unrelated to it. What is now established about that failure, from the vtables rather than by guessing:
+`ObjectWriterRuntime::CreateTypeImpl` calls vtable slot 1 of the XAML runtime, and slot 1 of both
+`??_7XamlNativeRuntime@@6B@` and `??_7XamlManagedRuntime@@6B@` is `CreateInstance` - so the failing
+call is `XamlNativeRuntime::CreateInstance`. Inside it, the per-type activator is found in a table at
+RVA `0xc904e0` (16-byte stride), AutoSuggestBox's entry is index 811 `OnCoreCreateAutoSuggestBox`,
+which tail-jumps to `CAutoSuggestBox::Create` -> `CDependencyObject::ValidateAndInit` -> vtable slot 24.
+Slot 24 of `CAutoSuggestBox`, `CItemsControl` and `CControl` is the *same* trivial `xor eax,eax; ret`,
+so initialisation succeeds and the failure is in what `CreateInstance` does **after** the activator
+returns - the type-info lookup and flag checks at `0x18020a03b` onwards.
