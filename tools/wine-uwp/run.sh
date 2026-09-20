@@ -3,9 +3,11 @@
 # Usage: tools/wine-uwp/run.sh [exe] [args...]     default exe: CalculatorApp.exe in the stage dir
 set -uo pipefail
 export WINEPREFIX=$HOME/.wine-uwp
-# Tests run on a headless Xvfb (DISPLAY=:98), but a desktop session also exports WAYLAND_DISPLAY,
+# Tests run on a headless Xvfb (DISPLAY=:98), but a desktop session also exports WAYLAND_DISPLAY
 # and Wine prefers winewayland.drv when it is set - which would put the app on the real desktop
-# compositor instead of the test display. Drop it so DISPLAY alone decides.
+# compositor instead of the test display. Unsetting it is NOT enough: libwayland then falls back to
+# $XDG_RUNTIME_DIR/wayland-0 and connects to the same compositor anyway (you can see it in
+# "err:waylanddrv:wayland_process_init ... compositor doesn't support ..."). Name the driver.
 unset WAYLAND_DISPLAY
 # Wine's normal channels by default: the +loaddll,+combase,+winrt tracing that debugging needs costs
 # about 6 s of the 10 s startup (4 s without it). Set WINEDEBUG to get it back.
@@ -29,6 +31,9 @@ export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-windows.ui.xaml=n;windows.ui=n;twin
 wineserver -k 2>/dev/null
 
 "$(dirname "$0")/install-overrides.sh" >/dev/null
+# Wine picks the graphics driver from this key; there is no environment override. Pin it to x11 so
+# a run cannot land on the desktop compositor (see the WAYLAND_DISPLAY note above).
+wine reg add 'HKCU\Software\Wine\Drivers' /v Graphics /d x11 /f >/dev/null 2>&1
 # CoreMessaging.dll blocks in WaitServiceState until its registrar service reports SERVICE_RUNNING,
 # so make sure the service is up before the app asks for a CoreDispatcher.
 if ! wine sc query CoreMessagingRegistrar 2>/dev/null | grep -q RUNNING; then

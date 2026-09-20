@@ -169,7 +169,7 @@ static HRESULT WINAPI cap_GetIids(void *, ULONG *count, IID **iids)
 static HRESULT WINAPI cap_GetRuntimeClassName(void *, HSTRING *name)
 {
     return WindowsCreateString(L"Windows.Security.Authorization.AppCapabilityAccess.AppCapability",
-                               63, name);
+                               64, name);
 }
 
 static HRESULT WINAPI cap_GetTrustLevel(void *, TrustLevel *level)
