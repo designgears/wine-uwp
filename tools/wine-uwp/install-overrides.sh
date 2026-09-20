@@ -135,6 +135,22 @@ if [ -f "$SR_SHIM" ]; then
   echo "installed: Windows.Internal.StateRepository stand-in"
 fi
 
+# Windows.Security.Authorization.AppCapabilityAccess.AppCapability stand-in. The registered
+# DllPath is the native CapabilityAccessManagerClient.dll, which RPCs to a service the prefix does
+# not have, so every CheckAccess is denied and Media Player paints "can't access your music
+# library" instead of the library. See shims/appcapability.
+AC_SHIM=$HOME/uwp-bin/build-probes/wineuwp_appcapability.dll
+if [ -f "$AC_SHIM" ]; then
+  AC_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_appcapability.dll
+  if ! cmp -s "$AC_SHIM" "$AC_DST"; then cp -f "$AC_SHIM" "$AC_DST"; fi
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Security.Authorization.AppCapabilityAccess.AppCapability"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_appcapability.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: AppCapability stand-in"
+fi
+
 # ICU data: the genuine icu.dll (used by the native windows.globalization.dll) loads
 # Windows\Globalization\ICU\icudtl.dat and the time-zone .res files next to it, and fails with
 # E_FAIL without them.

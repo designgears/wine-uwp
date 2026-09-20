@@ -3,6 +3,10 @@
 # Usage: tools/wine-uwp/run.sh [exe] [args...]     default exe: CalculatorApp.exe in the stage dir
 set -uo pipefail
 export WINEPREFIX=$HOME/.wine-uwp
+# Tests run on a headless Xvfb (DISPLAY=:98), but a desktop session also exports WAYLAND_DISPLAY,
+# and Wine prefers winewayland.drv when it is set - which would put the app on the real desktop
+# compositor instead of the test display. Drop it so DISPLAY alone decides.
+unset WAYLAND_DISPLAY
 # Wine's normal channels by default: the +loaddll,+combase,+winrt tracing that debugging needs costs
 # about 6 s of the 10 s startup (4 s without it). Set WINEDEBUG to get it back.
 export WINEDEBUG=${WINEDEBUG:-fixme+all,err+all}
