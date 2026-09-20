@@ -5094,3 +5094,43 @@ its own. Two candidates worth testing next, in order:
 Both experiments stay behind `WINE_UWP_DRIVE_FIRST_VIEW` and are off by default. Defaults verified
 after: Calculator byte-identical, and with `WINE_UWP_DRIVE_VIEW=run` Media Player still gets `Load`
 and `Activate` on the window's view thread with no fail-fasts.
+
+### Correction: it crashes, it does not deadlock - and where
+
+The previous entry called the `SetWindowAndGetDispatcher` failure a hang. It is not. The thread
+stops logging, `ps` finds no process a minute later, and the tail of the log is
+`fixme:dbghelp_dwarf:compute_location` - Wine's own debugger running. The process **crashes**:
+
+```
+wine: Unhandled page fault on read access to 0000000000000000 at address 0x...9434 (thread 01b8)
+```
+
+`0x...9434` is `twinapi.appcore.dll+0x29434`, which its public PDB names
+`CoreApplicationView::RegisterForCoreWindowActivatedEvent +0x54`:
+
+```
+mov rcx, [rdi+0xe8]     ; the view's CoreWindow slot
+mov rax, [rcx]          ; <- reads through NULL
+```
+
+So `SetWindowAndGetDispatcher` gets as far as hooking the window's Activated event, and the view's
+window field is still NULL - consistent with our `wf_CreateCoreWindow` never being entered on that
+path. The call is not waiting for anything; it runs into a field that something earlier in the
+view's lifecycle was supposed to fill.
+
+Two candidates from the previous entry are now settled:
+
+- **`PrepareToActivateAsync` is not the missing precondition.** The host already has
+  `prepare_view_for_activation()`; calling it on this view first returns **`E_NOTIMPL`** (`0x80004001`)
+  and changes nothing.
+- **It is not an APC/pumping problem.** That theory was for a blocking wait, and there is no wait.
+
+A note on tooling, because it cost time: `gdb` cannot attach here (`/proc/sys/kernel/yama/ptrace_scope`
+is 1, and changing it is a system-wide setting, not something to do unasked), `eu-stack` returns
+nothing useful for Wine threads, and `winedbg` crashes on startup in this build. Mapping the fault
+address from the log against a `+loaddll` run and resolving it with the public PDB is the way to
+locate a crash in a native DLL here. Also worth knowing: `pgrep -f "<exe name>"` matches the
+agent's own shell commands containing that string, which is how a stale background poller ended up
+being reported as the app's pid.
+
+`WINE_UWP_DRIVE_FIRST_VIEW` stays off by default; Calculator byte-identical with it unset.
