@@ -7,6 +7,7 @@ derived. This does the derivation, so a shim does not have to guess.
 
     piid.py 'IAsyncOperation<Windows.Storage.StorageLibrary;{1edd7103-0e5e-4d6c-b5e8-9318983d6a03}>'
     piid.py 'IAsyncOperation<enum Windows.Storage.Search.IndexedState>'
+    piid.py 'IAsyncOperation<{4207a996-ca2f-42f7-bde8-8b10457a7f30}>'   # a bare interface
     piid.py --signature 'pinterface({9fc2b0bb-...};rc(Foo;{...}))'
     piid.py --self-test
 
@@ -56,6 +57,9 @@ def signature_for(generic, arg):
     arg = arg.strip()
     if arg.startswith("enum "):
         return "pinterface({%s};enum(%s;i4))" % (GENERIC[generic], arg[5:].strip())
+    if arg.startswith("{") and arg.endswith("}"):
+        # a plain interface parameter signs as its own IID, not as rc(...)
+        return "pinterface({%s};%s)" % (GENERIC[generic], arg)
     name, _, iid = arg.partition(";")
     return "pinterface({%s};rc(%s;%s))" % (GENERIC[generic], name.strip(), iid.strip())
 
@@ -73,6 +77,9 @@ SELF_TEST = [
      "c00bc2f2-a7f8-5f3f-80d1-2808ef6bca10"),
     ("IAsyncOperation", "enum Windows.Storage.KnownFoldersAccessStatus",
      "d7f094b5-0ea2-5654-85b9-38ee5de90ffa"),
+    # an interface argument signs as its bare IID - IStorageItem is an interface, not a class
+    ("IAsyncOperation", "{4207a996-ca2f-42f7-bde8-8b10457a7f30}",
+     "5fc9c137-ebb7-5e6c-9cba-686f2ec2b0bb"),
 ]
 
 

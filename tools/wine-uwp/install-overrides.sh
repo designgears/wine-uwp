@@ -13,7 +13,10 @@ SRC=$HOME/uwp-bin/win11/Windows/System32
 # listing changed since the last run: the file-by-file comparison below costs about three seconds
 # of every launch. WINE_UWP_FORCE_OVERRIDES=1 skips the check.
 STAMP=$WINEPREFIX/.install-overrides.stamp
-stamp=$( { find "$SRC" "$(dirname "$SRC")/Globalization" -printf '%p %s %T@\n' 2>/dev/null; stat -c '%Y' "$SYS32" "$WINE_BIN/dlls/ntdll/x86_64-windows/ntdll.dll" "$0" "$(dirname "$0")/globalization.reg" 2>/dev/null; echo "${1:-}"; } | md5sum | cut -d' ' -f1 )
+# The shim DLLs have to be in the stamp: without them, rebuilding a shim leaves the stamp
+# unchanged, the installer skips itself, and the prefix keeps running the previous build - which
+# looks exactly like the code change having no effect.
+stamp=$( { find "$SRC" "$(dirname "$SRC")/Globalization" -printf '%p %s %T@\n' 2>/dev/null; stat -c '%Y' "$SYS32" "$WINE_BIN/dlls/ntdll/x86_64-windows/ntdll.dll" "$0" "$(dirname "$0")/globalization.reg" 2>/dev/null; stat -c '%n %s %Y' "$HOME"/uwp-bin/build-probes/wineuwp_*.dll 2>/dev/null; echo "${1:-}"; } | md5sum | cut -d' ' -f1 )
 if [ -z "${WINE_UWP_FORCE_OVERRIDES:-}" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$stamp" ]; then
   echo "overrides unchanged"
   exit 0
@@ -165,6 +168,37 @@ if [ -f "$SL_SHIM" ]; then
   "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
   echo "installed: StorageLibrary stand-in"
+fi
+
+# Windows.Storage.Pickers.FileOpenPicker stand-in. The registered DllPath is the native
+# twinui.appcore.dll, whose picker is a shell UI in a broker process the prefix does not have, so
+# PickSingleFileAsync never completes and an app's "open file" button does nothing. The stand-in
+# returns the file named by WINE_UWP_PICKER_FILE. See shims/filepicker.
+FP_SHIM=$HOME/uwp-bin/build-probes/wineuwp_filepicker.dll
+if [ -f "$FP_SHIM" ]; then
+  FP_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_filepicker.dll
+  if ! cmp -s "$FP_SHIM" "$FP_DST"; then cp -f "$FP_SHIM" "$FP_DST"; fi
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Storage.Pickers.FileOpenPicker"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_filepicker.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: FileOpenPicker stand-in"
+fi
+
+# Windows.Storage.AccessCache.StorageApplicationPermissions stand-in. An app adds a picked file to
+# its future-access list so it can reopen it later; the class does not exist in Wine, so the
+# activation throws straight out of the pick with 0x80040111. See shims/accesscache.
+AC2_SHIM=$HOME/uwp-bin/build-probes/wineuwp_accesscache.dll
+if [ -f "$AC2_SHIM" ]; then
+  AC2_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_accesscache.dll
+  if ! cmp -s "$AC2_SHIM" "$AC2_DST"; then cp -f "$AC2_SHIM" "$AC2_DST"; fi
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Storage.AccessCache.StorageApplicationPermissions"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_accesscache.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: StorageApplicationPermissions stand-in"
 fi
 
 # ICU data: the genuine icu.dll (used by the native windows.globalization.dll) loads
