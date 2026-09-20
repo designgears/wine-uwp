@@ -5018,3 +5018,36 @@ thing to establish is why the container creates a second view at all - i.e. what
 missing that makes it ineligible - rather than trying to redirect work onto it after the fact.
 
 Regression checks: Calculator byte-identical, Feedback Hub unchanged (822 colours, no fail-fast).
+
+### Correction: two views is normal here, and that is not what is wrong
+
+`WINE_UWP_REPORT_VIEWS=1` queues a read-only APC onto every thread; each reports whether
+`CoreApplication` hands it a real `CoreApplicationView` (vtable inside twinapi) or a marshalled
+proxy, plus its `DXamlCore`. Media Player:
+
+```
+tid 444  view 0x...8481E0  REAL   core 0x...890020
+tid 480  view 0x...ECBDA0  REAL   core 0x...DD5A30
+others   view 0x...83F278  proxy  core 0
+```
+
+Two real views, each with its own core - as expected. **But Calculator reports exactly the same
+shape**: two real views, on tids 408 and 444, each with a core. Calculator works.
+
+So the entry above, and the commit message with it, put the emphasis in the wrong place: the second
+view is not the defect. The defect is that Media Player *uses both* - its `App` object and the
+`UserControl` it makes are on the first view, and `OnLaunched` and the rest of the UI are on the
+second. Calculator has the same two views but does all its work on the one that ends up owning the
+CoreWindow, so nothing of its is ever split.
+
+That changes what the fix has to do. It does not have to stop the second view existing; it has to
+make the activation - `Load`/`Activate`, and therefore `OnLaunched` - land on the *same* view the
+app's `App` object was constructed on. That is what the two backed-out experiments were reaching
+for, and the one that got there (broadcasting the startup to every thread, so the first view can
+claim it) is the right shape; what defeated it is that the first view has no CoreWindow, and giving
+it one through `SetWindowAndGetDispatcher` deadlocks. Understanding that deadlock is the next step,
+not avoiding it.
+
+`report_views` is kept as a deliberate debugging aid rather than removed: it is off unless
+`WINE_UWP_REPORT_VIEWS` is set, it only reads, and counting real views per thread is the
+measurement this whole area kept needing. Calculator is byte-identical with it in and unset.
