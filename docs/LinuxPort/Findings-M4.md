@@ -4812,3 +4812,80 @@ registration: it is `0x8001010e`, `RPC_E_WRONG_THREAD`. Still unregistered and w
 
 The window is still blank. Regression checks: Calculator byte-identical, Feedback Hub unchanged
 (822 colours, no fail-fast, no app error).
+
+## RPC_E_WRONG_THREAD: the XAML core and the CoreWindow are on different threads
+
+Media Player's remaining error, `0x8001010e`, is not a missing API. Finding it took three steps,
+each of which is reusable:
+
+**1. Get the managed stack.** `trace_language_exception` in `dlls/combase/roerror.c` prints the
+exception's `IStringable` text, but `debugstr_wn` truncates and the interesting part is the stack
+below the message. Printing it in 160-character chunks gives:
+
+```
+System.Exception: Exception from HRESULT: 0x8001010E
+   at System.Runtime.InteropServices.McgMarshal.ThrowOnExternalCallFailed(Int32, RuntimeTypeHandle)
+   at Microsoft.Media.Player.App.AppChrome..ctor(IAppChromeViewModel, INotificationService,
+       IConfigurationService, INavigationService, NavigationHost, IOverlayProgressRingService)
+```
+
+`ThrowOnExternalCallFailed` means a *native* call returned it and the runtime rethrew, so the
+originate stack (which showed .NET Native frames) was the rethrow, not the source.
+
+**2. Find which native call.** Neither of Wine's two `RPC_E_WRONG_THREAD` sites logs its
+"called from wrong apartment" ERR, so it is not Wine's. Rather than guess, patch **every** site that
+loads the constant in a candidate DLL to load a *unique* value instead - `0x8001e000 + index` - and
+read the index straight out of the exception message. One run per DLL identifies the exact function.
+`Windows.UI.dll` (96 sites) was a clean negative; `Windows.UI.Xaml.dll` (231 sites) answered
+`0x8001e030`, i.e. site 48:
+`DirectUI::DependencyObject::SetValueCore(const CDependencyProperty *, IInspectable *, bool, BaseValueSource)`.
+Bypassing that one guard moves the failure to `GetValueByKnownIndex`, so it is systematic rather
+than one bad call.
+
+**3. Read the guard.** At `0x2382fc`:
+
+```
+mov  rax, [rbx+0x90]      ; the object's core
+mov  rcx, [rax+0x10]
+mov  rax, [rcx]
+mov  r15d, [rax+0xbc]     ; the thread the XAML core belongs to
+call [__imp_GetCurrentThreadId]
+cmp  r15d, eax
+jne  -> RPC_E_WRONG_THREAD
+```
+
+Patching the site to return each of the two values in turn gives them directly: the core belongs to
+thread **0x52c**, the call comes from **0x550**.
+
+And the log says what those threads are. `052c` is the real view thread: it activates
+`Windows.UI.Core.CoreDispatcher`, calls `NtUserInitThreadCoreMessagingIocp2` and
+`CoSetMessageDispatcher`, activates `Windows.UI.Xaml.FrameworkView`, and ends up pumping
+`CoMsgWaitInProcessEvents`. `0550` is a *second* thread that does its own core-messaging init and
+then:
+
+```
+0550:err:wineuwp:wf_CreateCoreWindow CreateCoreWindow L"" on thread 1360
+0550:err:wineuwp:publish_core_window_mailbox published CoreWindow ... to XAML mailbox
+0550:fixme:combase:RoGetActivationFactory (L"Windows.UI.Xaml.Window", ...)
+```
+
+So **the host creates the CoreWindow, and the app builds its XAML tree, on a different thread from
+the one XAML's `DXamlCore` was initialized on**. On Windows a view's `Initialize`, `SetWindow` and
+`Run` all happen on one thread; here they are split, and every `DependencyObject` the app touches
+from the second thread is correctly rejected as cross-thread.
+
+This is ours - `dlls/wineuwp/main.c` - not a missing Windows API, and the mailbox and
+APC-broadcast machinery around `try_configure_from_get_for_current_thread` exists to paper over the
+same split. Calculator and Feedback Hub do not hit it because they do their work on the thread that
+ends up owning the core. Fixing it means running the FrameworkView's whole lifecycle on the thread
+that creates the CoreWindow, which is host surgery rather than another stand-in, so it is written up
+rather than attempted at the end of this pass.
+
+Also fixed along the way: `RoGetApartmentIdentifier` answered `0xdeadbeef` for every apartment,
+which makes every thread in the process look like the same one. .NET Native's RCW records the
+identifier an object belongs to and compares it per call, so a constant is not a harmless stub. It
+now returns the thread id for a single-threaded apartment and a shared value for the MTA. It is not
+what caused this error - the error predates the change - but it was wrong.
+
+Binaries restored: `Windows.UI.dll` and `Windows.UI.Xaml.dll` both byte-identical to the originals.
+Regression checks: Calculator byte-identical, Feedback Hub unchanged (822 colours, no fail-fast).
