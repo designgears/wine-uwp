@@ -5134,3 +5134,50 @@ agent's own shell commands containing that string, which is how a stale backgrou
 being reported as the app's pid.
 
 `WINE_UWP_DRIVE_FIRST_VIEW` stays off by default; Calculator byte-identical with it unset.
+
+## RPC_E_WRONG_THREAD is fixed: the window has to be made through the view, not through SetWindowAndGetDispatcher
+
+The null read in `RegisterForCoreWindowActivatedEvent` is explained by one branch in
+`CoreApplicationView::SetWindowAndGetDispatcher` (twinapi.appcore `0x288a0`):
+
+```
+call IsApplicationActivationWatcherEnabled   ; 0x29320, a free function - process-wide
+test al,al
+je   +0x3f5                                  ; false -> call the factory's CreateCoreWindow
+...                                          ; true  -> straight on to
+call RegisterForCoreWindowActivatedEvent     ; which reads the view's window slot, +0xc0
+```
+
+`IsApplicationActivationWatcherEnabled()` calls `RtlGetDeviceFamilyInfoEnum` and returns **true for
+`DEVICEFAMILYINFOENUM_DESKTOP` (3)**, which is what Wine's stub reports. So on this device family
+`SetWindowAndGetDispatcher` never makes a window - it assumes the activation watcher already
+did - and faults on the empty slot. That is exactly what the comment in `dlls/ntdll/rtl.c` warns
+about: "the desktop family makes the app model expect shell services (an activation watcher, a view
+manager) that a Wine prefix has no counterpart for".
+
+Reporting a different family is not the answer: `WINE_UWP_DEVICE_FAMILY=7` avoids the branch but
+takes the app model somewhere far worse - three XAML activations instead of thirty-eight.
+
+The answer is to make the window the way the container does on the working path:
+`CoreApplicationView::CreateCoreWindow( ICoreWindowFactory * )`, which is slot 6 of the interface
+whose vtable is at twinapi RVA `0x1a4e68` (found by scanning the view's vtables for the method's
+address, `0x2c600`). With that called first, from the view's own thread, our `wf_CreateCoreWindow`
+runs **on that thread** and the view's window slot is filled. `SetWindowAndGetDispatcher` is then
+not needed at all - it only hands back a dispatcher, and it does not return when called from here -
+so the startup goes straight to `Load` and `Activate`.
+
+With `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1`:
+
+```
+STEP tid 448: CreateCoreWindow hr 0
+drive_view_startup Load(L"Microsoft.ZuneMusic") on view ..., hr 0
+drive_view_startup view Activate(callback ..., args ...), hr 0
+```
+
+no fail-fasts, 38 XAML activations, the window stays up for the run - and **`0x8001010e` is gone**.
+The app is no longer split across two views. The error is now
+`Delegate to an instance method cannot have null 'this'.`, a managed failure inside the app, which
+is a different problem entirely.
+
+Still blank. Both switches stay opt-in until the other apps are tried against them; defaults
+verified after: Calculator byte-identical, Feedback Hub unchanged (822 colours, no fail-fast).
