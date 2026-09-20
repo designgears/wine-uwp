@@ -1,0 +1,182 @@
+# Working on wine-uwp
+
+This repo is Microsoft's Calculator, but the work here is `tools/wine-uwp` and `docs/LinuxPort`:
+running **packaged UWP apps we have no source for** under a patched Wine. The target is Shapr3D.
+Calculator, Feedback Hub, Media Player and Camera are test subjects, in that order of usefulness -
+Calculator because it is small and byte-comparable, the others because they are the same .NET
+Native + WinUI 2 shape Shapr3D is.
+
+`docs/LinuxPort/Plan.md` has the architecture. `docs/LinuxPort/Findings-M*.md` are the running
+log - **append findings there**, including the ones that did not work. This file is the part that
+generalises: how to investigate, and the mistakes that have already cost time.
+
+## Ground rules
+
+- **Run on Xvfb `:98`, never the user's `:0`.** `DISPLAY=:98 tools/wine-uwp/run.sh`.
+- **The Wine tree (`~/src/wine`) is shared with another session and is deliberately uncommitted.**
+  Check `git -C ~/src/wine status` before touching anything. Files that are not yours include
+  `dlls/kernelbase/*`, `dlls/ntdll/{loader,rtl,sync,signal_x86_64,threadpool}.c`, `dlls/win32u`,
+  `dlls/user32`, `dlls/combase`, `dlls/d3d11`, `dlls/windows.graphics`, `dlls/wintypes`, `server/*`,
+  `include/*`. Commit only files in *this* repo.
+- **Never push.** Commit freely; pushing is the user's call.
+- **Byte patches go in `~/uwp-bin/win11/...`**; `run.sh` re-copies into the prefix. Always keep a
+  backup and verify the restore with `cmp` before moving on. Leaving one behind silently poisons
+  every later run - it has happened.
+- Commit messages end with the attribution line the harness gives you.
+
+## The regression protocol - do not skip it
+
+Every change to Wine or the host gets checked against apps that already work, *before* you believe
+a result:
+
+```
+# Calculator must stay byte-identical to the saved baseline
+DISPLAY=:98 UWP_TIMEOUT=80 UWP_LOG=/tmp/c.log tools/wine-uwp/run.sh &  sleep 48
+DISPLAY=:98 import -window root /tmp/c.png; cmp /tmp/c.png /tmp/calc-regress.png
+
+# Feedback Hub: no fail-fasts, no app error, ~822 unique colours
+DISPLAY=:98 UWP_STAGE=windowsfeedbackhub ... ; identify -format '%k' /tmp/fh.png
+```
+
+`identify -format %k` (unique colours) is the cheap "is it painting" metric: 1 = blank, hundreds =
+real UI.
+
+**Run anything flaky twice.** A change that produced 66 fail-fasts in one run and 6 XAML
+activations in the next looked fine in its first run. Single runs are not evidence.
+
+## Investigation toolkit
+
+These all exist and work. Prefer them over reading code and guessing.
+
+| Question | Tool |
+| --- | --- |
+| What is this IID, and what are its methods? | `tools/wine-uwp/winmd.py <winmd> --guid <iid>` (public interfaces; prints slots from 6) |
+| Demangle an MSVC symbol | `llvm-undname` |
+| Symbols for a Microsoft binary | fetch its PDB from `msdl.microsoft.com` (see `tools/wine-uwp/pdbsyms.py`; [public symbols docs](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/microsoft-public-symbols)), then `llvm-pdbutil dump --publics` into a `.syms` file |
+| Which module is this address in? | `tools/wine-uwp/addr2mod.py <log-with-+loaddll> <addr>` |
+| Which of N call sites returned this HRESULT? | unique-HRESULT tagging, below |
+| Did this code path run at all? | patch `0f 0b` (`ud2`) over its first two bytes, below |
+| What did managed code throw, and where? | `WINE_UWP_TRACE_ORIGINATE=1` + the chunked `trace_language_exception` in `dlls/combase/roerror.c` |
+| How many real `CoreApplicationView`s exist, on which threads? | `WINE_UWP_REPORT_VIEWS=1` (read-only census) |
+| What is the visual tree doing? | `WINEDEBUG=+dcomp`; `present_desktop_hwnd frame: N ops` - 0 ops means nothing to draw |
+| Method count of a private interface | parse the MIDL proxy/stub DLL, below |
+
+### Unique-HRESULT tagging
+
+To find which of hundreds of sites produced an HRESULT: rewrite every `mov reg, <hresult>` in a DLL
+to a distinct value (`base + index`), run once, and read the index out of the error message. One
+run identifies the exact function. `/tmp/tag.py` in a session is ten lines; the pattern is in
+Findings-M4.
+
+**Safe for `E_FAIL`. Not safe for `E_NOTIMPL` or `E_NOINTERFACE`** - callers test for those
+specifically and take a different path when they get something else. Tagging XAML's 629 `E_NOTIMPL`
+sites took a run from 46 XAML activations to 6. Find those from the FIXME lines our own stubs print
+instead.
+
+### ud2 probes
+
+To answer "does this basic block execute", overwrite its first two bytes with `0f 0b`. A hit shows
+up as `err:seh:NtRaiseException Unhandled exception code 1007`. The *address* in that line is the
+Wine-side rethrow and is the same for every probe - only the presence of the line means anything.
+
+**Always run a control probe** (a `ud2` somewhere that must execute) before trusting a negative.
+Three negatives in a row usually means the patched file is not the file being loaded.
+
+### Reading a private interface
+
+For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
+
+1. `HKCR\Interface\{iid}` in the Windows SOFTWARE hive (`tools/wine-uwp/fasthive.py`) often has the
+   name even when the metadata does not.
+2. Find which DLLs contain the IID bytes. A **proxy/stub** DLL gives the exact method count: find a
+   pointer to the IID (that is `CInterfaceStubHeader::piid`), read `DispatchTableCount` at +0x10.
+3. Best of all: find the **shipping implementation's vtable** and let its PDB name every slot. That
+   is how `{9d47a108}`'s 13 methods were recovered - the 19-entry `MediaPlayerImpl` vtable in
+   `Windows.Media.Playback.MediaPlayer.dll`. Do this before writing a single stub.
+4. Failing all that, implement the interface with one traced thunk per slot and let the app tell you
+   which methods it calls.
+
+## Mistakes already made - do not repeat them
+
+**Null is not a neutral answer.** This cost three separate debugging sessions:
+- `{9d47a108}` slot 6 looked like a getter. It is `add_CastingRenderLocationChanged`, an *event
+  registration* - writing NULL through its first argument overwrote the caller's handler and killed
+  the process.
+- `MediaBreakManager::get_PlaybackSession` returning NULL destabilised the whole run; the app reads
+  the session straight back out and uses it. Handing back the player's real session made Media
+  Player render.
+- The composition default slot wrote a fake object pointer into whatever looked like an
+  out-parameter. For `IKeyFrameAnimation` those are `HSTRING *`, `TimeSpan *` and `UINT32 *`; .NET
+  Native marshalled the bogus HSTRING and `memmove`d from the garbage it decoded.
+
+  **Before answering a getter, find out what the caller does with the answer** - from the shipping
+  implementation, or by instrumenting the call.
+
+**A refusal is usually the fatal thing** - `E_NOTIMPL` from an event registration, a `@ stub` in a
+.spec, an unresolvable delay-load, an interface revision answered `E_NOINTERFACE`. Registering an
+event has to succeed even when the event never fires.
+
+**But do not claim an interface you cannot implement.** Answering XAML's
+`IReferenceTrackerInternal` made it call tracking methods on an object that could not honour them:
+51 fail-fasts. A plain WinRT object is *supposed* to return `E_NOINTERFACE` there. Both
+`E_NOINTERFACE` and `E_NOTIMPL` are answers callers handle; an invented value is not.
+
+**Never guess which argument is the out-parameter.** In the StateRepository interfaces it is always
+the *last*; in `get_DescriptionReference(HSTRING **)` it is the *first*. Get arity from metadata
+(`gen-staterepository.py` generates a table from the vtables plus `llvm-undname`), or you will write
+eight bytes through the wrong argument and leave the real one holding the caller's stack garbage.
+
+**Measure a working app before theorising about a broken one.** "Media Player has two
+`CoreApplicationView`s" looked like the bug for two rounds of work. Calculator has two as well, and
+works. One census would have saved both.
+
+**Two data points that a third reading explains equally are not a conclusion.** An early finding
+about XAML's provider-kind dispatch was inferred from two byte-patch experiments and was wrong; the
+type resolved fine and the real failure was three layers further on.
+
+**Absence of a log line is only evidence if the line would have been printed.** A run looked fixed
+because `grep "Call failed"` found nothing - that string only appears when
+`WINE_UWP_TRACE_ORIGINATE` is set, and that run did not set it.
+
+**Check who owns a file before "fixing" it.** `RtlGetDeviceFamilyInfoEnum` has a ternary that reads
+inverted; it is correct, because `get_package_env` returns an `NTSTATUS` and 0 means success. It is
+also in another session's file.
+
+**Do not add fields to a struct whose prefix is shared.** Everything in `dlls/dcomp/composition.c`
+starts with `struct comp_object`'s three fields and reuses its AddRef/Release. A field added there
+landed on `kf_animation`'s `target[]` and made Release iterate 0x664f garbage entries - the fault
+report showed `rdx 007300660066004f`, `"Offs"` from `"Offset"`. Put new state in its own allocation.
+
+**`pgrep -f "<exe name>"` matches your own shell commands** containing that string, including
+background pollers you started earlier. Use `ps -eo pid,args | grep ... | grep -v grep`.
+
+## Environment facts worth knowing
+
+- `winedbg` crashes on startup in this build, `gdb` cannot attach (`/proc/sys/kernel/yama/ptrace_scope`
+  is 1, and changing it is a system-wide setting - do not do it unasked), and `eu-stack` returns
+  nothing useful for Wine threads. **Locate crashes by mapping the fault address from a `+loaddll`
+  log with `addr2mod.py` and resolving it against the public PDB.**
+- `.NET Native` apps (`ilc` in the PDB path, `SharedLibrary.dll` + `mrt100_app.dll` loaded) have no
+  public PDBs, but `mrt100_app.pdb` does - and `RhpPInvokeExceptionGuard` in a stack means a native
+  exception was taken under a P/Invoke, which is always a fail-fast. If you see that, look for a
+  *native* fault, not a managed bug.
+- Wine's builtins win by module name. Pointing an `ActivatableClassId` at a native DLL is not enough;
+  it also needs a `=n` override and the file in the prefix.
+- The unhandled-error text an app reports is often a *consequence*. `Delegate to an instance method
+  cannot have null 'this'` was the second exception; the first, further up, was the real one.
+
+## Current state (2026-09-20)
+
+| App | State |
+| --- | --- |
+| Calculator | Fully working; the byte-identical regression baseline |
+| Feedback Hub | Fully working and interactive (~822 colours) |
+| Media Player | **Renders its full UI** (~2205 colours) with `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1` |
+| Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
+| Solitaire | Starts clean, draws nothing (uses Windows.UI.Composition directly) |
+| Windows Security | Blank; needs the Defender SecurityHealth service |
+
+The three Media Player switches are opt-in only because the other apps have not been tested against
+them. **Testing that, and making them the default if it holds, is the next job** - they change the
+view/activation ordering for everyone, which is exactly the sort of thing Shapr3D will also depend
+on.
