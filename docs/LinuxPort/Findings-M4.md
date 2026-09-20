@@ -5181,3 +5181,46 @@ is a different problem entirely.
 
 Still blank. Both switches stay opt-in until the other apps are tried against them; defaults
 verified after: Calculator byte-identical, Feedback Hub unchanged (822 colours, no fail-fast).
+
+### After the wrong-thread fix: the window context's other getter
+
+With the app on one view, the next error is a managed one, and the chunked exception trace names it:
+
+```
+System.Exception: Call failed. (Exception from HRESULT: 0x80004005)
+   at McgMarshal.ThrowOnExternalCallFailed(...)
+   ...
+   at System.Lazy`1.ViaFactory(...)
+   at Microsoft.Media.Player.Controls.Uwp.Utilities.ViewportStateTrigger..ctor() + 0x168
+```
+
+followed by `System.ArgumentException: Delegate to an instance method cannot have null 'this'.`,
+which is the consequence - the `Lazy` never produced its value.
+
+Tracing the `dcomp` channel found one of ours in that path and it is now fixed:
+`MrmCoreR`'s `CoreWindowContainer::Initialize` (RVA `0x23aa8`, named from its public PDB) calls
+**slot 6** of the window-context partner interface with a single out-parameter, stores what comes
+back and releases it later, and treats a failure as fatal. That slot was the `window_host_method`
+stub added with the InputPane chain, returning `E_NOTIMPL`. It now hands back another hop carrying
+the same window handle, the way the QI and slot 7 already do, and the stub no longer appears in a
+run.
+
+The `E_FAIL` itself is still there, and these are ruled out:
+
+- Not `windows.graphics`: the last traced call before the exception is
+  `display_info_add_OrientationChanged`, which returns `S_OK`, and nothing else in that DLL is
+  called.
+- Not `twinapi.appcore`: all 21 sites that load `0x80004005` as a literal were tagged with unique
+  values and none of them fired. (That technique only covers literal loads - an `E_FAIL` returned
+  from a helper or propagated in a register would not be caught, so this is not conclusive, just
+  the cheap half.)
+- The originate hook does not help here: `RoOriginateError` is called by .NET Native's marshalling
+  layer when it converts the failed call, so the stack is the re-origination, not the producer.
+- The app's interop stub takes its vtable slot in `r8d`, and the caller loads it from `eax`
+  (computed), so the slot cannot be read statically the way it can for MSVC callers.
+
+The next step is to find the producer at runtime rather than statically - the same unique-HRESULT
+tagging, but covering non-literal returns, or a breakpoint-equivalent on the interop stub that
+records the interface pointer it is called with.
+
+Regression checks: Calculator byte-identical, Feedback Hub unchanged (822 colours, no fail-fast).
