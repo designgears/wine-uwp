@@ -5332,3 +5332,35 @@ other direction: claiming an interface you cannot implement is not a free way pa
 null is not.
 
 Regression checks: Calculator byte-identical, Feedback Hub unchanged (822 colours).
+
+### Why Media Player's window is blank, settled
+
+Two more things were tried and both are negative results worth keeping.
+
+**Serving the class from the native implementation does not work.** `Windows.Media.Playback.MediaPlayer.dll`
+from the Windows install exports `DllGetActivationFactory` and contains the class name, and it does
+implement `{9d47a108}` properly - but Wine's builtin wins by module name, so it takes both a
+`DllPath` change *and* a `windows.media.playback.mediaplayer=n` override plus the file in the
+prefix. With the native one actually loaded the run is far worse: **64 fail-fasts and 12 XAML
+activations** against 0 and 46. It wants media infrastructure this prefix does not have. Reverted.
+
+**The blank window is not a sizing or presentation bug.** The `+dcomp` paint trace for Media Player
+ends with
+
+```
+paint_public_visual visit public container ... size 0x0 ... children 1
+present_desktop_hwnd frame: 0 ops, 1 damage rects
+```
+
+which looked like the root visual never getting a size. It is not: Calculator, on the same code,
+reports real sizes and **68 ops** per frame. Media Player's tree is empty because the app aborts its
+startup before anything is set as `Window.Content` - the 0x0 is the consequence, not the cause.
+
+So the chain is now fully accounted for. Media Player gets a window, builds 46 XAML types on one
+view with no fail-fasts, and then stops in its own generated binding code on a cast to a private
+MediaPlayer interface that cannot be implemented from anything public. Painting is gated on that,
+not on the host, the view plumbing or the renderer - all of which work, as Calculator and Feedback
+Hub demonstrate every run.
+
+Prefix left clean: the MediaPlayer class points back at `C:\windows\system32\` and the builtin is
+restored. Calculator byte-identical.
