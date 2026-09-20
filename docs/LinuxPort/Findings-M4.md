@@ -5586,3 +5586,38 @@ Also seen on that path, not yet chased: `StdMarshalImpl_MarshalInterface` failin
 `{5c21c742-2ced-4fd9-ba38-7118d40e966b}` and `{18026348-8619-4c7b-b534-ced45d9de219}`, and a
 reproducible read fault at a fixed Wine-builtin IP `0x6FFFFECF8440` (target address always just
 past a page start) on the UI thread. The fault does not happen in every run.
+
+### StorageLibrary shim: the library page reaches the empty state (2026-09-20)
+
+`shims/storagelibrary` implements the class. Verified by trace in two runs: the app calls
+`GetLibraryAsync(0)` on the Music page and `GetLibraryAsync(2)` on the Video page - which
+corroborates `KnownLibraryId` Music=0, Videos=2 - then `GetResults`, `get_Folders` (one folder) and
+`get_SaveFolder` twice. `RoGetActivationFactory`'s class-not-found error is gone.
+
+The page consequently changes from the permission wall to the **normal empty-library page**:
+"We couldn't find any music / Your music library doesn't contain any music content" with an
+"Add folder" button (380 colours, vs 394 for the old denial page and 2205 for Home). So the
+capability and library layers are both satisfied and the app is past them.
+
+It still finds no files, and the reason is *not* the folder path: `KnownFolders.MusicLibrary`
+resolves through `SHGetKnownFolderPath(FOLDERID_Music)` to `C:\users\bobby\Music`, which in this
+prefix is a symlink to `/home/bobby/Music`, and the two test files are there.
+
+What the log shows instead is that **the app never enumerates the folder**. Wine's
+`storage_folder_QueryInterface` is asked for exactly one interface, thirteen times:
+`{11d3b13a-180e-4789-a8be-7712882893e6}`, which is `IReferenceTracker` - .NET Native's RCW layer
+asks every WinRT object and must be refused (claiming it caused 51 fail-fasts, see above). It is
+never asked for `IStorageFolderQueryOperations` `{cb43ccc9-446b-4a4f-be97-757771be5203}`, which
+Wine *does* implement, and no `Windows.Storage.Search` or indexer class is ever activated.
+
+So Media Player is not listing the folder through StorageFolder at all. It ships `e_sqlite3.dll`
+and builds its library in its own database from a background scan; the next thing to find is what
+starts that scan. The most likely candidate is `IStorageLibrary2::get_ChangeTracker`
+`{5b0ce348}` - a `StorageLibraryChangeTracker`, which the shim currently answers `E_NOTIMPL` - since
+the scan is driven by change-tracking on Windows. Implementing the tracker and its
+`StorageLibraryChangeReader` is the next step.
+
+Unrelated observation from the same runs: the page fault at `0x6FFFFECF8440` is **intermittent**,
+not deterministic - two runs completed without it. An earlier note here implying the Music library
+click triggers it was wrong: with the x11 driver pinned it has also been seen during startup,
+before any click.
