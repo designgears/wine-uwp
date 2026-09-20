@@ -52,7 +52,7 @@ These all exist and work. Prefer them over reading code and guessing.
 | --- | --- |
 | What is this IID, and what are its methods? | `tools/wine-uwp/winmd.py <winmd> --guid <iid>` (public interfaces; prints slots from 6) |
 | Demangle an MSVC symbol | `llvm-undname` |
-| Symbols for a Microsoft binary | fetch its PDB from `msdl.microsoft.com` (see `tools/wine-uwp/pdbsyms.py`; [public symbols docs](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/microsoft-public-symbols)), then `llvm-pdbutil dump --publics` into a `.syms` file |
+| Symbols for a Microsoft binary | read the RSDS record from the PE debug directory, `curl` it from `msdl.microsoft.com/download/symbols/<name>/<sig><age>/<name>` ([docs](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/microsoft-public-symbols)), then `llvm-pdbutil dump --publics` into a `rva name` `.syms` file next to it in `~/uwp-bin/pdb`. `tools/wine-uwp/pdbsyms.py` does this but needs `pefile`, which is **not installed** - parse the debug directory by hand (~20 lines) or install it |
 | Which module is this address in? | `tools/wine-uwp/addr2mod.py <log-with-+loaddll> <addr>` |
 | Which of N call sites returned this HRESULT? | unique-HRESULT tagging, below |
 | Did this code path run at all? | patch `0f 0b` (`ud2`) over its first two bytes, below |
