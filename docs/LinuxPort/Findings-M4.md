@@ -5268,3 +5268,35 @@ set, and that run did not set it. Re-tagging showed `get_BoundsImpl` still faili
 log line is only evidence when the line would have been printed.
 
 Regression checks: Calculator byte-identical, Feedback Hub unchanged.
+
+### Into the app's own bindings
+
+With the window configured, the next two failures were in the media stack and both were ours:
+
+- `media_player_add_CurrentStateChanged` returned `E_NOTIMPL` while its siblings returned `S_OK`.
+  Every `add_*`/`remove_*` in `dlls/windows.media.playback.mediaplayer/main.c` now succeeds with a
+  zero token - registering has to work, the events simply never fire here. (Four of them were still
+  refusing.)
+- That moved the error to `E_NOINTERFACE` (`0x80004002`), raised as an `InvalidCastException`
+  inside `AppChrome_obj1_Bindings.BindingsTracking.PropertyChanged_NavigationViewSelectedItem` -
+  the app's own generated x:Bind code. XAML QIs our `MediaPlayer` for `{5c526665-...}`
+  (`Windows.UI.Xaml.IDependencyObject` - correctly refused, a MediaPlayer is not one) and then for
+  `{02dd3ad0-...}`, `{64bd43f8-...}` and `{9d47a108-...}`, none of which are in any public `.winmd`
+  or named in `HKCR\Interface`. The first two appear only inside `Windows.UI.Xaml.dll`; the third is
+  also in `Windows.Media.Playback.ProxyStub.dll`.
+
+**A tagging caveat learned the hard way:** the unique-HRESULT trick is safe for `E_FAIL` but *not*
+for `E_NOTIMPL`. Tagging all 629 `E_NOTIMPL` sites in `Windows.UI.Xaml.dll` took the run from 46
+XAML activations down to 6 - callers test for `E_NOTIMPL` specifically and take a different path
+when they get something else. Tag `E_FAIL`, and find `E_NOTIMPL` from the FIXME lines our own stubs
+already print.
+
+Where this leaves Media Player: window up for the whole run, 46 XAML activations, no fail-fasts, and
+every remaining failure inside the app's own binding code rather than in the host. It still paints
+nothing, and the honest reading is that it aborts its startup bindings before any content reaches
+the tree - so "painting" is gated on those internal XAML interfaces, not on the presentation path,
+which demonstrably works for Calculator and Feedback Hub.
+
+All byte-patched binaries verified restored: `Windows.UI.Xaml.dll`, `Windows.UI.dll`,
+`twinapi.appcore.dll`, `Microsoft.UI.Xaml.dll`. Regression checks: Calculator byte-identical,
+Feedback Hub unchanged.
