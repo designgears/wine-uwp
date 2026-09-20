@@ -5412,3 +5412,45 @@ is NDR64 rather than the -Oicf layout assumed - and guessing further was not wor
 Also tried and rejected: serving `Windows.Media.Playback.MediaPlayer` from the native Windows DLL.
 
 Regression checks: Calculator byte-identical, Feedback Hub unchanged (822 colours).
+
+## Media Player's private interface, named at last
+
+The blocker written up above as unreachable was reachable, from the shipping implementation rather
+than from metadata. `Windows.Media.Playback.MediaPlayer.dll` has 24 `MediaPlayerImpl` vtables; the
+one with the 19 entries the proxy/stub reported is at RVA `0xbe830`, and its public PDB names every
+slot:
+
+| slot | method |
+| --- | --- |
+| 6/7 | add/remove_CastingRenderLocationChanged |
+| 8/9 | add/remove_TimelineControllerChanged |
+| 10/11 | add/remove_IsLoopingEnabledChanged |
+| 12 | get_MediaPlayerCastingRenderLocation |
+| 13 | get_VideoSwapchainHandle |
+| 14 | get_CurrentMediaPlaybackItem |
+| 15 | get_AudioSessionId |
+| 16/17 | get/put_TelemetryCorrelationId |
+| 18 | DisableVisibilityHandling |
+
+**Slot 6 is an event registration, not a getter**, which is exactly why the earlier guess killed the
+process: writing NULL through its first argument overwrote the caller's *handler*, not an
+out-parameter, and the caller then dereferenced it. Implemented from this table, the
+`InvalidCastException` out of `PropertyChanged_NavigationViewSelectedItem` is gone.
+
+`get_CommandManager` was next, and `IMediaPlaybackCommandManager` and
+`IMediaPlaybackCommandManagerCommandBehavior` *are* public - their slot lists come straight from
+`Windows.Media.winmd` - so both are implemented properly: disabled behaviours, events that register
+and never fire, and a real behaviour object from every getter, because the app dereferences what it
+gets. Wine's IDL declares `IMediaPlaybackCommandManager` with no members, so these use raw vtables
+rather than the header's empty one.
+
+`get_BreakManager` is next and stays refused. A `MediaBreakManager` built the same way from the
+public interface list made the run **unstable** - 66 fail-fasts in one run, six XAML activations in
+the next, against a steady 46 and none with it refusing - so the app does more with it than
+register events. That is written down rather than shipped: `E_NOTIMPL` is the honest answer until
+it is understood, and the experiment is recorded in a comment at the call site.
+
+State: 46 XAML activations, no fail-fasts, no page faults, repeatable across runs, stopping on
+`NotImplementedException` from `get_BreakManager`.
+
+Regression checks: Calculator byte-identical, Feedback Hub unchanged.
