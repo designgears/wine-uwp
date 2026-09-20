@@ -5051,3 +5051,46 @@ not avoiding it.
 `report_views` is kept as a deliberate debugging aid rather than removed: it is off unless
 `WINE_UWP_REPORT_VIEWS` is set, it only reads, and counting real views per thread is the
 measurement this whole area kept needing. Calculator is byte-identical with it in and unset.
+
+### The first view cannot be given a window: SetWindowAndGetDispatcher never returns
+
+With the diagnosis corrected - the job is to land the activation on the view the app's `App` object
+is on, not to stop the second view existing - the obvious move is to let that view claim the startup
+and give it a CoreWindow of its own. `WINE_UWP_DRIVE_FIRST_VIEW=1` does exactly that: broadcast the
+startup APC so any real view can take it, and call `ICoreApplicationViewInternal::SetWindowAndGetDispatcher`
+with our own window factory before `Load`. The factory has no thread affinity by design, so the
+window would be created on the claiming thread.
+
+It hangs, every time, and the instrumentation says precisely where:
+
+```
+01b8:err:wineuwp:drive_view_startup STEP tid 440: creating the window factory
+01b8:err:wineuwp:drive_view_startup STEP tid 440: factory 0x... hr 0
+01b8:err:wineuwp:drive_view_startup STEP tid 440: SetWindowAndGetDispatcher on view 0x...
+        <nothing further from tid 440>
+```
+
+Our `wf_CreateCoreWindow` is never entered, so it blocks *before* asking the factory for anything.
+
+The first hypothesis was contention: the startup was being driven from `wf_CreateCoreWindow`, i.e.
+asking the container for a window on one view while it was mid-way through creating another. Moving
+the broadcast into `activation_thread`, before the activation factory is called at all, makes the
+first view claim it with **no `CreateCoreWindow` anywhere in the run** - and it still hangs. So it is
+not contention with the second view's creation; it is unconditional.
+
+What that leaves is that the first view is not in a state where it can accept the call - which is
+the same thing the container is apparently deciding when it declines to use that view and stands up
+its own. Two candidates worth testing next, in order:
+
+- The call is made from inside a `QueueUserAPC` callback, so the view thread is blocked in our frame
+  and cannot pump. If `SetWindowAndGetDispatcher` posts to that view's own dispatcher and waits, it
+  can never complete. Testing this means driving the call from the thread's normal message loop
+  rather than from an APC.
+- The view is genuinely not ready: `ICoreApplicationView_Activation::PrepareToActivateAsync` (slot 6
+  of the activation vtable the host already knows how to find, `TWINAPI_VIEW_ACTIVATION_VTBL`) is
+  "how the shell tells a view that an activation is on its way before sending it". Nothing calls it
+  here. That is a concrete, cheap thing to try.
+
+Both experiments stay behind `WINE_UWP_DRIVE_FIRST_VIEW` and are off by default. Defaults verified
+after: Calculator byte-identical, and with `WINE_UWP_DRIVE_VIEW=run` Media Player still gets `Load`
+and `Activate` on the window's view thread with no fail-fasts.
