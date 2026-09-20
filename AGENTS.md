@@ -147,6 +147,14 @@ starts with `struct comp_object`'s three fields and reuses its AddRef/Release. A
 landed on `kf_animation`'s `target[]` and made Release iterate 0x664f garbage entries - the fault
 report showed `rdx 007300660066004f`, `"Offs"` from `"Offset"`. Put new state in its own allocation.
 
+**When results change and your code did not, check the shared tree before you debug.** Media Player
+rendered, navigated, and passed the regression suite; forty minutes later every app - Calculator
+included - died in an early `loader_section` deadlock. `ls -lt ~/src/wine-build/dlls/*/x86_64-windows/*.dll`
+showed `ntdll.dll` and `kernelbase.dll` rebuilt minutes earlier by the other session. **Calculator is
+the canary**: if it stops working, suspect the environment, not your change, and say so rather than
+thrashing. Nothing in this repo can fix a half-finished `ntdll` in someone else's working tree; wait
+for it to settle and re-measure.
+
 **`pgrep -f "<exe name>"` matches your own shell commands** containing that string, including
 background pollers you started earlier. Use `ps -eo pid,args | grep ... | grep -v grep`.
 
@@ -160,6 +168,13 @@ background pollers you started earlier. Use `ps -eo pid,args | grep ... | grep -
   public PDBs, but `mrt100_app.pdb` does - and `RhpPInvokeExceptionGuard` in a stack means a native
   exception was taken under a P/Invoke, which is always a fail-fast. If you see that, look for a
   *native* fault, not a managed bug.
+- A Wine DLL can have a **copy in the prefix** (`~/.wine-uwp/drive_c/windows/system32/`) shadowing
+  the build tree. Restoring a backup there can silently reinstate a pre-fix build - check with
+  `cmp` against `~/src/wine-build/dlls/<dll>/x86_64-windows/<dll>.dll` after any backup/restore
+  dance.
+- Leftover `explorer.exe /desktop` and `svchost.exe` from killed runs accumulate and make the
+  activation race fail (run.sh says so in a comment). `wineserver -k` and *verify* they are gone
+  before trusting a run.
 - Wine's builtins win by module name. Pointing an `ActivatableClassId` at a native DLL is not enough;
   it also needs a `=n` override and the file in the prefix.
 - The unhandled-error text an app reports is often a *consequence*. `Delegate to an instance method
