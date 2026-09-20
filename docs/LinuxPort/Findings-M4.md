@@ -5491,3 +5491,98 @@ destabilised the run from `get_PlaybackSession`. Both were solved by reading the
 implementation's vtable or by instrumenting the call and looking.
 
 Regression checks: Calculator byte-identical, Feedback Hub unchanged (822 colours).
+
+## The msftedit "DllMain deadlock" was a wedged Xvfb (2026-09-20)
+
+Media Player stopped starting: no `ZuneMusic` window, `first-view startup not taken after 600
+tries`, and Wine reporting `loader_section ... blocked by <tid> (in DllMain of L"msftedit.dll")`.
+I produced three explanations before the right one, and wrote the first two into `AGENTS.md`:
+
+1. *"The other session rebuilt ntdll and kernelbase."* Wrong. `ls -lt --time-style=+%H:%M` prints
+   no date; the `03:43` I read was **09-19**. Nothing shared had been rebuilt.
+2. *"Every app including Calculator is broken."* Wrong. That came from counting log lines
+   (`deadlock=4 xaml=2`), which appear in healthy Calculator runs too. A screenshot showed
+   Calculator byte-identical at 249 colours.
+3. *"msftedit's DllMain is intermittently slow."* Also wrong.
+
+The actual chain, found by adding load timing to `probes/probe-load.cpp` and reducing the failure
+to `wine probe-load.exe msftedit.dll`:
+
+- msftedit's `DllMain` calls `user32.RegisterClassW` (visible as the last relay line with no
+  matching `Ret`, under `RelayFromInclude=msftedit`).
+- Wine's first `RegisterClass` in a process runs `win32u/driver.c:load_desktop_driver`, whose
+  "wait for graphics driver to be ready" is `send_message( hwnd, WM_NULL, 0, 0 )` to the desktop
+  window - **with no timeout**. That is the `NtWaitForMultipleObjects type 1, handles {0x74},
+  timeout (infinite)` in a `+sync` trace.
+- The loader lock is held across all of it, so every other thread stalls and the host's first-view
+  poll expires.
+
+With `:98` wedged the load never returns; on a healthy display it takes **153 ms**. The wedge
+survives `wineserver -k` - it is the X server, not the prefix - so the display has to be restarted.
+Killing a run mid-X-grab is what wedges it.
+
+### WAYLAND_DISPLAY is not enough
+
+Runs kept printing `err:waylanddrv:wayland_process_init ... compositor doesn't support
+zwlr_data_control_manager_v1`, which only a real compositor answers: Wine was talking to the
+desktop session while `DISPLAY=:98` was set. `unset WAYLAND_DISPLAY` does not fix it, because
+libwayland falls back to `$XDG_RUNTIME_DIR/wayland-0`. Wine chooses its driver from
+`HKCU\Software\Wine\Drivers\Graphics` and has no environment override, so `run.sh` now writes
+`Graphics=x11`. A run then logs zero `waylanddrv` lines.
+
+### Measurement traps hit while chasing this
+
+- Screenshotting on a fixed timer produced several false "blank window"/"never started" results.
+  Media Player needs ~45 s to paint untraced and ~105 s with `+loaddll`/`+seh`. Gate on
+  `identify -format %k > 100`, not on a `sleep`.
+- `addr2mod.py` answers with the nearest *lower* module base, so it happily reports
+  `mrt100_app.dll+0x1f8440` for an address past the end of a 0x6CDF0-byte DLL. Check the offset
+  against `SizeOfImage` before believing it. Wine builtins are relocated off their preferred
+  `ImageBase`, so scanning the build tree for a covering base finds nothing either; read
+  `/proc/<pid>/maps` of the live faulting process instead.
+- `grep`/`pgrep`/`pkill` with `-f` match your own command line. This cost three separate
+  incidents in one session: `pkill -f ZuneMusic` killed the session shell, two
+  `pgrep -f runmp-relay.sh` pollers span forever and loaded the machine during timing runs, and a
+  crash-catcher watching for `[w]inedbg` fired on itself after one second. Use `pgrep -x` on the
+  image name.
+
+## Media Player: the music library needs AppCapability and StorageLibrary (2026-09-20)
+
+The Music and Video library pages painted *"Media Player can't access your music library"*. The app
+asks `Windows.Security.Authorization.AppCapabilityAccess.AppCapability`, registered to the native
+`CapabilityAccessManagerClient.dll`, which RPCs to a CapabilityAccessManager service the prefix does
+not have - so `CheckAccess` is always denied.
+
+`tools/wine-uwp/shims/appcapability` answers it from the package's `AppxManifest.xml`: declared
+capability -> `Allowed` (4), otherwise `NotDeclaredByApp` (1). Verified: the manifest's ten
+capabilities are parsed and `CheckAccess(musicLibrary)`/`CheckAccess(videosLibrary)` both return 4.
+`RequestAccessAsync` is deliberately `E_NOTIMPL` - it only ever prompts on Windows, and an app that
+respects `CheckAccess` never reaches it; a wrong answer there would be invisible.
+
+With the capability allowed the app gets further and hits the real gap:
+
+```
+err:combase:RoGetActivationFactory Class L"Windows.Storage.StorageLibrary" not found in
+    L"C:\windows\system32\windows.storage.dll", hr 0x80040111
+err:combase:RoGetActivationFactory Class L"Windows.UI.ViewManagement.Core.CoreFrameworkInputView"
+    not found in L"C:\windows\system32\windows.ui.core.textinput.dll", hr 0x80040111
+```
+
+`StorageLibrary` is small and `dlls/windows.storage` already has everything needed:
+
+| Interface | Slots |
+| --- | --- |
+| `IStorageLibraryStatics` `{4208a6db}` | 6 `GetLibraryAsync` |
+| `IStorageLibrary` `{1edd7103}` | 6 `RequestAddFolderAsync` 7 `RequestRemoveFolderAsync` 8 `get_Folders` 9 `get_SaveFolder` 10/11 `add`/`remove_DefinitionChanged` |
+| `IStorageLibrary2` `{5b0ce348}` | 6 `get_ChangeTracker` |
+| `IStorageLibrary3` `{8a281291}` | 6 `AreFolderSuggestionsAvailableAsync` |
+
+`async_operation_*_create` and `path_param` in `storagefile.c` are the pattern for the async
+operation; `known_folders_get_MusicLibrary` already resolves to the real profile directory, so
+`get_SaveFolder` is a one-liner. The one genuinely new piece is `get_Folders`, which returns
+`IObservableVector<StorageFolder>` rather than the `IVectorView` the existing helpers build.
+
+Also seen on that path, not yet chased: `StdMarshalImpl_MarshalInterface` failing `0x80004002` for
+`{5c21c742-2ced-4fd9-ba38-7118d40e966b}` and `{18026348-8619-4c7b-b534-ced45d9de219}`, and a
+reproducible read fault at a fixed Wine-builtin IP `0x6FFFFECF8440` (target address always just
+past a page start) on the UI thread. The fault does not happen in every run.
