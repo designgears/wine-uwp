@@ -162,12 +162,31 @@ wrote both of the following into this file, and both were wrong:
   Calculator byte-identical to baseline at 249 colours. **Judge an app by its pixels**, never by a
   grep tally.
 
-The failing Media Player run was mine and intermittent: `msftedit.dll`'s `DllMain` held
-`loader_section` for two 60-second timeouts, stalling the real view thread well past the
-activation thread's first-view poll (`600 tries x 25 ms` = 15 s), so startup was never claimed.
-Re-runs with no such timeout claim it after ~12 tries. If you see
-`first-view startup not taken after 600 tries`, look for `msftedit.dll` in the
-`RtlpWaitForCriticalSection` lines above it before changing anything.
+I then got the *third* explanation wrong too, and wrote it here: "msftedit's `DllMain` is
+intermittently slow". It is not. The real chain, found by timing the load in a five-line probe:
+
+**`Xvfb :98` wedges, and every Wine app then hangs in its first `RegisterClassW`.** msftedit's
+`DllMain` calls `RegisterClassW`; Wine's first `RegisterClass` in a process runs
+`win32u/driver.c:load_desktop_driver`, which does `send_message(desktop, WM_NULL)` with **no
+timeout** to wait for the graphics driver - and it does this while the caller holds the loader
+lock. With the display wedged that never returns, so the log shows
+`blocked by <tid> (in DllMain of L"msftedit.dll")` and `first-view startup not taken`. On a
+healthy display `LoadLibrary("msftedit.dll")` takes **153 ms**.
+
+So: **an "impossible" hang deep in a native DLL is usually the test display.** Check it first -
+`DISPLAY=:98 timeout 10 xdpyinfo` - and note it stays wedged after `wineserver -k`, so restart
+Xvfb. `tools/wine-uwp/probes/probe-load.cpp` reports per-DLL load times for exactly this. Killing
+a run mid-X-grab (a harness timeout, a `TaskStop`) is what wedges it, so restart the display at
+the start of every run rather than debugging the corpse of the last one.
+
+Two more traps from the same chase:
+
+- **`WAYLAND_DISPLAY` survives `export DISPLAY=:98`.** Wine prefers `winewayland.drv` when it is
+  set, which puts the app on the user's real compositor - which we are told never to do. `run.sh`
+  now unsets it; do the same in any wrapper that does not go through `run.sh`.
+- **`pkill -f <pattern>` matches your own shell command** and will kill your own session. I did
+  this again (`pkill -f ZuneMusic`, exit 144) after writing the warning below. Use `pkill -x` on
+  the image name, or `ps -eo pid,args | grep ... | grep -v grep`.
 
 **`pgrep -f "<exe name>"` matches your own shell commands** containing that string, including
 background pollers you started earlier. Use `ps -eo pid,args | grep ... | grep -v grep`.
