@@ -33,3 +33,6 @@ target_link_libraries(staterepository PRIVATE runtimeobject.lib advapi32.lib ole
 add_library(appcapability SHARED shims/appcapability/appcapability.cpp)
 set_target_properties(appcapability PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_appcapability")
 target_link_libraries(appcapability PRIVATE runtimeobject.lib)
+add_library(storagelibrary SHARED shims/storagelibrary/storagelibrary.cpp)
+set_target_properties(storagelibrary PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_storagelibrary")
+target_link_libraries(storagelibrary PRIVATE runtimeobject.lib)
