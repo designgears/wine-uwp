@@ -165,19 +165,26 @@ wrote both of the following into this file, and both were wrong:
 I then got the *third* explanation wrong too, and wrote it here: "msftedit's `DllMain` is
 intermittently slow". It is not. The real chain, found by timing the load in a five-line probe:
 
-**`Xvfb :98` wedges, and every Wine app then hangs in its first `RegisterClassW`.** msftedit's
-`DllMain` calls `RegisterClassW`; Wine's first `RegisterClass` in a process runs
-`win32u/driver.c:load_desktop_driver`, which does `send_message(desktop, WM_NULL)` with **no
-timeout** to wait for the graphics driver - and it does this while the caller holds the loader
-lock. With the display wedged that never returns, so the log shows
-`blocked by <tid> (in DllMain of L"msftedit.dll")` and `first-view startup not taken`. On a
-healthy display `LoadLibrary("msftedit.dll")` takes **153 ms**.
+**`import` grabs the X server, and a hung one wedges the display for every Wine app.** This is
+the whole chain, and the first link is our own tooling:
 
-So: **an "impossible" hang deep in a native DLL is usually the test display.** Check it first -
-`DISPLAY=:98 timeout 10 xdpyinfo` - and note it stays wedged after `wineserver -k`, so restart
-Xvfb. `tools/wine-uwp/probes/probe-load.cpp` reports per-DLL load times for exactly this. Killing
-a run mid-X-grab (a harness timeout, a `TaskStop`) is what wedges it, so restart the display at
-the start of every run rather than debugging the corpse of the last one.
+1. ImageMagick's `import` takes an X server grab while it captures. If it hangs - and under a
+   `timeout` it will eventually be killed mid-capture - the grab outlives it and `:98` stops
+   answering **any** client. `pgrep -x import` finds the straggler; `pkill -x import` makes the
+   display answer again *instantly*, with no Wine process running.
+2. With the display wedged, Wine's first `RegisterClassW` in a process runs
+   `win32u/driver.c:load_desktop_driver`, whose "wait for graphics driver to be ready" is
+   `send_message(desktop, WM_NULL)` with **no timeout** - taken while the caller holds the loader
+   lock.
+3. msftedit's `DllMain` calls `RegisterClassW`. So the log says
+   `blocked by <tid> (in DllMain of L"msftedit.dll")` and `first-view startup not taken`, and the
+   innocent DLL gets the blame. On a healthy display `LoadLibrary("msftedit.dll")` takes **153 ms**
+   (`tools/wine-uwp/probes/probe-load.cpp` reports per-DLL load times).
+
+**Reap `import` after every capture** (`timeout 15 import ...; pkill -x import`), or use a tool
+that does not grab - `xwd` does not, but is not installed here. When a run looks impossible, check
+`DISPLAY=:98 timeout 10 xdpyinfo` *first*; the wedge survives `wineserver -k` because it is not a
+Wine problem at all.
 
 Two more traps from the same chase:
 
