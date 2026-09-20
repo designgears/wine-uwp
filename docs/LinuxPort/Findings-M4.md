@@ -4977,3 +4977,44 @@ where the activation is delivered.
 `WINE_UWP_DRIVE_VIEW` stays opt-in: it is right for this app but wants the other apps re-tested
 against it before it becomes the default. Regression checks with the three fixes in: Calculator
 byte-identical, Feedback Hub unchanged (822 colours, no fail-fast).
+
+### Two views, and why driving the first one does not work yet
+
+The remaining split is between two `CoreApplicationView`s, and the log names who makes each:
+
+- `0180` (the process main thread) CoCreates `{dea794e0-1c1d-4363-b171-98d0b1703586}` -
+  `ActivatableApplicationRegistrar`, which is ours. The **first** view thread (`01b8`) comes up
+  right after: `CoreDispatcher`, then `Windows.UI.Xaml.FrameworkView`. The app's `App` object is
+  constructed here - it creates a `UserControl` at log line 133, well before any CoreWindow.
+- `01b4` (our activation thread) CoCreates `{3480a401-...}`, our `CoreWindowBroker`, and the
+  **second** view thread (`01dc`) appears immediately after and takes `CreateCoreWindow`.
+  (`{4b7a83d5-cf71-40ad-ab0f-bf6830e95330}`, `UiaManager`, fails to create on that thread as well;
+  it is unregistered and appears harmless.)
+
+So the container stands up a second view for the activation rather than using the one the app is
+already running on. Two experiments to close that, both **backed out**:
+
+1. **Broadcast the view startup to every thread** rather than only queueing it from
+   `wf_CreateCoreWindow`. This is safe in principle - off a view thread `GetCurrentView` returns a
+   proxy, `find_view_subobject` now says so, and the one-shot stays unclaimed - and it did reach an
+   *earlier* view thread than before. But with no CoreWindow on that view, `Load`/`Activate`
+   fail-fast inside XAML: 39 of them.
+2. **Call `SetWindowAndGetDispatcher` from the view thread first**, with our own window factory, so
+   that view makes its own CoreWindow (the factory has no thread affinity by design, precisely so
+   the window lands on the caller's thread). That removed the fail-fasts and the app error, but the
+   app then hangs: the startup is claimed, nothing after it logs, and only four XAML activations
+   ever happen. It deadlocks somewhere inside that call - which is the same class of hang the
+   comments around `pump_view_thread_later` and `broadcast_configure_core_window` describe.
+
+Both are reverted, leaving the state that measurably works: the startup is driven from
+`wf_CreateCoreWindow`'s thread, `Load` and `Activate` both return `hr 0` there, and the app builds
+about twice as much of its tree as before. The error is still `0x8001010e` because the `App` object
+remains on the first view thread.
+
+What this rules out: it is not about *where the activation is delivered*. Delivering it on the first
+view thread (`WINE_UWP_ACTIVATE_ON_VIEW`) still puts `CreateCoreWindow` on the second, and driving
+the startup on the first view thread directly deadlocks rather than producing a window. The next
+thing to establish is why the container creates a second view at all - i.e. what the first view is
+missing that makes it ineligible - rather than trying to redirect work onto it after the fact.
+
+Regression checks: Calculator byte-identical, Feedback Hub unchanged (822 colours, no fail-fast).
