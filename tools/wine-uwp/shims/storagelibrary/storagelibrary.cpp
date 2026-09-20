@@ -52,6 +52,17 @@ enum { LIBRARY_MUSIC = 0, LIBRARY_PICTURES = 1, LIBRARY_VIDEOS = 2, LIBRARY_DOCU
 /* Windows.Foundation.AsyncStatus */
 enum { ASYNC_STARTED = 0, ASYNC_COMPLETED = 1, ASYNC_CANCELED = 2, ASYNC_ERROR = 3 };
 
+static const char *iid_str(REFIID iid)
+{
+    static char buf[4][48];
+    static LONG n;
+    char *out = buf[InterlockedIncrement(&n) & 3];
+    sprintf(out, "{%08lx-%04x-%04x-%02x%02x%02x%02x%02x%02x%02x%02x}", iid.Data1, iid.Data2, iid.Data3,
+            iid.Data4[0], iid.Data4[1], iid.Data4[2], iid.Data4[3],
+            iid.Data4[4], iid.Data4[5], iid.Data4[6], iid.Data4[7]);
+    return out;
+}
+
 static void trace(const char *fmt, ...)
 {
     if (!getenv("WINE_UWP_STORAGELIBRARY_TRACE")) return;
@@ -228,7 +239,13 @@ static HRESULT WINAPI fv_QueryInterface(void *iface, REFIID iid, void **out)
     else if (IsEqualGUID(iid, IID_IVector_Folder))        *out = &impl->vtbl_vector;
     else if (IsEqualGUID(iid, IID_IVectorView_Folder))    *out = &impl->vtbl_view;
     else if (IsEqualGUID(iid, IID_IIterable_Folder))      *out = &impl->vtbl_iterable;
-    else { *out = nullptr; return E_NOINTERFACE; }
+    else
+    {
+        trace("folders QI %s -> E_NOINTERFACE", iid_str(iid));
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    trace("folders QI %s -> ok", iid_str(iid));
     InterlockedIncrement(&impl->ref);
     return S_OK;
 }
@@ -269,6 +286,7 @@ static HRESULT fv_get_at(folder_vector *impl, UINT32 index, IUnknown **value)
 {
     if (!value) return E_POINTER;
     *value = nullptr;
+    trace("folders GetAt(%u)", index);
     if (index || !impl->folder) return E_BOUNDS;
     *value = impl->folder;
     impl->folder->AddRef();
@@ -278,6 +296,7 @@ static HRESULT fv_size(folder_vector *impl, UINT32 *value)
 {
     if (!value) return E_POINTER;
     *value = impl->folder ? 1 : 0;
+    trace("folders get_Size -> %u", *value);
     return S_OK;
 }
 static HRESULT fv_index_of(folder_vector *impl, IUnknown *item, UINT32 *index, boolean *found)
@@ -329,6 +348,7 @@ static HRESULT WINAPI iter_First(void *i, void **out)
     folder_iterator *it;
     if (!out) return E_POINTER;
     *out = nullptr;
+    trace("folders First()");
     if (!(it = (folder_iterator *)calloc(1, sizeof(*it)))) return E_OUTOFMEMORY;
     it->vtbl = iterator_vtbl;
     it->ref = 1;
@@ -379,7 +399,12 @@ static HRESULT WINAPI lib_QueryInterface(void *iface, REFIID iid, void **out)
         *out = &impl->vtbl;
     else if (IsEqualGUID(iid, IID_IStorageLibrary2)) *out = &impl->vtbl2;
     else if (IsEqualGUID(iid, IID_IStorageLibrary3)) *out = &impl->vtbl3;
-    else { *out = nullptr; return E_NOINTERFACE; }
+    else
+    {
+        trace("library QI %s -> E_NOINTERFACE", iid_str(iid));
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
     InterlockedIncrement(&impl->ref);
     return S_OK;
 }

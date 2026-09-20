@@ -6,13 +6,16 @@ and friends needs those IIDs, and they are not in any .winmd or in HKCR\\Interfa
 derived. This does the derivation, so a shim does not have to guess.
 
     piid.py 'IAsyncOperation<Windows.Storage.StorageLibrary;{1edd7103-0e5e-4d6c-b5e8-9318983d6a03}>'
+    piid.py 'IAsyncOperation<enum Windows.Storage.Search.IndexedState>'
     piid.py --signature 'pinterface({9fc2b0bb-...};rc(Foo;{...}))'
     piid.py --self-test
 
 The IID is SHA-1 over the WinRT namespace GUID {11f47ad5-7b73-42c0-abae-878b1e16adee} followed by
 the UTF-8 type signature, truncated to 16 bytes with the UUID version set to 5. The signature of a
 runtime class is rc(<full name>;{<default interface IID>}) - the *default* interface, which is the
-first one listed on the class in metadata.
+first one listed on the class in metadata. An enum is enum(<full name>;i4), written here as
+"enum <full name>"; enums with an unsigned underlying type would be u4, which nothing has needed
+yet.
 
 --self-test checks the implementation against three IIDs widl generates into
 include/windows.storage.h, so a wrong answer here shows up immediately rather than as an
@@ -48,7 +51,11 @@ def piid(signature):
 
 
 def signature_for(generic, arg):
-    """generic is a name from GENERIC; arg is "Full.Type.Name;{default-iface-iid}"."""
+    """generic is a name from GENERIC; arg is "Full.Type.Name;{default-iface-iid}" for a runtime
+    class, or "enum Full.Type.Name" for an enum."""
+    arg = arg.strip()
+    if arg.startswith("enum "):
+        return "pinterface({%s};enum(%s;i4))" % (GENERIC[generic], arg[5:].strip())
     name, _, iid = arg.partition(";")
     return "pinterface({%s};rc(%s;%s))" % (GENERIC[generic], name.strip(), iid.strip())
 
@@ -61,6 +68,11 @@ SELF_TEST = [
      "c211026e-9e63-5452-ba54-3a07d6a96874"),
     ("IVectorView", "Windows.Storage.StorageFolder;{72d1cb78-b3ef-4f75-a80b-6fd9dae2944b}",
      "e20debc6-dc4e-542e-a2e7-a24d19c8dd62"),
+    # enum arguments take a different signature form, so check one of those too
+    ("IAsyncOperation", "enum Windows.Devices.Enumeration.DeviceAccessStatus",
+     "c00bc2f2-a7f8-5f3f-80d1-2808ef6bca10"),
+    ("IAsyncOperation", "enum Windows.Storage.KnownFoldersAccessStatus",
+     "d7f094b5-0ea2-5654-85b9-38ee5de90ffa"),
 ]
 
 
@@ -87,7 +99,8 @@ def main():
         return 0
     spec = args[0]
     if "<" not in spec or not spec.endswith(">"):
-        print("expected Generic<Full.Type.Name;{default-iface-iid}>, or --signature", file=sys.stderr)
+        print("expected Generic<Full.Type.Name;{default-iface-iid}> or Generic<enum Full.Type.Name>,"
+              " or --signature", file=sys.stderr)
         return 2
     generic, _, rest = spec.partition("<")
     if generic not in GENERIC:
