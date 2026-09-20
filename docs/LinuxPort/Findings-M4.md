@@ -5454,3 +5454,40 @@ State: 46 XAML activations, no fail-fasts, no page faults, repeatable across run
 `NotImplementedException` from `get_BreakManager`.
 
 Regression checks: Calculator byte-identical, Feedback Hub unchanged.
+
+## Media Player renders
+
+`MediaBreakManager::get_PlaybackSession` was the last blocker, and the fix was the opposite of the
+previous entry's conclusion. Instrumenting every entry point of the break manager - rather than
+guessing again - showed exactly what the app does with it:
+
+```
+get_BreakManager -> get_CurrentBreak      (null is fine)
+get_BreakManager -> get_CurrentBreak
+get_BreakManager -> get_PlaybackSession   <- returned null
+                 -> add_event x3
+```
+
+It reads the playback session straight back out of the break manager and uses it. Returning null
+there is what made the run unstable, not handing back a break manager at all. The player already
+has a session (`media_player3_get_PlaybackSession` creates one on demand), so the break manager now
+carries it and hands it back.
+
+**With that, Media Player renders its real UI**: the navigation pane (Home, Music library, Video
+library, Play queue, Playlists, Settings), the search box, the "Meet the new Media Player" hero
+panel with artwork and an Open file(s) button, the seek bar, and the full transport control strip.
+2205 colours, stable for the length of the run, **72 XAML activations, no fail-fasts, no app
+error**, repeatable across runs.
+
+It needs all three switches: `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1
+WINE_UWP_MANUAL_CONFIGURE=1`. They are opt-in because the other apps have not been tested against
+them; that is the obvious next job, and if it holds they should become the default.
+
+The general lesson from the last three fixes, all of which were the same mistake in different
+clothes: **when a stand-in has to answer a getter, find out what the caller does with the answer
+before choosing one.** Null is not a neutral value. It crashed the process from
+`{9d47a108}` slot 6 (which turned out to be an event registration, not a getter), and it
+destabilised the run from `get_PlaybackSession`. Both were solved by reading the shipping
+implementation's vtable or by instrumenting the call and looking.
+
+Regression checks: Calculator byte-identical, Feedback Hub unchanged (822 colours).
