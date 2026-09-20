@@ -147,13 +147,27 @@ starts with `struct comp_object`'s three fields and reuses its AddRef/Release. A
 landed on `kf_animation`'s `target[]` and made Release iterate 0x664f garbage entries - the fault
 report showed `rdx 007300660066004f`, `"Offs"` from `"Offset"`. Put new state in its own allocation.
 
-**When results change and your code did not, check the shared tree before you debug.** Media Player
-rendered, navigated, and passed the regression suite; forty minutes later every app - Calculator
-included - died in an early `loader_section` deadlock. `ls -lt ~/src/wine-build/dlls/*/x86_64-windows/*.dll`
-showed `ntdll.dll` and `kernelbase.dll` rebuilt minutes earlier by the other session. **Calculator is
-the canary**: if it stops working, suspect the environment, not your change, and say so rather than
-thrashing. Nothing in this repo can fix a half-finished `ntdll` in someone else's working tree; wait
-for it to settle and re-measure.
+**Do not blame the shared tree until you have dated proof, and do not declare an app broken
+without a screenshot.** Media Player rendered and navigated, then a later run failed to start. I
+wrote both of the following into this file, and both were wrong:
+
+- *"ntdll and kernelbase were rebuilt minutes ago by the other session."* I had run
+  `ls -lt --time-style=+%H:%M`, which prints **no date**, saw `03:43`, and assumed today. With
+  `--time-style='+%m-%d %H:%M'` those DLLs are from **09-19**. The only file rebuilt that day was my
+  own `windows.media.playback.mediaplayer.dll`. Always print the date; also check
+  `~/.wine-uwp/.update-timestamp` for a wineboot and `cmp` the byte-patched prefix DLLs.
+- *"Every app including Calculator is dying."* That came from counting log lines
+  (`deadlock=4 xaml=2`). Those same counts appear in **healthy** Calculator runs - the
+  `loader_section` retry messages are normal noise. A clean run with `import`/`identify` showed
+  Calculator byte-identical to baseline at 249 colours. **Judge an app by its pixels**, never by a
+  grep tally.
+
+The failing Media Player run was mine and intermittent: `msftedit.dll`'s `DllMain` held
+`loader_section` for two 60-second timeouts, stalling the real view thread well past the
+activation thread's first-view poll (`600 tries x 25 ms` = 15 s), so startup was never claimed.
+Re-runs with no such timeout claim it after ~12 tries. If you see
+`first-view startup not taken after 600 tries`, look for `msftedit.dll` in the
+`RtlpWaitForCriticalSection` lines above it before changing anything.
 
 **`pgrep -f "<exe name>"` matches your own shell commands** containing that string, including
 background pollers you started earlier. Use `ps -eo pid,args | grep ... | grep -v grep`.
