@@ -4922,3 +4922,58 @@ activation sequencing, not a stand-in, and it wants its own pass with the existi
 
 The diagnostic used to get here (an `ERR` in `wf_CreateCoreWindow` printing
 `DXamlCore::GetCurrent()`) has been removed. Calculator byte-identical afterwards.
+
+### Fixing half of it: the view startup now runs on the view thread
+
+Three defects in `dlls/wineuwp/main.c` kept the startup sequence off the view thread. All three are
+fixed; the remaining split is narrower and better understood.
+
+1. **`drive_view_startup` claimed its one-shot before it knew it could do the work.** The
+   `InterlockedCompareExchange( &view_startup_done, 1, 0 )` was the second line of the function, so
+   the first caller won even when it was on the wrong thread and could do nothing. The guard now
+   fires only once a usable view has been found, and the early check is a plain read.
+
+2. **Off the view thread, `CoreApplication` hands back a marshalled proxy**, and
+   `find_view_subobject` scanned its memory anyway looking for twinapi vtables that are not in it.
+   The log line is `no ICoreApplicationViewInternal vtable ... within 0x100 of view`; dumping the
+   object shows slot 0 is a heap address, not a twinapi one. It now recognises a proxy - the test
+   is whether the vtable lies inside twinapi's `SizeOfImage`, resolved from the module's own PE
+   header - and returns NULL so the caller can retry where the real object lives.
+
+   The first attempt at this compared the vtable against `CoreApplicationView`'s *primary* vtable
+   and bailed on any mismatch. **That broke Calculator** (blank window): a different twinapi vtable
+   is the ordinary case and must keep scanning. Only a vtable outside the image means a proxy.
+
+3. **Nothing drove the startup from the view thread at all.** The `drive_view_startup( NULL )` call
+   that the comment describes as "the view thread with a live DXamlCore and CoreWindow" sits at the
+   end of the manual `ConfigureCoreWindow` path, which is off by default (doing it twice fail-fasts
+   XAML). `wf_CreateCoreWindow` now queues the startup as an APC on its own thread, behind the
+   existing view pump - APCs run in order, so the pump delivers `SetWindowAndGetDispatcher` first
+   and `Load`/`Activate` follow.
+
+With `WINE_UWP_DRIVE_VIEW=run` the sequence now completes on the view thread:
+
+```
+01dc:err:wineuwp:drive_view_startup Load(L"Microsoft.ZuneMusic") on view ..., hr 0
+01dc:err:wineuwp:drive_view_startup view Activate(callback ..., args ...), hr 0
+```
+
+and the app builds 32 XAML controls on the view thread where it built 15 before.
+
+**It is not enough on its own.** `0x8001010e` is still the reported error, because the app's `App`
+object is constructed even earlier, on the *first* view thread (`01b8`, which activates
+`CoreDispatcher` and `FrameworkView` and creates a `UserControl` at log line 133 - before any
+CoreWindow exists), while the container puts its `CoreApplicationView` and the CoreWindow on `01dc`.
+Driving Load/Activate on `01dc` is right, but `OnLaunched` then runs there against objects the App
+constructor already made on `01b8`.
+
+So the remaining question is narrower than before: not "why is the activation on the wrong thread"
+but **why the container creates a `CoreApplicationView` on a new thread when XAML's `FrameworkView`
+already exists on the app's main thread**. `WINE_UWP_ACTIVATE_ON_VIEW=1` does not change it - even
+with `Activate` running on `01b8`, `CreateCoreWindow` still lands on `01dc` - which points at the
+view never having been associated with a `CoreApplicationView` in the first place, rather than at
+where the activation is delivered.
+
+`WINE_UWP_DRIVE_VIEW` stays opt-in: it is right for this app but wants the other apps re-tested
+against it before it becomes the default. Regression checks with the three fixes in: Calculator
+byte-identical, Feedback Hub unchanged (822 colours, no fail-fast).
