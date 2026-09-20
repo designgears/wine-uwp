@@ -5676,3 +5676,84 @@ was ImageMagick's `import`. It takes an X server grab while capturing; killed mi
 `timeout`, the grab outlives the process and `:98` stops answering every client. `pkill -x import`
 makes the display answer again instantly with no Wine process running. See AGENTS.md; the harness
 now reaps `import` after every capture.
+
+## Media Player plays audio from its own UI
+
+Clicking **Open file(s)**, picking a file and pressing **Play** now decodes and renders it. The
+trace of a complete run:
+
+```
+[filepicker] picked C:\users\bobby\Music\tone.mp3
+trace:media:item_vector_InsertAt          index 0, value 00007F8A41206310
+trace:mediaplayer:media_player_Play       (the app, not us)
+trace:media:binder_resolve                raising Binding
+trace:media:binding_args_set_path         bound to L"C:\users\bobby\Music\tone.mp3"
+trace:mediaplayer:playback_thread         1 ch, 44100 Hz, 16 bits
+trace:mediaplayer:playback_thread         playback finished, hr 0
+```
+
+Both WAV and MP3 work; the transport bar shows the file's real duration (0:00:05). Four separate
+refusals had to be fixed, and the order in which they were found is the whole lesson.
+
+### An empty collection is a refusal in disguise
+
+`MediaPlaybackItem.AudioTracks` returned an anonymous empty `IVectorView`. The app casts that
+result to `MediaPlaybackAudioTrackList` and the cast threw
+`Unable to cast object of type 'EETypeRva:0x00064F98'`, so the item was dropped **before** it was
+ever added to the playlist. That is why the list the player had been handed as its source stayed
+empty for the entire run, and why every diagnosis aimed at the player was aimed at the wrong layer.
+
+The fix is a real `MediaPlaybackAudioTrackList` (`dlls/windows.media/tracks.c`) carrying one
+`AudioTrack`, plus the matching `MediaPlaybackVideoTrackList` and
+`MediaPlaybackTimedMetadataTrackList` - empty, because a music file has neither, but of the right
+class. What makes them the right class is `GetRuntimeClassName`: .NET types the RCW from it, so
+naming the *interface* rather than the class is what threw.
+
+### AudioTrack's default interface is IMediaTrack, and widl disagrees
+
+The app QIs the track list for `{e71ffa4a-14a7-5068-891c-6e717af8bf8d}`. That value only comes out
+of the PIID derivation as `IVectorView<AudioTrack>` when AudioTrack's default interface is
+`IMediaTrack {03e1fafc-...}`. Wine's `windows.media.core.idl` declares the default as `IAudioTrack`,
+so the generated `IID_IVectorView_AudioTrack` is a different GUID and never matches. The same is
+true of `VideoTrack` (`{200c6224-...}`) and `TimedMetadataTrack`.
+
+`IID_IVectorView_MediaPlaybackItem` *is* right - checked against `piid.py` before using it. **Check
+a generated parameterised IID against the derivation before trusting it**; they agree only when the
+IDL's interface order matches the shipping metadata.
+
+### MediaBinder has to actually raise Binding
+
+`binder_add_Binding` was a stub with the comment "the player never needs to ask for content". It
+does: Binding is the *only* channel through which the app names the picked file. Media Player
+creates a `MediaBinder`, registers a handler, wraps it in a `MediaSource` and never mentions the
+path again.
+
+`binder_resolve` now invokes the handler - a WinRT delegate, so `Invoke` is at slot **3**, not 6 -
+with a real `MediaBindingEventArgs` (`IMediaBindingEventArgs` + `IMediaBindingEventArgs2`), and the
+app answers with `SetStorageFile`. `IMediaBindingEventArgs3` is deliberately refused: its
+`SetDownloadOperation` takes a download we cannot honour, and `E_NOINTERFACE` is an answer the
+caller handles. The args double as their own `IDeferral`, and the resolve polls for the path for up
+to five seconds rather than modelling the deferral's lifetime, which covers both the inline and the
+deferred answer.
+
+`CreateFromMediaBinder` also had to stop snapshotting the path. It read `IWineMediaPath` off the
+binder at creation time - when the binder cannot possibly know the answer yet - and stored the
+empty result forever. The source now holds the binder and asks it lazily, which is what a binder is
+*for*.
+
+### IMediaPlaybackList2
+
+With the item finally in the list, the app QI'd the list for
+`IMediaPlaybackList2 {0e09b478-600a-4274-a14b-0b6723d0f48b}` and threw on the refusal.
+`windows.media.playback.idl` stops at revision 1. `get_ShuffledItems` returns a real
+`IVectorView<MediaPlaybackItem>` over the same storage (shuffle is off, so the shuffled order is
+the real order) - `item_vector_GetView` used to be an `E_NOTIMPL` stub. `MaxPrefetchTime` and
+`StartingItem` are `IReference`-shaped and nullable, so NULL there is a genuine value rather than
+the usual trap.
+
+### Regression
+
+Calculator: 249 colours, **0 differing pixels** against `/tmp/calc-regress.png`. Feedback Hub: 822
+colours. Note that `xwd` + `magick` and `import` produce byte-different PNGs of identical pixels -
+compare with `magick compare -metric AE`, not `cmp`, when the two captures came from different
+tools.

@@ -98,6 +98,22 @@ For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
 
 ## Mistakes already made - do not repeat them
 
+**An empty collection is a refusal in disguise.** `MediaPlaybackItem.AudioTracks` handing back an
+anonymous empty `IVectorView` made the app's cast to `MediaPlaybackAudioTrackList` throw, so it
+dropped the item before adding it to the playlist - and every subsequent symptom appeared in the
+*player*, one layer below where the damage was done. The collection has to be the right class, and
+what makes it the right class is `GetRuntimeClassName`: .NET types the RCW from that string, so
+naming the interface instead of the class throws `Unable to cast object of type 'EETypeRva:...'`.
+
+**A generated parameterised IID is only right if the IDL agrees with the shipping metadata.**
+`IID_IVectorView_AudioTrack` from widl does not match what the app asks for, because Wine's
+`windows.media.core.idl` gives `AudioTrack` the default interface `IAudioTrack` and the metadata
+gives it `IMediaTrack`. `IID_IVectorView_MediaPlaybackItem` *does* match. Check with `piid.py`
+before using a generated one.
+
+**A WinRT delegate is not IInspectable.** `TypedEventHandler<A,B>` is three `IUnknown` slots and
+`Invoke` - slot **3**, not 6. Calling slot 6 on one lands past the end of its vtable.
+
 **Null is not a neutral answer.** This cost three separate debugging sessions:
 - `{9d47a108}` slot 6 looked like a getter. It is `add_CastingRenderLocationChanged`, an *event
   registration* - writing NULL through its first argument overwrote the caller's handler and killed
@@ -226,7 +242,7 @@ background pollers you started earlier. Use `ps -eo pid,args | grep ... | grep -
 | --- | --- |
 | Calculator | Fully working; the byte-identical regression baseline |
 | Feedback Hub | Fully working and interactive (~822 colours) |
-| Media Player | **Renders its full UI** (~2205 colours) with `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1` |
+| Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1` |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
 | Solitaire | Starts clean, draws nothing (uses Windows.UI.Composition directly) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
