@@ -5224,3 +5224,47 @@ tagging, but covering non-literal returns, or a breakpoint-equivalent on the int
 records the interface pointer it is called with.
 
 Regression checks: Calculator byte-identical, Feedback Hub unchanged (822 colours, no fail-fast).
+
+### Window::get_BoundsImpl, and why skipping SetWindowAndGetDispatcher was only half a fix
+
+The `E_FAIL` in `ViewportStateTrigger..ctor()` was found by tagging: all 1662 sites in
+`Windows.UI.Xaml.dll` that load `0x80004005` as a literal were given unique values
+(`0x8001c000 + index`), and one run reported `0x8001c32a` -
+**`DirectUI::Window::get_BoundsImpl( Rect * )`**, i.e. the app reading `Window.Current.Bounds`.
+Its failure path is reached from
+
+```
+0x5a0820: cmp QWORD PTR [rdi+0x1e8], 0   ; the HWND
+0x5a0828: je  -> test al,al -> E_FAIL
+```
+
+with the CoreWindow branch above it already skipped because `[rdi+0x148]` is null too. So XAML's
+`Window` had neither a CoreWindow nor an HWND - because `CreateCoreWindow` gives the window to the
+*view*, and what tells XAML about it is `FrameworkView::SetWindow`, which only runs as part of the
+`SetWindowAndGetDispatcher` this path deliberately skips.
+
+The host already has the missing step (`try_configure_core_window` ->
+`DXamlCore::ConfigureCoreWindow`). It is off by default for a good reason - running it *as well as*
+XAML's own `SetWindow` fail-fasts - but on this path XAML's never runs, so it is the only one. With
+`WINE_UWP_MANUAL_CONFIGURE=1` alongside the other two switches:
+
+```
+try_configure_core_window ConfigureCoreWindow core ... window ... hr 0
+drive_view_startup Load(L"Microsoft.ZuneMusic") hr 0
+```
+
+XAML activations go from 38 to **46**, and the error changes again - `get_BoundsImpl` no longer
+fails. Media Player is now far enough in to be running its own x:Bind bindings:
+
+```
+System.NotImplementedException: Not implemented. (0x80004001)
+   at ...AppChrome_obj1_Bindings.BindingsTracking.PropertyChanged_NavigationViewSelectedItem(...)
+   at Microsoft.Media.Player.Observables.ComputedObservable`1.set_Value(T)
+```
+
+A caution worth writing down: an intermediate run looked like the `E_FAIL` had gone, because
+`grep "Call failed"` found nothing - but that text only appears when `WINE_UWP_TRACE_ORIGINATE` is
+set, and that run did not set it. Re-tagging showed `get_BoundsImpl` still failing. Absence of a
+log line is only evidence when the line would have been printed.
+
+Regression checks: Calculator byte-identical, Feedback Hub unchanged.
