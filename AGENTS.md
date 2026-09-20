@@ -263,6 +263,50 @@ output is block-buffered into a file**, so a log line can appear seconds after t
 from has exited - prefix with `stdbuf -o0 -e0` when a poller has to act on a line *while the
 process is still alive*.
 
+## My own time-wasting, written down so the next session skips it
+
+None of these were Wine bugs. Every one cost a full test loop (8-25 minutes) or more, and all of
+them are avoidable by checking one cheap thing first.
+
+**I wrote the missing-latch bug twice in one session.** A run loop that polls
+`ps ... | grep -q Microsoft.Media.Player.exe` and breaks when it does not match will break on the
+*first* poll, because the app process does not exist yet during `run.sh`'s prefix setup. Fifteen
+"runs" completed in 8 seconds each and reported "no fault"; I only noticed when I checked
+`wc -l` on the logs. **Before believing a negative result from a loop, check how long each run
+actually took.** The latch:
+
+```
+seen=0; gone=0
+if alive; then seen=1; gone=0
+elif [ $seen = 1 ]; then gone=$((gone+1)); [ $gone -ge 6 ] && break
+fi
+```
+
+**I polled a log for a line and then acted on it after the process had exited.** `run.sh`'s output
+is block-buffered into a file, so an `err:` line can surface seconds *after* the process that wrote
+it is gone. My `/proc/<pid>/maps` capture came back empty twice for this reason, and I blamed the
+`ps` pattern instead. Prefix with `stdbuf -o0 -e0` whenever a poller must act while the process is
+still alive.
+
+**I trusted `addr2mod.py` without checking `SizeOfImage`** and spent a round chasing
+`mrt100_app.dll` and its PDB for a fault that was in `ucrtbase`. The offset was 4x the module size.
+One `objdump -p | grep SizeOfImage` would have killed that immediately.
+
+**I reused a module map across a rebuild** and concluded a correct fix had failed. Rebuilding
+`ucrtbase` moved every base; the fault had simply moved to a new address in the same function.
+
+**I killed my own shell with `pkill` for the fifth time** (exit 144). The `[s]oak2.sh` bracket
+trick does not help when the plain string also appears elsewhere on the same line - in my case in
+the `pkill -x soak2.sh` argument itself. See the rule above; build the pattern from pieces.
+
+**I burned turns polling background tasks.** Re-reading a task's output file every few seconds
+tells you nothing the completion notification will not, and the harness rejects the repeats
+outright. Start the wait with `run_in_background`, then *stop* and do unrelated work - or nothing -
+until the notification arrives.
+
+**I asked `winmd.py --type` for `MediaBindingEventArgs`** and got silence, because `--type` matches
+the fully-qualified name. `--grep` first, always.
+
 ## Environment facts worth knowing
 
 - `winedbg` crashes on startup in this build, `gdb` cannot attach (`/proc/sys/kernel/yama/ptrace_scope`
