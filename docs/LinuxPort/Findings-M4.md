@@ -5364,3 +5364,51 @@ Hub demonstrate every run.
 
 Prefix left clean: the MediaPlayer class points back at `C:\windows\system32\` and the builtin is
 restored. Calculator byte-identical.
+
+## Camera paints
+
+Retesting the other staged apps against this session's fixes:
+`The property 'Title' was not found in type 'Microsoft.CameraApp.TitleBar'` - Camera's blocker for
+most of this file - **is gone**, and Camera now renders: 223 colours, stable for the whole run, no
+fail-fasts, no app error reported to the host.
+
+What it renders is its own crash page: a .NET Native exception screen reading
+`System.TypeInitializationException ... ---> System.NotImplementedException: The method or
+operation is not implemented`, thrown from a static constructor
+(`ClassConstructorRunner.EnsureClassConstructorRun`). That is still a real result - the text is laid
+out and drawn by XAML through DWrite, so Camera's rendering path works end to end.
+
+Immediately before the error page, repeatedly:
+
+```
+fixme:wineuwp:nav_QueryInterface navigation client has no interface {ba5e7927-7cc2-4ee3-bc78-781c98ca88ce}
+```
+
+That IID is in `twinapi.appcore.dll` and `CoreUIComponents.dll`, in no `.winmd` and unregistered,
+but twinapi's public PDB names its user:
+`CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter( ITitleBarClientAdapter ** )`. So the
+interface is **`ITitleBarClientAdapter`**, our own `wineuwp` navigation client is what is being
+asked for it, and Camera's static constructor is title-bar code - which is exactly what its old
+`Microsoft.CameraApp.TitleBar` error was about. `CoreApplicationViewTitleBar` has the methods that
+would use it: `get_Height`, `put_ExtendViewIntoTitleBar`, `SetTitleBarVisual`, `SetInputSinkWindow`,
+`OnLayoutMetricsChanged`. That is the next concrete target for Camera, and unlike Media Player's
+blocker this one has a name.
+
+### Reading method counts out of a MIDL proxy/stub
+
+For Media Player's `{9d47a108}` there is one more authoritative source: `Windows.Media.Playback.ProxyStub.dll`.
+Walking it gives the exact size of the interface:
+
+- find the IID in `.rdata`, then a pointer to it - that pointer is the `piid` of a
+  `CInterfaceStubHeader`, whose `DispatchTableCount` sits at +0x10;
+- a pointer to that header is an entry in the `pStubVtblList` array, and a pointer to the array is
+  the `ProxyFileInfo`'s second field, giving `TableSize` and `pNamesArray`.
+
+`{9d47a108}` has **19 vtable entries, i.e. 13 methods**, and is interface 0 of 12 in that proxy
+file. The names array is NULL in this build, so it stays unnamed. Decoding the `MIDL_SERVER_INFO`
+proc strings for the parameter lists did not work - the output repeats implausibly, which says this
+is NDR64 rather than the -Oicf layout assumed - and guessing further was not worth it.
+
+Also tried and rejected: serving `Windows.Media.Playback.MediaPlayer` from the native Windows DLL.
+
+Regression checks: Calculator byte-identical, Feedback Hub unchanged (822 colours).
