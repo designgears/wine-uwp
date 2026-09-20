@@ -5300,3 +5300,35 @@ which demonstrably works for Calculator and Feedback Hub.
 All byte-patched binaries verified restored: `Windows.UI.Xaml.dll`, `Windows.UI.dll`,
 `twinapi.appcore.dll`, `Microsoft.UI.Xaml.dll`. Regression checks: Calculator byte-identical,
 Feedback Hub unchanged.
+
+### The three private interfaces, and why two of them must stay refused
+
+Attempting to satisfy the `InvalidCastException` by answering the three unknown IIDs with a traced
+view produced three clear results, two of them negative and worth keeping:
+
+- **`{64bd43f8-bfee-4ec4-b7eb-2935158dae21}` is XAML's `IReferenceTrackerInternal.`** Its users in
+  `Windows.UI.Xaml.dll` are `TrackerTargetReference::Set`,
+  `ComposingTrackerTargetWrapper::Ensure`, `ComposingTrackerExtensionWrapper::IsComposed` and
+  `interface_forwarder<IReferenceTrackerInternal>::ClearReferenceTrackerPeg`. Claiming it made XAML
+  start calling tracking methods (slots 14 and 19) on an object that cannot honour them: **51
+  fail-fasts**. A plain WinRT object is *supposed* to answer `E_NOINTERFACE` here.
+  `{02dd3ad0-...}` appears only in `Windows.UI.Xaml.dll` too and is almost certainly the same kind.
+- **`{9d47a108-81a6-43f9-b40d-6403552df734}` is the one the app's cast wants.** Answering the QI
+  removes the `InvalidCastException`; the app then calls **slot 6**. Returning `E_NOTIMPL` there
+  gives a clean `NotImplementedException`, i.e. no better than refusing the QI. Returning `S_OK`
+  with a null out-parameter is **worse**: the caller uses the result without a null check and the
+  process dies on a read of `0x10`.
+- What the interface looks like, from the only caller that can be read:
+  `CMediaPlayerSubtitleManager::AttachMediaPlayer` in `Windows.Media.Playback.MediaPlayer.dll` QIs
+  for it and calls **slot 14** with a single out-parameter, then checks the result for null and
+  carries on. So its methods are object getters - but slot 6, the one Media Player calls, needs a
+  real object, and there is nothing to build one from: the IID is in no `.winmd`, unnamed in
+  `HKCR\Interface`, and the only implementations are inside shipped binaries.
+
+All of it is reverted; the tree is back to the state that does not crash (46 XAML activations, no
+fail-fasts, `InvalidCastException`). The lesson is the same one this file keeps recording from the
+other direction: claiming an interface you cannot implement is not a free way past a cast. Both
+`E_NOINTERFACE` and `E_NOTIMPL` are honest answers that the caller handles; a plausible-looking
+null is not.
+
+Regression checks: Calculator byte-identical, Feedback Hub unchanged (822 colours).
