@@ -4889,3 +4889,36 @@ what caused this error - the error predates the change - but it was wrong.
 
 Binaries restored: `Windows.UI.dll` and `Windows.UI.Xaml.dll` both byte-identical to the originals.
 Regression checks: Calculator byte-identical, Feedback Hub unchanged (822 colours, no fail-fast).
+
+### Where the second view thread comes from
+
+The thread split behind the `RPC_E_WRONG_THREAD` above is not a race or a marshalling accident. The
+log's ordering says what happens, and it is the same with and without `WINE_UWP_ACTIVATE_ON_VIEW`:
+
+| line | thread | what |
+| --- | --- | --- |
+| 37  | `01b8` | activates `CoreDispatcher`, then `Windows.UI.Xaml.FrameworkView` - the **first** view thread |
+| 133 | `01b8` | activates `Windows.UI.Xaml.Controls.UserControl` - the app is already building its tree here |
+| 207 | `01b8` | enters `CoMsgWaitInProcessEvents` - `FrameworkView::Run`, its dispatcher loop |
+| 209 | `01b4` | the activation thread: `com_get_class_object ... in-process server for {3480a401-bde9-4407-bc02-798a866ac051}` |
+| 214 | `01dc` | a **second** view thread appears: `NtUserInitThreadCoreMessagingIocp2`, `CoSetMessageDispatcher` |
+| 244 | `01dc` | `wf_CreateCoreWindow` - and `DXamlCore::GetCurrent()` is non-null here too, so there are two cores |
+| 528+ | `01dc` | the rest of the tree: `MediaPlayerElement`, `MediaTransportControls`, `ContentControl`, ... |
+
+So the app starts on the first view thread, that thread enters its dispatcher loop, and only *then*
+does the activation run - and it brings up a second view, with its own thread, its own `DXamlCore`
+and the `CoreWindow`. The app's remaining UI work happens on the second one while the objects it
+made at line 133 belong to the first. XAML rejecting that is correct.
+
+This is why Calculator and Feedback Hub are unaffected: they do not create anything before the
+activation lands, so everything they own belongs to whichever core ends up with the window.
+
+The fix is for the activation to reuse the existing view rather than cause a second one, which
+means changing when the host activates relative to `FrameworkView::Run` - the ordering the comments
+around `queue_activate_apcs` and `activate_apc` are already fighting ("Waiting for a dispatcher used
+to lose the race with the UI thread crashing before SetWindow"). That is a rework of the host's
+activation sequencing, not a stand-in, and it wants its own pass with the existing
+`WINE_UWP_ACTIVATE_ON_VIEW` / `WINE_UWP_NO_VIEW_PUMP` experiments redone against it.
+
+The diagnostic used to get here (an `ERR` in `wf_CreateCoreWindow` printing
+`DXamlCore::GetCurrent()`) has been removed. Calculator byte-identical afterwards.
