@@ -53,7 +53,7 @@ These all exist and work. Prefer them over reading code and guessing.
 | What is this IID, and what are its methods? | `tools/wine-uwp/winmd.py <winmd> --guid <iid>` (public interfaces; prints slots from 6) |
 | Demangle an MSVC symbol | `llvm-undname` |
 | Symbols for a Microsoft binary | read the RSDS record from the PE debug directory, `curl` it from `msdl.microsoft.com/download/symbols/<name>/<sig><age>/<name>` ([docs](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/microsoft-public-symbols)), then `llvm-pdbutil dump --publics` into a `rva name` `.syms` file next to it in `~/uwp-bin/pdb`. `tools/wine-uwp/pdbsyms.py` does this but needs `pefile`, which is **not installed** - parse the debug directory by hand (~20 lines) or install it |
-| Which module is this address in? | `tools/wine-uwp/addr2mod.py <log-with-+loaddll> <addr>` |
+| Which module is this address in? | `tools/wine-uwp/addr2mod.py <log-with-+loaddll> <addr>` - **native modules only**, see below; for a Wine builtin use `/proc/<pid>/maps` |
 | Which of N call sites returned this HRESULT? | unique-HRESULT tagging, below |
 | Did this code path run at all? | patch `0f 0b` (`ud2`) over its first two bytes, below |
 | What did managed code throw, and where? | `WINE_UWP_TRACE_ORIGINATE=1` + the chunked `trace_language_exception` in `dlls/combase/roerror.c` |
@@ -97,6 +97,32 @@ For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
    which methods it calls.
 
 ## Mistakes already made - do not repeat them
+
+**A successful QueryInterface for a private IID proves nothing in `dlls/dcomp/composition.c`.**
+Every object there ends its QI with `else *out = &impl->vtbl; return S_OK;` - a catch-all that
+answers *any* IID. `comp_shape_from_any` believed it, so `TryGetAnimationController` on a non-shape
+read `bindings[8]` at `+0x290` and `binding_count` at `+0x510` out of a smaller allocation and
+faulted about one run in seven. "It is not a `dcomp_visual`, so it must be a `struct visual`" is the
+same error in the other direction. **Check the vtbl** - `dcv_from_any`, `visual_from_interop`,
+`comp_shape_from_any` and `path_geometry_from_any` all do now.
+
+**`addr2mod.py` cannot see Wine builtins, and will misattribute confidently.** `+loaddll` traces
+only `native` modules (a full Media Player run: 23 `Loaded ... : native`, zero `builtin`), and
+`addr2mod` returns the highest base below the target - so every address above the last native DLL
+is blamed on it. It reported `mrt100_app.dll+0x1f8440` for a fault in `ucrtbase`; that module's
+`SizeOfImage` is `0x86000`. **Check the offset against `SizeOfImage`**, and get the real map from
+`/proc/<pid>/maps` (Wine builtins load at fixed addresses, so any run of the same build will do).
+
+**A captured module map is only valid for the build that produced it.** Rebuilding one DLL shifts
+every base. A stale map made a correct fix look like a failure - the fault had moved to a new
+address in the same function, and the old map pointed at the wrong DLL entirely. Re-capture after
+every rebuild.
+
+**To find who called a hot libc function with a bad pointer**, put a temporary probe in it that
+`VirtualQuery`s the arguments and logs `__builtin_return_address(0)`. `dlls/msvcrt/wcs.c`'s
+`_wcsicmp_l` named `dcomp!object4_view_TryGetAnimationController` on the first hit. Revert it
+afterwards and `cmp` against the backup - and note the probe *shifts the module layout*, so any map
+captured before it is stale.
 
 **An empty collection is a refusal in disguise.** `MediaPlaybackItem.AudioTracks` handing back an
 anonymous empty `IVectorView` made the app's cast to `MediaPlaybackAudioTrackList` throw, so it
@@ -197,10 +223,16 @@ the whole chain, and the first link is our own tooling:
    innocent DLL gets the blame. On a healthy display `LoadLibrary("msftedit.dll")` takes **153 ms**
    (`tools/wine-uwp/probes/probe-load.cpp` reports per-DLL load times).
 
-**Reap `import` after every capture** (`timeout 15 import ...; pkill -x import`), or use a tool
-that does not grab - `xwd` does not, but is not installed here. When a run looks impossible, check
-`DISPLAY=:98 timeout 10 xdpyinfo` *first*; the wedge survives `wineserver -k` because it is not a
-Wine problem at all.
+**Do not use `import`.** `xwd` is installed now (`xorg-xwd`) and does not grab:
+`xwd -id <win> -silent > f.xwd && magick xwd:f.xwd f.png`, or `-root` for the whole screen. If you
+must use `import`, reap it after every capture (`timeout 15 import ...; pkill -x import`). When a
+run looks impossible, check `DISPLAY=:98 timeout 10 xdpyinfo` *first*; the wedge survives
+`wineserver -k` because it is not a Wine problem at all.
+
+`xwd` + `magick` and `import` produce **byte-different PNGs of identical pixels**, so a capture
+taken with one cannot be `cmp`-ed against a baseline taken with the other. Compare those with
+`magick compare -metric AE a.png b.png null:` - 0 means identical - and note the baseline
+`/tmp/calc-regress.png` is a 1600x1000 *root* capture, not a window capture.
 
 Two more traps from the same chase:
 
@@ -213,6 +245,23 @@ Two more traps from the same chase:
 
 **`pgrep -f "<exe name>"` matches your own shell commands** containing that string, including
 background pollers you started earlier. Use `ps -eo pid,args | grep ... | grep -v grep`.
+
+I killed my own shell with this **a fifth time** (exit 144), with `pkill -x soak2.sh` - and the
+`[s]oak2.sh` bracket trick in the *same command line* did not save me, because the literal string
+`soak2.sh` appeared earlier in that line, in the `pkill` argument itself. The rule that actually
+works: **never let the pattern appear literally anywhere in the command line.** Build it from
+pieces and exclude your own pid:
+
+```
+P=soak2; ME=$$
+ps -eo pid,args --no-headers | awk -v pat="$P"".sh" -v me="$ME" '$1 != me && index($0, pat) {print $1}' | xargs -r kill
+```
+
+**A background run loop needs a "process was seen" latch**, or the first poll fires before the app
+exists and every run is killed after 8 s. I have now written this bug twice. Also: **`run.sh`'s
+output is block-buffered into a file**, so a log line can appear seconds after the process it came
+from has exited - prefix with `stdbuf -o0 -e0` when a poller has to act on a line *while the
+process is still alive*.
 
 ## Environment facts worth knowing
 
@@ -242,7 +291,7 @@ background pollers you started earlier. Use `ps -eo pid,args | grep ... | grep -
 | --- | --- |
 | Calculator | Fully working; the byte-identical regression baseline |
 | Feedback Hub | Fully working and interactive (~822 colours) |
-| Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1` |
+| Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean ~80% of runs; the rest deadlock in `DXamlCore::ConfigureCoreWindow` (below) |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
 | Solitaire | Starts clean, draws nothing (uses Windows.UI.Composition directly) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
@@ -250,4 +299,14 @@ background pollers you started earlier. Use `ps -eo pid,args | grep ... | grep -
 The three Media Player switches are opt-in only because the other apps have not been tested against
 them. **Testing that, and making them the default if it holds, is the next job** - they change the
 view/activation ordering for everyone, which is exactly the sort of thing Shapr3D will also depend
-on.
+on. One data point so far: `WINE_UWP_MANUAL_CONFIGURE` is **load-bearing for Media Player** and
+cannot simply be dropped - without it the app never paints (8 runs, 8 no-paint), because
+`broadcast_configure_core_window` returns before both the direct call and the APC broadcast.
+
+**The open bug: `DXamlCore::ConfigureCoreWindow` intermittently never returns** (~1 run in 5-10).
+The hung runs are identical to good ones up to `publish_core_window_mailbox`; a probe around the
+two calls in `try_configure_core_window` shows `GetCurrent` returning a live core and the
+`configure` call never coming back. Every run makes exactly one real `ConfigureCoreWindow`, always
+on the window-factory thread, so the call is not redundant - this is a deadlock inside XAML, and
+the next step is to record every thread's `wchan`/`syscall` at the moment it wedges
+(`winedbg` is broken and `gdb` cannot attach here).

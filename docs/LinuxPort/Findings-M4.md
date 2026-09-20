@@ -5757,3 +5757,106 @@ Calculator: 249 colours, **0 differing pixels** against `/tmp/calc-regress.png`.
 colours. Note that `xwd` + `magick` and `import` produce byte-different PNGs of identical pixels -
 compare with `magick compare -metric AE`, not `cmp`, when the two captures came from different
 tools.
+
+## The intermittent page fault was type confusion in dcomp
+
+Media Player faulted on about one run in seven:
+
+```
+wine: Unhandled page fault on read access to 00007F08409D0010 at address 00006FFFFECF8440
+```
+
+It is fixed. `dcomp` answered a private-IID QueryInterface from objects that were not the type the
+caller asked for, and the caller then read fields past the end of a smaller allocation.
+
+### Finding it: three tools that lied, and the one that did not
+
+**`addr2mod.py` was confidently wrong.** It said `mrt100_app.dll+0x1f8440`; that module's
+`SizeOfImage` is `0x86000`, so the offset is outside it. `addr2mod` picks the highest `+loaddll`
+base below the target, and **Wine's builtin PE modules are not traced by `+loaddll` at all** - the
+log for a full Media Player run has 23 `Loaded ... : native` lines and zero `builtin` ones. Every
+address above the last native DLL is therefore misattributed to it. *Always sanity-check an
+`addr2mod` answer against the module's `SizeOfImage`.*
+
+**The public PDB did not cover it either** - `mrt100_app.pdb`'s publics stop at RVA `0x83200`.
+That was a second symptom of the same wrong attribution.
+
+**`/proc/<pid>/maps` is the reliable map.** Wine builtins load at fixed addresses, so a map from
+any run of the same build identifies the module:
+
+```
+6ffffec81000-6ffffed17000 r-xp .../dlls/ucrtbase/x86_64-windows/ucrtbase.dll
+```
+
+**But a captured map is only valid for the build that produced it.** Rebuilding `ucrtbase` shifted
+every module base; a stale map then pointed at the wrong DLL and made a working fix look like a
+failure. Re-capture after every rebuild.
+
+### Naming the caller
+
+`objdump -d` at the RVA gave `movzwl (%rdi,%r15,1)` inside `_wcsicmp_l` - reading its first string.
+A temporary probe in `dlls/msvcrt/wcs.c` that `VirtualQuery`d both arguments and logged
+`__builtin_return_address(0)` named the caller in one hit:
+
+```
+WCSICMP-BAD ptr 00007F809E590000 (str1 00007F809E590000 str2 00007F80A3A4014C) called from 00006FFFF3781A39
+WCSICMP-BAD ptr 00007F809E590050 ...
+WCSICMP-BAD ptr 00007F809E5900A0 ...
+```
+
+`str1` advancing by `0x50` is a scan over an array of 0x50-byte records. The caller disassembled to
+`dcomp!object4_view_TryGetAnimationController`, whose loop reads the array at `obj+0x290` with the
+count at `obj+0x510`. `struct anim_binding` is exactly 0x50 bytes and `struct comp_shape`'s
+`bindings[8]` / `binding_count` sit at exactly those offsets - so the object *was* being treated as
+a `comp_shape`. The count read succeeded while the array read faulted, which means the allocation
+was **smaller than a `comp_shape`**: the wrong type, not a freed one.
+
+### The cause
+
+`comp_shape_QueryInterface` ends with
+
+```c
+InterlockedIncrement( &shape->ref );
+if (IsEqualGUID( iid, &IID_ICompositionShape_ )) *out = &shape->shape_vtbl;
+else if (IsEqualGUID( iid, &IID_comp_shape_private )) *out = shape;
+else *out = &shape->vtbl;          /* <- every other IID, with S_OK */
+return S_OK;
+```
+
+Every object in `composition.c` has a catch-all like this, so **a successful QI for a private IID
+proves nothing about what came back**. `comp_shape_from_any` believed it, and
+`TryGetAnimationController` on any non-shape object read that object's non-existent `bindings[]`.
+It only faulted when the page after the allocation happened to be unmapped.
+
+Three more sites made the same mistake in the other direction, inferring "it is not a
+`dcomp_visual`, so it must be a `struct visual`" and calling `CONTAINING_RECORD` on the result.
+
+The fix checks the vtbl before believing a QI result, which is the idiom the file already used in
+`dcv_from_any`. `comp_shape_from_any` and `path_geometry_from_any` now verify against
+`sprite_shape_vtbl` / `container_shape_vtbl` / `path_geometry_vtbl`, and a new
+`visual_from_interop()` replaces the three unchecked `impl_from_visual_interop()` uses.
+
+Result: **0 faults in 26 runs**, against 3 in 20 before.
+
+## Media Player's remaining ~10-25% failure is a deadlock in XAML, not a fault
+
+The runs that show no UI are a different problem and are *not* fixed. They are byte-identical to a
+good run up to `publish_core_window_mailbox`, and a probe around the two calls in
+`try_configure_core_window` shows exactly where they stop:
+
+```
+PROBE pre-GetCurrent tid 460
+PROBE post-GetCurrent -> 00007FFFFE88FF60 tid 460
+PROBE pre-ConfigureCoreWindow core 00007FFFFE88FF60 window 00007FFFFE8E4DB0 tid 460
+   <nothing - DXamlCore::ConfigureCoreWindow never returns>
+```
+
+Two things this rules out:
+
+- **`WINE_UWP_MANUAL_CONFIGURE` cannot simply be dropped.** Without it Media Player never paints:
+  **8 runs, 8 no-paint.** `broadcast_configure_core_window` returns before both the direct call and
+  the APC broadcast when the variable is unset. This answers half of the "make the three switches
+  default" job in AGENTS.md - for this app the switch is load-bearing.
+- **The call is not redundant.** Every one of 10 runs performs exactly one real
+  `ConfigureCoreWindow`, always on the window-factory thread; 9 returned, 1 hung. So it is a
+  genuine intermittent deadlock inside XAML, not our code calling something it should not.
