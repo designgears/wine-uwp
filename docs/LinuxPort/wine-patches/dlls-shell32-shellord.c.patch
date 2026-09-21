@@ -1,0 +1,68 @@
+diff --git a/dlls/shell32/shellord.c b/dlls/shell32/shellord.c
+index c94b2592..fb0a673a 100644
+--- a/dlls/shell32/shellord.c
++++ b/dlls/shell32/shellord.c
+@@ -2020,3 +2020,63 @@ BOOL WINAPI LinkWindow_UnregisterClass(void)
+ void WINAPI SHFlushSFCache(void)
+ {
+ }
++
++/*************************************************************************
++ * CreateStorageItemFromShellItem_FullTrustCaller_ForPackage [SHELL32.@]
++ *
++ * Undocumented; a packaged app reaches it (through the shell32 apiset) to turn a shell item into a
++ * Windows.Storage item on another package's behalf. Implemented as a refusal rather than left as a
++ * spec stub: the stub aborts the process, and Solitaire delay-loads this during startup.
++ */
++HRESULT WINAPI CreateStorageItemFromShellItem_FullTrustCaller_ForPackage( void *item, void *package,
++        DWORD flags, void *iid, void **out )
++{
++    static HRESULT (WINAPI *create_file)( const WCHAR *, void ** );
++    static HRESULT (WINAPI *create_folder)( const WCHAR *, void ** );
++    static HMODULE storage;
++    IShellItem *shell_item = item;
++    WCHAR *path = NULL;
++    HRESULT hr;
++    DWORD attr;
++
++    TRACE( "(%p %p %#lx %s %p)\n", item, package, flags, debugstr_guid( iid ), out );
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (!shell_item) return E_INVALIDARG;
++
++    /* Xbox Services (XSAPI) turns the package folder into a Windows.Storage item through here
++     * during initialisation; refusing made it fail with E_FAIL and Solitaire logged
++     * "Failed to initialize XSAPI". windows.storage already knows how to build both kinds from a
++     * filesystem path, so ask the shell item for one and hand the right type back. */
++    if (FAILED(hr = IShellItem_GetDisplayName( shell_item, SIGDN_FILESYSPATH, &path )) || !path)
++    {
++        WARN( "no filesystem path for shell item %p, hr %#lx\n", item, hr );
++        return FAILED(hr) ? hr : E_INVALIDARG;
++    }
++
++    if (!storage)
++    {
++        storage = LoadLibraryW( L"windows.storage.dll" );
++        if (storage)
++        {
++            create_file = (void *)GetProcAddress( storage, "__wine_storage_file_create" );
++            create_folder = (void *)GetProcAddress( storage, "__wine_storage_folder_create" );
++        }
++    }
++    if (!create_file || !create_folder)
++    {
++        FIXME( "windows.storage does not export the creators\n" );
++        CoTaskMemFree( path );
++        return E_NOTIMPL;
++    }
++
++    attr = GetFileAttributesW( path );
++    if (attr == INVALID_FILE_ATTRIBUTES) hr = HRESULT_FROM_WIN32( GetLastError() );
++    else if (attr & FILE_ATTRIBUTE_DIRECTORY) hr = create_folder( path, out );
++    else hr = create_file( path, out );
++
++    TRACE( "%s -> %p, hr %#lx\n", debugstr_w( path ), *out, hr );
++    CoTaskMemFree( path );
++    return hr;
++}

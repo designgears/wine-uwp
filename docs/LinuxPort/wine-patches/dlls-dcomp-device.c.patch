@@ -1,0 +1,345 @@
+diff --git a/dlls/dcomp/device.c b/dlls/dcomp/device.c
+index e6960c5a..2a89da76 100644
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -83,8 +83,34 @@ struct uicontext
+ {
+     IInspectable IInspectable_iface;
+     LONG ref;
++    HWND hwnd;
+ };
+ 
++/* ICoreWindowInterop, the documented way from a CoreWindow to its HWND. */
++static const GUID IID_ICoreWindowInterop =
++    { 0x45d64a29, 0xa63e, 0x4cb6, { 0xb4, 0x98, 0x57, 0x81, 0xd2, 0x98, 0xcb, 0x4f } };
++struct corewindow_interop_vtbl
++{
++    HRESULT (WINAPI *QueryInterface)(void *iface, REFIID iid, void **out);
++    ULONG (WINAPI *AddRef)(void *iface);
++    ULONG (WINAPI *Release)(void *iface);
++    HRESULT (WINAPI *get_WindowHandle)(void *iface, HWND *hwnd);
++};
++
++static HWND hwnd_from_view(void *view)
++{
++    struct corewindow_interop_vtbl **interop;
++    HWND hwnd = NULL;
++
++    if (view && SUCCEEDED(((IUnknown *)view)->lpVtbl->QueryInterface((IUnknown *)view,
++            &IID_ICoreWindowInterop, (void **)&interop)))
++    {
++        if (FAILED((*interop)->get_WindowHandle(interop, &hwnd))) hwnd = NULL;
++        (*interop)->Release(interop);
++    }
++    return hwnd;
++}
++
+ static struct uicontext *impl_from_IInspectable(IInspectable *iface)
+ {
+     return CONTAINING_RECORD(iface, struct uicontext, IInspectable_iface);
+@@ -139,15 +165,263 @@ static HRESULT WINAPI uicontext_GetTrustLevel(IInspectable *iface, TrustLevel *l
+     return S_OK;
+ }
+ 
+-/* IUIContext's own methods are not public. MrmCoreR's CoreWindowContainer calls the second one
+- * with a single out pointer; nothing here can produce what it wants, so the slots exist to report
+- * that honestly instead of running off the end of the table. */
++/* The interface dcomp.dll hands out here is IUIContextPartner, not the empty public IUIContext: the
++ * vtable in the shipping dcomp.dll (??_7UIContext@UI@Windows@@6B<partner>, slots 6 and 7) is
++ * IInspectable followed by get_UIContentRoot and get_WindowContext. Slot 6 has no answer here -
++ * there is no UIContentRoot - and callers handle the failure. */
+ static HRESULT WINAPI uicontext_method(void *iface)
+ {
+     FIXME("stub.\n");
+     return E_NOTIMPL;
+ }
+ 
++/*
++ * The window context handed back by get_WindowContext. Callers reach it for interfaces we do not
++ * implement and check the QI (MrmCoreR's CoreWindowContainer::Initialize logs and carries on), but
++ * they do want an object: XAML fails to create a control that owns an InputPane when the getter
++ * itself fails, and MRM faults if it succeeds with a null out parameter.
++ */
++/*
++ * twinapi's CInputPaneEventSourceFactory::GetForUIContext() does not want any state from the
++ * UIContext: it walks UIContext -> (IID_IUIContext) -> get_WindowContext -> (IID_IWindowHostPartner)
++ * -> slot 7 -> slot 7 purely to arrive at an HWND, which it then hands to
++ * CInputPaneEventSource_GetInstance(). Each hop is IInspectable plus one unused method, with the
++ * getter at slot 7. Answering the first QI with E_NOINTERFACE ends the walk, and that is what made
++ * every AutoSuggestBox fail to construct (DirectUI::AutoSuggestBox::PrepareState subscribes to the
++ * input pane and propagates the failure). So carry the HWND down the chain and hand it over.
++ */
++static const GUID IID_IWindowHostPartner =
++    { 0x84acbbfe, 0x649c, 0x5ac7, { 0x81, 0x30, 0x7b, 0x6b, 0x76, 0xdb, 0x46, 0x3c } };
++
++struct window_host
++{
++    const void **lpVtbl;
++    LONG ref;
++    HWND hwnd;
++    BOOL last;  /* the last hop returns the HWND itself rather than another hop */
++};
++
++static const void *window_host_vtbl[];
++
++static HRESULT WINAPI window_host_QueryInterface(void *iface, REFIID iid, void **out)
++{
++    struct window_host *impl = iface;
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject) || IsEqualGUID(iid, &IID_IWindowHostPartner))
++    {
++        InterlockedIncrement(&impl->ref);
++        *out = iface;
++        return S_OK;
++    }
++
++    FIXME("window host: no interface %s.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI window_host_AddRef(void *iface)
++{
++    return InterlockedIncrement(&((struct window_host *)iface)->ref);
++}
++
++static ULONG WINAPI window_host_Release(void *iface)
++{
++    struct window_host *impl = iface;
++    ULONG ref = InterlockedDecrement(&impl->ref);
++
++    if (!ref) free(impl);
++    return ref;
++}
++
++static HRESULT WINAPI window_host_GetIids(void *iface, ULONG *count, IID **iids)
++{
++    *count = 0;
++    *iids = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI window_host_GetRuntimeClassName(void *iface, HSTRING *name)
++{
++    return WindowsCreateString(L"Windows.UI.WindowContext", 24, name);
++}
++
++static HRESULT WINAPI window_host_GetTrustLevel(void *iface, TrustLevel *level)
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT create_window_host(HWND hwnd, BOOL last, void **out);
++
++/* Slot 6 is another getter: MrmCoreR's CoreWindowContainer::Initialize calls it with a single
++ * out-parameter, stores what comes back and releases it later, and treats a failure as fatal -
++ * which is what E_NOTIMPL here did to Media Player's ViewportStateTrigger. Hand back another hop
++ * carrying the same window handle, the way the QI and slot 7 do. */
++static HRESULT WINAPI window_host_method(void *iface, void **out)
++{
++    struct window_host *impl = iface;
++
++    TRACE("iface %p, out %p.\n", iface, out);
++
++    if (!out) return E_POINTER;
++    return create_window_host(impl->hwnd, FALSE, out);
++}
++
++static HRESULT create_window_host(HWND hwnd, BOOL last, void **out)
++{
++    struct window_host *impl;
++
++    if (!out) return E_POINTER;
++    if (!(impl = calloc(1, sizeof(*impl)))) return E_OUTOFMEMORY;
++    impl->lpVtbl = window_host_vtbl;
++    impl->ref = 1;
++    impl->hwnd = hwnd;
++    impl->last = last;
++    *out = impl;
++    return S_OK;
++}
++
++static HRESULT WINAPI window_host_get_next(void *iface, void **out)
++{
++    struct window_host *impl = iface;
++
++    TRACE("iface %p, out %p.\n", iface, out);
++
++    if (!out) return E_POINTER;
++    if (impl->last)
++    {
++        /* The caller stores this as an HWND, not as an interface pointer. */
++        *out = impl->hwnd;
++        return impl->hwnd ? S_OK : E_FAIL;
++    }
++    return create_window_host(impl->hwnd, TRUE, out);
++}
++
++/* The real interface is longer than the eight slots implemented above: MrmCoreR calls slot 17
++ * (`mov 0x88(%rax),%rax; call`), which read nine entries past the end of this array and jumped to
++ * whatever .data held next - a NULL, caught only by dcomp's NX handler. The interface is in no
++ * .winmd and unnamed in HKCR, so give every slot up to 32 a traced thunk and let the app say which
++ * ones it actually needs. A thunk that returns E_NOTIMPL is an answer a caller can handle; a jump
++ * through NULL is not. */
++#define WINDOW_HOST_THUNK(n)                                                                  \
++    static HRESULT WINAPI window_host_slot_##n( void *iface, void *a, void *b, void *c )      \
++    {                                                                                         \
++        FIXME( "window host %p: unimplemented slot " #n " (a %p, b %p, c %p).\n",              \
++               iface, a, b, c );                                                              \
++        return E_NOTIMPL;                                                                     \
++    }
++WINDOW_HOST_THUNK(8)  WINDOW_HOST_THUNK(9)  WINDOW_HOST_THUNK(10) WINDOW_HOST_THUNK(11)
++WINDOW_HOST_THUNK(12) WINDOW_HOST_THUNK(13) WINDOW_HOST_THUNK(14) WINDOW_HOST_THUNK(15)
++WINDOW_HOST_THUNK(16) WINDOW_HOST_THUNK(17) WINDOW_HOST_THUNK(18) WINDOW_HOST_THUNK(19)
++WINDOW_HOST_THUNK(20) WINDOW_HOST_THUNK(21) WINDOW_HOST_THUNK(22) WINDOW_HOST_THUNK(23)
++WINDOW_HOST_THUNK(24) WINDOW_HOST_THUNK(25) WINDOW_HOST_THUNK(26) WINDOW_HOST_THUNK(27)
++WINDOW_HOST_THUNK(28) WINDOW_HOST_THUNK(29) WINDOW_HOST_THUNK(30) WINDOW_HOST_THUNK(31)
++
++static const void *window_host_vtbl[] =
++{
++    window_host_QueryInterface,
++    window_host_AddRef,
++    window_host_Release,
++    window_host_GetIids,
++    window_host_GetRuntimeClassName,
++    window_host_GetTrustLevel,
++    window_host_method,
++    window_host_get_next,
++    window_host_slot_8,  window_host_slot_9,  window_host_slot_10, window_host_slot_11,
++    window_host_slot_12, window_host_slot_13, window_host_slot_14, window_host_slot_15,
++    window_host_slot_16, window_host_slot_17, window_host_slot_18, window_host_slot_19,
++    window_host_slot_20, window_host_slot_21, window_host_slot_22, window_host_slot_23,
++    window_host_slot_24, window_host_slot_25, window_host_slot_26, window_host_slot_27,
++    window_host_slot_28, window_host_slot_29, window_host_slot_30, window_host_slot_31,
++};
++
++struct window_context
++{
++    IInspectable IInspectable_iface;
++    LONG ref;
++    HWND hwnd;
++};
++
++static HRESULT WINAPI window_context_QueryInterface(IInspectable *iface, REFIID iid, void **out)
++{
++    struct window_context *impl = CONTAINING_RECORD(iface, struct window_context, IInspectable_iface);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) ||
++        IsEqualGUID(iid, &IID_IAgileObject))
++    {
++        InterlockedIncrement(&impl->ref);
++        *out = &impl->IInspectable_iface;
++        return S_OK;
++    }
++
++    if (IsEqualGUID(iid, &IID_IWindowHostPartner))
++        return create_window_host(impl->hwnd ? impl->hwnd : GetActiveWindow(), FALSE, out);
++
++    FIXME("window context: no interface %s.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI window_context_AddRef(IInspectable *iface)
++{
++    return InterlockedIncrement(&CONTAINING_RECORD(iface, struct window_context, IInspectable_iface)->ref);
++}
++
++static ULONG WINAPI window_context_Release(IInspectable *iface)
++{
++    struct window_context *impl = CONTAINING_RECORD(iface, struct window_context, IInspectable_iface);
++    ULONG ref = InterlockedDecrement(&impl->ref);
++
++    if (!ref) free(impl);
++    return ref;
++}
++
++static HRESULT WINAPI window_context_GetIids(IInspectable *iface, ULONG *count, IID **iids)
++{
++    *count = 0;
++    *iids = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI window_context_GetRuntimeClassName(IInspectable *iface, HSTRING *name)
++{
++    return WindowsCreateString(L"Windows.UI.WindowContext", 24, name);
++}
++
++static HRESULT WINAPI window_context_GetTrustLevel(IInspectable *iface, TrustLevel *level)
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static const IInspectableVtbl window_context_vtbl =
++{
++    window_context_QueryInterface,
++    window_context_AddRef,
++    window_context_Release,
++    window_context_GetIids,
++    window_context_GetRuntimeClassName,
++    window_context_GetTrustLevel,
++};
++
++static HRESULT WINAPI uicontext_get_WindowContext(void *iface, void **out)
++{
++    struct window_context *impl;
++
++    TRACE("iface %p, out %p.\n", iface, out);
++
++    if (!out) return E_POINTER;
++    if (!(impl = calloc(1, sizeof(*impl)))) return E_OUTOFMEMORY;
++    impl->IInspectable_iface.lpVtbl = &window_context_vtbl;
++    impl->ref = 1;
++    impl->hwnd = impl_from_IInspectable(iface)->hwnd;
++
++    *out = &impl->IInspectable_iface;
++    return S_OK;
++}
++
++
+ static const void *uicontext_vtbl[] =
+ {
+     uicontext_QueryInterface,
+@@ -156,17 +430,18 @@ static const void *uicontext_vtbl[] =
+     uicontext_GetIids,
+     uicontext_GetRuntimeClassName,
+     uicontext_GetTrustLevel,
+-    uicontext_method, uicontext_method, uicontext_method, uicontext_method,
++    uicontext_method, uicontext_get_WindowContext, uicontext_method, uicontext_method,
+     uicontext_method, uicontext_method, uicontext_method, uicontext_method,
+ };
+ 
+-static HRESULT create_uicontext(IInspectable **out)
++static HRESULT create_uicontext(void *view, IInspectable **out)
+ {
+     struct uicontext *impl;
+ 
+     if (!(impl = calloc(1, sizeof(*impl)))) return E_OUTOFMEMORY;
+     impl->IInspectable_iface.lpVtbl = (const IInspectableVtbl *)uicontext_vtbl;
+     impl->ref = 1;
++    impl->hwnd = hwnd_from_view(view);
+     *out = &impl->IInspectable_iface;
+     return S_OK;
+ }
+@@ -216,7 +491,7 @@ static HRESULT WINAPI uicontext_factory_GetTrustLevel(IActivationFactory *iface,
+ }
+ static HRESULT WINAPI uicontext_factory_ActivateInstance(IActivationFactory *iface, IInspectable **instance)
+ {
+-    return create_uicontext(instance);
++    return create_uicontext(NULL, instance);
+ }
+ 
+ static const IActivationFactoryVtbl uicontext_factory_vtbl =
+@@ -261,7 +536,7 @@ static HRESULT WINAPI uicontext_statics_CreateForView(void *iface, void *view, U
+     TRACE("%p, %#x, %p.\n", view, flags, out);
+ 
+     if (!out) return E_POINTER;
+-    return create_uicontext(out);
++    return create_uicontext(view, out);
+ }
+ 
+ static const struct uicontext_statics_vtbl uicontext_statics_vtbl =

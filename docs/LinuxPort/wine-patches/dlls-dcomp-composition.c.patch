@@ -1,0 +1,1317 @@
+diff --git a/dlls/dcomp/composition.c b/dlls/dcomp/composition.c
+index a53243bf..5cd742c8 100644
+--- a/dlls/dcomp/composition.c
++++ b/dlls/dcomp/composition.c
+@@ -1031,6 +1031,17 @@ static BOOL compositor_iface_required( REFIID iid )
+  * 128 or 512 entries (info[0]=8 at the literal) — keep this very large. */
+ #define COMP_OBJECT_SLOTS 4096
+ 
++#define COMP_MAP_ENTRIES 32
++struct comp_map_entry
++{
++    WCHAR key[64];
++    IUnknown *value;
++};
++
++/* struct comp_object's three fields are the shared prefix of every recording object in this file -
++ * kf_animation, comp_shape and the typed brushes all start with them and reuse comp_object_AddRef /
++ * comp_object_Release. Anything added here is read as those types' own fields, so the map below
++ * lives in its own allocation and is looked up by owner. */
+ struct comp_object
+ {
+     const void **vtbl;
+@@ -1173,6 +1184,7 @@ static BOOL expr_resolve_colorrgb( void *animation, Color *color );
+ static HRESULT create_matrix_transform( void **out );
+ struct visual;
+ static struct visual *impl_from_visual_interop( void *iface );
++static struct visual *visual_from_interop( void *iface );
+ static HRESULT create_expr_animation( void **out );
+ static void *matrix_transform_vtbl[COMP_OBJECT_SLOTS];
+ static void *manip_transform_vtbl[COMP_OBJECT_SLOTS];
+@@ -1199,6 +1211,8 @@ struct kf_animation
+     const char *kind;
+     LONG ref;
+     const void **typed_vtbl;    /* IColorKeyFrameAnimation / IScalarKeyFrameAnimation / IBooleanKeyFrameAnimation */
++    const void **anim2_vtbl;    /* ICompositionAnimation2 view: the Target property */
++    WCHAR target[64];           /* CompositionAnimation.Target, as set through ICompositionAnimation2 */
+     enum kf_kind value_kind;
+     float last_key;
+     BOOL has_value;
+@@ -1375,6 +1389,11 @@ static HRESULT create_object4_view( IUnknown *owner, void **out )
+     return S_OK;
+ }
+ 
++static const GUID IID_IMap_animations_local =
++    {0x4ba9aa1d,0x57ac,0x54de,{0xa8,0x07,0xb5,0x2e,0x68,0x9b,0xfc,0x04}};
++static HRESULT comp_map_for_owner( IUnknown *owner, void **out );
++static HRESULT WINAPI comp_object_GetRuntimeClassName( void *iface, HSTRING *name );
++
+ static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void **out )
+ {
+     struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
+@@ -1393,6 +1412,8 @@ static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void
+      * dereferenced the animation it never got. */
+     if (IsEqualGUID( iid, &IID_ICompositionObject ) && object->kind && strstr( object->kind, "Light" ))
+         return create_composition_object_view( (IUnknown *)&object->vtbl, out );
++    if (IsEqualGUID( iid, &IID_IMap_animations_local ))
++        return comp_map_for_owner( (IUnknown *)&object->vtbl, out );
+     InterlockedIncrement( &object->ref );
+     *out = &object->vtbl;
+     return S_OK;
+@@ -1413,6 +1434,226 @@ static ULONG WINAPI comp_object_Release( void *iface )
+     return ref;
+ }
+ 
++/* IMap<HSTRING, ICompositionAnimationBase> {4ba9aa1d-57ac-54de-a807-b52e689bfc04}, and the
++ * IMapView reached through GetView. An ImplicitAnimationCollection really is a map and the Windows
++ * Community Toolkit round-trips through it: it inserts an animation keyed by the animation's Target
++ * and reads it back. Served by the generic slot handler, Insert recorded nothing and Lookup returned
++ * S_OK without writing an animation, so the Toolkit got null and XAML reported "Cannot add instance
++ * of type 'Vector3Animation' to a collection of type 'ImplicitAnimationSet'". Slots follow
++ * IMap`2 (Lookup, get_Size, HasKey, GetView, Insert, Remove, Clear) and IMapView`2 (Lookup,
++ * get_Size, HasKey, Split). */
++struct comp_map
++{
++    const void **vtbl;
++    const void **view_vtbl;
++    LONG ref;
++    IUnknown *owner;
++    unsigned int entry_count;
++    struct comp_map_entry entries[COMP_MAP_ENTRIES];
++};
++
++/* Owner -> map. A handful of implicit-animation collections exist at a time; the owner cannot hold
++ * the pointer itself because its struct prefix is shared (see struct comp_object). */
++#define COMP_MAPS 64
++static struct comp_map *comp_maps[COMP_MAPS];
++static CRITICAL_SECTION comp_maps_cs = { NULL, -1, 0, 0, 0, 0 };
++
++static struct comp_map_entry *comp_map_find( struct comp_map *map, HSTRING key )
++{
++    const WCHAR *str = key ? WindowsGetStringRawBuffer( key, NULL ) : NULL;
++    unsigned int i;
++
++    if (!str) str = L"";
++    for (i = 0; i < map->entry_count; i++)
++        if (!wcscmp( map->entries[i].key, str )) return &map->entries[i];
++    return NULL;
++}
++
++static struct comp_map *comp_from_map( void *iface )
++{
++    return CONTAINING_RECORD( iface, struct comp_map, vtbl );
++}
++static struct comp_map *comp_from_mapview( void *iface )
++{
++    return CONTAINING_RECORD( iface, struct comp_map, view_vtbl );
++}
++static HRESULT WINAPI comp_map_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    struct comp_map *map = comp_from_map( iface );
++    return IUnknown_QueryInterface( map->owner, iid, out );
++}
++static ULONG WINAPI comp_map_AddRef( void *iface )
++{
++    return InterlockedIncrement( &comp_from_map( iface )->ref );
++}
++static ULONG WINAPI comp_map_Release( void *iface )
++{
++    /* The map stays in the owner table for the life of the process: it is small, bounded, and the
++     * app asks for it again every time it touches the collection. */
++    return InterlockedDecrement( &comp_from_map( iface )->ref );
++}
++static HRESULT WINAPI comp_map_GetIids( void *iface, ULONG *count, IID **iids )
++{
++    *count = 0;
++    *iids = NULL;
++    return S_OK;
++}
++static HRESULT WINAPI comp_map_GetRuntimeClassName( void *iface, HSTRING *name )
++{
++    return comp_object_GetRuntimeClassName( &comp_from_map( iface )->owner, name );
++}
++static HRESULT WINAPI comp_map_GetTrustLevel( void *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI comp_map_Lookup( void *iface, HSTRING key, IUnknown **value )
++{
++    struct comp_map *map = comp_from_map( iface );
++    struct comp_map_entry *entry = comp_map_find( map, key );
++
++    TRACE( "%p, key %s -> %p.\n", map, debugstr_hstring( key ), entry ? entry->value : NULL );
++    if (!value) return E_POINTER;
++    if (!entry || !entry->value)
++    {
++        *value = NULL;
++        return E_BOUNDS;
++    }
++    IUnknown_AddRef( (*value = entry->value) );
++    return S_OK;
++}
++static HRESULT WINAPI comp_map_get_Size( void *iface, UINT32 *value )
++{
++    if (!value) return E_POINTER;
++    *value = comp_from_map( iface )->entry_count;
++    return S_OK;
++}
++static HRESULT WINAPI comp_map_HasKey( void *iface, HSTRING key, boolean *found )
++{
++    struct comp_map *map = comp_from_map( iface );
++
++    if (!found) return E_POINTER;
++    *found = comp_map_find( map, key ) != NULL;
++    TRACE( "%p, key %s -> %u.\n", map, debugstr_hstring( key ), *found );
++    return S_OK;
++}
++static HRESULT WINAPI comp_map_GetView( void *iface, void **view )
++{
++    struct comp_map *map = comp_from_map( iface );
++
++    if (!view) return E_POINTER;
++    InterlockedIncrement( &map->ref );
++    *view = &map->view_vtbl;
++    return S_OK;
++}
++static HRESULT WINAPI comp_map_Insert( void *iface, HSTRING key, IUnknown *value, boolean *replaced )
++{
++    struct comp_map *map = comp_from_map( iface );
++    struct comp_map_entry *entry = comp_map_find( map, key );
++    const WCHAR *str = key ? WindowsGetStringRawBuffer( key, NULL ) : NULL;
++
++    TRACE( "%p, key %s, value %p.\n", map, debugstr_hstring( key ), value );
++    if (replaced) *replaced = entry != NULL;
++    if (!entry)
++    {
++        if (map->entry_count >= COMP_MAP_ENTRIES) return E_OUTOFMEMORY;
++        entry = &map->entries[map->entry_count++];
++        lstrcpynW( entry->key, str ? str : L"", ARRAY_SIZE(entry->key) );
++    }
++    if (value) IUnknown_AddRef( value );
++    if (entry->value) IUnknown_Release( entry->value );
++    entry->value = value;
++    return S_OK;
++}
++static HRESULT WINAPI comp_map_Remove( void *iface, HSTRING key )
++{
++    struct comp_map *map = comp_from_map( iface );
++    struct comp_map_entry *entry = comp_map_find( map, key );
++
++    if (!entry) return E_BOUNDS;
++    if (entry->value) IUnknown_Release( entry->value );
++    *entry = map->entries[--map->entry_count];
++    return S_OK;
++}
++static HRESULT WINAPI comp_map_Clear( void *iface )
++{
++    struct comp_map *map = comp_from_map( iface );
++    unsigned int i;
++
++    for (i = 0; i < map->entry_count; i++)
++        if (map->entries[i].value) IUnknown_Release( map->entries[i].value );
++    map->entry_count = 0;
++    return S_OK;
++}
++static const void *comp_map_vtbl[] =
++{
++    comp_map_QueryInterface, comp_map_AddRef, comp_map_Release,
++    comp_map_GetIids, comp_map_GetRuntimeClassName, comp_map_GetTrustLevel,
++    comp_map_Lookup, comp_map_get_Size, comp_map_HasKey, comp_map_GetView,
++    comp_map_Insert, comp_map_Remove, comp_map_Clear,
++};
++
++static HRESULT WINAPI comp_mapview_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    struct comp_map *map = comp_from_mapview( iface );
++    return IUnknown_QueryInterface( map->owner, iid, out );
++}
++static ULONG WINAPI comp_mapview_AddRef( void *iface )
++{
++    return InterlockedIncrement( &comp_from_mapview( iface )->ref );
++}
++static ULONG WINAPI comp_mapview_Release( void *iface )
++{
++    return InterlockedDecrement( &comp_from_mapview( iface )->ref );
++}
++static HRESULT WINAPI comp_mapview_Lookup( void *iface, HSTRING key, IUnknown **value )
++{
++    return comp_map_Lookup( &comp_from_mapview( iface )->vtbl, key, value );
++}
++static HRESULT WINAPI comp_mapview_get_Size( void *iface, UINT32 *value )
++{
++    return comp_map_get_Size( &comp_from_mapview( iface )->vtbl, value );
++}
++static HRESULT WINAPI comp_mapview_HasKey( void *iface, HSTRING key, boolean *found )
++{
++    return comp_map_HasKey( &comp_from_mapview( iface )->vtbl, key, found );
++}
++static HRESULT WINAPI comp_mapview_Split( void *iface, void **first, void **second )
++{
++    if (first) *first = NULL;
++    if (second) *second = NULL;
++    return S_OK;
++}
++static const void *comp_mapview_vtbl[] =
++{
++    comp_mapview_QueryInterface, comp_mapview_AddRef, comp_mapview_Release,
++    comp_map_GetIids, comp_map_GetRuntimeClassName, comp_map_GetTrustLevel,
++    comp_mapview_Lookup, comp_mapview_get_Size, comp_mapview_HasKey, comp_mapview_Split,
++};
++
++static HRESULT comp_map_for_owner( IUnknown *owner, void **out )
++{
++    struct comp_map *map = NULL;
++    unsigned int i;
++
++    EnterCriticalSection( &comp_maps_cs );
++    for (i = 0; i < COMP_MAPS && comp_maps[i]; i++)
++        if (comp_maps[i]->owner == owner) { map = comp_maps[i]; break; }
++    if (!map && i < COMP_MAPS && (map = calloc( 1, sizeof(*map) )))
++    {
++        map->vtbl = comp_map_vtbl;
++        map->view_vtbl = comp_mapview_vtbl;
++        map->owner = owner;
++        comp_maps[i] = map;
++    }
++    LeaveCriticalSection( &comp_maps_cs );
++
++    if (!map) return E_OUTOFMEMORY;
++    InterlockedIncrement( &map->ref );
++    *out = &map->vtbl;
++    return S_OK;
++}
++
+ /* Many island-site / partner slots are Create* or getters. Returning S_OK without filling a real
+  * out-pointer fail-fasts; treating float/handle args as out-pointers AVs. Only fill when a looks
+  * like an aligned pointer to a NULL slot. */
+@@ -1425,17 +1666,23 @@ static BOOL is_out_pointer( void *a )
+      * pattern must not be used as a reason, since user stack addresses like 0x7f98c018dfc0 have
+      * one, and rejecting them left XAML's out-pointers (ICompositionObject::get_Properties on an
+      * expression animation) unset. */
++    MEMORY_BASIC_INFORMATION mbi;
++    const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
++                           PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
++
+     if (!p || (p & (sizeof(void *) - 1)) || p < 0x10000) return FALSE;
+     if (p >> 47) return FALSE; /* non-canonical user address on x86-64 */
+-    __TRY
+-    {
+-        value = *(void **)a;
+-    }
+-    __EXCEPT_ALL
+-    {
+-        return FALSE;
+-    }
+-    __ENDTRY
++    /* Ask the memory manager rather than probing with a read. This used to be a dereference inside
++     * __TRY, which raises a real access violation for every argument that is not a pointer - about
++     * twenty per run. That was survivable while only XAML called in, but .NET Native installs
++     * RhpPInvokeExceptionGuard on its P/Invoke transition frames and turns *any* native exception
++     * taken underneath one into a fail-fast, so as soon as an app's managed code called a
++     * composition method directly (Media Player, once it got past the state repository) the probe
++     * itself killed the process. */
++    if (!VirtualQuery( a, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT) return FALSE;
++    if (!(mbi.Protect & readable) || (mbi.Protect & PAGE_GUARD)) return FALSE;
++    if ((ULONG_PTR)a + sizeof(void *) > (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize) return FALSE;
++    value = *(void **)a;
+     return !value;
+ }
+ 
+@@ -1487,6 +1734,20 @@ static unsigned comp_object_caller_slot( void *iface )
+                 if (d32 >= 0 && d32 / sizeof(void *) < COMP_OBJECT_SLOTS) return d32 / sizeof(void *);
+             }
+         }
++        /* .NET Native's interop stubs load the slot then call the register:
++         *   mov rax, [rcx]; mov rax, [rax+disp]; call rax   (ff d0)
++         * Without this the slot always decodes as 0 and the trace cannot name the method. */
++        if (ip[-2] == 0xff && (ip[-1] & 0xf8) == 0xd0)
++        {
++            if ((ip[-6] == 0x48 || ip[-6] == 0x4c) && ip[-5] == 0x8b && (ip[-4] & 0xc0) == 0x40)
++                return (unsigned char)ip[-3] / sizeof(void *);
++            if ((ip[-9] == 0x48 || ip[-9] == 0x4c) && ip[-8] == 0x8b && (ip[-7] & 0xc0) == 0x80)
++            {
++                LONG32 d32;
++                memcpy( &d32, ip - 6, sizeof(d32) );
++                if (d32 >= 0 && d32 / (LONG32)sizeof(void *) < COMP_OBJECT_SLOTS) return d32 / sizeof(void *);
++            }
++        }
+         if (ip[-2] == 0xff && (ip[-1] & 0xf8) == 0x10) return 0; /* call [reg] */
+         if (ip[-6] == 0xff && (ip[-5] & 0xf8) == 0x90)
+         {
+@@ -1506,12 +1767,12 @@ static unsigned comp_object_caller_slot( void *iface )
+     return 0;
+ }
+ 
+-static HRESULT WINAPI comp_object_default_slot( void *iface, void *a, void *b, void *c, void *d )
++static HRESULT comp_object_slot_call( unsigned slot, void *iface, void *a, void *b, void *c, void *d )
+ {
+     struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
+-    unsigned slot = comp_object_caller_slot( iface );
+ 
+-    TRACE( "%s %p slot %u a %p b %p: ignored.\n", object->kind, object, slot, a, b );
++    TRACE( "%s %p slot %u a %p b %p from %p: ignored.\n", object->kind, object, slot, a, b,
++           __builtin_return_address( 0 ) );
+     /* Fill the out-pointer with a recording object. Preserve a typed object's method layout across
+      * private-interface getters: XAML asks an ExpressionAnimation for an internal animation object
+      * before it calls ICompositionAnimationBase::CreateAnimatorPartner (slot 3) on that child. */
+@@ -1532,6 +1793,18 @@ static HRESULT WINAPI comp_object_default_slot( void *iface, void *a, void *b, v
+                  * GetNineGridBrush on hover). Only the two recording tables are cloned as such. */
+                 if (object->vtbl == (const void **)comp_object_vtbl || object->vtbl == (const void **)expression_animation_vtbl)
+                     return create_comp_object_vtbl( object->kind, (void **)object->vtbl, (void **)args[i] );
++                /* A key frame animation's unknown slots are its IKeyFrameAnimation /
++                 * ICompositionAnimation property accessors, and those out-parameters are HSTRINGs,
++                 * TimeSpans and counts rather than objects. Handing back a fake object pointer makes
++                 * the caller read it as whatever it asked for: .NET Native marshals the HSTRING that
++                 * get_Target() never wrote, and memmove()s from the garbage pointer and length it
++                 * decodes, which fail-fasts the process through RhpPInvokeExceptionGuard. NULL is a
++                 * valid empty HSTRING, a zero TimeSpan and a zero count, so write that instead. */
++                if (object->vtbl == (const void **)kf_animation_vtbl)
++                {
++                    *(void **)args[i] = NULL;
++                    return S_OK;
++                }
+                 return create_comp_object( object->kind, (void **)args[i] );
+             }
+             if (!is_object_pointer( args[i] )) break;
+@@ -1540,6 +1813,570 @@ static HRESULT WINAPI comp_object_default_slot( void *iface, void *a, void *b, v
+     return S_OK;
+ }
+ 
++static HRESULT WINAPI comp_object_default_slot( void *iface, void *a, void *b, void *c, void *d )
++{
++    return comp_object_slot_call( comp_object_caller_slot( iface ), iface, a, b, c, d );
++}
++
++/* One thunk per slot. Decoding the caller's `call [reg+disp]` only works for compilers that load the
++ * slot at the call site; .NET Native's interop stub takes the slot index as an argument
++ * (`movsxd rdi,r8d; mov rdi,[rdx+rdi*8]; call rax`), so the call site says nothing. A distinct
++ * function per slot is the only way to know which method an app actually called. */
++static HRESULT WINAPI comp_object_slot_00( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x00, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_01( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x01, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_02( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x02, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_03( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x03, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_04( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x04, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_05( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x05, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_06( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x06, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_07( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x07, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_08( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x08, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_09( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x09, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_0a( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x0a, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_0b( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x0b, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_0c( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x0c, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_0d( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x0d, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_0e( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x0e, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_0f( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x0f, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_10( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x10, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_11( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x11, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_12( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x12, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_13( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x13, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_14( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x14, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_15( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x15, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_16( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x16, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_17( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x17, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_18( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x18, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_19( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x19, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_1a( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x1a, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_1b( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x1b, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_1c( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x1c, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_1d( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x1d, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_1e( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x1e, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_1f( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x1f, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_20( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x20, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_21( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x21, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_22( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x22, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_23( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x23, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_24( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x24, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_25( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x25, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_26( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x26, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_27( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x27, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_28( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x28, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_29( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x29, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_2a( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x2a, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_2b( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x2b, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_2c( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x2c, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_2d( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x2d, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_2e( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x2e, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_2f( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x2f, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_30( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x30, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_31( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x31, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_32( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x32, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_33( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x33, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_34( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x34, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_35( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x35, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_36( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x36, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_37( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x37, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_38( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x38, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_39( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x39, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_3a( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x3a, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_3b( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x3b, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_3c( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x3c, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_3d( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x3d, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_3e( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x3e, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_3f( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x3f, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_40( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x40, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_41( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x41, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_42( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x42, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_43( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x43, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_44( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x44, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_45( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x45, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_46( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x46, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_47( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x47, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_48( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x48, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_49( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x49, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_4a( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x4a, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_4b( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x4b, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_4c( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x4c, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_4d( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x4d, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_4e( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x4e, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_4f( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x4f, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_50( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x50, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_51( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x51, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_52( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x52, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_53( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x53, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_54( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x54, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_55( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x55, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_56( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x56, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_57( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x57, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_58( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x58, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_59( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x59, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_5a( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x5a, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_5b( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x5b, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_5c( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x5c, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_5d( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x5d, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_5e( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x5e, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_5f( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x5f, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_60( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x60, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_61( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x61, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_62( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x62, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_63( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x63, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_64( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x64, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_65( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x65, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_66( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x66, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_67( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x67, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_68( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x68, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_69( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x69, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_6a( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x6a, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_6b( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x6b, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_6c( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x6c, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_6d( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x6d, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_6e( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x6e, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_6f( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x6f, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_70( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x70, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_71( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x71, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_72( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x72, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_73( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x73, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_74( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x74, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_75( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x75, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_76( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x76, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_77( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x77, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_78( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x78, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_79( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x79, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_7a( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x7a, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_7b( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x7b, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_7c( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x7c, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_7d( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x7d, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_7e( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x7e, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_7f( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x7f, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_80( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x80, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_81( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x81, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_82( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x82, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_83( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x83, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_84( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x84, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_85( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x85, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_86( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x86, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_87( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x87, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_88( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x88, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_89( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x89, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_8a( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x8a, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_8b( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x8b, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_8c( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x8c, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_8d( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x8d, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_8e( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x8e, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_8f( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x8f, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_90( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x90, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_91( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x91, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_92( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x92, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_93( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x93, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_94( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x94, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_95( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x95, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_96( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x96, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_97( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x97, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_98( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x98, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_99( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x99, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_9a( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x9a, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_9b( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x9b, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_9c( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x9c, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_9d( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x9d, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_9e( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x9e, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_9f( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0x9f, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_a0( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xa0, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_a1( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xa1, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_a2( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xa2, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_a3( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xa3, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_a4( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xa4, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_a5( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xa5, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_a6( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xa6, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_a7( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xa7, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_a8( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xa8, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_a9( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xa9, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_aa( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xaa, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_ab( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xab, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_ac( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xac, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_ad( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xad, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_ae( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xae, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_af( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xaf, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_b0( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xb0, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_b1( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xb1, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_b2( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xb2, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_b3( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xb3, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_b4( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xb4, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_b5( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xb5, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_b6( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xb6, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_b7( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xb7, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_b8( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xb8, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_b9( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xb9, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_ba( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xba, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_bb( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xbb, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_bc( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xbc, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_bd( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xbd, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_be( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xbe, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_bf( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xbf, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_c0( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xc0, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_c1( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xc1, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_c2( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xc2, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_c3( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xc3, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_c4( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xc4, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_c5( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xc5, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_c6( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xc6, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_c7( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xc7, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_c8( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xc8, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_c9( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xc9, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_ca( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xca, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_cb( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xcb, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_cc( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xcc, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_cd( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xcd, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_ce( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xce, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_cf( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xcf, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_d0( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xd0, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_d1( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xd1, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_d2( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xd2, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_d3( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xd3, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_d4( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xd4, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_d5( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xd5, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_d6( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xd6, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_d7( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xd7, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_d8( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xd8, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_d9( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xd9, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_da( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xda, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_db( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xdb, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_dc( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xdc, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_dd( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xdd, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_de( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xde, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_df( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xdf, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_e0( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xe0, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_e1( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xe1, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_e2( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xe2, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_e3( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xe3, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_e4( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xe4, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_e5( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xe5, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_e6( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xe6, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_e7( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xe7, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_e8( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xe8, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_e9( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xe9, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_ea( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xea, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_eb( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xeb, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_ec( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xec, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_ed( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xed, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_ee( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xee, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_ef( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xef, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_f0( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xf0, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_f1( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xf1, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_f2( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xf2, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_f3( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xf3, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_f4( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xf4, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_f5( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xf5, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_f6( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xf6, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_f7( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xf7, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_f8( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xf8, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_f9( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xf9, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_fa( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xfa, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_fb( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xfb, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_fc( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xfc, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_fd( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xfd, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_fe( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xfe, iface, a, b, c, d ); }
++static HRESULT WINAPI comp_object_slot_ff( void *iface, void *a, void *b, void *c, void *d )
++{ return comp_object_slot_call( 0xff, iface, a, b, c, d ); }
++
++static void *const comp_object_slot_thunks[] =
++{
++    comp_object_slot_00, comp_object_slot_01, comp_object_slot_02, comp_object_slot_03, comp_object_slot_04, comp_object_slot_05, comp_object_slot_06, comp_object_slot_07,
++    comp_object_slot_08, comp_object_slot_09, comp_object_slot_0a, comp_object_slot_0b, comp_object_slot_0c, comp_object_slot_0d, comp_object_slot_0e, comp_object_slot_0f,
++    comp_object_slot_10, comp_object_slot_11, comp_object_slot_12, comp_object_slot_13, comp_object_slot_14, comp_object_slot_15, comp_object_slot_16, comp_object_slot_17,
++    comp_object_slot_18, comp_object_slot_19, comp_object_slot_1a, comp_object_slot_1b, comp_object_slot_1c, comp_object_slot_1d, comp_object_slot_1e, comp_object_slot_1f,
++    comp_object_slot_20, comp_object_slot_21, comp_object_slot_22, comp_object_slot_23, comp_object_slot_24, comp_object_slot_25, comp_object_slot_26, comp_object_slot_27,
++    comp_object_slot_28, comp_object_slot_29, comp_object_slot_2a, comp_object_slot_2b, comp_object_slot_2c, comp_object_slot_2d, comp_object_slot_2e, comp_object_slot_2f,
++    comp_object_slot_30, comp_object_slot_31, comp_object_slot_32, comp_object_slot_33, comp_object_slot_34, comp_object_slot_35, comp_object_slot_36, comp_object_slot_37,
++    comp_object_slot_38, comp_object_slot_39, comp_object_slot_3a, comp_object_slot_3b, comp_object_slot_3c, comp_object_slot_3d, comp_object_slot_3e, comp_object_slot_3f,
++    comp_object_slot_40, comp_object_slot_41, comp_object_slot_42, comp_object_slot_43, comp_object_slot_44, comp_object_slot_45, comp_object_slot_46, comp_object_slot_47,
++    comp_object_slot_48, comp_object_slot_49, comp_object_slot_4a, comp_object_slot_4b, comp_object_slot_4c, comp_object_slot_4d, comp_object_slot_4e, comp_object_slot_4f,
++    comp_object_slot_50, comp_object_slot_51, comp_object_slot_52, comp_object_slot_53, comp_object_slot_54, comp_object_slot_55, comp_object_slot_56, comp_object_slot_57,
++    comp_object_slot_58, comp_object_slot_59, comp_object_slot_5a, comp_object_slot_5b, comp_object_slot_5c, comp_object_slot_5d, comp_object_slot_5e, comp_object_slot_5f,
++    comp_object_slot_60, comp_object_slot_61, comp_object_slot_62, comp_object_slot_63, comp_object_slot_64, comp_object_slot_65, comp_object_slot_66, comp_object_slot_67,
++    comp_object_slot_68, comp_object_slot_69, comp_object_slot_6a, comp_object_slot_6b, comp_object_slot_6c, comp_object_slot_6d, comp_object_slot_6e, comp_object_slot_6f,
++    comp_object_slot_70, comp_object_slot_71, comp_object_slot_72, comp_object_slot_73, comp_object_slot_74, comp_object_slot_75, comp_object_slot_76, comp_object_slot_77,
++    comp_object_slot_78, comp_object_slot_79, comp_object_slot_7a, comp_object_slot_7b, comp_object_slot_7c, comp_object_slot_7d, comp_object_slot_7e, comp_object_slot_7f,
++    comp_object_slot_80, comp_object_slot_81, comp_object_slot_82, comp_object_slot_83, comp_object_slot_84, comp_object_slot_85, comp_object_slot_86, comp_object_slot_87,
++    comp_object_slot_88, comp_object_slot_89, comp_object_slot_8a, comp_object_slot_8b, comp_object_slot_8c, comp_object_slot_8d, comp_object_slot_8e, comp_object_slot_8f,
++    comp_object_slot_90, comp_object_slot_91, comp_object_slot_92, comp_object_slot_93, comp_object_slot_94, comp_object_slot_95, comp_object_slot_96, comp_object_slot_97,
++    comp_object_slot_98, comp_object_slot_99, comp_object_slot_9a, comp_object_slot_9b, comp_object_slot_9c, comp_object_slot_9d, comp_object_slot_9e, comp_object_slot_9f,
++    comp_object_slot_a0, comp_object_slot_a1, comp_object_slot_a2, comp_object_slot_a3, comp_object_slot_a4, comp_object_slot_a5, comp_object_slot_a6, comp_object_slot_a7,
++    comp_object_slot_a8, comp_object_slot_a9, comp_object_slot_aa, comp_object_slot_ab, comp_object_slot_ac, comp_object_slot_ad, comp_object_slot_ae, comp_object_slot_af,
++    comp_object_slot_b0, comp_object_slot_b1, comp_object_slot_b2, comp_object_slot_b3, comp_object_slot_b4, comp_object_slot_b5, comp_object_slot_b6, comp_object_slot_b7,
++    comp_object_slot_b8, comp_object_slot_b9, comp_object_slot_ba, comp_object_slot_bb, comp_object_slot_bc, comp_object_slot_bd, comp_object_slot_be, comp_object_slot_bf,
++    comp_object_slot_c0, comp_object_slot_c1, comp_object_slot_c2, comp_object_slot_c3, comp_object_slot_c4, comp_object_slot_c5, comp_object_slot_c6, comp_object_slot_c7,
++    comp_object_slot_c8, comp_object_slot_c9, comp_object_slot_ca, comp_object_slot_cb, comp_object_slot_cc, comp_object_slot_cd, comp_object_slot_ce, comp_object_slot_cf,
++    comp_object_slot_d0, comp_object_slot_d1, comp_object_slot_d2, comp_object_slot_d3, comp_object_slot_d4, comp_object_slot_d5, comp_object_slot_d6, comp_object_slot_d7,
++    comp_object_slot_d8, comp_object_slot_d9, comp_object_slot_da, comp_object_slot_db, comp_object_slot_dc, comp_object_slot_dd, comp_object_slot_de, comp_object_slot_df,
++    comp_object_slot_e0, comp_object_slot_e1, comp_object_slot_e2, comp_object_slot_e3, comp_object_slot_e4, comp_object_slot_e5, comp_object_slot_e6, comp_object_slot_e7,
++    comp_object_slot_e8, comp_object_slot_e9, comp_object_slot_ea, comp_object_slot_eb, comp_object_slot_ec, comp_object_slot_ed, comp_object_slot_ee, comp_object_slot_ef,
++    comp_object_slot_f0, comp_object_slot_f1, comp_object_slot_f2, comp_object_slot_f3, comp_object_slot_f4, comp_object_slot_f5, comp_object_slot_f6, comp_object_slot_f7,
++    comp_object_slot_f8, comp_object_slot_f9, comp_object_slot_fa, comp_object_slot_fb, comp_object_slot_fc, comp_object_slot_fd, comp_object_slot_fe, comp_object_slot_ff,
++};
++
++static void *comp_object_slot_fn( unsigned slot )
++{
++    if (slot < ARRAY_SIZE(comp_object_slot_thunks)) return comp_object_slot_thunks[slot];
++    return comp_object_default_slot;
++}
++
+ /* Install the fault logger once. Also called from DllMain so faults before the first composition object are seen. */
+ void dcomp_install_fault_logger(void)
+ {
+@@ -1612,7 +2449,7 @@ static void ensure_comp_object_vtbl(void)
+     comp_object_vtbl[1] = comp_object_AddRef;
+     comp_object_vtbl[2] = comp_object_Release;
+     for (i = 3; i < COMP_OBJECT_SLOTS; i++)
+-        comp_object_vtbl[i] = comp_object_default_slot;
++        comp_object_vtbl[i] = comp_object_slot_fn( i );
+     comp_object_set_inspectable( comp_object_vtbl );
+     /* Publish last so waiters do not observe a half-filled table. */
+     comp_object_vtbl[0] = comp_object_QueryInterface;
+@@ -2891,7 +3728,7 @@ static void ensure_typed_vtbls(void)
+     surface_factory_vtbl[3] = surface_factory_CreateSurface;
+     surface_factory_vtbl[4] = surface_factory_CreateVirtualSurface;
+     for (i = 5; i < COMP_OBJECT_SLOTS; i++)
+-        surface_factory_vtbl[i] = comp_object_default_slot;
++        surface_factory_vtbl[i] = comp_object_slot_fn( i );
+     /* 5 CreateGradientSurface stays a default slot; 6 Flush, 7 private CreateSurface overload. */
+     surface_factory_vtbl[6] = surface_factory_Flush;
+     surface_factory_vtbl[7] = surface_factory_CreateSurfaceEx;
+@@ -2905,7 +3742,7 @@ static void ensure_typed_vtbls(void)
+     surface_vtbl[6] = surface_ResumeDraw;
+     surface_vtbl[7] = surface_Scroll;
+     for (i = 8; i < COMP_OBJECT_SLOTS; i++)
+-        surface_vtbl[i] = comp_object_default_slot;
++        surface_vtbl[i] = comp_object_slot_fn( i );
+     /* IDCompositionSurfaceInternal {5680c979}, the interface XAML's DCompSurface draws through:
+      * slots 3-7 match IDCompositionSurface, then 8 BeginDrawWithGutters, 9 BeginDrawWithClear,
+      * 10 HasValidPixels, 11 Resize, 12 CopySurface (CCompositionSurface vtable in dcomp.pdb). */
+@@ -2919,7 +3756,7 @@ static void ensure_typed_vtbls(void)
+     surface_brush_vtbl[1] = comp_object_AddRef;
+     surface_brush_vtbl[2] = comp_object_Release;
+     for (i = 3; i < COMP_OBJECT_SLOTS; i++)
+-        surface_brush_vtbl[i] = comp_object_default_slot;
++        surface_brush_vtbl[i] = comp_object_slot_fn( i );
+     comp_object_set_inspectable( surface_brush_vtbl );
+     surface_brush_vtbl[12] = surface_brush_get_Surface;
+     surface_brush_vtbl[13] = surface_brush_put_Surface;
+@@ -2928,7 +3765,7 @@ static void ensure_typed_vtbls(void)
+     drop_shadow_vtbl[1] = comp_object_AddRef;
+     drop_shadow_vtbl[2] = drop_shadow_Release;
+     for (i = 3; i < COMP_OBJECT_SLOTS; i++)
+-        drop_shadow_vtbl[i] = comp_object_default_slot;
++        drop_shadow_vtbl[i] = comp_object_slot_fn( i );
+     comp_object_set_inspectable( drop_shadow_vtbl );
+     drop_shadow_vtbl[6] = drop_shadow_get_BlurRadius;
+     drop_shadow_vtbl[7] = drop_shadow_put_BlurRadius;
+@@ -2946,7 +3783,7 @@ static void ensure_typed_vtbls(void)
+     expression_animation_vtbl[2] = comp_object_Release;
+     expression_animation_vtbl[3] = expression_animation_CreateAnimatorPartner;
+     for (i = 4; i < COMP_OBJECT_SLOTS; i++)
+-        expression_animation_vtbl[i] = comp_object_default_slot;
++        expression_animation_vtbl[i] = comp_object_slot_fn( i );
+     /* Publish last so waiters never observe half-filled tables. */
+     surface_vtbl[0] = comp_object_QueryInterface;
+ }
+@@ -4751,7 +5588,7 @@ static HRESULT WINAPI device_CreateTargetForHwnd( void *iface, void *hwnd, void
+     TRACE( "CreateTargetForHwnd hwnd %p topmost %p.\n", hwnd, topmost );
+     if (!dcomp_target_vtbl[3])
+     {
+-        for (i = 0; i < COMP_OBJECT_SLOTS; i++) dcomp_target_vtbl[i] = comp_object_default_slot;
++        for (i = 0; i < COMP_OBJECT_SLOTS; i++) dcomp_target_vtbl[i] = comp_object_slot_fn( i );
+         dcomp_target_vtbl[1] = comp_object_AddRef;
+         dcomp_target_vtbl[2] = comp_object_Release;
+         dcomp_target_vtbl[3] = dcomp_target_SetRoot;
+@@ -5473,12 +6310,7 @@ static struct visual *public_visual_from( IInspectable *object )
+     if (FAILED( IInspectable_QueryInterface( object, &IID_IInteropVisual_private, &view ) )) return NULL;
+     /* dcomp (interop) visuals answer this interface too; treating one as a public visual computed a
+      * struct visual inside a struct dcomp_visual, and writing its parent link corrupted that visual. */
+-    if (dcv_from_any( view ))
+-    {
+-        IUnknown_Release( (IUnknown *)view );
+-        return NULL;
+-    }
+-    impl = impl_from_visual_interop( view );
++    impl = visual_from_interop( view );
+     IUnknown_Release( (IUnknown *)view );
+     return impl;
+ }
+@@ -5794,6 +6626,17 @@ static inline struct visual *impl_from_visual_interop( void *iface )
+     return CONTAINING_RECORD( iface, struct visual, interop_vtbl );
+ }
+ 
++/* Every object in this file answers an unknown IID with its own vtbl and S_OK, so QI-ing for
++ * IID_IInteropVisual_private and assuming the result is a visual's interop view is not safe:
++ * "it is not a dcomp_visual" does not make it a struct visual. CONTAINING_RECORD on the wrong
++ * object put bindings[] and binding_count past the end of a smaller allocation, and the scan in
++ * anim_find then walked into unmapped memory. Check the vtbl instead. */
++static struct visual *visual_from_interop( void *iface )
++{
++    if (!iface || *(const void ***)iface != visual_interop_vtbl) return NULL;
++    return impl_from_visual_interop( iface );
++}
++
+ static HRESULT WINAPI visual_interop_QueryInterface( void *iface, REFIID iid, void **out )
+ {
+     return visual_qi( impl_from_visual_interop( iface ), iid, out );
+@@ -6700,9 +7543,9 @@ static HRESULT anim_controller_for( IUnknown *owner, const WCHAR *prop, void **o
+     if (shape && prop) binding = anim_find( shape->bindings, shape->binding_count, prop );
+     else if (owner && prop && SUCCEEDED( IUnknown_QueryInterface( owner, &IID_IInteropVisual_private, &interop ) ))
+     {
+-        if (!dcv_from_any( interop ))
++        struct visual *impl = visual_from_interop( interop );
++        if (impl)
+         {
+-            struct visual *impl = impl_from_visual_interop( interop );
+             visual_undo_animation( impl, prop );
+             binding = anim_find( impl->bindings, impl->binding_count, prop );
+         }
+@@ -7801,6 +8644,86 @@ static const GUID IID_IVector2KeyFrameAnimation_ =
+ static const GUID IID_IVector3KeyFrameAnimation_ =
+     { 0xc8039daa, 0xa281, 0x43c2, { 0xa7, 0x3d, 0xb6, 0x8e, 0x3c, 0x53, 0x3c, 0x40 } };
+ 
++/*
++ * ICompositionAnimation2 {369b603e-a80f-4948-93e3-ed23fb38c6cb}: SetBooleanParameter, get_Target,
++ * put_Target. Target matters because the Windows Community Toolkit keys the implicit-animation map
++ * by it - ImplicitAnimationCollection is an IMap<HSTRING, ICompositionAnimationBase> - so an
++ * animation whose Target does not survive the round trip is inserted under an empty key and XAML
++ * reports "Cannot add instance of type 'Vector3Animation' to a collection of type
++ * 'ImplicitAnimationSet'". The generic slot handler cannot serve this: slot 7 is get_Target here and
++ * put_DelayTime on IKeyFrameAnimation, so it needs a vtable of its own.
++ */
++static const GUID IID_ICompositionAnimation2_local =
++    {0x369b603e,0xa80f,0x4948,{0x93,0xe3,0xed,0x23,0xfb,0x38,0xc6,0xcb}};
++
++static HRESULT WINAPI kf_animation_QueryInterface( void *iface, REFIID iid, void **out );
++
++static struct kf_animation *kf_from_anim2( void *iface )
++{
++    return CONTAINING_RECORD( iface, struct kf_animation, anim2_vtbl );
++}
++static HRESULT WINAPI kf_anim2_QueryInterface( void *iface, REFIID iid, void **out )
++{
++    return kf_animation_QueryInterface( &kf_from_anim2( iface )->vtbl, iid, out );
++}
++static ULONG WINAPI kf_anim2_AddRef( void *iface )
++{
++    return comp_object_AddRef( &kf_from_anim2( iface )->vtbl );
++}
++static ULONG WINAPI kf_anim2_Release( void *iface )
++{
++    return comp_object_Release( &kf_from_anim2( iface )->vtbl );
++}
++static HRESULT WINAPI kf_anim2_SetBooleanParameter( void *iface, HSTRING key, boolean value )
++{
++    TRACE( "%p, key %s, value %u: ignored.\n", iface, debugstr_hstring( key ), value );
++    return S_OK;
++}
++static HRESULT WINAPI kf_anim2_get_Target( void *iface, HSTRING *value )
++{
++    struct kf_animation *impl = kf_from_anim2( iface );
++
++    TRACE( "%p -> %s.\n", impl, debugstr_w( impl->target ) );
++    if (!value) return E_POINTER;
++    if (!impl->target[0])
++    {
++        *value = NULL;  /* a NULL HSTRING is the empty string */
++        return S_OK;
++    }
++    return WindowsCreateString( impl->target, wcslen( impl->target ), value );
++}
++static HRESULT WINAPI kf_anim2_put_Target( void *iface, HSTRING value )
++{
++    struct kf_animation *impl = kf_from_anim2( iface );
++    const WCHAR *str = value ? WindowsGetStringRawBuffer( value, NULL ) : NULL;
++
++    TRACE( "%p, value %s.\n", impl, debugstr_w( str ) );
++    if (!str) impl->target[0] = 0;
++    else lstrcpynW( impl->target, str, ARRAY_SIZE(impl->target) );
++    return S_OK;
++}
++static HRESULT WINAPI kf_anim2_GetIids( void *iface, ULONG *count, IID **iids )
++{
++    *count = 0;
++    *iids = NULL;
++    return S_OK;
++}
++static HRESULT WINAPI kf_anim2_GetRuntimeClassName( void *iface, HSTRING *name )
++{
++    return comp_object_GetRuntimeClassName( &kf_from_anim2( iface )->vtbl, name );
++}
++static HRESULT WINAPI kf_anim2_GetTrustLevel( void *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static const void *kf_anim2_vtbl[] =
++{
++    kf_anim2_QueryInterface, kf_anim2_AddRef, kf_anim2_Release,
++    kf_anim2_GetIids, kf_anim2_GetRuntimeClassName, kf_anim2_GetTrustLevel,
++    kf_anim2_SetBooleanParameter, kf_anim2_get_Target, kf_anim2_put_Target,
++};
++
+ static HRESULT WINAPI kf_animation_QueryInterface( void *iface, REFIID iid, void **out )
+ {
+     struct kf_animation *impl = CONTAINING_RECORD( iface, struct kf_animation, vtbl );
+@@ -7811,6 +8734,11 @@ static HRESULT WINAPI kf_animation_QueryInterface( void *iface, REFIID iid, void
+     if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
+         return create_object4_view( (IUnknown *)&impl->vtbl, out );
+     InterlockedIncrement( &impl->ref );
++    if (IsEqualGUID( iid, &IID_ICompositionAnimation2_local ))
++    {
++        *out = &impl->anim2_vtbl;
++        return S_OK;
++    }
+     if ((impl->value_kind == KF_COLOR && IsEqualGUID( iid, &IID_IColorKeyFrameAnimation_ )) ||
+         (impl->value_kind == KF_SCALAR && IsEqualGUID( iid, &IID_IScalarKeyFrameAnimation_ )) ||
+         (impl->value_kind == KF_BOOLEAN && IsEqualGUID( iid, &IID_IBooleanKeyFrameAnimation_ )) ||
+@@ -7989,7 +8917,7 @@ static HRESULT create_kf_animation( enum kf_kind kind, void **out )
+     {
+         kf_animation_vtbl[1] = comp_object_AddRef;
+         kf_animation_vtbl[2] = comp_object_Release;
+-        for (i = 3; i < COMP_OBJECT_SLOTS; i++) kf_animation_vtbl[i] = comp_object_default_slot;
++        for (i = 3; i < COMP_OBJECT_SLOTS; i++) kf_animation_vtbl[i] = comp_object_slot_fn( i );
+         kf_animation_vtbl[0] = kf_animation_QueryInterface;
+         comp_object_set_inspectable( kf_animation_vtbl );
+         InterlockedExchange( &kf_animation_vtbl_ready, 1 );
+@@ -8003,6 +8931,7 @@ static HRESULT create_kf_animation( enum kf_kind kind, void **out )
+     impl->value_kind = kind;
+     impl->typed_vtbl = kind == KF_COLOR ? kf_color_vtbl : kind == KF_SCALAR ? kf_scalar_vtbl :
+                        kind == KF_BOOLEAN ? kf_boolean_vtbl : kind == KF_VECTOR2 ? kf_vector2_vtbl : kf_vector3_vtbl;
++    impl->anim2_vtbl = kf_anim2_vtbl;
+     /* CreateBooleanKeyFrameAnimation's default interface is IBooleanKeyFrameAnimation itself and XAML
+      * inserts its key frames through that pointer without a QI, so the generic view swallows them.
+      * That is deliberate for now: applying the last key's IsVisible hid the AnimatedIcon layers the
+@@ -8100,7 +9029,7 @@ static HRESULT create_inset_clip( float left, float top, float right, float bott
+     {
+         inset_clip_vtbl[1] = comp_object_AddRef;
+         inset_clip_vtbl[2] = comp_object_Release;
+-        for (i = 3; i < COMP_OBJECT_SLOTS; i++) inset_clip_vtbl[i] = comp_object_default_slot;
++        for (i = 3; i < COMP_OBJECT_SLOTS; i++) inset_clip_vtbl[i] = comp_object_slot_fn( i );
+         inset_clip_vtbl[0] = inset_clip_QueryInterface;
+         comp_object_set_inspectable( inset_clip_vtbl );
+         InterlockedExchange( &inset_clip_vtbl_ready, 1 );
+@@ -8389,7 +9318,7 @@ static HRESULT create_comp_batch( BOOL scoped, void **out )
+     {
+         comp_batch_vtbl[1] = comp_object_AddRef;
+         comp_batch_vtbl[2] = comp_batch_Release;
+-        for (i = 3; i < COMP_OBJECT_SLOTS; i++) comp_batch_vtbl[i] = comp_object_default_slot;
++        for (i = 3; i < COMP_OBJECT_SLOTS; i++) comp_batch_vtbl[i] = comp_object_slot_fn( i );
+         comp_batch_vtbl[0] = comp_batch_QueryInterface;
+         comp_object_set_inspectable( comp_batch_vtbl );
+         InterlockedExchange( &comp_batch_vtbl_ready, 1 );
+@@ -8557,7 +9486,7 @@ static HRESULT create_anim_controller( void **out )
+     {
+         anim_controller_vtbl[1] = comp_object_AddRef;
+         anim_controller_vtbl[2] = anim_controller_Release;
+-        for (i = 3; i < COMP_OBJECT_SLOTS; i++) anim_controller_vtbl[i] = comp_object_default_slot;
++        for (i = 3; i < COMP_OBJECT_SLOTS; i++) anim_controller_vtbl[i] = comp_object_slot_fn( i );
+         anim_controller_vtbl[0] = anim_controller_QueryInterface;
+         comp_object_set_inspectable( anim_controller_vtbl );
+         InterlockedExchange( &anim_controller_vtbl_ready, 1 );
+@@ -8675,7 +9604,7 @@ static void init_typed_vtbls( void )
+     unsigned int i;
+     if (manip_vtbls_ready) return;
+     for (i = 3; i < COMP_OBJECT_SLOTS; i++)
+-        matrix_transform_vtbl[i] = manip_transform_vtbl[i] = expr_animation_vtbl[i] = comp_object_default_slot;
++        matrix_transform_vtbl[i] = manip_transform_vtbl[i] = expr_animation_vtbl[i] = comp_object_slot_fn( i );
+     matrix_transform_vtbl[1] = manip_transform_vtbl[1] = expr_animation_vtbl[1] = comp_object_AddRef;
+     matrix_transform_vtbl[2] = manip_transform_vtbl[2] = expr_animation_vtbl[2] = comp_object_Release;
+     InterlockedExchange( &manip_vtbls_ready, 1 );
+@@ -9071,9 +10000,9 @@ static BOOL expr_visual_vector( struct expr_ctx *c, const WCHAR *ref, const WCHA
+     if (!wcsicmp( prop, L"Offset" ))
+     {
+         struct dcomp_visual *dcv = dcv_from_any( interop );
+-        if (dcv) { *x = dcv->offset_x; *y = dcv->offset_y; }
+-        else { *x = impl_from_visual_interop( interop )->offset.X; *y = impl_from_visual_interop( interop )->offset.Y; }
+-        ret = TRUE;
++        struct visual *pub = dcv ? NULL : visual_from_interop( interop );
++        if (dcv) { *x = dcv->offset_x; *y = dcv->offset_y; ret = TRUE; }
++        else if (pub) { *x = pub->offset.X; *y = pub->offset.Y; ret = TRUE; }
+     }
+     else if (!wcsicmp( prop, L"Translation" ))
+     {
+@@ -9273,7 +10202,8 @@ static struct property_set *propset_from_object( IUnknown *object )
+     if (SUCCEEDED( IUnknown_QueryInterface( object, &IID_IInteropVisual_private, &interop ) ))
+     {
+         struct dcomp_visual *dcv = dcv_from_any( interop );
+-        ICompositionPropertySet *props = dcv ? dcv->properties : impl_from_visual_interop( interop )->properties;
++        struct visual *pub = dcv ? NULL : visual_from_interop( interop );
++        ICompositionPropertySet *props = dcv ? dcv->properties : (pub ? pub->properties : NULL);
+         if (props && *(void ***)props == (void **)&propset_vtbl)
+             set = CONTAINING_RECORD( props, struct property_set, ICompositionPropertySet_iface );
+         IUnknown_Release( (IUnknown *)interop );
+@@ -9422,18 +10352,38 @@ static ULONG WINAPI comp_shape_Release( void *iface )
+     }
+     return ref;
+ }
++/* Every object in this file answers an unknown IID with its own vtbl and S_OK, so a successful QI
++ * for a private IID proves nothing about what came back. Check the vtbl before believing it.
++ *
++ * Without this, TryGetAnimationController on any non-shape object read that object's "bindings" at
++ * +0x290 and "binding_count" at +0x510 - past the end of a smaller allocation - and _wcsicmp faulted
++ * on the first entry. It reproduced about once in eight runs, whenever the following page happened
++ * not to be mapped. Both helpers hand back a borrowed pointer, so the QI reference is dropped
++ * through the object's own Release rather than through comp_shape's. */
+ static struct comp_shape *comp_shape_from_any( IInspectable *object )
+ {
+     struct comp_shape *shape = NULL;
++
+     if (!object || FAILED( IInspectable_QueryInterface( object, &IID_comp_shape_private, (void **)&shape ) )) return NULL;
+-    comp_shape_Release( &shape->vtbl );
++    IUnknown_Release( (IUnknown *)shape );
++    if (shape->vtbl != (const void **)sprite_shape_vtbl && shape->vtbl != (const void **)container_shape_vtbl)
++    {
++        TRACE( "%p is not a shape.\n", shape );
++        return NULL;
++    }
+     return shape;
+ }
+ static struct path_geometry *path_geometry_from_any( IUnknown *object )
+ {
+     struct path_geometry *geometry = NULL;
++
+     if (!object || FAILED( IUnknown_QueryInterface( object, &IID_path_geometry_private, (void **)&geometry ) )) return NULL;
+-    comp_object_Release( &geometry->vtbl );
++    IUnknown_Release( (IUnknown *)geometry );
++    if (geometry->vtbl != (const void **)path_geometry_vtbl)
++    {
++        TRACE( "%p is not a path geometry.\n", geometry );
++        return NULL;
++    }
+     return geometry;
+ }
+ /* ICompositionShape view */
+@@ -9746,7 +10696,7 @@ static void init_shape_vtbls( void )
+     unsigned int i;
+     if (shape_vtbls_ready) return;
+     for (i = 3; i < COMP_OBJECT_SLOTS; i++)
+-        sprite_shape_vtbl[i] = container_shape_vtbl[i] = path_geometry_vtbl[i] = comp_object_default_slot;
++        sprite_shape_vtbl[i] = container_shape_vtbl[i] = path_geometry_vtbl[i] = comp_object_slot_fn( i );
+     sprite_shape_vtbl[0] = container_shape_vtbl[0] = comp_shape_QueryInterface;
+     sprite_shape_vtbl[1] = container_shape_vtbl[1] = path_geometry_vtbl[1] = comp_object_AddRef;
+     sprite_shape_vtbl[2] = container_shape_vtbl[2] = comp_shape_Release;
+@@ -10129,7 +11079,7 @@ static HRESULT WINAPI compositor_CreateCubicBezierEasingFunction( ICompositor *i
+     {
+         cubic_bezier_vtbl[1] = comp_object_AddRef;
+         cubic_bezier_vtbl[2] = comp_object_Release;
+-        for (i = 3; i < COMP_OBJECT_SLOTS; i++) cubic_bezier_vtbl[i] = comp_object_default_slot;
++        for (i = 3; i < COMP_OBJECT_SLOTS; i++) cubic_bezier_vtbl[i] = comp_object_slot_fn( i );
+         cubic_bezier_vtbl[0] = cubic_bezier_QueryInterface;
+         comp_object_set_inspectable( cubic_bezier_vtbl );
+         InterlockedExchange( &cubic_bezier_vtbl_ready, 1 );
+@@ -10530,8 +11480,8 @@ static void ensure_effect_vtbls( void )
+     effect_factory_vtbl[2] = comp_object_Release;
+     for (i = 3; i < COMP_OBJECT_SLOTS; i++)
+     {
+-        effect_brush_vtbl[i] = comp_object_default_slot;
+-        effect_factory_vtbl[i] = comp_object_default_slot;
++        effect_brush_vtbl[i] = comp_object_slot_fn( i );
++        effect_factory_vtbl[i] = comp_object_slot_fn( i );
+     }
+     comp_object_set_inspectable( effect_brush_vtbl );
+     comp_object_set_inspectable( effect_factory_vtbl );
+@@ -12067,7 +13017,7 @@ static HRESULT create_nine_grid_brush( void **out )
+     {
+         nine_grid_brush_vtbl[1] = nine_grid_AddRef;
+         nine_grid_brush_vtbl[2] = nine_grid_Release;
+-        for (i = 3; i < COMP_OBJECT_SLOTS; i++) nine_grid_brush_vtbl[i] = comp_object_default_slot;
++        for (i = 3; i < COMP_OBJECT_SLOTS; i++) nine_grid_brush_vtbl[i] = comp_object_slot_fn( i );
+         comp_object_set_inspectable( nine_grid_brush_vtbl );
+         nine_grid_brush_vtbl[0] = nine_grid_QueryInterface;
+         InterlockedExchange( &nine_grid_vtbls_ready, 1 );
+@@ -12235,7 +13185,7 @@ static HRESULT create_mask_brush( void **out )
+     {
+         mask_brush_vtbl[1] = mask_brush_AddRef;
+         mask_brush_vtbl[2] = mask_brush_Release;
+-        for (i = 3; i < COMP_OBJECT_SLOTS; i++) mask_brush_vtbl[i] = comp_object_default_slot;
++        for (i = 3; i < COMP_OBJECT_SLOTS; i++) mask_brush_vtbl[i] = comp_object_slot_fn( i );
+         comp_object_set_inspectable( mask_brush_vtbl );
+         mask_brush_vtbl[0] = mask_brush_QueryInterface;
+         InterlockedExchange( &mask_vtbls_ready, 1 );
