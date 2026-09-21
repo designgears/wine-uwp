@@ -92,3 +92,15 @@ set_target_properties(advertisingid PROPERTIES PREFIX "" SUFFIX ""
 add_library(taskbarmanager SHARED shims/taskbarmanager/taskbarmanager.cpp)
 set_target_properties(taskbarmanager PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_taskbarmanager")
 target_link_libraries(taskbarmanager PRIVATE runtimeobject.lib)
+
+add_executable(probe-useractivity probes/probe-useractivity.cpp)
+target_link_libraries(probe-useractivity PRIVATE runtimeobject.lib ole32.lib)
+add_library(useractivitychannel SHARED shims/useractivitychannel/useractivitychannel.cpp)
+set_target_properties(useractivitychannel PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_useractivitychannel")
+target_link_libraries(useractivitychannel PRIVATE runtimeobject.lib ole32.lib)
+add_executable(probe-toast probes/probe-toast.cpp)
+target_link_libraries(probe-toast PRIVATE runtimeobject.lib ole32.lib)
+
+add_library(toastnotifier SHARED shims/toastnotifier/toastnotifier.cpp)
+set_target_properties(toastnotifier PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_toastnotifier")
+target_link_libraries(toastnotifier PRIVATE runtimeobject.lib ole32.lib)

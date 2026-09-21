@@ -12,6 +12,14 @@ generalises: how to investigate, and the mistakes that have already cost time.
 
 ## Ground rules
 
+- **Keep this file current as you go, not at the end.** The moment a run teaches you something
+  that would have saved you an hour, write it down - a new toolkit entry, a new trap, a corrected
+  claim, an app's state changing. Do not batch it up for the end of a session: sessions get
+  truncated, and the finding that never got written is the one the next session pays for again.
+  The same goes for a line here that has become **wrong** - delete or correct it in the same commit
+  that disproves it. A stale `AGENTS.md` is worse than a short one, because it is trusted. The
+  `Current state` table at the bottom is the part that rots fastest; update it whenever an app's
+  behaviour changes.
 - **Run on Xvfb `:98`, never the user's `:0`.** `DISPLAY=:98 tools/wine-uwp/run.sh`.
 - **The Wine tree (`~/src/wine`) is shared with another session and is deliberately uncommitted.**
   Check `git -C ~/src/wine status` before touching anything. Files that are not yours include
@@ -61,6 +69,9 @@ These all exist and work. Prefer them over reading code and guessing.
 | What is the visual tree doing? | `WINEDEBUG=+dcomp`; `present_desktop_hwnd frame: N ops` - 0 ops means nothing to draw |
 | What is every thread actually doing? | `WINE_UWP_DUMP_STACKS=<seconds>` - suspends and unwinds every thread, prints `STACK tid N frame M rip=`. Works on an *idle* app, not just a hung one. Resolve against `/proc/<pid>/maps` from the same run |
 | Method count of a private interface | parse the MIDL proxy/stub DLL, below |
+| Where is the code behind one of the app's own log strings? | `tools/wine-uwp/xref.py <exe> --string '<log string>'` - finds rip-relative LEAs to it and resolves each to its **enclosing function** via `.pdata`, which is where a `ud2` has to go. `--callers <rva>` finds direct call sites |
+| Does a size change reach the app? | `~/uwp-bin/build-probes/probe-resize.exe <w> <h> [title]` - `SetWindowPos` through Wine. **`xdotool windowsize` does not reach Wine at all** |
+| Which methods of an interface does the app actually call? | give every slot a traced thunk returning `E_NOTIMPL` and read the log - see `shims/storecontext`, which proved the app wanted only `GetDefault` out of 26 methods |
 
 ### Unique-HRESULT tagging
 
@@ -264,6 +275,79 @@ type resolved fine and the real failure was three layers further on.
 because `grep "Call failed"` found nothing - that string only appears when
 `WINE_UWP_TRACE_ORIGINATE` is set, and that run did not set it.
 
+**A never-completing async is worse than a failure, and it is the commonest UWP-under-Wine trap.**
+Three of Solitaire's blockers were the same shape: a Windows class whose implementation needs an
+out-of-process broker that does not exist here (`TaskbarManager` -> ImmersiveShell,
+`StoreContext` -> ContainerHostActivation, `WebAuthenticationCoreManager` -> the token broker). It
+does not fail the `IAsyncOperation` - it simply never completes it, so the app's `.get()` parks
+forever with no error to handle and no timeout. A stand-in must hand back an operation that is
+**already in the Completed state** *and* whose `put_Completed` invokes the handler immediately, so
+both `.get()` (which checks `IAsyncInfo::Status` and skips the wait) and `co_await` (which
+registers a handler) work. `shims/taskbarmanager` is the reference implementation.
+
+**The last line in the log is not the blocker.** It is only the last thing that *logs*. This worked
+three times running on Solitaire and then failed twice: the Xbox auth path I "identified" that way
+had in fact completed, and `UserActivityChannel` fails with a clean HRESULT the app handles. Confirm
+with a probe (does the caller's return point execute?) before writing a shim for whatever appears
+last.
+
+**`WINE_UWP_DUMP_STACKS` negatives are not evidence.** It unwinds ~10 frames per thread, and when
+`RtlLookupFunctionEntry` fails it guesses `rip = *rsp` and derails. It reported *no thread inside
+`AppHost::EngineAppStartup`* while a `ud2` on that function's success path proved one was. A
+positive hit from it is good evidence; an absence is not. Two conclusions in one session were
+nearly drawn from its negatives.
+
+**Its frame lines come from `dump_one_thread_stack`, not `dump_stacks_thread`.** Grepping for
+`dump_stacks_thread STACK` gets the thread *names* and silently drops every frame, which looks
+exactly like "the unwinder produced nothing". Use `grep -aoE "dump_(one_thread_stack|stacks_thread) STACK.*"`.
+
+**A shim registration can be silently un-done after it succeeds.** `install-overrides.sh` copies
+DLLs into system32; the next `wine` invocation then runs a prefix update, and that update
+re-registers Wine's builtin WinRT classes - overwriting the `ActivatableClassId` `DllPath` a shim
+block wrote seconds earlier. Every `reg add` reports success and the shim never loads. The tell is a
+class you never touched (`Windows.Devices.Geolocation.Geolocator`) being rewritten with the same
+timestamp. `install-overrides.sh` now asserts the shim classes again after the prefix settles and
+**verifies**, retrying three times. Two traps inside that fix:
+
+- **`wine reg query` is itself a `wine` invocation and can trigger the clobber it is checking for.**
+  I destroyed the state I was measuring this way.
+- **Reading `system.reg` instead does not see a key written moments ago** - it is still in
+  wineserver's memory until a flush - so the first verifier reported a false failure for a shim it
+  had just installed correctly. Ask `wine reg query` first, fall back to the file, and loop.
+
+**Do not force `wineboot -u` to settle the prefix.** It starts a fresh `services.exe`/`explorer.exe`
+set on every launch, and those leftovers are exactly what run.sh warns break the activation race.
+`wineserver -w` plus a retry loop is enough.
+
+**Dropping a DLL named after an apiset works only if Wine has no schema entry for it.**
+`find_apiset_dll()` consults `Peb->ApiSetMap` *before* any file is looked at, and apiset matching
+**ignores the trailing version fields**. So a file named `api-ms-win-appmodel-runtime-l1-1-1.dll`
+is ignored, because `l1-1-1` matches `apisetschema.spec`'s `...-l1-1-2 = kernelbase.dll`; but
+`api-ms-win-appmodel-advertisingid-l1-1-0.dll` *is* picked up, because that apiset is in no entry at
+all and the delay-load helper falls back to a runtime `LoadLibrary`. Two apisets, two outcomes.
+**Grep `dlls/apisetschema/apisetschema.spec` first.** When the apiset *is* in the schema and the
+target is another session's file, repair the thunk instead: `dlls/wineuwp/main.c` walks each
+module's import tables and replaces the stub, driven by a one-entry table.
+
+**An unresolved import is not a `@ stub`.** `EXCEPTION_WINE_STUB` (**0x80000100**) with
+`wine: Unimplemented function <dll>.<func>` can mean the loader's `allocate_stub()` invented a
+raising thunk for an import nothing implements - in which case **grepping the Wine tree for the
+function name finds nothing**, which is confusing if you assume a `.spec` must declare it.
+
+**Imports you need to patch may be *delay* imports.** They are in a different data directory and
+`llvm-readobj --coff-imports` labels them `DelayImport {` - easy to skim past. A patcher that walks
+only `IMAGE_DIRECTORY_ENTRY_IMPORT` finds nothing and looks broken.
+
+**`wineuwp.dll` gets a stale copy in the prefix like any other builtin**, and it shadows the build
+tree - so a correct fix looks like it did nothing. This is already documented below for Wine DLLs
+generally and I walked into it anyway, because I checked the *timestamp* rather than `cmp`.
+`install-overrides.sh` now refreshes it and says `refreshed: stale wineuwp.dll in the prefix`.
+
+**Give every slot a traced thunk before implementing anything.** `IStoreContext` has 26+ methods;
+a traced stand-in returning `E_NOTIMPL` (with event registrations answered `S_OK`) showed the app
+calls **`GetDefault` and nothing else**. Merely being able to *create* the object was the entire
+fix. Guessing which methods mattered would have been days of wasted work.
+
 **Check who owns a file before "fixing" it.** `RtlGetDeviceFamilyInfoEnum` has a ternary that reads
 inverted; it is correct, because `get_package_env` returns an `NTSTATUS` and 0 means success. It is
 also in another session's file.
@@ -422,23 +506,51 @@ the fully-qualified name. `--grep` first, always.
 - The unhandled-error text an app reports is often a *consequence*. `Delegate to an instance method
   cannot have null 'this'` was the second exception; the first, further up, was the real one.
 
-## Current state (2026-09-20)
+## Current state (2026-09-21)
 
 | App | State |
 | --- | --- |
-| Calculator | Fully working; the byte-identical regression baseline |
-| Feedback Hub | Fully working and interactive (~822 colours) |
+| Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0) |
+| Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | **A native C++ engine (`Sgi::`), not a XAML app** - so its never calling `Window.put_Content`/`Activate` (ud2-proved) is expected, not the bug. XAL and XSAPI now initialise. The app is alive, responsive (closes cleanly in 2 s) and running a 60 Hz dispatcher loop with a real 1280x800 window, but never reaches its own `Startup START` and draws nothing. Closest proxy we have to Shapr3D's rendering path |
+| Solitaire | **Starts completely, renders nothing.** Runs to `Solitaire::Startup END`, loads sound banks and fonts, XSAPI/XAL initialise, real 1280x800 window, 60 Hz dispatcher loop, closes cleanly, **0 critical errors, 0 unresolved-import stubs**. Blocked in one subscriber of the event raise inside `AppHost::EngineAppStartup` - see below. Closest proxy we have to Shapr3D's rendering path |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
-them. **Testing that, and making them the default if it holds, is the next job** - they change the
+them. **Testing that, and making them the default if it holds, is a standing job** - they change the
 view/activation ordering for everyone, which is exactly the sort of thing Shapr3D will also depend
-on. One data point so far: `WINE_UWP_MANUAL_CONFIGURE` is **load-bearing for Media Player** and
-cannot simply be dropped - without it the app never paints (8 runs, 8 no-paint), because
-`broadcast_configure_core_window` returns before both the direct call and the APC broadcast.
+on. `WINE_UWP_MANUAL_CONFIGURE` is **load-bearing for Media Player** and cannot simply be dropped -
+without it the app never paints (8 runs, 8 no-paint), because `broadcast_configure_core_window`
+returns before both the direct call and the APC broadcast. They are **irrelevant to Solitaire**:
+all three unset behaves identically. Note the partial combinations (`MANUAL_CONFIGURE` alone,
+`DRIVE_VIEW=run` alone) fail to bootstrap Solitaire at all - the switches are not independent.
 
 The `ConfigureCoreWindow` hang that used to lose one run in three is **fixed** - it was our own
 APC landing on Wine's RPC server thread, not anything in XAML. See Findings-M4.md.
+
+### Solitaire: exactly where it stops, and what is already ruled out
+
+The 1x1 swap chain is **not** the bug. `Dx11RenderWindow::SwapBuffers` never executes - the engine
+never presents a frame - so the flat `srgb(32,96,192)` window is the XAML page's background. The
+chain, each link probed rather than argued:
+
+```
+WinUwp::BootStrap -- Startup Began        logged
+  -> call 4 of 4 = AppHost::EngineAppStartup (0x7eb8fc)   logs START, never END, never "Startup failed"
+       -> SystemInitializer            returns
+       -> virtual App::Startup         returns  (logs Solitaire::Startup START/END)
+       -> 0x7eba45 -> 0x96080c         an event-raise loop; ONE SUBSCRIBER NEVER RETURNS
+WinUwp::BootStrap -- Startup Finished     never logged  -> render loop never starts
+```
+
+Already fixed and *not* the remaining cause: `DeviceInformation` watcher refusals, `TaskbarManager`,
+`StoreContext`, `WebAuthenticationCoreManager`, the advertising-id apiset, and
+`GetPackageFamilyNameFromToken`. Also ruled out by probe: XAML **does** raise `SizeChanged` on the
+SwapChainPanel and the dispatched handler **does** run; `CoreDispatcher.RunAsync` works;
+`XamlBootStrap::OnInitRender`'s early return is benign; the three MP switches are irrelevant.
+
+**The next step is to identify the blocked subscriber directly** - `WINE_UWP_DUMP_STACKS` cannot
+(see its entry above), so either make it produce a usable stack for that thread, or instrument the
+loop at `0x96080c`, whose body calls `vtbl[1]` on each subscriber and counts iterations at
+`this+0x30`. Do not pick the next shim off the tail of the log; that reasoning has now failed twice.

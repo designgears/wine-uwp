@@ -6613,3 +6613,51 @@ and a *negative* is not. Two conclusions in this session were nearly drawn from 
 Regression after all of the above, including the `wineuwp` and `twinapi.appcore` changes that affect
 every app: Calculator 249 colours and `magick compare -metric AE` = **0** against the baseline;
 Feedback Hub **822** colours, 0 fail-fasts, 0 app errors.
+
+## 2026-09-21 pickup: the subscriber exits by exception, not by waiting
+
+The new session reproduced the blank window twice (`/tmp/resume-solitaire-pickup1.log`
+and `pickup2.log`, two-colour root screenshots). The EXE compares equal to
+`Solitaire.exe.probe-backup`; the prefix wineuwp compares equal to the build.
+Both runs log `GetRpsTokenAsync - FindAccountProviderAsync complete.`. Therefore
+absence of a later token log does not establish that the provider operation is blocked.
+
+`WINE_UWP_TRACE_CXX=1 WINE_UWP_TRACE_ORIGINATE=1 WINEDEBUG=...,+seh` resolves the
+ambiguity. The final exception in `/tmp/resume-solitaire-pickup-exceptions.log` is
+`winrt::hresult_error(0x8007007e)`, with these *actual unwound frames*:
+
+```
+Solitaire+0x9864f   throw_hresult
+Solitaire+0x939b4
+Solitaire+0x4ffef9  UserActivityChannel.GetDefault wrapper
+Solitaire+0x500565  startup subscriber
+Solitaire+0x96084c  subscriber iteration
+Solitaire+0x7eba4a  EngineAppStartup
+Solitaire+0x7df8e1  BootStrap startup
+Solitaire+0x7de6eb
+Solitaire+0x684d0d  thread entry
+```
+
+The exception then **unwinds to the thread entry's catch at `0x684d21`**. The
+engine thread exits. This is why no idle stack contains EngineAppStartup, and why
+neither its success nor explicit failure branch executes. The previous assertion
+that a subscriber is still waiting, and that UserActivityChannel's clean failure
+cannot matter, is withdrawn: a clean failure can throw out of the entire startup.
+The Xbox path is not established as the remaining blocker.
+
+The immediate failing API is
+`Windows.ApplicationModel.UserActivities.UserActivityChannel.GetDefault`.
+The native factory exists, but GetDefault needs `cdp.dll`, absent from this image.
+`probe-useractivity.exe` reproduces the real call sequence without the game:
+
+```
+UserActivityChannel factory: 0
+GetDefault: 0x8007007e channel=0000000000000000
+RED: default activity channel
+```
+
+The new `useractivitychannel` shim provides a concrete default channel, with
+metadata-defined interfaces and normal COM ownership. Only channel acquisition is
+implemented; Timeline CRUD methods return initialized failure outputs and
+E_NOTIMPL, with optional `WINE_UWP_USERACTIVITY_TRACE=1` logging, so later use is
+visible rather than silently pretending activities were saved.

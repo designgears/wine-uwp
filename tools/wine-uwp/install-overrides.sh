@@ -264,6 +264,33 @@ if [ -f "$WAC" ]; then
   echo "installed: WebAuthenticationCoreManager stand-in"
 fi
 
+# UserActivityChannel.GetDefault needs cdp.dll in the native implementation. Its failure
+# unwinds out of Solitaire's startup subscriber and terminates the engine thread.
+UA_SHIM=$HOME/uwp-bin/build-probes/wineuwp_useractivitychannel.dll
+if [ -f "$UA_SHIM" ]; then
+  UA_DST=$SYS32/wineuwp_useractivitychannel.dll
+  if ! cmp -s "$UA_SHIM" "$UA_DST"; then cp -f "$UA_SHIM" "$UA_DST"; fi
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.ApplicationModel.UserActivities.UserActivityChannel"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_useractivitychannel.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: UserActivityChannel stand-in"
+fi
+
+# The notification service is absent; expose its disabled availability to apps.
+TN_SHIM=$HOME/uwp-bin/build-probes/wineuwp_toastnotifier.dll
+if [ -f "$TN_SHIM" ]; then
+  TN_DST=$SYS32/wineuwp_toastnotifier.dll
+  if ! cmp -s "$TN_SHIM" "$TN_DST"; then cp -f "$TN_SHIM" "$TN_DST"; fi
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.UI.Notifications.ToastNotificationManager"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_toastnotifier.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: ToastNotifier availability stand-in"
+fi
+
 # Windows.Services.Store.StoreContext: traced stand-in (see shims/storecontext). The real one
 # needs ContainerHostActivation {22f5b1df-...}, which is not registered under Wine.
 SC_SHIM=$HOME/uwp-bin/build-probes/wineuwp_storecontext.dll
@@ -382,6 +409,8 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_taskbarmanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Shell.TaskbarManager:wineuwp_taskbarmanager.dll"
 [ -f "$SYS32/wineuwp_storecontext.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Services.Store.StoreContext:wineuwp_storecontext.dll"
 [ -f "$SYS32/wineuwp_webauthcore.dll" ]       && SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager:wineuwp_webauthcore.dll"
+[ -f "$SYS32/wineuwp_useractivitychannel.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.UserActivities.UserActivityChannel:wineuwp_useractivitychannel.dll"
+[ -f "$SYS32/wineuwp_toastnotifier.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Notifications.ToastNotificationManager:wineuwp_toastnotifier.dll"
 
 if [ -n "$SHIM_CLASSES" ]; then
   # Let any update already in flight finish. Forcing one with `wineboot -u` is deliberately not
