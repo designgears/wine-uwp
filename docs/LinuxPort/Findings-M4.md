@@ -6229,3 +6229,214 @@ The difference is in the other threads:
 render, audio and IO workers. It matches the app never reaching its own `Startup START`, and rules
 out the engine being stuck partway through initialising - there is nothing of its own running to be
 stuck in.
+
+### 2026-09-20: Solitaire's launch handler throws before installing its content
+
+Fresh reproduction (`/tmp/resume-solitaire-check.sh baseline1` and `baseline2`): both
+root screenshots contain 2 colours, and the app's last startup message is still
+`Command Line Arguments:`. Calculator's root capture matches `/tmp/calc-regress.png`
+with pixel AE=0. Xvfb :98 answers `xdpyinfo`; all captures use `xwd`, not `import`.
+
+Two earlier conclusions above are incorrect:
+
+- **There are direct string xrefs.** `.rdata` file offsets differ from RVAs by
+  `0x1800` in this executable. `Command Line Arguments: {}` occurs twice: first as
+  a suffix of `Extra Command Line Arguments: {}` (file offset `0xf70fa6`), then as
+  the standalone string at `0xf70fc8`, RVA `0xf727c8`. The latter is referenced
+  by the instruction at RVA `0x6858d6`, inside the log helper `0x6858a8`.
+  `{}::Startup START` also has direct references (`0x424cda`, `0xb01952`).
+  String interning does not prevent following this startup path.
+- **A native engine can still depend on a XAML shell finishing OnLaunched.**
+  The launch handler at `0x7cd124` calls `0x7ce3ec`, which constructs its page
+  (`0x7d2b9c` / `0x7d2df4`), then calls `Window.put_Content` and `Window.Activate`.
+  The previous negative probes were correct: construction throws first.
+
+`+seh` exposes a caught C++ exception (`0xe06d7363`) after the command-line line.
+The PE ThrowInfo at RVA `0x11ab020` identifies `winrt::hresult_error`. A temporary,
+read-only vectored handler in wineuwp captured the exception's actual object and
+unwound its context with `RtlVirtualUnwind`; it did not alter execution:
+
+```
+hresult_error object: 00000000 00000000 aabbccdd 800706d9 ...
+Solitaire.exe+0x9864f  throw_hresult
+Solitaire.exe+0x7d2a52 event subscription error path
+Solitaire.exe+0x7d30b6 page constructor
+Solitaire.exe+0x7d2bd8
+Solitaire.exe+0x7ce514
+Solitaire.exe+0x7cd31e launch handler
+Solitaire.exe+0x7cf270 ABI boundary
+```
+
+The failing call is slot 9 (`vtable+0x48`) on
+`Windows.System.IMemoryManagerStatics {5c6c279c-d7ca-4779-9188-4057219ce64c}`:
+**add_AppMemoryUsageIncreased**. The shipping metadata confirms the signature.
+The registered native implementation is `rmclient.dll`, and it fails its RPC to
+an absent resource-manager service with `0x800706d9` (`EPT_S_NOT_REGISTERED`).
+The ABI boundary catches the exception, and our later `ActivationHandled` / `hr 0`
+messages do **not** prove that the app completed its launch handler successfully.
+The earlier assertion that this RPC failure was harmless is therefore withdrawn.
+
+The focused regression probe is `probe-memorymanager.exe`, built from
+`tools/wine-uwp/probes/probe-memorymanager.cpp`. Before the fix, running it through
+`run.sh` in Solitaire's package identity prints:
+
+```
+add_AppMemoryUsageIncreased: 0x800706d9 token=0 refs=1
+```
+
+The replacement `wineuwp_memorymanager.dll` implements the metadata-defined
+`IMemoryManagerStatics`, retains and releases event handlers using distinct tokens,
+and reports process private usage and host physical capacity. It has no pressure
+notification source or UWP-enforced quota; those are explicit implementation limits.
+Other interface revisions are refused rather than falsely claimed.
+
+## A shim can be registered, verified, and still never load: the prefix-update clobber
+
+The `DeviceInformation` shim was built, exported correctly (`llvm-readobj --coff-exports` clean),
+installed into `system32`, and its `ActivatableClassId\...\DllPath` written by `install-overrides.sh`
+with `reg add` reporting success. The app still got Wine's builtin:
+
+```
+fixme:combase:RoGetActivationFactory (L"Windows.Devices.Enumeration.DeviceInformation", ...): semi-stub
+fixme:enumeration:device_statics_CreateWatcherDeviceClass iface 00006FFFF540D108, class 2, watcher ... stub!
+```
+
+The cause is a **write-ordering race inside our own installer**. `install-overrides.sh` copies
+Windows DLLs into `drive_c/windows/system32`. That makes the *next* `wine` invocation run a prefix
+update, and the update re-registers Wine's own builtin WinRT classes - rewriting `DllPath` for every
+class Wine owns, including the ones a shim block had just claimed seconds earlier.
+
+**The tell was a class we do not touch.** Reading `system.reg` directly:
+
+```
+[...ActivatableClassId\Windows.Devices.Enumeration.DeviceInformation] #time=1dd498cc781a7d2
+"DllPath"="C:\\windows\\system32\\windows.devices.enumeration.dll"
+[...ActivatableClassId\Windows.Devices.Geolocation.Geolocator]        #time=1dd498cc88e0c38
+"DllPath"="C:\\windows\\system32\\geolocation.dll"
+```
+
+`Geolocator` is rewritten with a timestamp 16 ticks after `DeviceInformation`, and nothing in this
+repo has ever registered `Geolocator`. That is a bulk re-registration pass, not our write losing a
+single key - which is what ruled out "the `reg add` failed" and pointed at wineboot.
+
+Two things this invalidates:
+
+- **`reg add` reporting success proves nothing about the value the app will see.** Neither does
+  querying it back immediately - `wine reg query` is itself a `wine` invocation and can *trigger*
+  the update that clobbers the value you are checking. I did exactly this and destroyed the state I
+  was measuring.
+- **Every shim registered this way was affected, not just the new one.** `UserPicker` and
+  `MemoryManager` go through the same path. This is the leading explanation for the Solitaire render
+  flakiness (52 unique colours on one run, 1 on the next, with *identical* `+dcomp` frame ops):
+  whether `MemoryManager` was Wine's stub or astra's shim depended on where the update landed.
+  A shim that works "most of the time" is a registration race, not a logic bug.
+
+The fix is at the end of `install-overrides.sh`: force the pending update to completion
+(`wineboot -u` + `wineserver -w`), then assert the shim classes again and **verify by reading
+`system.reg`** - not by asking `wine` - retrying up to three times, and warn loudly if a class still
+will not stick. It prints `verified: shim ActivatableClassId registrations`.
+
+**Generalisation:** when a shim "is installed but never loads", check the registry *last*, by
+reading `system.reg` with `grep`, and check a neighbouring key you never wrote. If that one changed
+too, you are racing the prefix, not failing to register.
+
+## Solitaire now starts completely: the two refusals that were stopping it
+
+With the registration race fixed so the shims actually load, two `E_NOTIMPL`s turned out to be all
+that stood between Solitaire and a complete startup. Both are the same failure mode - this app is
+C++/CX, so `vccorlib140_app` converts any failed HRESULT into a thrown `Platform::Exception`, and
+the throw abandons whatever was in progress.
+
+1. `IDeviceInformationStatics::CreateWatcher(DeviceClass)` - Wine returns `E_NOTIMPL`. Solitaire
+   asks for `DeviceClass.AudioRender` (class 2) inside `AppHost::EngineInitialize`.
+2. The watcher Wine hands back then refuses its own events: `add_Removed`, `remove_Removed` and
+   `remove_Updated` all return `E_NOTIMPL` (`add_Updated` returns `S_OK` but drops the handler).
+   The app subscribes to all five events, so it threw on `add_Removed` immediately.
+
+The second one was only visible *after* fixing the first - classic layering, and a reminder that
+"the exception moved" is progress even when the symptom looks identical. The log showed it with no
+gap at all:
+
+```
+fixme:enumeration:device_watcher_add_Updated ... stub!
+fixme:enumeration:device_watcher_add_Removed ... stub!
+[   1.211] *** CRITICAL ERROR ***   Microsoft C++ Exception
+```
+
+`tools/wine-uwp/shims/deviceinformation` handles both: it forwards every `IDeviceInformationStatics`
+method to Wine's real implementation, maps `DeviceClass` to the equivalent AQS interface-class
+filter for slot 13, and wraps every watcher it returns in a 19-slot proxy that answers those four
+event methods itself (retaining each handler against a unique token) and forwards the other fifteen.
+The events never fire - there is no device arrival plumbing behind this - but "registered and
+silent" is a state callers handle and `E_NOTIMPL` is not.
+
+**Result.** Solitaire goes from dying at `AppHost::EngineInitialize` to running its startup to
+completion, reproducibly, with **zero critical errors** (previously 2):
+
+```
+[1.247] AppHost::EngineInitialize -- END        [1.247] AppHost::EngineAppStartup -- START
+[1.286] SoundSystemWWise - LoadResources - Done [1.286] FreeType 2.13.2 / HarfBuzz 8.4.0
+[1.289] SystemInitializer::Startup -- Completed in 0.0412679 seconds
+[1.289] Solitaire::Startup START                [1.292] Solitaire::Startup END
+```
+
+It reaches `Solitaire::Startup START`/`END` - the sequence an earlier session established it had
+never got to - then settles into a 60 Hz dispatcher loop. Calculator stays byte-identical to the
+baseline (249 colours, `magick compare -metric AE` = 0).
+
+### What is left: a 1x1 swap chain
+
+The game runs but renders into a 1x1 surface:
+
+```
+[0.444] Dx11RenderWindowXaml::Initialize -- created swap chain with resolution 1 x 1
+[0.444] Setting Render Window - Surface is 1 x 1, DpiScaleFactor is 1
+```
+
+The window is a full 1280x800 of flat `srgb(32,96,192)`. That the unique-colour count *dropped*
+from 52 (blue plus a scrollbar) to 1 when the engine started working is itself evidence: the
+engine's swap chain is now being composited and is covering the XAML shell underneath. So the
+`SwapChainPanel` is in the visual tree and is full-window sized - only its swap chain is 1x1.
+
+Measurements so far, with a validated control probe each time (see `xref.py` below):
+
+- `Dx11RenderWindow::UpdateWindowRect` (`0x8563fc`) **does** run - probe fires at `0x1408563FC`.
+- Its caller at `0x7df188` **does** run, at 0.419 s, i.e. the initialisation path.
+- The virtual `Resize` thunk at `0x856310` **never** runs, in a run that reached `Startup END`.
+  So the engine is never told a new size.
+- The three Media Player switches are **not** the cause: `WINE_UWP_DRIVE_VIEW`/`DRIVE_FIRST_VIEW`/
+  `MANUAL_CONFIGURE` all unset gives the same 1x1 result and the same clean startup. (Note the
+  partial combinations `MANUAL_CONFIGURE` alone and `DRIVE_VIEW=run` alone fail to bootstrap at all
+  - these switches are not independent.)
+
+**A negative that turned out to be worthless, recorded so it is not repeated:** resizing the X
+window with `xdotool windowsize` and watching for an engine reaction. It produced no reaction - but
+a `+dcomp` run shows every visual still reporting `size 1280x800` after the window was shrunk to
+1000x640, and the string `1000` appears nowhere in the log. The resize never reached XAML at all,
+so the experiment tested nothing. Instrumentation has to be shown to do what you think before its
+negative means anything.
+
+### `tools/wine-uwp/xref.py`
+
+Written for this hunt and reusable for Shapr3D. For a binary with no symbols, it turns one of the
+app's own log strings into a code address you can probe:
+
+```
+xref.py Solitaire.exe --string 'Dx11RenderWindow::UpdateWindowRect'   # -> enclosing function
+xref.py Solitaire.exe --callers 0x8563fc                             # -> direct call sites
+```
+
+It finds the string, scans `.text` for rip-relative `LEA`s that reference it, and looks each one up
+in the **`.pdata` exception table** to get the enclosing function's start - which is where a `ud2`
+has to go, not the LEA. It only matches a NUL-terminated string preceded by a terminator, so a
+suffix inside a longer format string cannot match; that exact mistake cost an earlier session a
+round.
+
+Two things it taught us about this binary:
+
+- The `.rdata` file-offset-to-RVA delta is `0x1800`, confirmed independently by the tool's own
+  section parsing.
+- Solitaire.exe is built with **Control Flow Guard**, so every indirect call is
+  `callq *__guard_dispatch_icall_fptr(%rip)` through one address (`0x140dcc730`). `--callers`
+  therefore reports "no direct call site" for any virtual method, which is information, not a
+  failure - it means the target is reached through a vtable.

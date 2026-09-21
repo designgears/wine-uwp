@@ -202,6 +202,36 @@ if [ -f "$UP_SHIM" ]; then
   echo "installed: UserPicker stand-in"
 fi
 
+# MemoryManager's native rmclient event registration requires an absent Windows service.
+# Solitaire throws out of its page constructor when registration returns 0x800706d9.
+MM_SHIM=$HOME/uwp-bin/build-probes/wineuwp_memorymanager.dll
+if [ -f "$MM_SHIM" ]; then
+  MM_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_memorymanager.dll
+  if ! cmp -s "$MM_SHIM" "$MM_DST"; then cp -f "$MM_SHIM" "$MM_DST"; fi
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.System.MemoryManager"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_memorymanager.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: MemoryManager stand-in"
+fi
+
+# Windows.Devices.Enumeration.DeviceInformation: Wine implements every CreateWatcher overload
+# except the DeviceClass one, which returns E_NOTIMPL. Solitaire is C++/CX, so that becomes a
+# thrown Platform::Exception that abandons AppHost::EngineInitialize - including the render-window
+# event subscription it needs to resize its swap chain. See shims/deviceinformation.
+DI_SHIM=$HOME/uwp-bin/build-probes/wineuwp_deviceinformation.dll
+if [ -f "$DI_SHIM" ]; then
+  DI_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_deviceinformation.dll
+  if ! cmp -s "$DI_SHIM" "$DI_DST"; then cp -f "$DI_SHIM" "$DI_DST"; fi
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Devices.Enumeration.DeviceInformation"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_deviceinformation.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: DeviceInformation CreateWatcher(DeviceClass) shim"
+fi
+
 # Windows.Storage.AccessCache.StorageApplicationPermissions stand-in. An app adds a picked file to
 # its future-access list so it can reopen it later; the class does not exist in Wine, so the
 # activation throws straight out of the pick with 0x80040111. See shims/accesscache.
@@ -231,5 +261,64 @@ if [ -d "$GLOB_SRC/ICU" ]; then
   done
   echo "installed: Globalization data"
 fi
+
+# --- shim registrations are not final until the prefix stops updating -------------------------
+# Copying DLLs into system32 above makes the next `wine` invocation run a prefix update, and that
+# update re-registers Wine's own builtin WinRT classes - rewriting "DllPath" for every class it
+# owns, including ones a shim block above just claimed. This is silent: each `reg add` reports
+# success, and the value is Wine's again by the time the app asks for it. It cost a full round of
+# debugging on Solitaire, where the DeviceInformation shim was installed, exported correctly and
+# never once loaded. The tell was Windows.Devices.Geolocation.Geolocator being rewritten with the
+# same timestamp - nothing here touches Geolocator.
+#
+# So: let any pending update finish, then assert the shim classes again and *verify* by reading
+# system.reg, rather than trusting the write.
+reassert_activatable() {
+  local cls="$1" dll="$2" key="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\$cls"
+  "${WINE_BIN}wine" reg add "$key" /v DllPath /d "C:\\windows\\system32\\$dll" /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$key" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$key" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$key" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+}
+
+# Read the live DllPath straight out of system.reg. The section header is escaped-backslash form.
+activatable_dllpath() {
+  local cls_esc=${1//./\\.}
+  sed -n "/^\[Software\\\\\\\\Microsoft\\\\\\\\WindowsRuntime\\\\\\\\ActivatableClassId\\\\\\\\${cls_esc}\]/,/^\[/p" \
+      "$WINEPREFIX/system.reg" 2>/dev/null |
+    sed -n 's/^"DllPath"="\(.*\)"$/\1/p' | head -1 | tr 'A-Z' 'a-z' | sed 's/\\\\/\\/g'
+}
+
+SHIM_CLASSES=""
+[ -f "$SYS32/wineuwp_userpicker.dll" ]       && SHIM_CLASSES="$SHIM_CLASSES Windows.System.UserPicker:wineuwp_userpicker.dll"
+[ -f "$SYS32/wineuwp_memorymanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.System.MemoryManager:wineuwp_memorymanager.dll"
+[ -f "$SYS32/wineuwp_deviceinformation.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Devices.Enumeration.DeviceInformation:wineuwp_deviceinformation.dll"
+
+if [ -n "$SHIM_CLASSES" ]; then
+  # Let any update already in flight finish. Forcing one with `wineboot -u` is deliberately not
+  # done here: it starts a fresh services.exe/explorer.exe set on every launch, and run.sh already
+  # warns that those leftovers make the activation race fail. The retry loop below copes with a
+  # clobber whenever it lands, which is the whole point of verifying rather than asserting once.
+  "${WINE_BIN}wineserver" -w 2>/dev/null || true
+
+  for attempt in 1 2 3; do
+    bad=""
+    for entry in $SHIM_CLASSES; do
+      cls=${entry%%:*}; dll=${entry#*:}
+      want="c:\\windows\\system32\\$dll"
+      [ "$(activatable_dllpath "$cls")" = "$want" ] || bad="$bad $entry"
+    done
+    [ -n "$bad" ] || break
+    for entry in $bad; do reassert_activatable "${entry%%:*}" "${entry#*:}"; done
+    "${WINE_BIN}wineserver" -w 2>/dev/null || true
+  done
+
+  if [ -n "$bad" ]; then
+    echo "WARNING: shim registration did not stick for:$bad" >&2
+  else
+    echo "verified: shim ActivatableClassId registrations"
+  fi
+fi
+
 
 echo "$stamp" > "$STAMP"
