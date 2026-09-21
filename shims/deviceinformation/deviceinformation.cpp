@@ -14,7 +14,7 @@
 //
 // The fix belongs in dlls/windows.devices.enumeration/main.c, but that DLL does not currently
 // link in this tree (multiple definition of RuntimeClass_* across its translation units, a
-// pre-existing breakage in generated headers under include/, which is another session's). A shim
+// pre-existing breakage in generated headers under include/). A shim
 // gets the behaviour without touching either.
 //
 // IDeviceInformationStatics {c17f100e-3a46-4a78-8013-769dc9b97390}, from Windows.Devices.winmd:

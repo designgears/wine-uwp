@@ -15,4 +15,10 @@ export WINE_UWP_ROOT
 export UWP_BIN=${UWP_BIN:-$WINE_UWP_ROOT/uwp-bin}
 export WINEPREFIX=${WINEPREFIX:-$WINE_UWP_ROOT/prefix}
 export WINE_SRC=${WINE_SRC:-$HOME/src/wine}
-export WINE_BIN_DIR=${WINE_BIN_DIR:-$HOME/src/wine-build/}
+# One directory, two historical names. run.sh, perf/ and the Python tools said WINE_BUILD while
+# this file and install-overrides.sh said WINE_BIN_DIR, each with its own $HOME fallback - so
+# overriding the documented WINE_BIN_DIR silently did nothing to run.sh. Accept either, derive both.
+# WINE_BUILD has no trailing slash ("$WINE_BUILD/wine"); WINE_BIN_DIR keeps one ("${WINE_BIN_DIR}wine").
+WINE_BUILD=${WINE_BUILD:-${WINE_BIN_DIR:-$HOME/src/wine-build}}
+export WINE_BUILD=${WINE_BUILD%/}
+export WINE_BIN_DIR="$WINE_BUILD/"

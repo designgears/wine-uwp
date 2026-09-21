@@ -10,7 +10,7 @@ import uwppaths
 import sys, os, re, bisect, subprocess, collections, glob
 
 path = sys.argv[1]; topn = int(sys.argv[2]) if len(sys.argv) > 2 else 25
-PDB = uwppaths.PDB; BUILD = os.environ.get('WINE_BUILD', os.path.expanduser('~/src/wine-build'))
+PDB = uwppaths.PDB; BUILD = uwppaths.WINE_BUILD
 PREFIX = uwppaths.PREFIX
 modules = []; samples = []
 for line in open(path, errors='replace'):

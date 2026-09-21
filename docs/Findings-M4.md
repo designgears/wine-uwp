@@ -7024,3 +7024,15 @@ being pumped. They are **Wine fixes written into Microsoft's binary because the 
 to the other session**. The dequeue thread-check is already half ours (`wineuwp` writes the UI
 thread id to `+0x10d010`). Re-homing them into Wine - or into `wineuwp` where the file is not ours -
 is what actually retires this dependency; preserving diffs of them does not.
+
+### Correction: the "other session" never existed (2026-09-21)
+
+Entries above refer to `~/src/wine` being shared with another session, and to files in it belonging
+to someone else. **That was never true.** All 116 commits in that tree are one author, one
+committer - `git log --format=%an` settles it. The claim originated in AGENTS.md, was trusted
+because AGENTS.md is trusted, and propagated into `env.sh`, `uwppaths.py`, `README.md`, two shim
+source comments and the Wine patch exporter's file list. It is left in the historical entries above
+rather than rewritten, because the reasoning recorded there really did proceed from it - but any
+sentence in this log that treats a Wine file as off-limits is wrong on that point. Cost: the patch
+export excluded ~5,000 lines of our own work, and a Media Player regression got a fabricated
+explanation ("the other session rebuilt ntdll").

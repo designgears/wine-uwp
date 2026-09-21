@@ -11,7 +11,7 @@
 //
 // Eight functions are imported from this apiset across the DLLs in the prefix, and Wine's
 // kernelbase exports seven of them. Only GetPackageFamilyNameFromToken is missing. It belongs in
-// kernelbase, but that file is another session's, so this provides the apiset instead.
+// kernelbase; providing the apiset here keeps the fix in this project's own code.
 //
 // **Shadowing an apiset is only safe if you provide all of it.** Unlike the advertising-id apiset,
 // which Wine implements not at all, this one is in active use: a DLL here exporting only the

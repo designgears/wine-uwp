@@ -13,7 +13,7 @@ font list from the registry, not from a directory scan), and the combination has
 be harmless - see Findings-M4.md. Run it by hand if you want to experiment.
 
 Usage: tools/wine-uwp/stage-fonts.py [path-to-SegUIVar.ttf] [output-dir]
-Defaults: /mnt/win/Windows/Fonts/SegUIVar.ttf -> ~/uwp-bin/win11/Windows/Fonts
+Defaults: /mnt/win/Windows/Fonts/SegUIVar.ttf -> $UWP_BIN/win11/Windows/Fonts
 
 The registry side, for reference - bare filenames resolve against the Fonts directory:
   [HKLM\Software\Microsoft\Windows NT\CurrentVersion\Fonts]

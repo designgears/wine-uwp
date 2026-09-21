@@ -20,7 +20,7 @@ export WINEDEBUG=${WINEDEBUG:-fixme+all,err+all}
 export WINE_SKIP_NATIVE_THREAD_CALLS=${WINE_SKIP_NATIVE_THREAD_CALLS:-1}
 export WINE_D3D_CONFIG=${WINE_D3D_CONFIG:-renderer=vulkan}
 # Patched Wine build (see docs/LinuxPort/Findings-M1.md), falls back to system wine.
-WINE_BUILD=${WINE_BUILD:-$HOME/src/wine-build}
+# WINE_BUILD comes from env.sh, which reconciles it with WINE_BIN_DIR.
 if [ -x "$WINE_BUILD/wine" ]; then export PATH="$WINE_BUILD:$PATH"; fi
 # DLLs where Wine's builtin must yield to the extracted Windows copy. Wine also ships these names.
 export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-windows.ui.xaml=n;windows.ui=n;twinapi.appcore=n;coremessaging=n;windows.applicationmodel=n;wintypes=n;threadpoolwinrt=n;msvcp_win=n;bcp47mrm=n;bcp47langs=n;profapi=n;rometadata=n;windows.globalization=n;msftedit=n;msxml6=n}"

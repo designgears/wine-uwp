@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Name things inside Microsoft binaries using Microsoft's public symbol server.
 
-  pdbsyms.py DLL                      download DLL's PDB into ~/uwp-bin/pdb (cached)
+  pdbsyms.py DLL                      download DLL's PDB into $UWP_BIN/pdb (cached)
   pdbsyms.py DLL --ordinals 122 134   name ordinal-only exports
   pdbsyms.py DLL --rva 0x6260 ...     name arbitrary RVAs (nearest public symbol below)
 Requires: pefile, curl, llvm-pdbutil.
