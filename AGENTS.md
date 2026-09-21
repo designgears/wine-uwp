@@ -98,6 +98,32 @@ For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
 
 ## Mistakes already made - do not repeat them
 
+**Never queue an APC onto a thread you do not own.** Wine parks its own workers
+(`wine_rpcrt4_server`, `wine_threadpool_*`, `wined3d_cs`) in *alertable* waits, so an APC queued
+onto one runs inside that wait. `wineuwp` broadcast startup APCs to every thread in the process;
+on the RPC server thread the APC reached `CoUnmarshalInterface`, which makes an outgoing RPC call
+that *that same thread* has to service. It never returned to its loop, never set
+`server_ready_event`, and every later `RoGetAgileReference` blocked - one Media Player run in three
+started and never painted. `open_app_thread()` in `dlls/wineuwp/main.c` filters them out by
+`GetThreadDescription`; use it for any new broadcast.
+
+**When a thread will not answer, go and look at it.** There is no usable debugger here, but a
+watchdog thread inside the process can `SuspendThread` any target, `GetThreadContext` it, and walk
+frames with `RtlLookupFunctionEntry` + `RtlVirtualUnwind`, then resolve against `/proc/<pid>/maps`
+from the same process. That ended a hunt that three rounds of reasoning had got wrong. **Do not
+scan the stack for module-range values instead** - that yields a plausible chain that resolves to
+vtables and GUIDs, not frames.
+
+**Instrumentation that alters control flow is an experiment, not a measurement.** A 10 s timeout
+added to a wait "just to see" made 12/12 runs pass and looked exactly like a fix. Restoring the
+`INFINITE` wait and keeping only the logging reproduced the bug in 3 runs.
+
+**Wine block-buffers its debug output inside its own process**, so a log line can appear seconds
+after the process that wrote it has exited - `stdbuf` on `run.sh` does not help. A poller that must
+act while the process is still alive needs a signal from outside the log. For a UWP app the
+reliable one is the window's unique colour count; the window's *existence* is not, because it is
+created before the app paints and a wedged run has one.
+
 **A successful QueryInterface for a private IID proves nothing in `dlls/dcomp/composition.c`.**
 Every object there ends its QI with `else *out = &impl->vtbl; return S_OK;` - a catch-all that
 answers *any* IID. `comp_shape_from_any` believed it, so `TryGetAnimationController` on a non-shape
@@ -335,7 +361,7 @@ the fully-qualified name. `--grep` first, always.
 | --- | --- |
 | Calculator | Fully working; the byte-identical regression baseline |
 | Feedback Hub | Fully working and interactive (~822 colours) |
-| Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean ~80% of runs; the rest deadlock in `DXamlCore::ConfigureCoreWindow` (below) |
+| Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
 | Solitaire | Starts clean, draws nothing (uses Windows.UI.Composition directly) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
@@ -347,10 +373,5 @@ on. One data point so far: `WINE_UWP_MANUAL_CONFIGURE` is **load-bearing for Med
 cannot simply be dropped - without it the app never paints (8 runs, 8 no-paint), because
 `broadcast_configure_core_window` returns before both the direct call and the APC broadcast.
 
-**The open bug: `DXamlCore::ConfigureCoreWindow` intermittently never returns** (~1 run in 5-10).
-The hung runs are identical to good ones up to `publish_core_window_mailbox`; a probe around the
-two calls in `try_configure_core_window` shows `GetCurrent` returning a live core and the
-`configure` call never coming back. Every run makes exactly one real `ConfigureCoreWindow`, always
-on the window-factory thread, so the call is not redundant - this is a deadlock inside XAML, and
-the next step is to record every thread's `wchan`/`syscall` at the moment it wedges
-(`winedbg` is broken and `gdb` cannot attach here).
+The `ConfigureCoreWindow` hang that used to lose one run in three is **fixed** - it was our own
+APC landing on Wine's RPC server thread, not anything in XAML. See Findings-M4.md.

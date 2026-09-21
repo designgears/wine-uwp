@@ -5860,3 +5860,75 @@ Two things this rules out:
 - **The call is not redundant.** Every one of 10 runs performs exactly one real
   `ConfigureCoreWindow`, always on the window-factory thread; 9 returned, 1 hung. So it is a
   genuine intermittent deadlock inside XAML, not our code calling something it should not.
+
+## The intermittent startup hang: we queued an APC onto Wine's RPC server thread
+
+Media Player failed to paint on roughly one run in three. Fixed. The cause was ours, and the
+mechanism is worth knowing because it will bite any app that marshals during startup.
+
+`wineuwp` has **six** loops that enumerate every thread in the process with `Toolhelp32` and
+`QueueUserAPC` onto each one. Wine's internal worker threads are in that enumeration, and their
+waits are *alertable*, so the APC runs inside the wait. The fatal case is the RPC server thread:
+
+```
+frame 21  RPCRT4_server_thread
+frame 20  rpcrt4_protseq_np_wait_for_new_connection   <- the alertable wait
+frame 17  ntdll (APC dispatch)
+frame 16  wineuwp!drive_view_startup_apc              <- our APC
+frame 15  wineuwp!drive_view_startup
+frame 14  wineuwp!get_current_core_application_view
+frame 11  ole32!StdGlobalInterfaceTable_GetInterfaceFromGlobal
+frame 10  combase!CoUnmarshalInterface
+frame  4  rpcrt4!NdrProxySendReceive
+frame  2  combase!CoWaitForMultipleHandles            <- blocked in an outgoing RPC call
+```
+
+The RPC server thread is blocked **making an RPC call that it is itself the server for**. It never
+returns to its loop, so it never reaches `SetEvent(server_ready_event)`, so
+`RPCRT4_sync_with_server_thread` waits forever - and the next `RoGetAgileReference` (XAML does one
+from `ConfigureCoreWindow`) blocks with it. Everything else follows from that one edge.
+
+The fix routes all six loops through `open_app_thread()`, which refuses any thread whose
+`GetThreadDescription` starts with `wine` (`wine_rpcrt4_server`, `wine_threadpool_*`, `wined3d_cs`).
+**Never queue an APC onto a thread you do not own**; anything Wine parks in an alertable wait will
+run it.
+
+15/15 clean with the probes removed, against ~6/15 before. Calculator 249 colours and zero
+differing pixels; Feedback Hub 822.
+
+### Three wrong theories, and what ended them
+
+Each of these explained every symptom I had at the time. That is exactly why fitting the symptoms
+is not evidence.
+
+1. **`mgr_mutex`.** My first instrumentation gave that wait a 10 s timeout that *proceeds anyway*,
+   and 12/12 runs passed - which looked like a fix and was an artefact of the instrument changing
+   behaviour. Restoring `INFINITE` and keeping only the logging reproduced the hang in 3 runs.
+   **Instrumentation that alters control flow is an experiment, not a measurement.**
+2. **An ABBA against `protseq->cs`.** Ruled out by a probe on both sides of the
+   `EnterCriticalSection`: the server thread never printed either line.
+3. **The wrong APC.** I filtered `configure_core_window_apc` and the hang was unchanged (6/15).
+   The offender was `drive_view_startup_apc`, from a different loop.
+
+What ended it was not more reasoning: it was extending the watchdog to **suspend the RPC server
+thread and unwind it**. I had spent several cycles inferring that thread's state from the outside
+when `SuspendThread` + `RtlVirtualUnwind` reads it directly. When a thread will not answer, go and
+look at it.
+
+### Getting a stack when there is no debugger
+
+`winedbg` is broken here and `gdb` cannot attach, but a watchdog thread inside the process can:
+duplicate the target's handle, `SuspendThread`, `GetThreadContext`, then walk frames with
+`RtlLookupFunctionEntry` + `RtlVirtualUnwind`. Resolve the addresses against `/proc/<pid>/maps`
+**captured from the same process**.
+
+Do not scan the stack for module-range values instead. I tried that first and it produced a
+plausible-looking chain that resolved to vtables, `GUID` constants and `gPFactory` - data, not
+return addresses. A real unwind gave a different and correct answer.
+
+Wine also **block-buffers its debug output inside its own process**, so a log line can land seconds
+after the process that wrote it has exited. `stdbuf` on `run.sh` does not help - the buffering is
+in the Wine child. A poller that must act while the process is alive needs a signal from outside
+the log; the one that works here is the window's unique colour count, the same measure the soak
+uses. The window itself is not a usable signal: it exists before `ConfigureCoreWindow`, so a
+wedged run has a window that never paints.
