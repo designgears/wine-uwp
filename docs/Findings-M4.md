@@ -7349,3 +7349,59 @@ with the real cause. Three specific traps:
    `mov %rbx,0x18(%rsp)` at `DoTransition`'s entry produced **zero** log lines even though the
    function definitely runs; hooking 0x2a bytes later, past the prologue, gave the correct count of
    1. Never hook the register-save prologue - hook after it.
+
+### Next blocker: the CDN main-manifest download never issues a request
+
+With the render byte patch in place the app reaches `gui/screenfiles/loading/loading` and stays
+there. The app's own log names the blocker:
+
+```
+[1.713] ContentManifestAppComponent::InitiateDownload - Failed to download main manifest
+        from 'https://go.microsoft.com/fwlink/?linkid=2310143'.
+```
+
+Everything downstream follows from it: `CdnAppComponent::MountContent -- Skipping content mount for
+[...] as the secondary manifest is not yet downloaded` for ~20 content sets, and a long tail of
+`Inventory - Failed to Find/Load asset`.
+
+What is established:
+
+- **The URL is fine.** From the host it is a 302 to
+  `download-ssl.msgamestudios.com/content/mgs/ce/production/Solitaire/prod/contentmanifest/2025_04_21/contentmanifest.json`,
+  then 200, 7023 bytes.
+- **No HTTP request is ever issued for it.** With `WINEDEBUG=+wininet`, the only `InternetConnectW`
+  calls in the whole run are to `92ab.playfabapi.com` (PlayFab, which works). So the failure is
+  *before* the network, not a TLS or DNS problem.
+- **The downloader is cpprestsdk**, not libHttpClient: the binary contains `xmlhttp_http_task` and
+  `IXMLHTTPRequest2Callback` (`.?AVxmlhttp_http_task@@`), i.e. the C++ REST SDK's IXMLHTTPRequest2
+  backend. PlayFab uses a different path (XPlatCppSdk over WinINet), which is why one works and the
+  other does not.
+- `msxml6.dll` (native) **is** loaded, and the XMLHTTP CLSIDs `{88d96a09/0a/0b-f192-11d4-...}` are
+  registered in the prefix. `msxml6` delay-imports WININET, urlmon and **WINHTTP**, and
+  `winhttp.dll` exists in the prefix - but it is **never opened** during the run, so msxml6 never
+  reaches its transport.
+- **Connectivity is not the cause**: the app polls `IConnectionProfile2` 63 times successfully.
+  `network_information_statics_GetConnectionProfiles` is `E_NOTIMPL` but is called only once.
+
+**Unrelated failure found on the way** (worth fixing separately, not the blocker): the managed Ad
+SDK's static constructor throws, caught with `WINE_UWP_TRACE_ORIGINATE=1`:
+
+```
+System.TypeInitializationException ---> System.Exception: Invalid data. (HRESULT: 0x8007000D)
+   at McgMarshal.ThrowOnExternalCallFailed(...)
+   at Microsoft.AdSdk.Uwp.MsAdSdkController..ctor(ISdkWebViewFactory, ITelemetryProvider, IInternalConfigProvider)
+   at Microsoft.AdSdk.Uwp.MsAdSdkController.get_Instance()
+   at Microsoft.AdSdk.Uwp.MsAdSdk..cctor()
+```
+
+alongside `RoGetActivationFactory Class L"Windows.System.Profile.HardwareIdentification" not found`
+and `BootflowItemAds::BeginInit -- ad consent flow error [Invalid parameter.]`.
+
+**Cache seeding does not work as a shortcut.** `WINEDEBUG=+file` shows the app probes exactly
+`LocalState\Cache\dlfiles\cdn\contentmanifest.json`. Dropping the real 7 KB manifest there changes
+nothing: it still logs `CdnAppComponent::LoadCachedMainManifest -- failed to retrieve existing
+forward link`, so the cached manifest is gated behind a stored "forward link" record that lives
+somewhere else (keys `ForwardLink` / `ForwardLinkUri` / `RequestAttemptCount` appear around
+`0x507f98`-`0x508328`). The binary also has a debug setting `cdnManifestUriOverride`
+("Used to specify a uri override for modern cdn download") next to `proxyHost`/`proxyPort`, which
+may be a cleaner lever than cache seeding.
