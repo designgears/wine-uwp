@@ -1,0 +1,6 @@
+
+# Autoconf scratch and editor backups, committed here by accident.
+autom4te.cache/
+*~
+*.orig
+*.rej

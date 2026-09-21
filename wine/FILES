@@ -9,6 +9,7 @@
 # Derived from committed changes since the upstream base, working-tree changes AND untracked
 # files - all three are needed. `git diff UP..HEAD` alone drops every file only ever edited in
 # the working tree, which is most of the Media Player work.
+.gitignore
 configure.ac
 dlls/advapi32/advapi32.spec
 dlls/advapi32/lsa.c
