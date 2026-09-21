@@ -75,6 +75,15 @@ instead.
 
 ### ud2 probes
 
+**The hit line is `wine: Unhandled illegal instruction at address <addr>, starting debugger...`**,
+not `err:seh:NtRaiseException Unhandled exception code 1007` as this file used to claim. Grepping
+for the old string reports a miss on a probe that fired.
+
+**Patch and restore *every* copy.** `run.sh` copies `~/uwp-bin/win11/...` into the prefix, so a
+patch applied to the source is live in `~/.wine-uwp/drive_c/windows/system32/` too - restoring only
+the source leaves the probe in place for every later run. `cmp` both against the backup afterwards.
+
+
 To answer "does this basic block execute", overwrite its first two bytes with `0f 0b`. A hit shows
 up as `err:seh:NtRaiseException Unhandled exception code 1007`. The *address* in that line is the
 Wine-side rethrow and is the same for every probe - only the presence of the line means anything.
@@ -97,6 +106,13 @@ For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
    which methods it calls.
 
 ## Mistakes already made - do not repeat them
+
+**Reason backward from a measurement, not forward from a mechanism.** Four separate explanations
+for Solitaire drawing nothing each fitted every symptom available and were each wrong (Findings-M4).
+The one result that held was a `ud2` probe with a firing control: the app never calls
+`Window.put_Content` and never calls `Window.Activate`, so every rendering symptom below that was a
+consequence. When a theory "explains everything", that is not evidence - find the measurement that
+separates it from the alternatives.
 
 **An app may write its own log.** Solitaire prints `[  0.002] LiveManagerXsapi2 - ...` lines to
 stderr naming its own failures, which is better evidence than anything we can infer from outside.
@@ -376,7 +392,7 @@ the fully-qualified name. `--grep` first, always.
 | Feedback Hub | Fully working and interactive (~822 colours) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | Starts clean, activates, draws nothing. XAL and XSAPI now initialise (UserPicker shim + the shell storage bridge); the app creates a Window and Page then idles with `frame: 0 ops`. Closest proxy we have to Shapr3D's rendering path |
+| Solitaire | Starts clean; XAL and XSAPI now initialise. **Never calls `Window.put_Content` or `Window.Activate`** (ud2-proved), so it never finishes `OnLaunched` - the rendering symptoms are all downstream of that. Last act before idling is an `rmclient.dll` RPC to a missing Resource Manager service. Closest proxy we have to Shapr3D's rendering path |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against

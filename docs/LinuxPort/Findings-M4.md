@@ -6021,3 +6021,62 @@ Ruled out with evidence, so they need not be re-investigated: the `LoadComponent
 (zero network calls in the run), WebView2, swapchain rendering, window bounds (the CoreWindow is
 created 1280x800), and thrown exceptions (`WINE_UWP_TRACE_ORIGINATE` reports none - the app is not
 swallowing an error, it is deciding it has nothing to draw).
+
+### Why Solitaire draws nothing: it never finishes OnLaunched
+
+Two `ud2` probes on XAML, each with a firing control, settle what a day of theorising could not:
+
+| probe (RVA in Windows.UI.Xaml.dll) | fired? |
+| --- | --- |
+| `DXamlCore::GetCurrent` 0x1134d4 (control) | **yes** |
+| `WindowGenerated::put_Content` 0x307140 | no |
+| `WindowGenerated::Activate` 0x6121f0 | no |
+
+The app sets no content and never activates its window. **Everything downstream was a symptom**:
+`frame: 0 ops`, the `0x0` visuals and the empty visual tree are all correct behaviour for a window
+with no content, and none of it was worth investigating.
+
+`activation_cb_ActivationHandled` *does* fire, so the app entered `OnLaunched` and returned from it.
+For a managed `async void OnLaunched` that means it returned at an `await` whose continuation never
+runs. The last thing it does before idling at 60 Hz is an RPC through **`rmclient.dll`** (the
+Resource Manager / Game Mode client, reached just after `CapabilityCheck "gameBarServices"` is
+granted) to a service the prefix does not have:
+
+```
+fixme:rpc:RpcBindingBind ...: semi-stub          <- Wine never establishes the binding
+fixme:ole:RoGetMatchingRestrictedErrorInfo 0x800706d9   <- EPT_S_NOT_REGISTERED
+```
+
+That is the next thing to chase. It is a lead, not a conclusion.
+
+### Four theories that fitted every symptom and were all wrong
+
+Recorded because each cost a full cycle, and the pattern is the lesson - all four were reasoned
+*forward* from a plausible mechanism to a prediction, instead of *backward* from a measurement:
+
+1. **`LoadComponent(App.xaml)` failing `0x802b000a`** - the package contains no `.xaml` or `.xbf`
+   at all, so the failure is expected.
+2. **The refused `{7ca84d06}`** - only Solitaire asks for it, which made it look like *the*
+   differentiator. It is `IValueMarshalByPropertySet`, a marshalling shortcut with a fallback.
+   Answering it with stubs made `CoreApplicationView::Activate` fail and produced *no window at
+   all*.
+3. **WNF** - `RtlSubscribeWnfStateChangeNotification` is a stub that takes a callback we never
+   invoke, which looked damning. The callback resolves to
+   `wil::details::make_wnf_subscription_state<empty_wnf_state>` inside `windows.ui.dll` - generic
+   WIL change-notification housekeeping, not the app. (And `rtl.c` is another session's file, so
+   verifying first also avoided touching it for nothing.)
+4. **The splash screen** - `splash_add_Dismissed` accepted a registration and never fired it, which
+   is exactly the extended-splash pattern. Solitaire never registers a handler. Fixed anyway,
+   because it is a real trap for apps that do use it, but it changes nothing here.
+
+The one thing that held up all day was a direct measurement with a validated control.
+
+**AGENTS.md's ud2 signature was wrong** and nearly cost a correct negative: the line is
+`wine: Unhandled illegal instruction at address ..., starting debugger...`, not
+`err:seh:NtRaiseException Unhandled exception code 1007`. Grepping for the documented string found
+nothing in a run where the probe *had* fired.
+
+**Restore every copy of a byte-patched DLL.** `run.sh` copies `~/uwp-bin/win11/...` into the
+prefix, so restoring only the source leaves a live `ud2` in
+`~/.wine-uwp/drive_c/windows/system32/`. I did exactly that and only noticed because the next
+diff of the two copies showed my own patch sitting in the prefix.
