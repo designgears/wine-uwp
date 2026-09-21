@@ -690,7 +690,7 @@ the fully-qualified name. `--grep` first, always.
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | **Renders, does not reach the game.** Paints its splash page (`splashpage_pc`) fully at 1280x800, 151118 colours, 0 critical errors, and keeps presenting frames (`SwapBuffers` runs). It is genuinely online - `PlayFab login successful` - after msxml6's XMLHTTP classes were registered. It never leaves the splash: exactly one `BootflowItem` begins and its completion future is never fulfilled, so no item that does real work ever starts. Five minutes adds no further log line. See Findings-M4 |
+| Solitaire | **Renders, does not reach the game.** Paints its splash page (`splashpage_pc`) fully at 1280x800, 151118 colours, 0 critical errors, and keeps presenting frames (`SwapBuffers` runs). It is genuinely online - `PlayFab login successful` - after msxml6's XMLHTTP classes were registered. It never leaves the splash, and the blocker is now **identified**: of the eight bootflow items, `BootflowItemFont` (2nd) begins and never completes. Its `UpdateInit` returns "done" only when `[app_context+0x190]` is set, and that byte is only set by a continuation on a future that loads `gui/fonts/fonts.fontlib` - the future is never fulfilled. Nothing is logged on success, which is why the log simply stops. See Findings-M4 |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
@@ -736,6 +736,12 @@ the resize never reached XAML at all.
 Next: the app holds on the splash page. The CDN explanation first written here was **wrong** - the
 app had no working HTTP at all (msxml6's XMLHTTP classes were never registered, so libHttpClient's
 IXMLHTTPRequest2 backend could not create its transport), and with that fixed it logs
-`PlayFab login successful`. It still stops, one layer deeper: `BootflowState::Enter` begins exactly
-one item and the future that would advance the flow is never fulfilled. The rendering path itself
-is proven end to end, which is the part Shapr3D needs.
+`PlayFab login successful`. It still stops, one layer deeper, and that layer is now pinned: the
+bootflow runs eight items in a fixed order and stalls on the **2nd, `BootflowItemFont`**, whose
+completion is gated on a never-fulfilled future loading `gui/fonts/fonts.fontlib`. Items 3, 5 and 7
+provably never begin (`ud2` probes with a firing control). The rendering path itself is proven end
+to end, which is the part Shapr3D needs.
+
+**Beware ~1-in-3 run variance**: some Solitaire runs stall before `App -- AppState Transition ...
+'Sgi::BootflowState'` with no probe applied at all. A probe that "did not fire" in such a run means
+nothing - check the run reached the bootflow first.
