@@ -20,6 +20,19 @@ generalises: how to investigate, and the mistakes that have already cost time.
   that disproves it. A stale `AGENTS.md` is worse than a short one, because it is trusted. The
   `Current state` table at the bottom is the part that rots fastest; update it whenever an app's
   behaviour changes.
+- **Always capture a screenshot and put it in front of the user with any progress claim.** Not a
+  colour count, not a grep tally, not a log line - a picture. `identify`/`%k` is a cheap *screening*
+  metric, never the evidence. And read the screenshot yourself before showing it: 151118 colours and
+  "cards on screen" was Solitaire's **splash-screen artwork**, which is decorative and means the
+  game has not started. A high colour count proves something painted, not that the app works. Say
+  which screen it is.
+
+    ```
+    W=$(DISPLAY=:98 xdotool search --name "<title>" | tail -1)
+    DISPLAY=:98 xwd -id "$W" -silent > /tmp/s.xwd && magick xwd:/tmp/s.xwd /tmp/s.png
+    ```
+
+  Then `Read` the PNG, describe what is actually on it, and embed it in the reply.
 - **Run on Xvfb `:98`, never the user's `:0`.** `DISPLAY=:98 tools/wine-uwp/run.sh`.
 - **The Wine tree (`~/src/wine`) is shared with another session and is deliberately uncommitted.**
   Check `git -C ~/src/wine status` before touching anything. Files that are not yours include
