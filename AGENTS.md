@@ -228,11 +228,19 @@ For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
 
 ## Mistakes already made - do not repeat them
 
-**A byte patch to a Windows DLL is not a deliverable, and cannot be exported as a diff.** Unlike
-our Wine source, which is vendored in full under `wine/`, a diff against a Microsoft DLL needs the
-exact base binary to apply, and Microsoft serves only current revisions. When a patch to a Microsoft DLL turns out to be load-bearing, the
-job is to **re-home it** into Wine - anywhere in the tree, `wineuwp` included - not to archive it. Most of the CoreMessaging patches are Wine IOCP/message-pump fixes wearing a
-disguise. See Findings-M4.
+**Byte-patching a Windows DLL is fine; patching our own code is not.** We have no source for
+those binaries, so a byte patch is the only tool there is - `CoreMessaging.dll` and
+`Windows.UI.dll` carry load-bearing ones today and that is a legitimate, permanent state. Our own
+Wine source is the opposite case: it is vendored in full under `wine/` and there is never a reason
+to represent it as a diff.
+
+What *is* true of a DLL patch is that it **cannot be shipped or re-applied as a diff** - that needs
+the exact base binary, and Microsoft serves only current revisions. So the thing that matters is
+keeping the pristine original (see the byte-patch ground rule) and recording what each patch does
+in Findings, not converting it into something else. Re-home one into Wine when the Wine-side fix is
+worth having on its own merits - most of the CoreMessaging patches are IOCP/message-pump behaviour
+that Wine arguably should get right anyway - but that is an improvement, not a debt. See
+Findings-M4.
 
 **There is no "other session", and this file said there was for months.** Every one of the 116
 commits in `~/src/wine` is ours, one author, one committer - checked with `git log --format=%an`,
