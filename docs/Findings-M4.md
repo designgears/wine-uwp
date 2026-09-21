@@ -7235,3 +7235,48 @@ slot `+0x20` (vtable at `0xec2708`).
 Caution for whoever continues: `0x88d2f8` also reads `+0x290` *and* calls slot `+0x20`, and is **not**
 the state manager - it is a ring buffer where `+0x290`/`+0x298` are a size and a mask. Offsets alone
 are not identification.
+
+### The per-frame path runs; the state it ticks is not BootflowState
+
+Mapping the whole chain, every link measured rather than assumed:
+
+```
+frame loop 0x7ec5a8            ALIVE - 3659 dcomp presents in a 60s run, still 1 op/frame at the end
+  └─ 0x7ec6c1  unconditional call, every frame
+     app-state manager update 0x95eb50   (the function that logs "App -- AppState Transition")
+       ├─ 0x95ed9b..0x95ee06  loop: drain queued transitions
+       ├─ 0x95ee08  mov 0x288(%rdi),%rdi     ; active state
+       ├─ 0x95ee12  test/je                  ; NOT taken - NOPing it does not fault, so +0x288 != 0
+       ├─ 0x95ee14..0x95ee41  iterate the state's sub-updatables, slot +0x18 each
+       └─ 0x95ee50  call slot +0x20          ; the state's Update   <- the single tick came from here
+```
+
+Manager fields: **`+0x288` = active state**, `+0x290` = pending/requested. `DoTransition` installs
+pending as active at `0x95ed40` (`mov 0x290(%rdi),%rbx ; mov %rbx,0x288(%rdi)`) and clears `+0x288`
+at `0x95ecb8` while exiting the old one.
+
+**The contradiction, and how it resolves.** The per-frame path provably reaches `0x95ee50` every
+frame (the null check is not taken), yet `BootflowState::Update` runs only a handful of times. Two
+forced-error experiments pin it:
+
+- NOP the guard at `0x3070af` so *any* non-zero `UpdateInit` takes the error path -> **no line**. So
+  on every tick that did happen, `UpdateInit` returned 0 (done).
+- If the tick ran per-frame with `UpdateInit` returning 0, the index would advance each frame and
+  the flow would finish inside 8 frames, logging `Bootflow -- Successfully Initialized all boot flow
+  items.` (string at `0xf745d8`). It never appears in 3659 frames.
+
+So the tick is not on the per-frame path at all. The object at `+0x288` that *is* ticked every frame
+is **not** `BootflowState`, despite `App -- AppState Transition ... NewState 'Sgi::BootflowState'`
+being logged once. Either a second transition silently replaces it, or the manager instance driven
+by the frame loop (`mov 0x8(%r15),%rcx` at `0x7ec6bd`) is not the instance that owns the bootflow.
+
+**Next**: identify the object actually at `+0x288` on a later frame. A `ud2` cannot answer this - it
+is one-shot and fires on the first frame, which is the frame where the answer is still
+`BootflowState`. What is needed is either the vtable pointer of `[manager+0x288]` read on a late
+frame, or a trampoline that logs it without altering flow (the app's own logger is
+`0x14066940c(ecx=1, edx=3, r8=fmt)`).
+
+**Instrumentation caveat worth carrying**: the "log every tick" patch (redirecting the tick into its
+own error path) *does* alter control flow - the error path shuts the bootflow down. Its "exactly one
+line" reading is only safe because the two experiments above independently rule out the tick running
+per-frame. Had it been the sole evidence, it would have been an experiment misread as a measurement.
