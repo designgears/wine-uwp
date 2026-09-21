@@ -40,6 +40,12 @@ generalises: how to investigate, and the mistakes that have already cost time.
   `dlls/user32`, `dlls/combase`, `dlls/d3d11`, `dlls/windows.graphics`, `dlls/wintypes`, `server/*`,
   `include/*`. Commit only files in *this* repo.
 - **Never push.** Commit freely; pushing is the user's call.
+- **Export our Wine changes into this repo after touching them**:
+  `tools/wine-uwp/export-wine-patches.sh` writes `docs/LinuxPort/wine-patches/`. "Commit only files
+  in this repo" is not the same as "let our Wine work exist nowhere" - it was ~2,700 lines living
+  in one working tree, one `git checkout` from gone. Nothing gets committed in the shared tree; the
+  diffs get committed here. The exporter takes an **explicit file list**, not a glob, so it cannot
+  start sweeping the other session's work into our history.
 - **Byte patches go in `~/uwp-bin/win11/...`**; `run.sh` re-copies into the prefix. Always keep a
   backup and verify the restore with `cmp` before moving on. Leaving one behind silently poisons
   every later run - it has happened.
