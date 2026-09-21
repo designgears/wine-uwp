@@ -20,7 +20,7 @@ environment:
 | `run.sh`, `install-overrides.sh`, `stage-app.sh` | launching and prefix setup |
 | `shims/`, `probes/`, `CMakeLists.txt` | the WinRT stand-ins and the diagnostic probes |
 | `*.py` | the investigation toolkit (`xref.py`, `winmd.py`, `piid.py`, `fasthive.py`, ...) |
-| `wine/` | **our Wine source**, vendored in full by `sync-wine.sh` - 120 files, ~22,700 lines |
+| `wine/` | **our Wine source**, vendored in full by `sync-wine.sh` - 196 files, +49k lines vs upstream |
 | `docs/` | Plan, Findings, screenshots |
 | `uwp-bin/` | **gitignored**, 3.9G: staged apps, the Windows image we borrow DLLs from, PDBs, built shims |
 | `prefix/` | **gitignored**, 946M: the live Wine prefix |
@@ -28,10 +28,10 @@ environment:
 `env.sh` defines `UWP_BIN`, `WINEPREFIX`, `WINE_SRC` and `WINE_BIN_DIR`; every shell script sources
 it and the Python tools get the same values from `uwppaths.py`. All four are overridable.
 
-**The Wine source is deliberately *not* in here.** `~/src/wine` and `~/src/wine-build` are shared
-with another session; they are not ours to move or commit. That is why our Wine changes live as
-real files in `wine/`, and why a fix that belongs in one of their files has to be made
-somewhere else instead.
+**The Wine *checkout* is not in here**, because `~/src/wine` plus `~/src/wine-build` is a large
+build tree that predates this repo. Our Wine *source* very much is: `wine/` holds every file this
+project has changed, in full, and `sync-wine.sh` moves them either way. All of it is ours - there
+is no other owner and no file in that tree is off-limits.
 
 This repo was split out of the Microsoft Calculator fork it started in, keeping the 131 commits
 that were ours; the Calculator tree is no longer involved.
@@ -60,24 +60,27 @@ that were ours; the Calculator tree is no longer involved.
 
   Then `Read` the PNG, describe what is actually on it, and embed it in the reply.
 - **Run on Xvfb `:98`, never the user's `:0`.** `DISPLAY=:98 ./run.sh`.
-- **The Wine tree (`~/src/wine`) is shared with another session and is deliberately uncommitted.**
-  Check `git -C ~/src/wine status` before touching anything. Files that are not yours include
-  `dlls/kernelbase/*`, `dlls/ntdll/{loader,rtl,sync,signal_x86_64,threadpool}.c`, `dlls/win32u`,
-  `dlls/user32`, `dlls/combase`, `dlls/d3d11`, `dlls/windows.graphics`, `dlls/wintypes`, `server/*`,
-  `include/*`. Commit only files in *this* repo.
+- **The Wine tree (`~/src/wine`) is ours, all of it.** It is simply a checkout that lives outside
+  this repo. Edit anything in it, then `./sync-wine.sh --from-tree` and commit the result here.
+  Earlier revisions of this file claimed the tree was "shared with another session" and listed
+  `dlls/kernelbase`, `dlls/ntdll`, `dlls/win32u`, `dlls/user32`, `dlls/combase`, `dlls/d3d11`,
+  `dlls/windows.graphics`, `dlls/wintypes`, `server/` and `include/` as off-limits. **That was
+  false** - every commit in the tree is ours - and it cost real work; see the mistakes section.
 - **Never push.** Commit freely; pushing is the user's call.
 - **Sync our Wine source into this repo after touching it**: `./sync-wine.sh --from-tree`, then
   commit. `--check` tells you whether the two are in step; `--to-tree` reconstructs the tree from
   the repo. "Commit only files in this repo" is not the same as "let our Wine work exist nowhere":
-  it is ~22,700 lines across 120 files, and `dlls/dcomp/composition.c` (14k lines) and
-  `dlls/wineuwp/main.c` (3.8k) **do not exist upstream at all** - they are our source, not patches.
+  it is **+49,264/-1,024 lines across 196 files**, and 29 of them - `dlls/dcomp/composition.c`
+  (14k lines), `dlls/wineuwp/main.c` (4.8k), `dlls/dxgi/compswapchain.c` - **do not exist upstream
+  at all**. They are our source, not patches.
   Nothing gets committed in the shared tree; the files get committed here, in full.
   `wine/FILES` is an **explicit list, never a glob**, so this cannot start sweeping the other
   session's work into our history.
-- **This used to be a patch export, and that silently lost 88% of the work.** `git diff` sees only
-  the *uncommitted* delta, but most of our Wine work had already been committed in the shared tree -
-  so `wine-patches/` captured 2,700 of 22,700 lines and looked complete. If you ever find yourself
-  exporting diffs of our own code again, check what is already committed over there first.
+- **This used to be a patch export, and it silently lost ~95% of the work.** Two compounding
+  causes: `git diff` sees only the *uncommitted* delta, while most of the work was already
+  committed in that tree; and the exporter's file list came from the bogus "not yours" claim
+  below, dropping another ~5,000 lines. It captured 2,700 lines and looked complete. If you ever
+  find yourself exporting diffs of our own code again, stop.
 - **Byte patches go in `$UWP_BIN/win11/...`**; `run.sh` re-copies into the prefix. Always keep a
   backup and verify the restore with `cmp` before moving on. Leaving one behind silently poisons
   every later run - it has happened.
@@ -227,9 +230,19 @@ For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
 **A byte patch to a Windows DLL is not a deliverable, and cannot be exported as a diff.** Unlike
 our Wine source, which is vendored in full under `wine/`, a diff against a Microsoft DLL needs the
 exact base binary to apply, and Microsoft serves only current revisions. When a patch to a Microsoft DLL turns out to be load-bearing, the
-job is to **re-home it** into Wine (or into `wineuwp` when the right file is the other session's),
-not to archive it. Most of the CoreMessaging patches are Wine IOCP/message-pump fixes wearing a
+job is to **re-home it** into Wine - anywhere in the tree, `wineuwp` included - not to archive it. Most of the CoreMessaging patches are Wine IOCP/message-pump fixes wearing a
 disguise. See Findings-M4.
+
+**There is no "other session", and this file said there was for months.** Every one of the 116
+commits in `~/src/wine` is ours, one author, one committer - checked with `git log --format=%an`,
+which is all it ever took. The claim sat in the Layout section and the ground rules, was repeated
+in `env.sh`, `README.md` and two tool headers, and was **trusted** because AGENTS.md is trusted. It
+did direct damage: a list of "files that are not yours" excluded 56 files and ~5,000 lines of our
+own work - `combase/roerror.c`, `user32/message.c`, `server/alpc.c` - from being vendored into this
+repo, and this same file's toolkit table describes two of those very files as our own
+instrumentation. It also produced a bogus explanation for a regression (above). **When this file
+asserts a constraint about who owns what or what you may not touch, verify it once and delete it if
+it is wrong** - that is the rule at the top, and the "other session" is what it exists to prevent.
 
 **Reason backward from a measurement, not forward from a mechanism.** Several explanations for
 Solitaire drawing nothing each fitted every symptom available and were each wrong (Findings-M4).
@@ -466,8 +479,8 @@ set on every launch, and those leftovers are exactly what run.sh warns break the
 is ignored, because `l1-1-1` matches `apisetschema.spec`'s `...-l1-1-2 = kernelbase.dll`; but
 `api-ms-win-appmodel-advertisingid-l1-1-0.dll` *is* picked up, because that apiset is in no entry at
 all and the delay-load helper falls back to a runtime `LoadLibrary`. Two apisets, two outcomes.
-**Grep `dlls/apisetschema/apisetschema.spec` first.** When the apiset *is* in the schema and the
-target is another session's file, repair the thunk instead: `dlls/wineuwp/main.c` walks each
+**Grep `dlls/apisetschema/apisetschema.spec` first.** When the apiset *is* in the schema, repairing the
+import thunk is the tidier fix than editing the loader: `dlls/wineuwp/main.c` walks each
 module's import tables and replaces the stub, driven by a one-entry table.
 
 **An unresolved import is not a `@ stub`.** `EXCEPTION_WINE_STUB` (**0x80000100**) with
@@ -489,9 +502,8 @@ a traced stand-in returning `E_NOTIMPL` (with event registrations answered `S_OK
 calls **`GetDefault` and nothing else**. Merely being able to *create* the object was the entire
 fix. Guessing which methods mattered would have been days of wasted work.
 
-**Check who owns a file before "fixing" it.** `RtlGetDeviceFamilyInfoEnum` has a ternary that reads
-inverted; it is correct, because `get_package_env` returns an `NTSTATUS` and 0 means success. It is
-also in another session's file.
+**Read a suspicious ternary twice before "fixing" it.** `RtlGetDeviceFamilyInfoEnum` has one that
+reads inverted; it is correct, because `get_package_env` returns an `NTSTATUS` and 0 means success.
 
 **Do not add fields to a struct whose prefix is shared.** Everything in `dlls/dcomp/composition.c`
 starts with `struct comp_object`'s three fields and reuses its AddRef/Release. A field added there
@@ -502,7 +514,8 @@ report showed `rdx 007300660066004f`, `"Offs"` from `"Offset"`. Put new state in
 without a screenshot.** Media Player rendered and navigated, then a later run failed to start. I
 wrote both of the following into this file, and both were wrong:
 
-- *"ntdll and kernelbase were rebuilt minutes ago by the other session."* I had run
+- *"ntdll and kernelbase were rebuilt minutes ago by the other session."* There is no other
+  session (see below), and the timestamps were misread too. I had run
   `ls -lt --time-style=+%H:%M`, which prints **no date**, saw `03:43`, and assumed today. With
   `--time-style='+%m-%d %H:%M'` those DLLs are from **09-19**. The only file rebuilt that day was my
   own `windows.media.playback.mediaplayer.dll`. Always print the date; also check

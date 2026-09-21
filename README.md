@@ -28,13 +28,13 @@ Always on Xvfb `:98`, never a real display. `env.sh` resolves the paths; overrid
 
 ## What is not in here
 
-The Wine *build* (`~/src/wine`, `~/src/wine-build`) is shared with another workstream and is not
-part of this repo. Our Wine **source is** - `wine/` holds the 120 files this project owns, in full,
-at their real paths (~22,700 lines; `dlls/dcomp/composition.c` and `dlls/wineuwp/main.c` do not
-exist upstream at all). `sync-wine.sh` moves them in either direction and `wine/BASE.txt` records
-the upstream release they sit on. **You need a Wine tree at that base, plus `./sync-wine.sh
---to-tree`, to reproduce the environment.** The other workstream's changes - combase, ntdll,
-win32u, user32, kernelbase, server/, include/ - are deliberately not here.
+The Wine *checkout* (`~/src/wine`, `~/src/wine-build`) is a large build tree that predates this
+repo and stays outside it. Our Wine **source is** in here - `wine/` holds all 196 files this
+project has changed, in full, at their real paths - **+49,264/-1,024 lines against upstream Wine
+11.17**, and 29 of those files do not exist upstream at all (`dlls/dcomp/composition.c`,
+`dlls/wineuwp/main.c`, `dlls/dxgi/compswapchain.c`, ...). `sync-wine.sh` moves them in either direction
+and `wine/BASE.txt` records the upstream release they sit on. **You need a Wine tree at that base,
+plus `./sync-wine.sh --to-tree`, to reproduce the environment.**
 
 `uwp-bin/` (staged apps, borrowed Windows DLLs, PDBs) and `prefix/` (the live Wine prefix) live in
 this directory but are gitignored - about 4.8G of data that is not source.

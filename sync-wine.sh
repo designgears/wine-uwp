@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Keep this project's Wine source in *this* repo, as real files.
 #
-# The Wine tree ($WINE_SRC, default ~/src/wine) is shared with another session and is not ours to
-# commit in. That constraint used to mean our Wine work was exported as patches - which captured
-# only the *uncommitted* delta, about 12% of it. The other 88% existed nowhere but that tree's
-# commit history. This replaces that: the files we own are vendored here in full, at their real
+# The Wine checkout ($WINE_SRC, default ~/src/wine) lives outside this repo because it is a large
+# build tree that predates it. Our work in it used to be exported as patches, which was wrong twice
+# over: `git diff` sees only the *uncommitted* delta while most of the work was already committed in
+# that tree, and a bogus "files that are not yours" list excluded another ~5,000 lines. Between them
+# the export captured 2,700 of the ~49,000 lines this project has added to Wine. The files are now vendored here in full, at their real
 # paths under wine/, so they are greppable, diffable and reviewable like any other source.
 #
-# wine/FILES is the authoritative, explicit list of what we own. Never make it a glob.
+# wine/FILES is the authoritative, explicit list. Never make it a glob.
 #
 #   ./sync-wine.sh --check      diff repo against the tree; exit 1 if they differ  (default)
 #   ./sync-wine.sh --from-tree  pull the tree's current contents into the repo (then commit)
@@ -52,7 +53,7 @@ done
 # Record what upstream commit the vendored tree corresponds to, so the Wine side is reconstructible.
 if [ "$MODE" = --from-tree ]; then
   {
-    echo "Vendored from the shared Wine tree."
+    echo "Vendored from the Wine checkout at \$WINE_SRC."
     echo
     echo "  wine HEAD:     $(git -C "$WINE_SRC" rev-parse HEAD)"
     echo "                 $(git -C "$WINE_SRC" log -1 --format=%s)"
@@ -63,8 +64,8 @@ if [ "$MODE" = --from-tree ]; then
     echo "                 $(git -C "$WINE_SRC" log -1 --format='%s (%ad)' --date=short "$base")"
     echo "  captured:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo
-    echo "Files listed in wine/FILES are ours. Everything else in that tree - combase, ntdll,"
-    echo "win32u, user32, kernelbase, server/, include/ - belongs to the other session."
+    echo "wine/FILES lists every file in that tree this project has changed. The only things left"
+    echo "out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej."
   } > "$VENDOR/BASE.txt"
 fi
 

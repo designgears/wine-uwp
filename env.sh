@@ -7,8 +7,9 @@
 #   UWP_BIN     staged apps, the Windows image we borrow DLLs from, PDBs, built probes/shims
 #   WINEPREFIX  the live Wine prefix
 #
-# The Wine *source* deliberately stays outside: ~/src/wine is shared with another session and is
-# not ours to relocate. WINE_SRC / WINE_BIN_DIR point at it and can be overridden.
+# The Wine *checkout* stays outside the repo because it is a large build tree that predates it;
+# our Wine source is vendored in wine/ and synced with sync-wine.sh. WINE_SRC / WINE_BIN_DIR point
+# at the checkout and can be overridden.
 WINE_UWP_ROOT=${WINE_UWP_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)}
 export WINE_UWP_ROOT
 export UWP_BIN=${UWP_BIN:-$WINE_UWP_ROOT/uwp-bin}

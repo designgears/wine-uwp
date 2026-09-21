@@ -1,0 +1,12 @@
+MODULE  = windows.graphics.dll
+IMPORTS = combase user32 gdi32 uuid
+# main.c and displayinformation.c both emit the selectany RuntimeClass_Windows_Foundation_* strings
+# from windows.foundation.h and mingw ld does not merge them here, so the link needs this until the
+# duplication is sorted out (adding initguid.h to the second file only trades them for IID_*).
+EXTRADLLFLAGS = -Wl,--allow-multiple-definition
+
+SOURCES = \
+	classes.idl \
+	displayinformation.c \
+	main.c \
+	weakref.c

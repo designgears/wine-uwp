@@ -1,18 +1,33 @@
-# Files in the shared Wine tree that THIS project owns, vendored into wine/ as real source.
+# Every file in the Wine tree that this project has changed, vendored into wine/ as real source.
 #
-# EXPLICIT LIST, NEVER A GLOB. A glob would start sweeping the other session's work into our
-# history the first time they touched a neighbouring file.
+# EXPLICIT LIST, NEVER A GLOB.
 #
-# Ownership follows AGENTS.md's "files that are not yours": dlls/kernelbase, dlls/ntdll,
-# dlls/win32u, dlls/user32, dlls/combase, dlls/d3d11, dlls/windows.graphics, dlls/wintypes,
-# server/ and include/ are theirs and are deliberately absent (~5,000 lines of changes).
+# The only things deliberately left out are generated or editor-backup files: autom4te.cache/,
+# the generated `configure` (autoreconf regenerates it from configure.ac, which IS here), and
+# *~ / *.orig / *.rej.
 #
-# Derived once from committed changes since upstream, working-tree changes, AND untracked files -
-# all three are needed. Deriving it from `git diff UP..HEAD` alone silently drops every file we
-# only ever edited in the working tree, which is most of the Media Player work.
+# Derived from committed changes since the upstream base, working-tree changes AND untracked
+# files - all three are needed. `git diff UP..HEAD` alone drops every file only ever edited in
+# the working tree, which is most of the Media Player work.
+configure.ac
 dlls/advapi32/advapi32.spec
 dlls/advapi32/lsa.c
 dlls/apisetschema/apisetschema.spec
+dlls/combase/Makefile.in
+dlls/combase/apartment.c
+dlls/combase/asta.c
+dlls/combase/combase.c
+dlls/combase/combase.spec
+dlls/combase/combase_private.h
+dlls/combase/errorinfo.c
+dlls/combase/marshal.c
+dlls/combase/roapi.c
+dlls/combase/roerror.c
+dlls/combase/rpc.c
+dlls/d3d11/d3d11_private.h
+dlls/d3d11/device.c
+dlls/d3d11/texture.c
+dlls/d3d11/view.c
 dlls/dataexchange/main.c
 dlls/dcomp/Makefile.in
 dlls/dcomp/composition.c
@@ -35,6 +50,14 @@ dlls/iertutil/iertutil.spec
 dlls/iertutil/main.c
 dlls/kernel32/kernel32.spec
 dlls/kernel32/process.c
+dlls/kernelbase/debug.c
+dlls/kernelbase/kernelbase.spec
+dlls/kernelbase/loader.c
+dlls/kernelbase/locale.c
+dlls/kernelbase/main.c
+dlls/kernelbase/security.c
+dlls/kernelbase/sync.c
+dlls/kernelbase/version.c
 dlls/msctf/msctf.c
 dlls/msctf/msctf.spec
 dlls/msftedit/msftedit.spec
@@ -42,6 +65,19 @@ dlls/msvcp90/misc.c
 dlls/msvcrt/msvcrt.spec
 dlls/ninput/main.c
 dlls/ninput/ninput.spec
+dlls/ntdll/loader.c
+dlls/ntdll/misc.c
+dlls/ntdll/ntdll.spec
+dlls/ntdll/ntdll_misc.h
+dlls/ntdll/ntsyscalls.h
+dlls/ntdll/resource.c
+dlls/ntdll/rtl.c
+dlls/ntdll/signal_x86_64.c
+dlls/ntdll/sync.c
+dlls/ntdll/threadpool.c
+dlls/ntdll/unix/alpc.c
+dlls/ntdll/unix/security.c
+dlls/ntdll/unix/virtual.c
 dlls/ole32/Makefile.in
 dlls/ole32/git.c
 dlls/ole32/inspectable_guid.c
@@ -67,13 +103,32 @@ dlls/shell32/shellord.c
 dlls/ucrtbase/ucrtbase.spec
 dlls/urlmon/urlmon.spec
 dlls/urlmon/urlmon_main.c
+dlls/user32/message.c
+dlls/user32/misc.c
+dlls/user32/user32.spec
 dlls/userenv/userenv.spec
 dlls/userenv/userenv_main.c
 dlls/uxtheme/system.c
 dlls/uxtheme/uxtheme.spec
+dlls/win32u/defwnd.c
+dlls/win32u/input.c
+dlls/win32u/main.c
+dlls/win32u/message.c
+dlls/win32u/ntuser_private.h
+dlls/win32u/syscall.c
+dlls/win32u/win32syscalls.h
+dlls/win32u/win32u.spec
+dlls/win32u/win32u_private.h
+dlls/win32u/window.c
 dlls/windows.globalization/main.c
 dlls/windows.globalization/numberformatting.c
 dlls/windows.globalization/private.h
+dlls/windows.graphics/Makefile.in
+dlls/windows.graphics/displayinformation.c
+dlls/windows.graphics/main.c
+dlls/windows.graphics/private.h
+dlls/windows.graphics/weakref.c
+dlls/windows.graphics/weakref.h
 dlls/windows.media.playback.mediaplayer/Makefile.in
 dlls/windows.media.playback.mediaplayer/main.c
 dlls/windows.media.playback.mediaplayer/playback_engine.c
@@ -127,6 +182,26 @@ dlls/wined3d/wined3d_vk.h
 dlls/wineuwp/Makefile.in
 dlls/wineuwp/main.c
 dlls/wineuwp/wineuwp.spec
+dlls/wintypes/main.c
+dlls/wintypes/storage.c
+dlls/wintypes/wintypes.spec
 dlls/wldp/wldp.spec
 dlls/wow64/syscall.c
 dlls/wow64win/user.c
+include/appmodel.h
+include/ddk/ntddk.h
+include/ntuser.h
+include/windows.data.json.idl
+include/windows.media.core.idl
+include/windows.media.playback.idl
+include/windows.storage.idl
+include/windows.ui.text.core.idl
+include/wine/server_protocol.h
+include/winnt.h
+include/winternl.h
+server/alpc.c
+server/protocol.def
+server/queue.c
+server/request_handlers.h
+server/request_trace.h
+server/token.c
