@@ -76,12 +76,20 @@ int main(int argc, char **argv)
     WCHAR wurl[1024];
     MultiByteToWideChar(CP_ACP, 0, url, -1, wurl, ARRAYSIZE(wurl));
 
-    printf("probe-http: %s\n", url);
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    /* argv[2]: apartment, "mta" (default) or "sta" - Solitaire's COM call comes from a UWP
+     * apartment, and argv[3]: CLSCTX, because the app asks with 0x15
+     * (INPROC_SERVER|LOCAL_SERVER|REMOTE_SERVER) rather than a bare INPROC_SERVER. Both are
+     * candidate explanations for the class resolving standalone but not inside the app. */
+    const bool sta = argc > 2 && !strcmp(argv[2], "sta");
+    const DWORD clsctx = argc > 3 ? (DWORD)strtoul(argv[3], nullptr, 0) : CLSCTX_INPROC_SERVER;
+
+    printf("probe-http: %s  apartment=%s clsctx=%#lx\n", url, sta ? "sta" : "mta",
+           (unsigned long)clsctx);
+    HRESULT hr = CoInitializeEx(nullptr, sta ? COINIT_APARTMENTTHREADED : COINIT_MULTITHREADED);
     REPORT(hr, "CoInitializeEx");
 
     IXMLHTTPRequest2 *req = nullptr;
-    hr = CoCreateInstance(CLSID_FreeThreadedXMLHTTP60_, nullptr, CLSCTX_INPROC_SERVER,
+    hr = CoCreateInstance(CLSID_FreeThreadedXMLHTTP60_, nullptr, clsctx,
                           IID_IXMLHTTPRequest2_, (void **)&req);
     REPORT(hr, "CoCreateInstance(XMLHTTP60)");
     if (FAILED(hr))

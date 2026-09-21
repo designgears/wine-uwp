@@ -113,6 +113,12 @@ silently break if it moves again. All of these bit me during the move out of the
 - **`.reg` files cannot expand variables**, so any path in one is baked to whoever generated it.
   `wineuwp.reg` now carries an `@UWP_BIN_WINPATH@` placeholder that `install-overrides.sh`
   substitutes at import time.
+- **`build.sh` fails with a stale CMake cache after a move.** `uwp-bin/build-probes/CMakeCache.txt`
+  records the *old* source and binary directories (`/home/bobby/Projects/calculator/tools/wine-uwp`,
+  `$HOME/uwp-bin/build-probes`) and CMake refuses to reconfigure. `rm -f
+  uwp-bin/build-probes/CMakeCache.txt && rm -rf uwp-bin/build-probes/CMakeFiles` then `./build.sh`.
+  Back up `uwp-bin/build-probes/*.exe` first if you are mid-investigation - they are the only copies
+  until the rebuild finishes.
 - **`identity.env` in a stage directory must not contain `WINE_UWP_PACKAGE_PATH`.** `run.sh` sources
   that file, so a stale value there wins over the computed one. `run.sh` now always computes it from
   the stage directory and `stage-app.sh` no longer writes it.
