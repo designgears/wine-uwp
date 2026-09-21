@@ -232,6 +232,32 @@ if [ -f "$DI_SHIM" ]; then
   echo "installed: DeviceInformation CreateWatcher(DeviceClass) shim"
 fi
 
+# api-ms-win-appmodel-advertisingid-l1-1-0.dll. No registry entry: this is a plain DLL resolved by
+# name at load time, so it only has to exist in system32 for twinapi.appcore's imports to bind to
+# it instead of Wine's raising stub.
+ADID=$HOME/uwp-bin/build-probes/api-ms-win-appmodel-advertisingid-l1-1-0.dll
+if [ -f "$ADID" ]; then
+  ADID_DST=$SYS32/api-ms-win-appmodel-advertisingid-l1-1-0.dll
+  if ! cmp -s "$ADID" "$ADID_DST"; then cp -f "$ADID" "$ADID_DST"; fi
+  echo "installed: advertising-id apiset stand-in"
+fi
+
+# Windows.UI.Shell.TaskbarManager: the real implementation reaches for ImmersiveShell
+# ({c2f03a33-...}, not registered under Wine) and, when that fails, never completes the
+# IAsyncOperation the caller is waiting on. Solitaire blocks there forever and its render loop
+# never starts. See shims/taskbarmanager.
+TB_SHIM=$HOME/uwp-bin/build-probes/wineuwp_taskbarmanager.dll
+if [ -f "$TB_SHIM" ]; then
+  TB_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_taskbarmanager.dll
+  if ! cmp -s "$TB_SHIM" "$TB_DST"; then cp -f "$TB_SHIM" "$TB_DST"; fi
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.UI.Shell.TaskbarManager"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_taskbarmanager.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: TaskbarManager stand-in"
+fi
+
 # Windows.Storage.AccessCache.StorageApplicationPermissions stand-in. An app adds a picked file to
 # its future-access list so it can reopen it later; the class does not exist in Wine, so the
 # activation throws straight out of the pick with 0x80040111. See shims/accesscache.
@@ -283,16 +309,31 @@ reassert_activatable() {
 
 # Read the live DllPath straight out of system.reg. The section header is escaped-backslash form.
 activatable_dllpath() {
-  local cls_esc=${1//./\\.}
-  sed -n "/^\[Software\\\\\\\\Microsoft\\\\\\\\WindowsRuntime\\\\\\\\ActivatableClassId\\\\\\\\${cls_esc}\]/,/^\[/p" \
-      "$WINEPREFIX/system.reg" 2>/dev/null |
-    sed -n 's/^"DllPath"="\(.*\)"$/\1/p' | head -1 | tr 'A-Z' 'a-z' | sed 's/\\\\/\\/g'
+  # `wine reg query` is asked first because it is the only authoritative source: a key written
+  # moments ago still lives in wineserver's memory and is not in system.reg until the server
+  # flushes, which made the first version of this check report a false failure for the
+  # TaskbarManager shim it had just installed correctly. system.reg is the fallback. A query is
+  # itself a `wine` invocation and can trigger the very update that clobbers the value - which is
+  # fine, because the caller re-asserts and re-checks in a loop.
+  local cls=$1 out
+  out=$("${WINE_BIN}wine" reg query \
+        "HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\$cls" /v DllPath 2>/dev/null \
+        | tr -d '\r' | awk '/DllPath/ {print $NF}' | head -1)
+  if [ -z "$out" ]; then
+    out=$(awk -v key="[Software\\\\\\\\Microsoft\\\\\\\\WindowsRuntime\\\\\\\\ActivatableClassId\\\\\\\\$cls]" '
+            index($0, key)==1 {inkey=1; next}
+            inkey && /^\[/ {exit}
+            inkey && /^"DllPath"=/ {sub(/^"DllPath"="/,""); sub(/"$/,""); gsub(/\\\\/,"\\"); print; exit}
+          ' "$WINEPREFIX/system.reg" 2>/dev/null)
+  fi
+  printf '%s' "$out" | tr 'A-Z' 'a-z'
 }
 
 SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_userpicker.dll" ]       && SHIM_CLASSES="$SHIM_CLASSES Windows.System.UserPicker:wineuwp_userpicker.dll"
 [ -f "$SYS32/wineuwp_memorymanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.System.MemoryManager:wineuwp_memorymanager.dll"
 [ -f "$SYS32/wineuwp_deviceinformation.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Devices.Enumeration.DeviceInformation:wineuwp_deviceinformation.dll"
+[ -f "$SYS32/wineuwp_taskbarmanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Shell.TaskbarManager:wineuwp_taskbarmanager.dll"
 
 if [ -n "$SHIM_CLASSES" ]; then
   # Let any update already in flight finish. Forcing one with `wineboot -u` is deliberately not

@@ -5,6 +5,9 @@ add_executable(probe-activate probes/probe-activate.cpp)
 target_link_libraries(probe-activate PRIVATE runtimeobject.lib)
 add_library(mrt100 SHARED shims/mrt100/mrt100.cpp)
 set_target_properties(mrt100 PROPERTIES PREFIX "" OUTPUT_NAME "mrt100")
+# Drives a real SetWindowPos on a running app's windows: an X-side resize never reaches Wine.
+add_executable(probe-resize probes/probe-resize.cpp)
+
 add_executable(probe-token probes/probe-token.cpp)
 target_link_libraries(probe-token PRIVATE ntdll.lib)
 add_executable(probe-alpc probes/probe-alpc.cpp)
@@ -57,3 +60,16 @@ target_link_libraries(memorymanager PRIVATE runtimeobject.lib ole32.lib psapi.li
 add_library(deviceinformation SHARED shims/deviceinformation/deviceinformation.cpp)
 set_target_properties(deviceinformation PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_deviceinformation")
 target_link_libraries(deviceinformation PRIVATE runtimeobject.lib)
+
+# api-ms-win-appmodel-advertisingid-l1-1-0: twinapi.appcore imports three functions from this
+# apiset and Wine implements none, so the loader's unresolved-import stub raises
+# EXCEPTION_WINE_STUB (0x80000100) mid-startup. Built with the apiset's exact file name.
+add_library(advertisingid SHARED shims/advertisingid/advertisingid.cpp)
+set_target_properties(advertisingid PROPERTIES PREFIX "" SUFFIX ""
+                      OUTPUT_NAME "api-ms-win-appmodel-advertisingid-l1-1-0.dll")
+
+# Windows.UI.Shell.TaskbarManager. The real one needs ImmersiveShell, which does not exist here,
+# and leaves its IAsyncOperation permanently incomplete - which is what stops Solitaire's startup.
+add_library(taskbarmanager SHARED shims/taskbarmanager/taskbarmanager.cpp)
+set_target_properties(taskbarmanager PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_taskbarmanager")
+target_link_libraries(taskbarmanager PRIVATE runtimeobject.lib)

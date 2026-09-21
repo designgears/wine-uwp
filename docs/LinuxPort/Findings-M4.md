@@ -6440,3 +6440,87 @@ Two things it taught us about this binary:
   `callq *__guard_dispatch_icall_fptr(%rip)` through one address (`0x140dcc730`). `--callers`
   therefore reports "no direct call site" for any virtual method, which is information, not a
   failure - it means the target is reached through a vtable.
+
+## Why Solitaire draws nothing: the bootstrap never finishes (the 1x1 swap chain is a red herring)
+
+The 1x1 swap chain is two layers downstream of the actual problem. The measurement that settles it,
+with a validated control probe each time:
+
+**`Dx11RenderWindow::SwapBuffers` never executes.** The engine does not present a single frame. So
+the flat `srgb(32,96,192)` window is the XAML page's own background, not a stretched 1x1 surface,
+and resizing the swap chain would change nothing.
+
+Working back from there, via `xref.py` and the app's own log vocabulary:
+
+```
+WinUwp::BootStrap -- Startup Began        <- logged
+WinUwp::BootStrap -- Startup Finished     <- NEVER logged, and no failure branch is taken either
+```
+
+`BootStrap::Startup` (`0x7df800`) makes four guarded calls between those two log lines. Probing all
+four *failure* branches at once: none fires. Probing each call's *return point* instead, bisecting:
+calls 1-3 return, call 4 does not. Call 4 is `AppHost::EngineAppStartup` (`0x7eb8fc`), which logs
+`-- START` and never reaches `-- END` or `-- Startup failed`. Inside it, `SystemInitializer` and the
+virtual `App::Startup` both return; the call that never returns is `0x7eba45` -> `0x96080c`, and
+`0x96080c` is a small subscriber-iteration loop - an event raise. One subscriber never returns.
+
+The render loop is started after `Startup Finished`, so nothing ever renders. That is the whole
+explanation for "the app is alive and responsive and draws nothing".
+
+Things ruled out along the way, each with a probe rather than an argument:
+
+- XAML **does** raise `SizeChanged` on the SwapChainPanel: `SizeChangedEventHandler::Invoke`
+  (`0x7cff90`, found by walking the RTTI `implements_delegate<...lambda_198_>` type descriptor ->
+  COL -> vtable -> slot 3) fires.
+- `XamlDxgiPage::OnSwapChainPanelSizeChanged`'s `DispatchedHandler` lambda (`0x7d86b0`) fires too,
+  on another thread - so `CoreDispatcher.RunAsync` works. That lambda is six instructions and just
+  stores the new size into a field, so the size *is* being delivered and recorded.
+- `XamlBootStrap::OnInitRender` (`0x7de1a0`) runs but always takes its **early return** (both
+  `this+0x48` and `this+0x50` are already set), so its lambda never posting is benign. I was one
+  step from writing this up as "cross-thread `RunAsync` is dropped in combase" - probing the post
+  path at `0x7de1df` instead of assuming is what stopped that. `dlls/combase` is another session's
+  file and would have been the wrong thing to touch.
+- The three Media Player switches are irrelevant here: unset gives identical behaviour.
+
+### The chain of never-completing asyncs
+
+Two links of the chain are now fixed, and both had the same shape - a Windows implementation that
+needs an out-of-process server which does not exist under Wine, and which then leaves its
+`IAsyncOperation` **permanently incomplete** rather than failing it:
+
+1. `Windows.UI.Shell.TaskbarManager` -> `TaskbarPinnableSurface` -> `ImmersiveShell`
+   `{c2f03a33-21f5-47fa-b4bb-156362a2f239}`, not registered. Fixed by
+   `shims/taskbarmanager`, which hands back an `IAsyncOperation<bool>` that is *born completed* and
+   whose `put_Completed` invokes the handler immediately, so both `.get()` and `co_await` work.
+   After this the app runs on into Inventory, `AdIdProvider` and the ads SDK.
+2. `api-ms-win-appmodel-advertisingid-l1-1-0.dll` - `twinapi.appcore` imports three functions Wine
+   does not have, so the loader's `allocate_stub()` raises `EXCEPTION_WINE_STUB` (**0x80000100**)
+   when one is called. Note this is *not* a `@ stub` in a .spec - nothing declares the function
+   anywhere; the loader invented the stub for an unresolvable import, which is why grepping the
+   Wine tree for the name finds nothing. Fixed by `shims/advertisingid`, a plain DLL with the
+   apiset's exact file name in system32. Critical errors: **2 -> 0**.
+
+The next link looks like `Windows.Services.Store.StoreContext` -> `StoreContextServer` ->
+`ContainerHostActivation` `{22f5b1df-7d7a-4d21-97f8-c21aefba859c}`, not registered - the last thing
+logged before the app goes quiet. **This is not yet proven**: a `WINE_UWP_DUMP_STACKS` census of all
+21 threads shows no thread with `Windows.Services.Store` on its stack, so the Store may just be the
+last thing logged rather than the thing being waited on. `IStoreContext` has 26+ slots, so it is
+worth proving before implementing - the disciplined way being one traced thunk per slot, letting
+the app say which methods it calls.
+
+The most suspicious thread in that census is a threadpool thread
+(`threadpoolwinrt.dll` -> `Solitaire+0x7d89d0` -> `Solitaire+0x7d89ec` -> `windows.ui.dll` ->
+`combase` -> `win32u`): a cross-apartment call waiting for an apartment to service it. That is the
+shape of the blocked subscriber. It is present both before and after the TaskbarManager fix, so it
+has not been shown to be the *cause* rather than a normal parked worker - checking it against a
+working app is the next step, per the rule that a stack which looks alarming may be the normal
+state.
+
+### Current Solitaire state
+
+Startup runs to `Solitaire::Startup END`, sound banks and fonts load, XSAPI and XAL initialise, the
+window is a real 1280x800, the app pumps a 60 Hz dispatcher loop and closes cleanly, and there are
+**zero critical errors**. It does not render, because `BootStrap::Startup` never finishes.
+Calculator stays byte-identical to the baseline (249 colours, `magick compare -metric AE` = 0)
+across every change here, including the `advertisingid` stand-in, which affects `twinapi.appcore`
+for every app.
