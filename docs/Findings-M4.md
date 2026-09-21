@@ -7280,3 +7280,72 @@ frame, or a trampoline that logs it without altering flow (the app's own logger 
 own error path) *does* alter control flow - the error path shuts the bootflow down. Its "exactly one
 line" reading is only safe because the two experiments above independently rule out the tick running
 per-frame. Had it been the sole evidence, it would have been an experiment misread as a measurement.
+
+## SOLVED: Solitaire never enables continuous rendering (+0x20a), so it runs one frame
+
+The stall is not in the bootflow, not in any bootflow item, and not in the app state machine. It is
+one byte of state in `WinUwp::BootStrap`.
+
+**The loop, at last.** `BootStrap::Startup`'s main loop begins at `0x7dfa4d`:
+
+```
+0x7dfa4d  call  vtbl+0x28                 ; pump events
+0x7dfa5d  cmp   %r15b,0x20a(%rdi)         ; r15b == 0
+0x7dfa64  jne   0x7dfa73                  ; [+0x20a] != 0  -> run a frame
+0x7dfa66  cmp   %r15b,0x208(%rdi)
+0x7dfa6d  je    0x7dfb9d                  ; both zero     -> SKIP THE FRAME
+0x7dfa73  ...   run one frame (calls the frame loop 0x7ec5a8 at 0x7dfb78)
+0x7dfbc3  mov   %r15b,0x208(%rdi)         ; clear the one-shot request
+0x7dfbd2  je    0x7dfa4d                  ; loop while [+0x210] == 0
+```
+
+- **`+0x208`** = "run one frame" one-shot, cleared after each frame.
+- **`+0x20a`** = "keep rendering" - the continuous-render flag. **It is 0 for the whole run.**
+
+So the loop spins (measured: **45,889,062 iterations in 45 s**, a 918 MB log) and skips the frame
+body every time. Exactly one frame ever runs, from the initial `+0x208` request. That single frame
+is why `BootflowState::Update`, `DoTransition` and the manager update each ran exactly once, and why
+every "does item N begin" probe was negative - **none of it was ever ticked again.**
+
+The 3659 dcomp presents that made it look alive are the compositor redrawing a static surface, not
+the game rendering.
+
+**Proof.** Patch one byte - `jne` -> `jmp` at `0x7dfa64` (`75` -> `eb`), forcing the frame to run
+every iteration:
+
+```
+[   2.189] BootflowItemAds::BeginInit -- ad consent flow error [Invalid parameter.]
+[   2.204] BootflowItemAds::BeginInit -- finished initializing MCGShared
+[   2.204] Bootflow -- Successfully Initialized all boot flow items.
+           Gui -- EnterScreen [gui/screenfiles/loading/loading]
+```
+
+The bootflow **completes**, the app leaves the splash for the loading screen, and it keeps ticking
+real time for the whole run (ad-cooldown timers every 5 s at t=11..66 s) instead of dying at 1.8 s.
+
+**Who should set `+0x20a`.** `0x7d96e0` is a queued closure that does `mov %sil,0x20a(%rdi)` with the
+bool taken from `[closure+0xe8]`; it is created at `0x7d49f7` inside `0x7d4950..0x7d4bc9`. That
+function has no direct callers and no `.rdata` pointer - it is reached through a CFG-guarded
+indirect call, i.e. it is a delegate. The obvious candidate is the CoreWindow visibility/activation
+event: the app is never told it is visible, so it never turns on continuous rendering. `+0x247`
+(quit) is never set, and neither `OnRenderDeviceLost` nor `App::Exit` ever runs, so nothing is
+asking it to stop - it simply never starts.
+
+**The byte patch is a diagnostic, not the fix.** The fix is to deliver the visibility/activation
+event that sets `+0x20a`, which is Wine-side work in the CoreWindow path.
+
+### How six rounds of probing missed it
+
+Every probe of the form "is item/function N reached?" was negative, and all of them were consistent
+with the real cause. Three specific traps:
+
+1. **A loop counter placed after a conditional skip counts the loop, not the work.** The hook at
+   `0x7dfbca` reported 45 M iterations and I read that as "the frame loop runs 45 M times". The
+   `je 0x7dfb9d` at `0x7dfa6d` jumps *past the frame call but before the hook*. Place counters on
+   the thing you care about, not downstream of a branch you have not read.
+2. **ICF folding.** `0x6dcb0` (`mov [rcx+0x10],0; ret`) and `0x67f50` (`mov 0x10(rcx),eax; ret`) are
+   one-liners the linker merges across classes, so `ud2` hits there proved nothing.
+3. **Hooking a function's first instruction can silently do nothing.** Displacing
+   `mov %rbx,0x18(%rsp)` at `DoTransition`'s entry produced **zero** log lines even though the
+   function definitely runs; hooking 0x2a bytes later, past the prologue, gave the correct count of
+   1. Never hook the register-save prologue - hook after it.
