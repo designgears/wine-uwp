@@ -75,9 +75,20 @@ instead.
 
 ### ud2 probes
 
-**The hit line is `wine: Unhandled illegal instruction at address <addr>, starting debugger...`**,
-not `err:seh:NtRaiseException Unhandled exception code 1007` as this file used to claim. Grepping
-for the old string reports a miss on a probe that fired.
+**A hit appears in one of TWO forms, and you must grep for both:**
+
+- `wine: Unhandled illegal instruction at address <addr>, starting debugger...` - nothing caught it.
+- `err:seh:NtRaiseException Unhandled exception code 1007` - the app's own fail-fast handler caught
+  it first, so the run ends in a `RaiseFailFastException` unwind instead.
+
+Which one you get depends on the app, not on the probe. I grepped for only the first and read a
+*fired* probe as a miss; this file previously documented only the second and did the same in
+reverse. `grep -aE "illegal instruction|code 1007"`.
+
+**Validate the probe target on an app that already works**, not just the probe mechanism. Those are
+different claims: a firing control proves `ud2` works in that process, not that the address is the
+function the app actually calls. Calculator and Media Player both fire
+`WindowGenerated::put_Content`, which is what makes Solitaire's silence there mean something.
 
 **Patch and restore *every* copy.** `run.sh` copies `~/uwp-bin/win11/...` into the prefix, so a
 patch applied to the source is live in `~/.wine-uwp/drive_c/windows/system32/` too - restoring only

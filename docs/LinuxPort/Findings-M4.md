@@ -6080,3 +6080,28 @@ nothing in a run where the probe *had* fired.
 prefix, so restoring only the source leaves a live `ud2` in
 `~/.wine-uwp/drive_c/windows/system32/`. I did exactly that and only noticed because the next
 diff of the two copies showed my own patch sitting in the prefix.
+
+### Validating the probe target, not just the probe
+
+The `put_Content` result above initially rested on an unvalidated assumption: the control proved
+`ud2` fires in that process, but not that `WindowGenerated::put_Content` is the function a .NET
+Native app actually reaches through the projection (a `ctl::interface_forwarder` thunk was a real
+possibility). Probing two apps that *do* render settles it:
+
+| probe | Calculator | Media Player | Solitaire |
+| --- | --- | --- | --- |
+| control (`DXamlCore::GetCurrent`) | fired | fired | fired |
+| `WindowGenerated::put_Content` | **fired** | **fired** | **no** |
+| `WindowGenerated::Activate` | - | - | **no** |
+
+So the address is right and Solitaire genuinely never sets content or activates.
+
+Two of my own errors on the way, both of the same kind - reading a miss off a bad grep:
+
+- The first Calculator run scored 0 on *both* probes, and I explained it as "Calculator is WinUI 2,
+  so it loads `Microsoft.UI.Xaml.dll`, not the system XAML I patched". That was wrong: Calculator
+  loads `windows.ui.xaml.dll` too and both probes had in fact fired.
+- They fired as `code 1007`, not `Unhandled illegal instruction`. **Both forms occur** - the first
+  when the app's fail-fast handler catches the exception, the second when nothing does. Earlier
+  today I "corrected" AGENTS.md to say only the second, having been bitten by only the first.
+  The correction is now that you must grep for both.
