@@ -75,6 +75,12 @@ that were ours; the Calculator tree is no longer involved.
 - **Byte patches go in `$UWP_BIN/win11/...`**; `run.sh` re-copies into the prefix. Always keep a
   backup and verify the restore with `cmp` before moving on. Leaving one behind silently poisons
   every later run - it has happened.
+- **Never patch the last pristine copy of a Windows DLL.** Three DLLs are patched today
+  (`CoreMessaging.dll`, `Windows.UI.dll`, `Windows.UI.Xaml.dll`, all 26100.8972); their originals are
+  kept as `<name>.pristine-26100.8972` and **cannot be re-obtained** - the tree is a mix of builds,
+  and the machine they were copied from has serviced past them. `./pecheck.py` tells a pristine
+  Microsoft PE from a patched one with no reference copy. Check before patching, and never delete a
+  `.pristine-*`.
 - Commit messages end with the attribution line the harness gives you.
 
 ## Moving this tree
@@ -143,6 +149,7 @@ These all exist and work. Prefer them over reading code and guessing.
 | Method count of a private interface | parse the MIDL proxy/stub DLL, below |
 | Where is the code behind one of the app's own log strings? | `./xref.py <exe> --string '<log string>'` - finds rip-relative LEAs to it and resolves each to its **enclosing function** via `.pdata`, which is where a `ud2` has to go. `--callers <rva>` finds direct call sites |
 | Does a size change reach the app? | `$UWP_BIN/build-probes/probe-resize.exe <w> <h> [title]` - `SetWindowPos` through Wine. **`xdotool windowsize` does not reach Wine at all** |
+| Is this Windows DLL one we have byte-patched? | `./pecheck.py <file>...`, or `./pecheck.py --sweep uwp-bin/win11` to list every modified file. Authenticode + PE checksum; needs no reference copy |
 | Which methods of an interface does the app actually call? | give every slot a traced thunk returning `E_NOTIMPL` and read the log - see `shims/storecontext`, which proved the app wanted only `GetDefault` out of 26 methods |
 
 ### Unique-HRESULT tagging
@@ -210,6 +217,14 @@ For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
    which methods it calls.
 
 ## Mistakes already made - do not repeat them
+
+**A byte patch to a Windows DLL is not a deliverable, and cannot be exported as a diff.** The
+`wine-patches/` mechanism exists because the Wine tree is *shared*, not because patch files are
+good - and it does not transfer here: applying a diff needs the exact base binary, and Microsoft
+serves only current revisions. When a patch to a Microsoft DLL turns out to be load-bearing, the
+job is to **re-home it** into Wine (or into `wineuwp` when the right file is the other session's),
+not to archive it. Most of the CoreMessaging patches are Wine IOCP/message-pump fixes wearing a
+disguise. See Findings-M4.
 
 **Reason backward from a measurement, not forward from a mechanism.** Several explanations for
 Solitaire drawing nothing each fitted every symptom available and were each wrong (Findings-M4).
@@ -631,7 +646,7 @@ the fully-qualified name. `--grep` first, always.
 
 | App | State |
 | --- | --- |
-| Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0) |
+| Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0). **Depends on hand-patched `CoreMessaging.dll` and `Windows.UI.dll`** - see the byte-patch rule above |
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |

@@ -6955,3 +6955,72 @@ started in the same breath. The crash text said
 leftover probe looks exactly like a regression in whatever you did next.** The rule in AGENTS.md is
 now "restore in the same command that reads the result", because "restore afterwards" is clearly
 not something I reliably do.
+
+## The patched Windows DLLs are unreproducible, and the pristine bytes nearly died (2026-09-21)
+
+Prompted by "are we relying on Windows files that aren't normally redistributable?". The answer is
+yes - `uwp-bin/win11` is 850M of Windows 11 binaries, hives, metadata and fonts - but the
+interesting part turned out to be a much narrower problem.
+
+**Three DLLs in the tree are hand-patched, and their originals cannot be re-obtained.**
+
+| File | Build | State |
+| --- | --- | --- |
+| `CoreMessaging.dll` | 26100.**8972** | patched: fail-fast soft-nops, `SetRelative` enqueue cave, relocated dequeue at `+0xd4a60`, island109 GQCS retarget |
+| `Windows.UI.dll` | 26100.**8972** | patched: `ProcessMessage`->`DrainCoreMessaging` trampoline, `Handled` byte at RVA `0x97493` |
+| `Windows.UI.Xaml.dll` | 26100.8972 | patched (island114+) |
+
+The tree is **not a single Windows build**: `kernel32.dll` is 26100.**9168** while those three are
+26100.**8972**. It accreted by copying from a mounted install over months. No ISO, no UUP build and
+no Microsoft download will ever reproduce it, and `/mnt/win` - the machine they came from - has since
+serviced to 26100.9444/.9278. So:
+
+- **A byte-diff of these patches is worthless as a distribution mechanism.** Applying one needs the
+  exact `.8972` base, which no longer exists anywhere except this disk. Exporting them the way
+  `wine-patches/` exports our Wine work does not work here; that mechanism exists because the Wine
+  tree is *shared*, not because patch files are good.
+- The **`.bak-*` chain was the only surviving copy of the unpatched bytes**, distinguished from the
+  patched ones only by a filename convention (`X.bak-<patch>` = the state *before* patch `<patch>`).
+
+**Identifying the pristine copy without a reference, via `pecheck.py`.** Two tests:
+
+1. *Authenticode* - recompute the SHA-256 the signature seals (whole file minus the `CheckSum`
+   field, the certificate-table directory entry, and the certificate blob) and look for it in the
+   blob. Conclusive, but only for embedded-signed files.
+2. *PE optional-header `CheckSum`* - Microsoft ships these correct and none of our patch scripts
+   recomputed them. This is the test that works on catalog-signed files, which report `unsigned`.
+
+The two agree on every embedded-signed file here, which is what makes the checksum verdict
+trustworthy on `Windows.UI.Xaml.dll`, which has no embedded signature.
+
+Result - all three originals survived, now copied to `<name>.pristine-26100.8972`:
+
+```
+1aa150fd2e11d70c3d065d891fc740ac7404004344eb922d33f5e534ba784061  CoreMessaging.dll.pristine-26100.8972      (was .bak-failfast)
+ab328520e7daa7fc482ca5938bde11603203f12f9d3f59ff9352f7f908e9a972  Windows.UI.dll.pristine-26100.8972         (was .bak-island87)
+b0a1d10f9766565658bf210ee521861dfa16fb22b331925fc1f039ef626ad2cb  Windows.UI.Xaml.dll.pristine-26100.8972    (was .bak-island114)
+```
+
+**`--sweep` over the whole 850M found nothing else modified** - 512 of the 515 System32 files, every
+`.winmd`, every MUI and every framework package is pristine. The patched surface really is three
+files.
+
+**A valid signature beats a bad checksum, and the first version of `pecheck.py` got this backwards.**
+`mrt100_app.dll` reports Authenticode-**pristine** with a **mismatched** `CheckSum`: Authenticode
+excludes that field from its digest, so Microsoft can and does ship files whose stored checksum is
+stale. The tool now only consults the checksum when there is no signature. Corollary for reading its
+output: `checksum=MODIFIED` on an unsigned file is suggestive, not proof, while `checksum=pristine`
+is strong - a patch will not leave a valid checksum by accident.
+
+Minor: `Windows.UI.Xaml.dll`'s stored `CheckSum` at file offset `0x160` changed `0x01118268` ->
+`0x0000456a` between the island191 and behavior37 saves - a patch script attempting a fixup and
+writing a wrong value. Nothing else in the first 1K differs, and user-mode DLLs are not
+checksum-validated, so it is harmless.
+
+**What this means for the work.** Reading the CoreMessaging patches together, nearly all of them
+compensate for the same thing: Wine's IOCP and message pump - `GetQueuedCompletionStatus` failing
+where Windows succeeds, due-now timers never reaching the UI thread, `DrainCoreMessaging` never
+being pumped. They are **Wine fixes written into Microsoft's binary because the correct file belongs
+to the other session**. The dequeue thread-check is already half ours (`wineuwp` writes the UI
+thread id to `+0x10d010`). Re-homing them into Wine - or into `wineuwp` where the file is not ours -
+is what actually retires this dependency; preserving diffs of them does not.
