@@ -204,6 +204,13 @@ different claims: a firing control proves `ud2` works in that process, not that 
 function the app actually calls. Calculator and Media Player both fire
 `WindowGenerated::put_Content`, which is what makes Solitaire's silence there mean something.
 
+**Do not name a probe helper function after a shell alias.** A helper called `c()` failed with
+`defining function based on alias 'c'` - a *parse* error, so the whole command aborted. It happened
+to abort before patching, but the restore lives at the end of that same command, so a parse or
+runtime failure after the patch leaves a `ud2` in the binary. After any probe command that exits
+non-zero, `cmp` the target against its pristine copy before doing anything else. Use distinctive
+helper names (`runprobe`, not `p`/`c`/`r`).
+
 **Patch and restore *every* copy.** `run.sh` copies `$UWP_BIN/win11/...` into the prefix, so a
 patch applied to the source is live in `$WINEPREFIX/drive_c/windows/system32/` too - restoring only
 the source leaves the probe in place for every later run. `cmp` both against the backup afterwards.
