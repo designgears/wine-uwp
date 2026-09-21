@@ -6105,3 +6105,41 @@ Two of my own errors on the way, both of the same kind - reading a miss off a ba
   when the app's fail-fast handler catches the exception, the second when nothing does. Earlier
   today I "corrected" AGENTS.md to say only the second, having been bitten by only the first.
   The correction is now that you must grep for both.
+
+### Solitaire is a native C++ engine, not a XAML app - and it is running
+
+Reading `Solitaire.exe`'s own strings changes the picture and **corrects an over-stated claim
+above**. The app is built on a custom native engine: `Sgi::HostPlatform`, `Sgi::Log`, `Sgi::Meta`,
+`Math::Vector2/Matrix4`, with selectable host backends (`universal windows`, `windows app sdk`,
+`android`, `generic`). The XAML `Page` is a thin shell; the game is native code rendering through
+composition.
+
+That matters because **a composition-rendering engine has no reason to call `Window.Content`**. The
+`put_Content` / `Activate` probe results are solid measurements, but the inference drawn from them -
+"it never finishes `OnLaunched`" - does not follow for this app, and is withdrawn.
+
+What the evidence now supports:
+
+- **The app is alive and looping.** The thousands of `CoMsgWaitInProcessEvents(..., timeout 16)`
+  calls are `CoreDispatcher::ProcessEvents` at 60 Hz, on the view thread (`01a8`), continuing long
+  after our own 5 s pump has ended. Something is running a dispatcher loop.
+- **It is responsive.** Sent `WM_DELETE_WINDOW`, it shut down cleanly in **2 seconds**.
+- **Its window is real**: mapped and visible, `'Solitaire & Casual Games'`, 1280x800 at (4,30). The
+  "2 colours" reading was a black window on a black root, not a missing window.
+- **No thread is doing any work**: `utime` is identical across all 15 threads in two samples three
+  seconds apart.
+- **It never reaches its own startup.** The engine logs `{}::Startup START`, `{}::Startup END`,
+  `SolitaireApp::SetActivationArgs -- Uri = {}` and `SolitaireApp::StartupComplete -- ...`. None of
+  those ever appear. Its last line is `Command Line Arguments:` at ~0.35 s, after XAL/XSAPI
+  initialise at 2-4 ms.
+
+### Useful technique: an app's own strings give you its startup sequence
+
+`Solitaire.exe` holds its log format strings in `.rdata`. Finding the one we *do* see
+(`Command Line Arguments: {}`) and dumping the surrounding region yields the engine's whole
+diagnostic vocabulary - which is how the startup sequence above was recovered without any symbols.
+
+The app also opens `LocalState\Logs\Solitaire.log`, but that file stays **0 bytes even after a
+clean exit**, so the file writer is never installed and stderr is the only copy. Worth knowing
+before spending a run trying to recover it: closing the window politely instead of
+`wineserver -k` did produce a clean 2 s shutdown, and still no log.

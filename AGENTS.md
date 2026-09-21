@@ -118,12 +118,20 @@ For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
 
 ## Mistakes already made - do not repeat them
 
-**Reason backward from a measurement, not forward from a mechanism.** Four separate explanations
-for Solitaire drawing nothing each fitted every symptom available and were each wrong (Findings-M4).
-The one result that held was a `ud2` probe with a firing control: the app never calls
-`Window.put_Content` and never calls `Window.Activate`, so every rendering symptom below that was a
-consequence. When a theory "explains everything", that is not evidence - find the measurement that
-separates it from the alternatives.
+**Reason backward from a measurement, not forward from a mechanism.** Several explanations for
+Solitaire drawing nothing each fitted every symptom available and were each wrong (Findings-M4).
+When a theory "explains everything", that is not evidence - find the measurement that separates it
+from the alternatives.
+
+**And keep the measurement separate from the inference drawn from it.** The `ud2` probes showing
+Solitaire never calls `Window.put_Content` are sound. The conclusion I hung on them - "so it never
+finishes `OnLaunched`" - was not: the app is a *native* engine that renders through composition and
+has no reason to call it. A correct measurement will still mislead if the model around it is wrong.
+
+**Read the app's own strings before theorising.** `Solitaire.exe`'s `.rdata` gave up its entire
+startup log vocabulary (`{}::Startup START`, `SolitaireApp::StartupComplete -- ...`) with no
+symbols at all, which is how we know it never reaches its own startup. Find a log line you *do*
+see, dump the strings around it, and read the sequence.
 
 **An app may write its own log.** Solitaire prints `[  0.002] LiveManagerXsapi2 - ...` lines to
 stderr naming its own failures, which is better evidence than anything we can infer from outside.
@@ -403,7 +411,7 @@ the fully-qualified name. `--grep` first, always.
 | Feedback Hub | Fully working and interactive (~822 colours) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | Starts clean; XAL and XSAPI now initialise. **Never calls `Window.put_Content` or `Window.Activate`** (ud2-proved), so it never finishes `OnLaunched` - the rendering symptoms are all downstream of that. Last act before idling is an `rmclient.dll` RPC to a missing Resource Manager service. Closest proxy we have to Shapr3D's rendering path |
+| Solitaire | **A native C++ engine (`Sgi::`), not a XAML app** - so its never calling `Window.put_Content`/`Activate` (ud2-proved) is expected, not the bug. XAL and XSAPI now initialise. The app is alive, responsive (closes cleanly in 2 s) and running a 60 Hz dispatcher loop with a real 1280x800 window, but never reaches its own `Startup START` and draws nothing. Closest proxy we have to Shapr3D's rendering path |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
