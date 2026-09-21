@@ -67,6 +67,11 @@ that were ours; the Calculator tree is no longer involved.
   `dlls/windows.graphics`, `dlls/wintypes`, `server/` and `include/` as off-limits. **That was
   false** - every commit in the tree is ours - and it cost real work; see the mistakes section.
 - **Never push.** Commit freely; pushing is the user's call.
+- **Stay in this directory.** The only path outside it that is ours is the Wine checkout
+  `$WINE_SRC` (`~/src/wine`), because `env.sh` and `sync-wine.sh` point at it. Everything else
+  under `~` is unrelated work - do not read it, scan it, or report on it unless asked. I once ran a
+  `git status` sweep over every repo in `~/src` and `~/Projects` while answering "is anything
+  uncommitted?"; the question meant *this project*, and the other repos were none of my business.
 - **Sync our Wine source into this repo after touching it**: `./sync-wine.sh --from-tree`, then
   commit. `--check` tells you whether the two are in step; `--to-tree` reconstructs the tree from
   the repo. "Commit only files in this repo" is not the same as "let our Wine work exist nowhere":
