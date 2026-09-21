@@ -7154,3 +7154,47 @@ with "the bootflow is never ticked", and I did not test that before naming a cul
 
 This is the same mistake AGENTS.md already records for the `ud2` work on `Window.put_Content`: a
 correct measurement, with a wrong model wrapped around it.
+
+### Resolved: nothing in the bootflow is stuck - `BootflowState::Update` is called exactly once
+
+The app tells you itself, if you let it. The tick's error path already formats the current item's
+name (`Bootflow -- Error on bootflow item: %s`), and it is reached only when `UpdateInit` returns
+exactly 1. Two byte patches turn that into a probe that answers everything at once:
+
+- NOP the `jne` at `0x3070af` (`75 08` -> `90 90`) and "still working" also falls into the error
+  path. **Result: no line at all** - so `UpdateInit` is not returning "still working". No item is
+  blocking.
+- Replace the `jne` at `0x30702e` (`0f 85 85 00 00 00`) with `jmp 0x3070b1`
+  (`e9 7e 00 00 00 90`) and *every* call of the tick logs the current item.
+
+**Result: exactly one line, `BootflowItemArkadiumMigration`** - index 0, the first item.
+
+So: `Enter` builds all eight items, sets the status word to 1 and calls `items[0]->BeginInit()`;
+the tick runs **once**; and then nothing ever calls it again. The flow never errors
+(`Bootflow -- Error on bootflow item`) and never completes
+(`Bootflow -- Successfully Initialized all boot flow items.`, the string at `0xf745d8`) because it
+is simply not being driven.
+
+The tick has **no direct call site** - it is `BootflowState::Update`, **slot `+0x20`** of the
+`BootflowState` vtable at `0xec2708` (`Enter` is slot `+0x10` at `0x306670`). So the missing thing
+is the app state machine's per-frame `Update` on the current state, not anything in the bootflow.
+
+**This supersedes both earlier conclusions in this file.** `BootflowItemFont` was wrong, and so was
+the follow-up guess that the tick's status guard was failing - the guard passes, the tick just is
+not called again.
+
+**Why six rounds of `ud2` could not see it.** Every probe of the form "does item N's `BeginInit`
+run?" returns negative when the flow is not being ticked, regardless of which item is stuck - so a
+whole table of confident negatives was consistent with the real cause and with a dozen wrong ones.
+Worse, two of the probes were meaningless for a second reason: `0x6dcb0` (`mov [rcx+0x10],0; ret`)
+and `0x67f50` (`mov 0x10(rcx),eax; ret`) are one-line functions that the linker **folds (ICF)**, so
+a `ud2` in them fires for any class that happens to share the code. **Never probe a function small
+enough to be ICF-folded** - check that its bytes are unique in `.text` first.
+
+The general lesson, which is not new here: **the binary already contained a code path that answers
+the question.** Solitaire formats the stuck item's name itself. Redirecting the app's own logging
+took one run and two bytes; triangulating around it took six rounds and about twenty.
+
+**Next**: find what calls vtable slot `+0x20` on the current app state. That is a `call *0x20(%rax)`
+through the state pointer, in whatever drives `AppState`. The app does keep presenting frames, so
+something is still running - the question is why the state machine's update is not part of it.
