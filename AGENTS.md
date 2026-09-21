@@ -558,7 +558,7 @@ the fully-qualified name. `--grep` first, always.
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | **Renders.** The splash screen paints fully at 1280x800 - cards, mahjong tiles, jewels, sudoku, bubbles - 151118 unique colours, **0 critical errors, 4/4 runs**. Starts clean, completes its bootstrap, runs its GUI. Does not yet advance past the splash page: the CDN content it wants cannot download here. Closest proxy we have to Shapr3D's rendering path |
+| Solitaire | **Renders, does not reach the game.** Paints its splash page (`splashpage_pc`) fully at 1280x800, 151118 colours, 0 critical errors, and keeps presenting frames (`SwapBuffers` runs). It is genuinely online - `PlayFab login successful` - after msxml6's XMLHTTP classes were registered. It never leaves the splash: exactly one `BootflowItem` begins and its completion future is never fulfilled, so no item that does real work ever starts. Five minutes adds no further log line. See Findings-M4 |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
@@ -601,6 +601,9 @@ irrelevant (all three unset is identical). Two wrong turns worth remembering: I 
 session's file), and an `xdotool windowsize` test gave a clean negative that meant nothing because
 the resize never reached XAML at all.
 
-Next: the app holds on the splash page because its CDN content will not download. Whether that is
-worth pursuing depends on whether Shapr3D needs the same path - the rendering path itself is now
-proven end to end.
+Next: the app holds on the splash page. The CDN explanation first written here was **wrong** - the
+app had no working HTTP at all (msxml6's XMLHTTP classes were never registered, so libHttpClient's
+IXMLHTTPRequest2 backend could not create its transport), and with that fixed it logs
+`PlayFab login successful`. It still stops, one layer deeper: `BootflowState::Enter` begins exactly
+one item and the future that would advance the flow is never fulfilled. The rendering path itself
+is proven end to end, which is the part Shapr3D needs.
