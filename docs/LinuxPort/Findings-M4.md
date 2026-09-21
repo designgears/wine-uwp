@@ -5932,3 +5932,92 @@ in the Wine child. A poller that must act while the process is alive needs a sig
 the log; the one that works here is the window's unique colour count, the same measure the soak
 uses. The window itself is not a usable signal: it exists before `ConfigureCoreWindow`, so a
 wedged run has a window that never paints.
+
+## Solitaire: three real gaps closed, and it still does not draw
+
+Solitaire uses Windows.UI.Composition directly with no XAML markup in the package, which makes it
+the closest proxy we have to Shapr3D's rendering path. It still paints nothing, but three genuine
+holes in our implementation are now shut, each confirmed by the app's own output.
+
+### It writes its own log to stdout
+
+The single most useful discovery: the app prints `[  0.002] LiveManagerXsapi2 - ...` lines to
+stderr, and names its own failures. That is worth grepping for in any app before theorising:
+
+```
+grep -aE "^\[ *[0-9]+\.[0-9]+\]" run.log
+```
+
+It also opens `LocalState\Logs\Solitaire.log`, but that file stays 0 bytes unless the app exits
+cleanly, so the stdout lines are the usable copy.
+
+### window_host_vtbl was nine slots too short
+
+`MrmCoreR` (the resource manager) calls **slot 17** on the object `dcomp/device.c` hands out for
+`{84acbbfe-649c-5ac7-8130-7b6b76db463c}`:
+
+```
+1800081fd:  mov (%rcx),%rax        ; vtable
+18000820a:  mov 0x88(%rax),%rax    ; slot 17
+180008211:  call ...
+```
+
+The array had 8 entries, so this read past its end into whatever `.data` held next - a NULL - and
+jumped to 0, five times a run. `dcomp` installs a process-wide vectored handler, so the fault was
+reported as `comp_object_nx_veh` and *looked* like a composition bug; it was a resource-manager
+call through a short vtable. Every slot to 31 now has a traced thunk. **A vtable shorter than the
+interface is a wild jump, not an error** - and the IID is version 5 (derived), so it is in no
+`.winmd` and unnamed in `HKCR`; the name `IWindowHostPartner` was invented by an earlier session.
+
+### Windows.System.UserPicker: an out-of-process class with no fallback
+
+```
+err:combase:RoGetActivationFactory Failed to find library for L"Windows.System.UserPicker"
+[   0.001] LiveManagerXsapi2 - Failed to initialize XAL with HRESULT: 0X80004005
+```
+
+The class is registered `ActivationType=1, Server=UserManager` - served by a system service, so
+there is no `DllPath` and the lookup fails outright rather than returning something XAL can handle.
+`shims/userpicker` answers `IsSupported = false`, which is the honest answer for a prefix with one
+local user and a value the caller is built for. `PickSingleUserAsync` returns `E_NOTIMPL` rather
+than inventing a user, which would only fail later at sign-in. Now: `XAL Initialized successfully.`
+
+**A shim that is registered and installed can still export nothing.** The first build had no
+`__declspec(dllexport)`, so `combase` said *"Module ... does not implement DllGetActivationFactory"*
+while `install-overrides.sh` cheerfully reported success. Check
+`llvm-readobj --coff-exports <dll> | grep -c Name:` after building a shim.
+
+### CreateStorageItemFromShellItem_FullTrustCaller_ForPackage
+
+XSAPI turns the package folder into a `Windows.Storage` item through this undocumented shell entry
+point; it returned `E_NOTIMPL`, and XSAPI init failed. It now asks the `IShellItem` for
+`SIGDN_FILESYSPATH` and builds a real StorageFile or StorageFolder through windows.storage's
+`__wine_storage_file_create` / `__wine_storage_folder_create`, choosing by file attributes. Now:
+`XSAPI Initialized successfully.` This function has now blocked Solitaire twice at different
+depths - an earlier session changed it from a spec stub (which aborted the process) to a refusal.
+
+### {7ca84d06-f54c-4ba8-bd6f-9abaf9380d51} is a marshalling helper - keep refusing it
+
+Only Solitaire asks its activation args for this IID, which made it look like *the* difference
+between the app that draws and the three that do not. It is not.
+`twinapi.appcore.pdb.syms` names it: `CLaunchActivatedEventArgs` carries it as
+`CloakedIid<IValueMarshalByPropertySet@Internal@Marshaling@Foundation@Windows>`, next to
+`MarshalObjectToPropertySet` / `UnmarshalObjectFromPropertySet`. It lets args serialise into a
+`PropertySet` instead of being COM-proxied, and the caller falls back when refused.
+
+Answering it with traced stubs made things **worse**: `CoreApplicationView::Activate` itself
+returned `E_NOTIMPL` and no window was created at all. `E_NOINTERFACE` is an answer callers handle;
+a claimed-but-broken interface is not. Reverted, with the identification recorded in the code.
+
+### Where it stands
+
+With the drive-view switches on, activation fully succeeds - `Load(L"App") hr 0`,
+`the app handled the activation`, `view Activate(...) hr 0`. The app then creates a XAML `Window`
+and `Page`, sets one black `0x0` sprite visual, dispatches a single message, and idles at 60 Hz
+with `present_desktop_hwnd frame: 0 ops`.
+
+Ruled out with evidence, so they need not be re-investigated: the `LoadComponent(App.xaml)` failure
+(there is no XAML in the package at all), `SHTaskPoolQueueTask` (a deliberate earlier fix), network
+(zero network calls in the run), WebView2, swapchain rendering, window bounds (the CoreWindow is
+created 1280x800), and thrown exceptions (`WINE_UWP_TRACE_ORIGINATE` reports none - the app is not
+swallowing an error, it is deciding it has nothing to draw).

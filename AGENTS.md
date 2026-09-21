@@ -98,6 +98,19 @@ For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
 
 ## Mistakes already made - do not repeat them
 
+**An app may write its own log.** Solitaire prints `[  0.002] LiveManagerXsapi2 - ...` lines to
+stderr naming its own failures, which is better evidence than anything we can infer from outside.
+`grep -aE "^\[ *[0-9]+\.[0-9]+\]" run.log` before theorising.
+
+**A vtable shorter than the interface is a wild jump, not an error.** `dcomp`'s `window_host_vtbl`
+had 8 entries and MrmCoreR calls slot 17; the call read past the array into `.data` and jumped
+through a NULL. When an interface is in no `.winmd` and unnamed in `HKCR`, give every slot a traced
+thunk up to a generous bound and let the app say which it calls.
+
+**A shim can be registered, installed, and export nothing.** A missing `__declspec(dllexport)` gets
+you *"Module ... does not implement DllGetActivationFactory"* while the installer reports success.
+`llvm-readobj --coff-exports <dll> | grep -c Name:` after every shim build.
+
 **Never queue an APC onto a thread you do not own.** Wine parks its own workers
 (`wine_rpcrt4_server`, `wine_threadpool_*`, `wined3d_cs`) in *alertable* waits, so an APC queued
 onto one runs inside that wait. `wineuwp` broadcast startup APCs to every thread in the process;
@@ -363,7 +376,7 @@ the fully-qualified name. `--grep` first, always.
 | Feedback Hub | Fully working and interactive (~822 colours) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | Starts clean, draws nothing (uses Windows.UI.Composition directly) |
+| Solitaire | Starts clean, activates, draws nothing. XAL and XSAPI now initialise (UserPicker shim + the shell storage bridge); the app creates a Window and Page then idles with `frame: 0 ops`. Closest proxy we have to Shapr3D's rendering path |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against

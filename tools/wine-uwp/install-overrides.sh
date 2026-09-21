@@ -186,6 +186,22 @@ if [ -f "$FP_SHIM" ]; then
   echo "installed: FileOpenPicker stand-in"
 fi
 
+# Windows.System.UserPicker stand-in. Registered on Windows as ActivationType=1 with
+# Server=UserManager - an out-of-process class with no DllPath - so RoGetActivationFactory fails
+# outright and Xbox Live auth (XAL) reports E_FAIL. Solitaire logs that as its first two lines.
+# See shims/userpicker.
+UP_SHIM=$HOME/uwp-bin/build-probes/wineuwp_userpicker.dll
+if [ -f "$UP_SHIM" ]; then
+  UP_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_userpicker.dll
+  if ! cmp -s "$UP_SHIM" "$UP_DST"; then cp -f "$UP_SHIM" "$UP_DST"; fi
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.System.UserPicker"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_userpicker.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: UserPicker stand-in"
+fi
+
 # Windows.Storage.AccessCache.StorageApplicationPermissions stand-in. An app adds a picked file to
 # its future-access list so it can reopen it later; the class does not exist in Wine, so the
 # activation throws straight out of the pick with 0x80040111. See shims/accesscache.
