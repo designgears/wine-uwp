@@ -125,6 +125,15 @@ function the app actually calls. Calculator and Media Player both fire
 patch applied to the source is live in `~/.wine-uwp/drive_c/windows/system32/` too - restoring only
 the source leaves the probe in place for every later run. `cmp` both against the backup afterwards.
 
+**Restore in the *same command* that reads the result.** The rule above is old and I broke it
+anyway: I read a probe's output, pivoted to a different tool, and left a `ud2` live in
+`Solitaire.exe`. The next two runs came back with 2 critical errors and no login - and I briefly
+blamed the profiler I had just started, because the regression and the new tool arrived together.
+The giveaway was in the crash text all along: `Unhandled Exception At 0x0000000140306eff --
+Illegal instruction`, an address I had patched myself. **A leftover probe looks exactly like a
+regression in whatever you did next.** Put the `restore` + `cmp` in the same command as the run,
+never in a follow-up, and if a run suddenly gets worse, `cmp` the binary before theorising.
+
 
 To answer "does this basic block execute", overwrite its first two bytes with `0f 0b`. A hit shows
 up as `err:seh:NtRaiseException Unhandled exception code 1007`. The *address* in that line is the
