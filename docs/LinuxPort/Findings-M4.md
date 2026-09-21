@@ -6904,3 +6904,54 @@ and no timeout or retry path, so nothing is going to shake loose on its own.
 
 Regression with all of the above: Calculator 249 colours and `AE` = **0**; Feedback Hub **822**
 colours, 0 fail-fasts, 0 app errors.
+
+## The bootstrap thread is not blocked - it is spinning
+
+`WINE_UWP_PROFILE` (already in `wineuwp`, and not previously in the toolkit) found in one run what
+`WINE_UWP_DUMP_STACKS` had failed to find across several. Thread `1e8`, ~600 samples:
+
+```
+WinUwp::BootStrap::Startup (0x7df800) +0x7dfa5d
+  -> 0x7de170              the tick, called over and over
+     -> 0x66b194 -> 0x66af00 -> 0x222d48      a task-queue drain
+```
+
+Disassembled, the loop is:
+
+```
+BootStrap::Startup:   call this->vtbl[5]()                 ; the tick
+                      if [this+0x20a] or [this+0x208] or [this+0x210] -> leave
+0x7de170 (the tick):  if any of those three flags is set -> return immediately
+                      else  executor = 0x626a8() ; drain(executor)   (0x66b194)
+```
+
+So the app is **busy, not parked**: it pumps its task queue forever waiting for one of three
+"finished / failed / cancelled" flags that nothing ever sets. Every earlier description of this as
+a thread "waiting on a future that is never fulfilled" was the wrong shape - and no single stack
+snapshot could have told the difference. That is now a rule in AGENTS.md.
+
+It also means the executor **is** being drained, by this very thread, using the same singleton
+(`0x626a8`) that `BootflowState::Enter` uses when it attaches its continuation - so "the
+continuation was posted to a queue nobody runs" is ruled out too.
+
+### Corrections to earlier entries in this file
+
+- **The two "trivial `BeginInit`s" are not both bootflow items.** `0x6dcb0` appears as a pointer in
+  **five** vtables (identical-code folding makes `mov dword [rcx+0x10], 2; ret` shared), so its
+  `ud2` firing says nothing about which class ran. `0xc7650` appears exactly **once** and is
+  genuinely Font's. Counting how many times a function address occurs as a pointer in the image is
+  the cheap way to know whether a probe on it is attributable at all - do that before reading
+  anything into a shared stub.
+- `0x306eff` is the **normal** path, not a failure: the smart pointer at `-0x21(%rbp)` has been
+  moved out and zeroed by then, so the `testq/je` is cleanup. A probe there fires on every healthy
+  run and means nothing.
+
+### And a self-inflicted one
+
+I left that `ud2` at `0x306eff` live in `Solitaire.exe`, pivoted to the profiler, and the next two
+runs came back with 2 critical errors and no login. I briefly blamed the profiler, which I had
+started in the same breath. The crash text said
+`Unhandled Exception At 0x0000000140306eff -- Illegal instruction` - my own patch address. **A
+leftover probe looks exactly like a regression in whatever you did next.** The rule in AGENTS.md is
+now "restore in the same command that reads the result", because "restore afterwards" is clearly
+not something I reliably do.
