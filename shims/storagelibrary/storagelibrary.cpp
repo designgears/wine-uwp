@@ -15,7 +15,7 @@
 // profile directory (dlls/windows.storage/storagefolder.c) - which this gets by calling
 // KnownFolders itself rather than duplicating the path logic.
 //
-// The parameterised IIDs below come from tools/wine-uwp/piid.py, whose --self-test checks the
+// The parameterised IIDs below come from ./piid.py, whose --self-test checks the
 // derivation against IIDs widl generates. They are in no .winmd and in no registry.
 #include <windows.h>
 #include <roapi.h>

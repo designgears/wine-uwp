@@ -1,0 +1,9 @@
+# Python dependencies for the investigation toolkit. They live in a venv at $UWP_BIN/venv, which is
+# inside the gitignored data directory, so a fresh clone has to recreate it:
+#
+#   python3 -m venv "$UWP_BIN/venv" && "$UWP_BIN/venv/bin/pip" install -r requirements.txt
+#
+# Six tools import these and fail under a bare `python3`: disas.py, import-audit.py,
+# ordinal-audit.py, pdbsyms.py, xrefs.py (pefile) and gen-classes-reg.py (regipy).
+pefile
+regipy

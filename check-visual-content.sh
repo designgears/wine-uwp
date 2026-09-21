@@ -7,11 +7,11 @@
 # whether the brush colour came from XAML ("matched 1") or from the renderer fallback.
 set -euo pipefail
 
-root=$(cd "$(dirname "$0")/../.." && pwd)
+root=$(cd "$(dirname "$0")" && pwd)
 log=${1:-${UWP_VISUAL_CONTENT_LOG:-/tmp/wine-uwp-visual-content-check.log}}
 
 if [ "$#" -eq 0 ]; then
-  if ! UWP_PRESENTATION_LOG="$log" "$root/tools/wine-uwp/check-presentation.sh"; then
+  if ! UWP_PRESENTATION_LOG="$log" "$root/check-presentation.sh"; then
     exit 1
   fi
 elif ! rg -q 'presented desktop hwnd' "$log"; then

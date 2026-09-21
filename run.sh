@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run a staged UWP app (or a probe) in the wine-uwp prefix with useful tracing.
-# Usage: tools/wine-uwp/run.sh [exe] [args...]     default exe: CalculatorApp.exe in the stage dir
+# Usage: ./run.sh [exe] [args...]     default exe: CalculatorApp.exe in the stage dir
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]:-$0}")/./env.sh"
 export WINEPREFIX=${WINEPREFIX}

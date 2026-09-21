@@ -148,11 +148,19 @@ activations in the next looked fine in its first run. Single runs are not eviden
 
 These all exist and work. Prefer them over reading code and guessing.
 
+**Run the Python tools with `$UWP_BIN/venv/bin/python`, not `python3`.** Six of them import `pefile`
+or `regipy`, which are installed only in that venv: `disas.py`, `import-audit.py`,
+`ordinal-audit.py`, `pdbsyms.py`, `xrefs.py`, `gen-classes-reg.py`. Under a bare `python3` they
+die with `ModuleNotFoundError` and look broken. This file previously asserted that `pefile` was
+"not installed", advising you to hand-parse PE headers instead - that was wrong, and it cost a
+session exactly that detour. `requirements.txt` records the dependencies; the venv lives inside
+gitignored `uwp-bin`, so a fresh clone has to recreate it.
+
 | Question | Tool |
 | --- | --- |
 | What is this IID, and what are its methods? | `./winmd.py <winmd> --guid <iid>` (public interfaces; prints slots from 6) |
 | Demangle an MSVC symbol | `llvm-undname` |
-| Symbols for a Microsoft binary | read the RSDS record from the PE debug directory, `curl` it from `msdl.microsoft.com/download/symbols/<name>/<sig><age>/<name>` ([docs](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/microsoft-public-symbols)), then `llvm-pdbutil dump --publics` into a `rva name` `.syms` file next to it in `$UWP_BIN/pdb`. `./pdbsyms.py` does this but needs `pefile`, which is **not installed** - parse the debug directory by hand (~20 lines) or install it |
+| Symbols for a Microsoft binary | read the RSDS record from the PE debug directory, `curl` it from `msdl.microsoft.com/download/symbols/<name>/<sig><age>/<name>` ([docs](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/microsoft-public-symbols)), then `llvm-pdbutil dump --publics` into a `rva name` `.syms` file next to it in `$UWP_BIN/pdb`. `./pdbsyms.py` does this - run it with `$UWP_BIN/venv/bin/python` (see below) |
 | Which module is this address in? | `./addr2mod.py <log-with-+loaddll> <addr>` - **native modules only**, see below; for a Wine builtin use `/proc/<pid>/maps` |
 | Which of N call sites returned this HRESULT? | unique-HRESULT tagging, below |
 | Did this code path run at all? | patch `0f 0b` (`ud2`) over its first two bytes, below |

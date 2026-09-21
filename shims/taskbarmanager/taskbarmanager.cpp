@@ -38,7 +38,7 @@
 //
 // IAsyncOperation<bool> {cdb5efb3-5788-509d-9be1-71ccb8a3362a} and
 // IAsyncOperationCompletedHandler<bool> {c1d3d1a2-ae17-5a5f-b5a2-bdcc8844889a} are parameterised
-// IIDs, in no .winmd; both were derived with tools/wine-uwp/piid.py (whose --self-test passes).
+// IIDs, in no .winmd; both were derived with ./piid.py (whose --self-test passes).
 #include <windows.h>
 #include <roapi.h>
 #include <winstring.h>

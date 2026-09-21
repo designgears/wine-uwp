@@ -12,7 +12,7 @@ Not wired into install-overrides.sh: staging these needs registry entries as wel
 font list from the registry, not from a directory scan), and the combination has not been shown to
 be harmless - see Findings-M4.md. Run it by hand if you want to experiment.
 
-Usage: tools/wine-uwp/stage-fonts.py [path-to-SegUIVar.ttf] [output-dir]
+Usage: ./stage-fonts.py [path-to-SegUIVar.ttf] [output-dir]
 Defaults: /mnt/win/Windows/Fonts/SegUIVar.ttf -> $UWP_BIN/win11/Windows/Fonts
 
 The registry side, for reference - bare filenames resolve against the Fonts directory:

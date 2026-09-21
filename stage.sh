@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stage the calculator package with its framework DLLs and our shims into ${UWP_BIN}/stage/calculator.
-# Usage: tools/wine-uwp/stage.sh [path-to-unpacked-msix]   (default: ${UWP_BIN}/calculator/pkg)
+# Usage: ./stage.sh [path-to-unpacked-msix]   (default: ${UWP_BIN}/calculator/pkg)
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]:-$0}")/./env.sh"
 SRC=${1:-${UWP_BIN}/calculator/pkg}

@@ -2,8 +2,8 @@
 # What is stopping an app right now? Reads a run log and reports the fatal gap, in the order that
 # matters - the checks are ordered by how the failure kills the app, not by where it appears in the log.
 #
-# Usage: tools/wine-uwp/next-gap.sh [log]        default: /tmp/wine-uwp-last.log
-#        tools/wine-uwp/next-gap.sh /tmp/*.log   summarises several runs
+# Usage: ./next-gap.sh [log]        default: /tmp/wine-uwp-last.log
+#        ./next-gap.sh /tmp/*.log   summarises several runs
 set -uo pipefail
 
 report_one() {

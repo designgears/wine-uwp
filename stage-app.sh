@@ -4,8 +4,8 @@
 # everything app-specific (identity, entry exe, window title) is read from the package manifest and
 # written next to the staged files as identity.env, which run.sh sources.
 #
-# Usage: tools/wine-uwp/stage-app.sh <package-family-or-full-name> [stage-name]
-#   e.g. tools/wine-uwp/stage-app.sh Microsoft.ZuneMusic media-player
+# Usage: ./stage-app.sh <package-family-or-full-name> [stage-name]
+#   e.g. ./stage-app.sh Microsoft.ZuneMusic media-player
 # WINDOWSAPPS overrides where installed packages are read from (default: the /mnt/win mount).
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]:-$0}")/./env.sh"
@@ -50,4 +50,4 @@ export WINE_UWP_AUMID=${name}_$pub!$appid
 export WINE_UWP_WINDOW_TITLE='$title'
 export UWP_EXE='$exe'
 EOF
-echo "staged  -> $S   (run: UWP_STAGE=$stage tools/wine-uwp/run.sh)"
+echo "staged  -> $S   (run: UWP_STAGE=$stage ./run.sh)"

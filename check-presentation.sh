@@ -3,7 +3,7 @@
 # Green means XAML built/committed a visual tree and dcomp attached a target to an HWND.
 set -euo pipefail
 
-root=$(cd "$(dirname "$0")/../.." && pwd)
+root=$(cd "$(dirname "$0")" && pwd)
 log=${UWP_PRESENTATION_LOG:-/tmp/wine-uwp-presentation-check.log}
 
 for attempt in 1 2 3; do
@@ -13,7 +13,7 @@ for attempt in 1 2 3; do
   WINE_UWP_BREAK_OFF=1be350 \
   UWP_TIMEOUT=12 \
   UWP_LOG="$log" \
-    "$root/tools/wine-uwp/run.sh" >/dev/null 2>&1 || true
+    "$root/run.sh" >/dev/null 2>&1 || true
 
   if rg -q "compositor_interop_CreateGraphicsDevice" "$log" &&
      rg -q "compositor_CreateContainerVisual" "$log" &&

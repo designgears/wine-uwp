@@ -15,7 +15,7 @@ perf_launch() {
     rm -f "$log"
     ( cd "$REPO" && WINEDEBUG="${WINEDEBUG:--all}" WINE_D3D_CONFIG=renderer=vulkan WINE_UWP_WINDOW_SIZE=1280x800 \
       WINE_UWP_ACTIVATE_ON_VIEW=1 UWP_TIMEOUT=${UWP_TIMEOUT:-600} UWP_LOG="$log" \
-      setsid nohup timeout $(( ${UWP_TIMEOUT:-600} + 20 )) tools/wine-uwp/run.sh >/dev/null 2>&1 & )
+      setsid nohup timeout $(( ${UWP_TIMEOUT:-600} + 20 )) "$(dirname "${BASH_SOURCE[0]}")/../run.sh" >/dev/null 2>&1 & )
 }
 perf_stop() { WINEPREFIX=$UWP_PREFIX $WINE_BUILD/server/wineserver -k 2>/dev/null; }
 # the Calculator process (the one with the most threads)

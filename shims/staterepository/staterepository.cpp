@@ -472,7 +472,7 @@ static HRESULT WINAPI generic_GetRuntimeClassName(void *iface, HSTRING *name)
 static HRESULT WINAPI generic_GetTrustLevel(void *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
 
 /* What to write through a slot's out-parameter, and where. Generated from the server vtables and
- * the public PDB by tools/wine-uwp/gen-staterepository.py; the out-parameter is the last one, so
+ * the public PDB by ./gen-staterepository.py; the out-parameter is the last one, so
  * the arity is what says which argument it is. Getting that wrong is not a small error - writing
  * the eight bytes at the wrong index leaves the real out-parameter holding whatever the caller's
  * stack had, and for an HSTRING that is a fail-fast. */
