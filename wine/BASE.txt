@@ -1,0 +1,10 @@
+Vendored from the shared Wine tree.
+
+  wine HEAD:     8101e4e8118246f3918800d3fe188ed7f4f3410e
+                 wineuwp: sample four stack frames per profile sample.
+  upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
+                 Release 11.17. (2026-09-04)
+  captured:      2026-09-21T21:10:29Z
+
+Files listed in wine/FILES are ours. Everything else in that tree - combase, ntdll,
+win32u, user32, kernelbase, server/, include/ - belongs to the other session.

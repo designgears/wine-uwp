@@ -1,0 +1,220 @@
+/*
+ * Windows.Storage.Search.IQueryOptionsFactory, declared here rather than in
+ * include/windows.storage.idl.
+ *
+ * include/windows.storage.idl has IQueryOptions but not the activation factory interface, and the
+ * IID is fixed by the Windows metadata, so declaring it locally is equivalent to having it there -
+ * the only thing that matters to a caller is the uuid and the method order.
+ *
+ * Copyright 2026 the Wine project authors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#pragma makedep header
+
+#ifdef __WIDL__
+#pragma winrt ns_prefix
+#endif
+
+import "inspectable.idl";
+import "windows.foundation.idl";
+import "windows.storage.idl";
+
+/* include/windows.storage.idl declares Windows.Storage.Search.IQueryOptions with no methods - only
+ * the IInspectable tail - and none of the Search property enums, so the real shapes are declared
+ * here instead. They carry the uuids from the Windows metadata, which is all a caller sees, and
+ * they live under Wine.Internal so nothing collides with the public header. Enum parameters are
+ * INT32, which is what they are on the wire.
+ *
+ * IQueryOptions            {1e5e46ee-0f45-4838-a8e9-d0479d446c30}
+ * IQueryOptionsFactory     {032e1f8c-a9c1-4e71-8011-0dee9d4811a3}
+ * IStorageFileQueryResult  {52fda447-2baa-412c-b29f-d4b1778efa1e}
+ *
+ * IStorageQueryResultBase and IStorageItemQueryResult are complete in the public header; only
+ * these three are not.
+ */
+namespace Wine.Internal {
+    interface IQueryOptionsInternal;
+    interface IQueryOptionsFactoryInternal;
+
+    [uuid(1e5e46ee-0f45-4838-a8e9-d0479d446c30)]
+    interface IQueryOptionsInternal : IInspectable
+    {
+        [propget] HRESULT FileTypeFilter([out, retval] Windows.Foundation.Collections.IVector<HSTRING> **value);
+        [propget] HRESULT FolderDepth([out, retval] INT32 *value);
+        [propput] HRESULT FolderDepth([in] INT32 value);
+        [propget] HRESULT ApplicationSearchFilter([out, retval] HSTRING *value);
+        [propput] HRESULT ApplicationSearchFilter([in] HSTRING value);
+        [propget] HRESULT UserSearchFilter([out, retval] HSTRING *value);
+        [propput] HRESULT UserSearchFilter([in] HSTRING value);
+        [propget] HRESULT Language([out, retval] HSTRING *value);
+        [propput] HRESULT Language([in] HSTRING value);
+        [propget] HRESULT IndexerOption([out, retval] INT32 *value);
+        [propput] HRESULT IndexerOption([in] INT32 value);
+        [propget] HRESULT SortOrder([out, retval] IInspectable **value);
+        [propget] HRESULT GroupPropertyName([out, retval] HSTRING *value);
+        [propget] HRESULT DateStackOption([out, retval] INT32 *value);
+        HRESULT SaveToString([out, retval] HSTRING *value);
+        HRESULT LoadFromString([in] HSTRING value);
+        HRESULT SetThumbnailPrefetch([in] INT32 mode, [in] UINT32 requested_size, [in] INT32 options);
+        HRESULT SetPropertyPrefetch([in] INT32 options,
+                                    [in] Windows.Foundation.Collections.IIterable<HSTRING> *properties_to_retrieve);
+    }
+
+    [uuid(032e1f8c-a9c1-4e71-8011-0dee9d4811a3)]
+    interface IQueryOptionsFactoryInternal : IInspectable
+    {
+        HRESULT CreateCommonFileQuery([in] INT32 query,
+                                      [in] Windows.Foundation.Collections.IIterable<HSTRING> *file_type_filter,
+                                      [out, retval] Wine.Internal.IQueryOptionsInternal **result);
+        HRESULT CreateCommonFolderQuery([in] INT32 query,
+                                        [out, retval] Wine.Internal.IQueryOptionsInternal **result);
+    }
+
+    [uuid(52fda447-2baa-412c-b29f-d4b1778efa1e)]
+    interface IStorageFileQueryResultInternal : IInspectable
+    {
+        HRESULT GetFilesAsync([in] UINT32 start_index, [in] UINT32 max_number_of_items,
+                              [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.Storage.StorageFile *> *> **operation);
+        HRESULT GetFilesAsyncDefaultStartAndCount(
+                              [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.Storage.StorageFile *> *> **operation);
+    }
+
+    /* IIterable<StorageFile> and its iterator. include/windows.storage.idl declares
+     * IIterable<IStorageItem> but not IIterable<StorageFile>, and .NET Native needs the latter to
+     * enumerate the IVectorView<StorageFile> that GetFilesAsync returns - without it a caller can
+     * read the count and nothing else. The uuids are the standard parameterised-IID derivation
+     * (tools/wine-uwp/piid.py in the calculator tree); {9ac00304-...} is exactly the IID Media
+     * Player asks the view for. */
+    [uuid(43e29f53-0298-55aa-a6c8-4edd323d9598)]
+    interface IIteratorStorageFileInternal : IInspectable
+    {
+        [propget] HRESULT Current([out, retval] Windows.Storage.StorageFile **value);
+        [propget] HRESULT HasCurrent([out, retval] boolean *value);
+        HRESULT MoveNext([out, retval] boolean *value);
+        HRESULT GetMany([in] UINT32 items_size, [out] Windows.Storage.StorageFile **items,
+                        [out, retval] UINT32 *value);
+    }
+
+    [uuid(9ac00304-83ea-5688-87b6-ae38aab65d0b)]
+    interface IIterableStorageFileInternal : IInspectable
+    {
+        HRESULT First([out, retval] Wine.Internal.IIteratorStorageFileInternal **value);
+    }
+
+    /* The file-properties stack. include/windows.storage.idl has none of these - not
+     * IStorageItemProperties, not IStorageItemContentProperties, not IMusicProperties - and
+     * Media Player asks a StorageFile for IStorageItemProperties {86664478-...} as soon as it
+     * has enumerated the folder. Refusing it is where the music library stops. */
+    [uuid(bc8aab62-66ec-419a-bc5d-ca65a4cb46da)]
+    interface IMusicPropertiesInternal : IInspectable
+    {
+        [propget] HRESULT Album([out, retval] HSTRING *value);
+        [propput] HRESULT Album([in] HSTRING value);
+        [propget] HRESULT Artist([out, retval] HSTRING *value);
+        [propput] HRESULT Artist([in] HSTRING value);
+        [propget] HRESULT Genre([out, retval] Windows.Foundation.Collections.IVector<HSTRING> **value);
+        [propget] HRESULT TrackNumber([out, retval] UINT32 *value);
+        [propput] HRESULT TrackNumber([in] UINT32 value);
+        [propget] HRESULT Title([out, retval] HSTRING *value);
+        [propput] HRESULT Title([in] HSTRING value);
+        [propget] HRESULT Rating([out, retval] UINT32 *value);
+        [propput] HRESULT Rating([in] UINT32 value);
+        [propget] HRESULT Duration([out, retval] Windows.Foundation.TimeSpan *value);
+        [propget] HRESULT Bitrate([out, retval] UINT32 *value);
+        [propget] HRESULT AlbumArtist([out, retval] HSTRING *value);
+        [propput] HRESULT AlbumArtist([in] HSTRING value);
+        [propget] HRESULT Composers([out, retval] Windows.Foundation.Collections.IVector<HSTRING> **value);
+        [propget] HRESULT Conductors([out, retval] Windows.Foundation.Collections.IVector<HSTRING> **value);
+        [propget] HRESULT Subtitle([out, retval] HSTRING *value);
+        [propput] HRESULT Subtitle([in] HSTRING value);
+        [propget] HRESULT Producers([out, retval] Windows.Foundation.Collections.IVector<HSTRING> **value);
+        [propget] HRESULT Publisher([out, retval] HSTRING *value);
+        [propput] HRESULT Publisher([in] HSTRING value);
+        [propget] HRESULT Writers([out, retval] Windows.Foundation.Collections.IVector<HSTRING> **value);
+        [propget] HRESULT Year([out, retval] UINT32 *value);
+        [propput] HRESULT Year([in] UINT32 value);
+    }
+
+    [uuid(0d023b76-20a7-56f3-84ab-ce31e6544b71)]
+    interface IAsyncOperationMusicPropertiesInternal : IInspectable
+    {
+        [propput] HRESULT Completed([in] IUnknown *handler);
+        [propget] HRESULT Completed([out, retval] IUnknown **handler);
+        HRESULT GetResults([out, retval] Wine.Internal.IMusicPropertiesInternal **results);
+    }
+
+    [uuid(05294bad-bc38-48bf-85d7-770e0e2ae0ba)]
+    interface IStorageItemContentPropertiesInternal : IInspectable
+    {
+        HRESULT GetMusicPropertiesAsync(
+            [out, retval] Wine.Internal.IAsyncOperationMusicPropertiesInternal **operation);
+        HRESULT GetVideoPropertiesAsync([out, retval] IInspectable **operation);
+        HRESULT GetImagePropertiesAsync([out, retval] IInspectable **operation);
+        HRESULT GetDocumentPropertiesAsync([out, retval] IInspectable **operation);
+    }
+
+    [uuid(86664478-8029-46fe-a789-1c2f3e2ffb5c)]
+    interface IStorageItemPropertiesInternal : IInspectable
+    {
+        HRESULT GetThumbnailAsyncOverloadDefaultSizeDefaultOptions([in] INT32 mode,
+            [out, retval] IInspectable **operation);
+        HRESULT GetThumbnailAsyncOverloadDefaultOptions([in] INT32 mode, [in] UINT32 requested_size,
+            [out, retval] IInspectable **operation);
+        HRESULT GetThumbnailAsync([in] INT32 mode, [in] UINT32 requested_size, [in] INT32 options,
+            [out, retval] IInspectable **operation);
+        [propget] HRESULT DisplayName([out, retval] HSTRING *value);
+        [propget] HRESULT DisplayType([out, retval] HSTRING *value);
+        [propget] HRESULT FolderRelativeId([out, retval] HSTRING *value);
+        [propget] HRESULT Properties(
+            [out, retval] Wine.Internal.IStorageItemContentPropertiesInternal **value);
+    }
+
+    /* IStorageItemExtraProperties is the generic property-system path: an app hands it a list of
+     * canonical property names (System.Music.Artist and friends) and gets a map back. Media Player
+     * asks StorageItemContentProperties for it right after get_Properties. The map is
+     * IMap<HSTRING, IInspectable> {1b0d3570-0877-5ec2-8a2c-3b9539506aca}. */
+    [uuid(1b0d3570-0877-5ec2-8a2c-3b9539506aca)]
+    interface IPropertyMapInternal : IInspectable
+    {
+        HRESULT Lookup([in] HSTRING key, [out, retval] IInspectable **value);
+        [propget] HRESULT Size([out, retval] UINT32 *value);
+        HRESULT HasKey([in] HSTRING key, [out, retval] boolean *value);
+        HRESULT GetView([out, retval] IInspectable **value);
+        HRESULT Insert([in] HSTRING key, [in] IInspectable *value, [out, retval] boolean *replaced);
+        HRESULT Remove([in] HSTRING key);
+        HRESULT Clear();
+    }
+
+    [uuid(127e39c7-07c1-58e5-b48e-3a4729839fec)]
+    interface IAsyncOperationPropertyMapInternal : IInspectable
+    {
+        [propput] HRESULT Completed([in] IUnknown *handler);
+        [propget] HRESULT Completed([out, retval] IUnknown **handler);
+        HRESULT GetResults([out, retval] Wine.Internal.IPropertyMapInternal **results);
+    }
+
+    [uuid(c54361b2-54cd-432b-bdbc-4b19c4b470d7)]
+    interface IStorageItemExtraPropertiesInternal : IInspectable
+    {
+        HRESULT RetrievePropertiesAsync(
+            [in] Windows.Foundation.Collections.IIterable<HSTRING> *properties_to_retrieve,
+            [out, retval] Wine.Internal.IAsyncOperationPropertyMapInternal **operation);
+        HRESULT SavePropertiesAsync([in] IInspectable *properties_to_save,
+            [out, retval] IInspectable **operation);
+        HRESULT SavePropertiesAsyncOverloadDefault([out, retval] IInspectable **operation);
+    }
+}

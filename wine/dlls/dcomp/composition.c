@@ -1,0 +1,14971 @@
+/*
+ * Windows.UI.Composition
+ *
+ * XAML asks dcomp.dll for a Compositor (CCoreServices::GetCompositor ->
+ * WindowsGraphicsDeviceManager::EnsureDCompDevice) and fail-fasts without one, so the class has to
+ * exist before any packaged app can build a visual tree. What is here is the object graph, not a
+ * renderer: visuals, brushes and a target that record their state. Nothing is presented yet.
+ *
+ * Copyright 2026 wine-uwp contributors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+
+#define COBJMACROS
+#include "initguid.h"
+#include "windef.h"
+#include "winbase.h"
+#include "winuser.h"
+#include "wingdi.h"
+#include "winstring.h"
+#include "objbase.h"
+#include "activation.h"
+#include "roapi.h"
+#include "dxgi.h"
+#include "d3d11.h"
+#include "d2d1_1.h"
+#include "d2d1_3.h"
+#include "dcomptypes.h"
+
+#define WIDL_using_Windows_Foundation
+#define WIDL_using_Windows_Foundation_Collections
+#define WIDL_using_Windows_Foundation_Numerics
+#define WIDL_using_Windows_Graphics_DirectX
+#define WIDL_using_Windows_Graphics_Effects
+#define WIDL_using_Windows_UI
+#define WIDL_using_Windows_UI_Core
+#define WIDL_using_Windows_UI_Composition
+#include "windows.foundation.h"
+#include "windows.graphics.directx.h"
+#include "windows.ui.core.h"
+#include "windows.ui.composition.h"
+#include "windows.ui.composition.interop.h"
+
+#include "wine/debug.h"
+#include "wine/exception.h"
+
+WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
+WINE_DECLARE_DEBUG_CHANNEL(dcompperf);
+/* WINEDEBUG=+dcompanim: every animation started on visuals and property sets, and what it resolved to */
+WINE_DECLARE_DEBUG_CHANNEL(dcompanim);
+
+/* WINEDEBUG=+dcompperf: a one-line summary per second of what the presenter did, cheap enough to leave
+ * on while measuring (the +dcomp trace itself costs more than the painting). */
+static struct
+{
+    unsigned int requests, deferred, unchanged, frames, commits, swapchain_frames, presents, readbacks;
+    double readback_ms, readback_max;
+    double walk_ms, raster_ms;
+    unsigned int batched, batches;
+    unsigned int visits, ops, pixels, verified, verify_bad;
+    double paint_ms, paint_max, blit_ms;
+    ULONGLONG start;
+} perf;
+static void perf_report( void )
+{
+    ULONGLONG now = GetTickCount64();
+    if (!perf.start) perf.start = now;
+    if (now - perf.start < 1000) return;
+    if (perf.frames)
+        TRACE_(dcompperf)( "frames: walk %.2f ms, raster %.2f ms, %u visits, %u ops, %u damaged kpixels per frame; %u surfaces read back in %u batches; verified %u, %u bad.\n",
+                           perf.walk_ms / perf.frames, perf.raster_ms / perf.frames, perf.visits / perf.frames, perf.ops / perf.frames,
+                           perf.pixels / perf.frames / 1000, perf.batched, perf.batches, perf.verified, perf.verify_bad );
+    if (perf.requests)
+        TRACE_(dcompperf)( "%I64u ms: %u commits, swap chain %u presents %u readbacks (%.2f avg %.2f max ms) %u shown, %u requests, %u deferred, %u unchanged, %u frames, paint %.2f avg %.2f max, blit %.2f avg.\n",
+                           now - perf.start, perf.commits, perf.presents, perf.readbacks,
+                           perf.readbacks ? perf.readback_ms / perf.readbacks : 0.0, perf.readback_max, perf.swapchain_frames, perf.requests, perf.deferred, perf.unchanged, perf.frames,
+                           perf.frames ? perf.paint_ms / perf.frames : 0.0, perf.paint_max,
+                           perf.frames ? perf.blit_ms / perf.frames : 0.0 );
+    memset( &perf, 0, sizeof(perf) );
+    perf.start = now;
+}
+
+/* Last desktop-target HWND — Commit paints it until a real presenter exists. */
+static HWND last_desktop_hwnd;
+/* Scene bookkeeping for the presenter: every state-changing entry point bumps the generation, and a
+ * frame is only painted when something changed, or changed within the last two seconds (time-driven
+ * animations and expressions move without any call). XAML commits ~60 times a second regardless. */
+static LONG scene_generation;
+static ULONGLONG scene_change_tick;
+static void scene_changed( void )
+{
+    InterlockedIncrement( &scene_generation );
+    scene_change_tick = GetTickCount64();
+}
+static IVisual *last_desktop_root;
+static void present_dcomp_visuals( HDC hdc );
+/* XAML hands the presenter a popup's position in the coordinate space of the XamlRoot content root
+ * (the visual that holds the page below the app's title bar row), but parents the popup's visual tree
+ * next to that content root, under the island root, where the content offset does not apply. A currency
+ * ComboBox popup was drawn one row above where XAML hit-tested it: XAML placed the popup host at the
+ * ComboBox's content-relative y (254) while the ComboBox itself paints at 286. So carry the content root's
+ * offset over to those popup roots; the flyouts XAML does place in window coordinates are told apart by
+ * the window-sized visual they are hosted in (see branch_is_window_space_dcv). */
+static float xaml_content_dy;
+static struct visual *xaml_island_container;
+static struct dcomp_visual *xaml_content_branch, *paint_branch;
+static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float parent_width,
+                                 float parent_height, float sx, float sy );
+static BOOL brush_solid_color( ICompositionBrush *brush, Color *color );
+static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int width, int height, float opacity );
+static HDC scratch_dc( HDC hdc );
+static int apply_inset_clip( HDC hdc, void *clip_iface, float x, float y, float width, float height );
+/* The presenter's back buffer: a top-down 32-bit DIB so the painters can blend into it directly.
+ * GDI's AlphaBlend costs a syscall and a clip setup per call, and a frame has sixty or more glyph
+ * runs and fills; the direct path handles the common unscaled blend under a rectangular clip. */
+static HDC back_dc;
+static HBITMAP back_bmp;
+static BYTE *back_bits;
+static int back_w, back_h;
+
+/* x / 255 for x in 0..65025, exact */
+#define DIV255( x ) (((x) + 1 + ((x) >> 8)) >> 8)
+
+/* The painter walks the composition tree into a display list of fills and blends (window coordinates,
+ * with the clip of their ancestors), compares it with the previous frame's list and rasterizes only where
+ * the two differ: hovering one button or typing a digit used to recompose all of the 1280x800 window.
+ *
+ * An operation's pixels are fully described by its fields: its kind, destination, clip, constant alpha,
+ * colour, and for blends the object the bits belong to plus that object's content generation (a surface's
+ * cache generation, a mask brush's composition serial). Where both lists hold the same operations in the
+ * same order, a pixel no changed operation covers composes to the same value, so damage is the union of
+ * the rectangles covered by changed operations, old and new.
+ *
+ * WINE_DCOMP_VERIFY_DAMAGE=1 rasterizes every frame in full as well and reports differing pixels. */
+enum paint_op_kind { OP_FILL, OP_BLEND, OP_STRETCH };
+struct paint_op
+{
+    enum paint_op_kind kind;
+    RECT dest;              /* where the source lands, unclipped */
+    RECT clip;              /* ancestors' clip, within the window */
+    BYTE alpha;             /* constant alpha */
+    Color color;            /* OP_FILL */
+    const BYTE *bits;       /* OP_BLEND: premultiplied BGRA, dest-sized */
+    HBITMAP bmp;            /* OP_STRETCH: the DIB holding the source */
+    int src_w, src_h;
+    const void *key;        /* the object the source bits belong to */
+    ULONG gen;              /* its content generation */
+    BOOL opaque;            /* covers every pixel of dest with alpha 255 */
+};
+struct paint_list
+{
+    struct paint_op *ops;
+    unsigned int count, capacity;
+};
+static struct paint_list paint_lists[2];
+static unsigned int paint_current;      /* index of the list being built */
+static RECT paint_clip;                 /* clip of the visual being walked */
+
+/* content generations are unique across objects: a freed surface or brush replaced by a new one at the same
+ * address must not look unchanged */
+static LONG content_generation;
+
+static BOOL paint_rect_empty( const RECT *r ) { return r->left >= r->right || r->top >= r->bottom; }
+
+static void paint_emit( const struct paint_op *op )
+{
+    struct paint_list *list = &paint_lists[paint_current];
+    RECT covered;
+
+    if (paint_rect_empty( &op->dest ) || !IntersectRect( &covered, &op->dest, &op->clip )) return;
+    if (list->count == list->capacity)
+    {
+        unsigned int capacity = list->capacity ? list->capacity * 2 : 256;
+        struct paint_op *ops = realloc( list->ops, capacity * sizeof(*ops) );
+        if (!ops) return;
+        list->ops = ops;
+        list->capacity = capacity;
+    }
+    list->ops[list->count++] = *op;
+}
+
+/* Blend premultiplied BGRA bits (stride src_stride) placed at x,y onto the back buffer within clip. */
+static void raster_blend( BYTE *target, int target_w, int x, int y, const BYTE *src, int src_stride, const RECT *clip,
+                          BYTE constant_alpha, BOOL opaque )
+{
+    int px, py;
+
+    if (opaque)
+    {
+        for (py = clip->top; py < clip->bottom; py++)
+            memcpy( target + (size_t)py * target_w * 4 + (size_t)clip->left * 4,
+                    src + (size_t)(py - y) * src_stride + (size_t)(clip->left - x) * 4, (size_t)(clip->right - clip->left) * 4 );
+        return;
+    }
+
+    for (py = clip->top; py < clip->bottom; py++)
+    {
+        const BYTE *in = src + (size_t)(py - y) * src_stride + (size_t)(clip->left - x) * 4;
+        BYTE *out = target + (size_t)py * target_w * 4 + (size_t)clip->left * 4;
+        for (px = clip->left; px < clip->right; px++, in += 4, out += 4)
+        {
+            unsigned int a = in[3], inv;
+            if (!a) continue;
+            if (constant_alpha == 255)
+            {
+                if (a == 255) { out[0] = in[0]; out[1] = in[1]; out[2] = in[2]; out[3] = 255; continue; }
+                inv = 255 - a;
+                out[0] = in[0] + DIV255( out[0] * inv );
+                out[1] = in[1] + DIV255( out[1] * inv );
+                out[2] = in[2] + DIV255( out[2] * inv );
+                out[3] = 255;
+                continue;
+            }
+            a = DIV255( a * constant_alpha );
+            inv = 255 - a;
+            out[0] = DIV255( in[0] * constant_alpha ) + DIV255( out[0] * inv );
+            out[1] = DIV255( in[1] * constant_alpha ) + DIV255( out[1] * inv );
+            out[2] = DIV255( in[2] * constant_alpha ) + DIV255( out[2] * inv );
+            out[3] = 255;
+        }
+    }
+}
+
+static void raster_fill( BYTE *target, int target_w, const RECT *clip, Color color, BYTE constant_alpha )
+{
+    unsigned int a, inv, r, g, b;
+    int px, py;
+
+    a = DIV255( color.A * constant_alpha );
+    if (!a) return;
+    if (a == 255)
+    {
+        DWORD pixel = 0xff000000 | (color.R << 16) | (color.G << 8) | color.B;
+        for (py = clip->top; py < clip->bottom; py++)
+        {
+            DWORD *out = (DWORD *)(target + (size_t)py * target_w * 4) + clip->left;
+            for (px = clip->left; px < clip->right; px++) *out++ = pixel;
+        }
+        return;
+    }
+    inv = 255 - a;
+    r = DIV255( color.R * a ); g = DIV255( color.G * a ); b = DIV255( color.B * a );
+    for (py = clip->top; py < clip->bottom; py++)
+    {
+        BYTE *out = target + (size_t)py * target_w * 4 + (size_t)clip->left * 4;
+        for (px = clip->left; px < clip->right; px++, out += 4)
+        {
+            out[0] = b + DIV255( out[0] * inv );
+            out[1] = g + DIV255( out[1] * inv );
+            out[2] = r + DIV255( out[2] * inv );
+            out[3] = 255;
+        }
+    }
+}
+
+static BOOL bits_opaque( const BYTE *bits, UINT width, UINT height )
+{
+    size_t i, n = (size_t)width * height * 4;
+    for (i = 3; i < n; i += 4) if (bits[i] != 255) return FALSE;
+    return TRUE;
+}
+
+/* Emitters used by the tree walk. The hdc arguments are kept for the shape of the callers. */
+static BOOL soft_blend_opaque( HDC hdc, int x, int y, int w, int h, const BYTE *src, int src_stride, BYTE constant_alpha,
+                               const void *key, ULONG gen, BOOL opaque );
+static BOOL soft_blend( HDC hdc, int x, int y, int w, int h, const BYTE *src, int src_stride, BYTE constant_alpha,
+                        const void *key, ULONG gen )
+{
+    return soft_blend_opaque( hdc, x, y, w, h, src, src_stride, constant_alpha, key, gen, FALSE );
+}
+static BOOL soft_blend_opaque( HDC hdc, int x, int y, int w, int h, const BYTE *src, int src_stride, BYTE constant_alpha,
+                               const void *key, ULONG gen, BOOL opaque )
+{
+    struct paint_op op = { OP_BLEND };
+
+    if (w <= 0 || h <= 0 || src_stride != w * 4) return FALSE;
+    SetRect( &op.dest, x, y, x + w, y + h );
+    op.clip = paint_clip;
+    op.alpha = constant_alpha;
+    op.bits = src;
+    op.src_w = w;
+    op.src_h = h;
+    op.key = key;
+    op.gen = gen;
+    op.opaque = opaque && constant_alpha == 255;
+    paint_emit( &op );
+    return TRUE;
+}
+
+static BOOL soft_fill( HDC hdc, int x, int y, int w, int h, Color color, BYTE constant_alpha )
+{
+    struct paint_op op = { OP_FILL };
+
+    if (w <= 0 || h <= 0) return FALSE;
+    if (!DIV255( color.A * constant_alpha )) return TRUE;
+    SetRect( &op.dest, x, y, x + w, y + h );
+    op.clip = paint_clip;
+    op.alpha = constant_alpha;
+    op.color = color;
+    op.opaque = color.A == 255 && constant_alpha == 255;
+    paint_emit( &op );
+    return TRUE;
+}
+
+static void soft_stretch( int x, int y, int dest_w, int dest_h, HBITMAP bmp, int src_w, int src_h, BYTE constant_alpha,
+                          const void *key, ULONG gen )
+{
+    struct paint_op op = { OP_STRETCH };
+
+    if (dest_w <= 0 || dest_h <= 0) return;
+    SetRect( &op.dest, x, y, x + dest_w, y + dest_h );
+    op.clip = paint_clip;
+    op.alpha = constant_alpha;
+    op.bmp = bmp;
+    op.src_w = src_w;
+    op.src_h = src_h;
+    op.key = key;
+    op.gen = gen;
+    paint_emit( &op );
+}
+
+static BOOL paint_op_equal( const struct paint_op *a, const struct paint_op *b )
+{
+    return a->kind == b->kind && EqualRect( &a->dest, &b->dest ) && EqualRect( &a->clip, &b->clip ) &&
+           a->alpha == b->alpha && a->key == b->key && a->gen == b->gen && a->bits == b->bits && a->bmp == b->bmp &&
+           a->src_w == b->src_w && a->src_h == b->src_h && a->opaque == b->opaque && !memcmp( &a->color, &b->color, sizeof(a->color) );
+}
+
+#define PAINT_DAMAGE_RECTS 16
+struct paint_damage
+{
+    RECT rects[PAINT_DAMAGE_RECTS];
+    unsigned int count;
+};
+
+static LONG rect_area( const RECT *r ) { return paint_rect_empty( r ) ? 0 : (r->right - r->left) * (r->bottom - r->top); }
+
+static void damage_add( struct paint_damage *damage, const RECT *rect, const RECT *bounds )
+{
+    unsigned int i, j, best = 0;
+    LONG best_cost = LONG_MAX;
+    RECT r, u;
+    BOOL merged;
+
+    if (!IntersectRect( &r, rect, bounds )) return;
+    if (damage->count == PAINT_DAMAGE_RECTS)
+    {
+        /* full: grow the rectangle that gains the least area */
+        for (i = 0; i < damage->count; i++)
+        {
+            LONG cost;
+            UnionRect( &u, &damage->rects[i], &r );
+            cost = rect_area( &u ) - rect_area( &damage->rects[i] );
+            if (cost < best_cost) { best_cost = cost; best = i; }
+        }
+        UnionRect( &damage->rects[best], &damage->rects[best], &r );
+    }
+    else damage->rects[damage->count++] = r;
+    /* keep the rectangles disjoint */
+    do
+    {
+        merged = FALSE;
+        for (i = 0; i < damage->count && !merged; i++)
+            for (j = i + 1; j < damage->count && !merged; j++)
+                if (IntersectRect( &u, &damage->rects[i], &damage->rects[j] ))
+                {
+                    UnionRect( &damage->rects[i], &damage->rects[i], &damage->rects[j] );
+                    damage->rects[j] = damage->rects[--damage->count];
+                    merged = TRUE;
+                }
+    } while (merged);
+}
+
+static void damage_add_op( struct paint_damage *damage, const struct paint_op *op, const RECT *bounds )
+{
+    RECT covered;
+    if (IntersectRect( &covered, &op->dest, &op->clip )) damage_add( damage, &covered, bounds );
+}
+
+/* Rasterize every operation of list onto target within area. */
+static void raster_ops( HDC dc, BYTE *target, int target_w, const struct paint_list *list, const RECT *area )
+{
+    static const Color backdrop = { 255, 0x20, 0x60, 0xc0 };
+    unsigned int i, first = 0;
+    RECT r;
+
+    /* whatever lies below the last opaque operation covering the whole area is not visible */
+    for (i = list->count; i > 0; i--)
+    {
+        const struct paint_op *op = &list->ops[i - 1];
+        if (op->opaque && op->kind != OP_STRETCH && IntersectRect( &r, &op->dest, &op->clip ) &&
+            r.left <= area->left && r.top <= area->top && r.right >= area->right && r.bottom >= area->bottom)
+        {
+            first = i - 1;
+            break;
+        }
+    }
+    if (!i) raster_fill( target, target_w, area, backdrop, 255 );   /* nothing opaque covers it */
+    for (i = first; i < list->count; i++)
+    {
+        const struct paint_op *op = &list->ops[i];
+        if (!IntersectRect( &r, &op->dest, &op->clip ) || !IntersectRect( &r, &r, area )) continue;
+        switch (op->kind)
+        {
+        case OP_FILL:
+            raster_fill( target, target_w, &r, op->color, op->alpha );
+            break;
+        case OP_BLEND:
+            raster_blend( target, target_w, op->dest.left, op->dest.top, op->bits, op->src_w * 4, &r, op->alpha, op->opaque );
+            break;
+        case OP_STRETCH:
+        {
+            BLENDFUNCTION blend = { AC_SRC_OVER, 0, op->alpha, AC_SRC_ALPHA };
+            static HRGN region;
+            HDC mem = scratch_dc( dc );
+            HBITMAP old;
+            if (!region) region = CreateRectRgn( 0, 0, 0, 0 );
+            SetRectRgn( region, r.left, r.top, r.right, r.bottom );
+            SelectClipRgn( dc, region );
+            old = SelectObject( mem, op->bmp );
+            GdiAlphaBlend( dc, op->dest.left, op->dest.top, op->dest.right - op->dest.left, op->dest.bottom - op->dest.top,
+                           mem, 0, 0, op->src_w, op->src_h, blend );
+            SelectObject( mem, old );
+            SelectClipRgn( dc, NULL );
+            break;
+        }
+        }
+    }
+}
+
+/* Frame pacing: XAML commits several times per input event and the app's swap chain presents on
+ * its own clock, and every one of those used to repaint the whole window (a drag ran at ~100
+ * paints a second). Paints closer than a frame apart are deferred to a one-shot timer, so at most
+ * one paint per ~16 ms happens and it paints the latest scene. */
+static void present_desktop_hwnd( HWND hwnd );
+static void readback_batch( void );
+static BOOL paint_have_previous;
+static RECT paint_forced;   /* rasterized whatever changed: a new back buffer, the region of an expose */
+static int paint_verify = -1;
+
+/* WINE_DCOMP_VERIFY_DAMAGE: rasterize the whole list into a second buffer and compare. */
+static void verify_damage( HDC dc, const struct paint_list *list )
+{
+    static HDC verify_dc;
+    static HBITMAP verify_bmp;
+    static BYTE *verify_bits;
+    static int verify_w, verify_h;
+    static ULONGLONG last_report;
+    RECT bounds = { 0, 0, back_w, back_h }, bad;
+    unsigned int count = 0;
+    int x, y;
+
+    if (verify_bmp && (verify_w != back_w || verify_h != back_h))
+    {
+        DeleteObject( verify_bmp );
+        verify_bmp = NULL;
+    }
+    if (!verify_dc) verify_dc = CreateCompatibleDC( dc );
+    if (!verify_bmp)
+    {
+        BITMAPINFO info = { { sizeof(info.bmiHeader), back_w, -back_h, 1, 32, BI_RGB } };
+        void *bits;
+        if (!(verify_bmp = CreateDIBSection( verify_dc, &info, DIB_RGB_COLORS, &bits, NULL, 0 ))) return;
+        SelectObject( verify_dc, verify_bmp );
+        verify_bits = bits;
+        verify_w = back_w;
+        verify_h = back_h;
+    }
+    raster_ops( verify_dc, verify_bits, back_w, list, &bounds );
+    SetRectEmpty( &bad );
+    for (y = 0; y < back_h; y++)
+    {
+        const BYTE *a = back_bits + (size_t)y * back_w * 4, *b = verify_bits + (size_t)y * back_w * 4;
+        if (!memcmp( a, b, (size_t)back_w * 4 )) continue;
+        for (x = 0; x < back_w; x++)
+            if (memcmp( a + x * 4, b + x * 4, 3 ))
+            {
+                RECT px = { x, y, x + 1, y + 1 };
+                count++;
+                UnionRect( &bad, &bad, &px );
+            }
+    }
+    perf.verified++;
+    if (count)
+    {
+        perf.verify_bad++;
+        if (GetTickCount64() - last_report > 1000)
+        {
+            ERR( "damage verification: %u pixels differ within %s (%u ops).\n", count, wine_dbgstr_rect( &bad ), list->count );
+            last_report = GetTickCount64();
+        }
+        /* repair the frame, so one error does not persist */
+        memcpy( back_bits, verify_bits, (size_t)back_w * back_h * 4 );
+        BitBlt( GetDC( last_desktop_hwnd ), 0, 0, back_w, back_h, dc, 0, 0, SRCCOPY );
+    }
+}
+static ULONGLONG last_paint_tick;
+static double readback_ms;   /* readback time accumulated over a frame (TRACE_ON only) */
+static BOOL paint_timer_armed;
+static void CALLBACK paint_timer_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD time )
+{
+    KillTimer( hwnd, id );
+    paint_timer_armed = FALSE;
+    if (last_desktop_hwnd) present_desktop_hwnd( last_desktop_hwnd );
+}
+
+static void present_desktop_hwnd( HWND hwnd )
+{
+    HDC hdc;
+    RECT rc;
+
+    HDC mem;
+    HBITMAP bmp, old;
+
+    static LONG painted_generation = -1;
+    LONG generation = scene_generation;
+    ULONGLONG now;
+
+    if (!hwnd || !IsWindow( hwnd )) return;
+    if (TRACE_ON(dcompperf)) { perf_report(); perf.requests++; }
+    /* Repainting an unchanged scene reproduces the previous frame bit for bit (checked by hashing every such
+     * frame over typing, hover, graph drag/zoom and resize runs), so only a new generation or a new window
+     * size paints. It used to repaint for two seconds after every change, three frames in four. */
+    if (generation == painted_generation && GetClientRect( hwnd, &rc ) && back_bmp &&
+        rc.right == back_w && rc.bottom == back_h)
+    {
+        perf.unchanged++;
+        return;
+    }
+    now = GetTickCount64();
+    if (last_paint_tick && now - last_paint_tick < 15)
+    {
+        perf.deferred++;
+        if (!paint_timer_armed && SetTimer( NULL, 0, 16 - (UINT)(now - last_paint_tick), paint_timer_proc ))
+            paint_timer_armed = TRUE;
+        return;
+    }
+    last_paint_tick = now;
+    painted_generation = generation;
+    ShowWindow( hwnd, SW_SHOW );
+    if (!GetClientRect( hwnd, &rc )) return;
+    if (!(hdc = GetDC( hwnd ))) return;
+    /* Paint the frame off-screen and copy it in one go: drawing straight into the window, backdrop
+     * first, showed half-painted frames (whole rows of buttons missing) whenever the screen was
+     * sampled mid-frame. */
+    /* The back buffer and its DC live across frames; only a resize recreates them. */
+    {
+        if (back_bmp && (back_w != rc.right || back_h != rc.bottom))
+        {
+            DeleteObject( back_bmp );
+            back_bmp = NULL;
+            back_bits = NULL;
+        }
+        if (!back_bmp) SetRect( &paint_forced, 0, 0, max( rc.right, 1 ), max( rc.bottom, 1 ) );
+        if (!back_dc) back_dc = CreateCompatibleDC( hdc );
+        if (back_dc && !back_bmp)
+        {
+            BITMAPINFO info = { { 0 } };
+            void *bits = NULL;
+
+            back_w = max( rc.right, 1 ); back_h = max( rc.bottom, 1 );
+            info.bmiHeader.biSize = sizeof(info.bmiHeader);
+            info.bmiHeader.biWidth = back_w;
+            info.bmiHeader.biHeight = -back_h;
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = BI_RGB;
+            back_bmp = CreateDIBSection( back_dc, &info, DIB_RGB_COLORS, &bits, NULL, 0 );
+            back_bits = bits;
+            if (back_bmp) SelectObject( back_dc, back_bmp );
+        }
+        mem = back_bmp ? back_dc : NULL;
+        bmp = back_bmp;
+        old = NULL;
+    }
+    if (bmp)
+    {
+        struct paint_list *list, *previous;
+        struct paint_damage damage = { { { 0 } } };
+        RECT bounds = { 0, 0, back_w, back_h };
+        LARGE_INTEGER t0, t1, t2, t3, freq;
+        BOOL timing = TRACE_ON(dcomp) || TRACE_ON(dcompperf);
+        unsigned int i, n_old, n_new, head = 0, tail = 0;
+
+        if (timing) QueryPerformanceCounter( &t0 );
+        paint_current ^= 1;
+        list = &paint_lists[paint_current];
+        previous = &paint_lists[!paint_current];
+        list->count = 0;
+        paint_clip = bounds;
+        readback_batch();
+        present_dcomp_visuals( mem );
+        if (timing) QueryPerformanceCounter( &t1 );
+
+        n_old = previous->count;
+        n_new = list->count;
+        if (!paint_have_previous)
+            damage_add( &damage, &bounds, &bounds );
+        else
+        {
+            /* operations only change in between an unchanged head and tail */
+            while (head < n_old && head < n_new && paint_op_equal( &previous->ops[head], &list->ops[head] )) head++;
+            while (tail < n_old - head && tail < n_new - head &&
+                   paint_op_equal( &previous->ops[n_old - 1 - tail], &list->ops[n_new - 1 - tail] )) tail++;
+            if (n_old == n_new)
+            {
+                for (i = head; i < n_new - tail; i++)
+                    if (!paint_op_equal( &previous->ops[i], &list->ops[i] ))
+                    {
+                        damage_add_op( &damage, &previous->ops[i], &bounds );
+                        damage_add_op( &damage, &list->ops[i], &bounds );
+                    }
+            }
+            else
+            {
+                for (i = head; i < n_old - tail; i++) damage_add_op( &damage, &previous->ops[i], &bounds );
+                for (i = head; i < n_new - tail; i++) damage_add_op( &damage, &list->ops[i], &bounds );
+            }
+        }
+        if (!IsRectEmpty( &paint_forced )) damage_add( &damage, &paint_forced, &bounds );
+        SetRectEmpty( &paint_forced );
+        paint_have_previous = TRUE;
+
+        for (i = 0; i < damage.count; i++) raster_ops( mem, back_bits, back_w, list, &damage.rects[i] );
+        if (timing) QueryPerformanceCounter( &t2 );
+        for (i = 0; i < damage.count; i++)
+            BitBlt( hdc, damage.rects[i].left, damage.rects[i].top, damage.rects[i].right - damage.rects[i].left,
+                    damage.rects[i].bottom - damage.rects[i].top, mem, damage.rects[i].left, damage.rects[i].top, SRCCOPY );
+        if (timing)
+        {
+            double walk, raster;
+            QueryPerformanceCounter( &t3 );
+            QueryPerformanceFrequency( &freq );
+            walk = (t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+            raster = (t2.QuadPart - t1.QuadPart) * 1000.0 / freq.QuadPart;
+            perf.frames++;
+            perf.paint_ms += walk + raster;
+            if (walk + raster > perf.paint_max) perf.paint_max = walk + raster;
+            perf.walk_ms += walk;
+            perf.raster_ms += raster;
+            perf.blit_ms += (t3.QuadPart - t2.QuadPart) * 1000.0 / freq.QuadPart;
+            perf.ops += n_new;
+            for (i = 0; i < damage.count; i++) perf.pixels += rect_area( &damage.rects[i] );
+            TRACE( "frame: %u ops, %u damage rects, walk %.2f ms, raster %.2f ms, readback %.2f.\n", n_new, damage.count,
+                   walk, raster, readback_ms );
+            readback_ms = 0;
+        }
+        if (paint_verify < 0) paint_verify = getenv( "WINE_DCOMP_VERIFY_DAMAGE" ) ? 1 : 0;
+        if (paint_verify) verify_damage( mem, list );
+    }
+    (void)old;
+    ReleaseDC( hwnd, hdc );
+}
+
+/* wineuwp creates the CoreWindow in-process instead of using the Windows shell,
+ * which is also where Windows normally connects the composition target. */
+void WINAPI __wine_dcomp_set_target_window( HWND hwnd )
+{
+    TRACE( "hosted CoreWindow hwnd %p.\n", hwnd );
+    last_desktop_hwnd = hwnd;
+    present_desktop_hwnd( hwnd );
+}
+
+/* An expose (X unmap/map, minimize/restore, another window dragged across) reaches the CoreWindow
+ * as WM_PAINT with nothing behind it: XAML paints on its own commits only. wineuwp's subclass
+ * calls this to put the back buffer up again. */
+void WINAPI __wine_dcomp_repaint_window( HWND hwnd )
+{
+    TRACE( "hwnd %p.\n", hwnd );
+    if (!hwnd) hwnd = last_desktop_hwnd;
+    if (!hwnd) return;
+    scene_changed();
+    last_paint_tick = 0;
+    GetClientRect( hwnd, &paint_forced );
+    present_desktop_hwnd( hwnd );
+}
+
+/* Same, for the region wineuwp's WM_PAINT had to update: an expose repaints what it uncovered, and the
+ * one-pixel invalidation a finished swap chain readback uses to wake the UI thread costs nothing. */
+void WINAPI __wine_dcomp_repaint_window_rect( HWND hwnd, const RECT *rect )
+{
+    TRACE( "hwnd %p, rect %s.\n", hwnd, wine_dbgstr_rect( rect ) );
+    if (!hwnd) hwnd = last_desktop_hwnd;
+    if (!hwnd) return;
+    if (rect) UnionRect( &paint_forced, &paint_forced, rect );
+    else GetClientRect( hwnd, &paint_forced );
+    scene_changed();    /* an unchanged scene would not paint at all */
+    last_paint_tick = 0;
+    present_desktop_hwnd( hwnd );
+}
+
+struct compositor
+{
+    IActivationFactory IActivationFactory_iface;
+    ICompositor ICompositor_iface;
+    ICompositorInterop ICompositorInterop_iface;
+    const void **device_vtbl;   /* the interop composition device, see below */
+    const void **internal_vtbl; /* IDCompositionDeviceInternal */
+    const void **icp_vtbl;      /* {e7894c70} interop compositor partner, see icp_vtbl_impl */
+    const void **islands_vtbl;  /* ICompositorWithCompositionIslands */
+    const void **desktop_vtbl;  /* ICompositorDesktopInterop */
+    const void **partner_vtbl;  /* IInteropCompositorPartner */
+    const void **compositor2_vtbl; /* ICompositor2, see compositor2_vtbl */
+    const void **compositor3_vtbl; /* ICompositor3, see compositor3_vtbl */
+    const void **compositor5_vtbl; /* ICompositor5, see compositor5_vtbl */
+    const void **compositor6_vtbl; /* ICompositor6, see compositor6_vtbl */
+    const void **compositor4_vtbl; /* ICompositor4, see compositor4_vtbl */
+    const void **compositor7_vtbl; /* ICompositor7, see compositor7_vtbl */
+    const void **shadow_vtbl;      /* ICompositorWithProjectedShadow, see compositor_shadow_vtbl */
+    LONG ref;
+};
+
+/* XAML gets at the compositor through a series of undocumented interfaces: the activation factory
+ * is asked for {22118adf-...}, whose only method hands back an "interop composition device", and
+ * that device is then asked for a chain of private interfaces. Rather than guess at each one, any
+ * interface the compositor does not implement is answered with a probe: a table of numbered stubs
+ * that logs which interface and which slot a caller wanted. One run then shows the whole sequence
+ * instead of one IID per rebuild. */
+#define PROBE_SLOTS 40
+
+struct probe
+{
+    const void **vtbl;
+    GUID iid;
+    struct compositor *owner;
+    LONG ref;
+};
+
+static HRESULT WINAPI compositor_QueryInterface( ICompositor *iface, REFIID iid, void **out );
+static ULONG WINAPI compositor_AddRef( ICompositor *iface );
+static ULONG WINAPI compositor_Release( ICompositor *iface );
+
+/* IReferenceTracker {11d3b13a-180e-4789-a8be-7712882893e6}: .NET Native's RCW layer asks every WinRT
+ * object for it and, when answered, drives the tracker protocol through it (ConnectFromTrackerSource,
+ * FindTrackerTargets(callback) ...). The recording tables have no such methods: answering with
+ * ourselves sent those calls into IInspectable slots that wrote through the callback pointers,
+ * corrupting XAML's objects, and the finalizer thread then fail-fasted. Refuse it. */
+static BOOL is_reference_tracker_iid( REFIID iid )
+{
+    static const GUID IID_IReferenceTracker_local =
+        { 0x11d3b13a, 0x180e, 0x4789, { 0xa8, 0xbe, 0x77, 0x12, 0x88, 0x28, 0x93, 0xe6 } };
+    /* Windows.UI.Xaml's IDependencyObject and a private XAML interface next to it: WinUI asks
+     * composition objects for them to tell XAML objects apart, and treated a visual that answered
+     * as a DependencyObject (calling into the visual's table: crash in dcv_SetClipRect). */
+    static const GUID IID_IDependencyObject_local =
+        { 0x5c526665, 0xf60e, 0x4912, { 0xaf, 0x59, 0x5f, 0xe0, 0x68, 0x0f, 0x08, 0x9d } };
+    static const GUID IID_xaml_private_local =
+        { 0x02dd3ad0, 0xb9de, 0x4b55, { 0xa0, 0xc3, 0x50, 0x72, 0x35, 0xea, 0xe8, 0xea } };
+    return IsEqualGUID( iid, &IID_IReferenceTracker_local ) || IsEqualGUID( iid, &IID_IDependencyObject_local ) ||
+           IsEqualGUID( iid, &IID_xaml_private_local );
+}
+
+static HRESULT WINAPI probe_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct probe *probe = CONTAINING_RECORD( iface, struct probe, vtbl );
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+    return compositor_QueryInterface( &probe->owner->ICompositor_iface, iid, out );
+}
+
+static ULONG WINAPI probe_AddRef( void *iface )
+{
+    struct probe *probe = CONTAINING_RECORD( iface, struct probe, vtbl );
+    compositor_AddRef( &probe->owner->ICompositor_iface );
+    return InterlockedIncrement( &probe->ref );
+}
+
+static ULONG WINAPI probe_Release( void *iface )
+{
+    struct probe *probe = CONTAINING_RECORD( iface, struct probe, vtbl );
+    ULONG ref = InterlockedDecrement( &probe->ref );
+    compositor_Release( &probe->owner->ICompositor_iface );
+    return ref;
+}
+
+static HRESULT WINAPI probe_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+
+static HRESULT WINAPI probe_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_Compositor,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_Compositor) - 1, name );
+}
+
+static HRESULT WINAPI probe_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+
+#define PROBE_STUB(n)                                                                              \
+    static HRESULT WINAPI probe_slot_##n( void *iface )                                            \
+    {                                                                                              \
+        struct probe *probe = CONTAINING_RECORD( iface, struct probe, vtbl );                      \
+        FIXME( "compositor %s slot %u: stub.\n", debugstr_guid(&probe->iid), (n) );                \
+        return E_NOTIMPL;                                                                          \
+    }
+PROBE_STUB(7)  PROBE_STUB(9)  PROBE_STUB(10) PROBE_STUB(11)
+PROBE_STUB(12) PROBE_STUB(13) PROBE_STUB(14) PROBE_STUB(15) PROBE_STUB(16) PROBE_STUB(17)
+PROBE_STUB(18) PROBE_STUB(19) PROBE_STUB(20) PROBE_STUB(21) PROBE_STUB(22) PROBE_STUB(23)
+PROBE_STUB(24) PROBE_STUB(25) PROBE_STUB(26) PROBE_STUB(27) PROBE_STUB(28) PROBE_STUB(29)
+static struct drawing_surface *surface_from_iface( void *iface );
+
+/* Slot 6. On ICompositorPrivate5 ({509eab63-...}, CompositorCommon's ICompositorPrivate part in dcomp.pdb) this is
+ * CreateCompositionSurfaceForDCompositionSurface(IDCompositionSurface *, ICompositionSurface **), which XAML's
+ * DCompSurface::InitializeSurface uses to hand an interop surface to a Windows.UI.Composition brush. Our drawing
+ * surfaces already serve as both, so the surface itself is the answer. */
+static HRESULT WINAPI probe_slot_6( void *iface, void *arg1, void **arg2 )
+{
+    static const GUID iid_compositor_private5 =
+        { 0x509eab63, 0x6a73, 0x4493, { 0xb7, 0xfe, 0x80, 0x00, 0x6d, 0xf8, 0x79, 0xc2 } };
+    struct probe *probe = CONTAINING_RECORD( iface, struct probe, vtbl );
+
+    if (IsEqualGUID( &probe->iid, &iid_compositor_private5 ))
+    {
+        struct drawing_surface *surface = surface_from_iface( arg1 );
+
+        TRACE( "CreateCompositionSurfaceForDCompositionSurface %p (%s), %p.\n", arg1, surface ? "ours" : "foreign", arg2 );
+        if (!arg2) return E_POINTER;
+        *arg2 = NULL;
+        if (!arg1) return E_INVALIDARG;
+        if (!surface)
+        {
+            FIXME( "foreign IDCompositionSurface %p.\n", arg1 );
+            return E_NOTIMPL;
+        }
+        IUnknown_AddRef( (IUnknown *)arg1 );
+        *arg2 = arg1;
+        return S_OK;
+    }
+
+    FIXME( "compositor %s slot 6: stub.\n", debugstr_guid(&probe->iid) );
+    return E_NOTIMPL;
+}
+
+/* Private5 slot 8 is exercised by Calculator while installing the scalar animation.  It is a
+ * notification/registration call on this path; returning E_NOTIMPL stows an error immediately
+ * after CreateScalarKeyFrameAnimation succeeds.  Keep the probe for the rest of the private
+ * surface, but let this harmless call proceed until the corresponding timeline is implemented. */
+static HRESULT WINAPI probe_slot_8( void *iface )
+{
+    TRACE( "private compositor slot 8: accepted.\n" );
+    return S_OK;
+}
+
+PROBE_STUB(30) PROBE_STUB(31) PROBE_STUB(32) PROBE_STUB(33) PROBE_STUB(34) PROBE_STUB(35)
+PROBE_STUB(36) PROBE_STUB(37) PROBE_STUB(38) PROBE_STUB(39)
+
+static const void *probe_vtbl[PROBE_SLOTS] =
+{
+    probe_QueryInterface, probe_AddRef, probe_Release,
+    probe_GetIids, probe_GetRuntimeClassName, probe_GetTrustLevel,
+    probe_slot_6,  probe_slot_7,  probe_slot_8,  probe_slot_9,  probe_slot_10, probe_slot_11,
+    probe_slot_12, probe_slot_13, probe_slot_14, probe_slot_15, probe_slot_16, probe_slot_17,
+    probe_slot_18, probe_slot_19, probe_slot_20, probe_slot_21, probe_slot_22, probe_slot_23,
+    probe_slot_24, probe_slot_25, probe_slot_26, probe_slot_27, probe_slot_28, probe_slot_29,
+    probe_slot_30, probe_slot_31, probe_slot_32, probe_slot_33, probe_slot_34, probe_slot_35,
+    probe_slot_36, probe_slot_37, probe_slot_38, probe_slot_39,
+};
+
+/* Probes are cached per interface so a caller that QIs twice gets the same pointer, which COM
+ * identity rules require. */
+static const GUID IID_ICompositorInteropFactory_private =
+    { 0x22118adf, 0x23f1, 0x4801, { 0xbc, 0xfa, 0x66, 0xcb, 0xf4, 0x8c, 0xc5, 0x1b } };
+
+static HRESULT create_compositor( REFIID iid, void **out );
+
+/* Used by DCompositionCreateDevice* so the public IDCompositionDevice path shares
+ * the same object as the WinRT interop device. */
+HRESULT dcomp_create_device( IUnknown *rendering_device, REFIID iid, void **out )
+{
+    TRACE( "rendering_device %p, iid %s.\n", rendering_device, debugstr_guid(iid) );
+    (void)rendering_device;
+    if (!out) return E_POINTER;
+    return create_compositor( iid, out );
+}
+static const void *compositor_islands_vtbl[];
+static const void *compositor_desktop_vtbl[];
+static const void *compositor_partner_vtbl[];
+
+#define MAX_PROBES 32
+static struct probe *probes[MAX_PROBES];
+static unsigned int probe_count;
+static CRITICAL_SECTION probe_cs;
+static CRITICAL_SECTION_DEBUG probe_cs_debug =
+{
+    0, 0, &probe_cs,
+    { &probe_cs_debug.ProcessLocksList, &probe_cs_debug.ProcessLocksList },
+    0, 0, { (DWORD_PTR)(__FILE__ ": probe_cs") }
+};
+static CRITICAL_SECTION probe_cs = { &probe_cs_debug, -1, 0, 0, 0, 0 };
+
+static const GUID IID_IInteropCompositionDevice_private =
+    { 0xd14b6158, 0xc3fa, 0x4bce, { 0x9c, 0x1f, 0xb6, 0x1d, 0x86, 0x65, 0xea, 0xb0 } };
+static const GUID IID_IInteropCompositionDevice2_private =
+    { 0xe7894c70, 0xaf56, 0x4f52, { 0xb3, 0x82, 0x4b, 0x3c, 0xd2, 0x63, 0xdc, 0x6f } };
+
+static const GUID IID_ICompositor2_private =
+    { 0x735081dc, 0x5e24, 0x45da, { 0xa3, 0x8f, 0xe3, 0x2c, 0xc3, 0x49, 0xa9, 0xa0 } };
+static const GUID IID_ICompositorPrivate1 =
+    { 0x7bd36c9a, 0x56ee, 0x4fdd, { 0xac, 0x4e, 0x76, 0xbb, 0xd1, 0x6e, 0xc8, 0xe4 } };
+static const GUID IID_ICompositorPrivate2 =
+    { 0x48ea31ad, 0x7fcd, 0x4076, { 0xa7, 0x9c, 0x90, 0xcc, 0x4b, 0x85, 0x2c, 0x9b } };
+static const GUID IID_ICompositorPrivate3 =
+    { 0x7a38b2bd, 0xcec8, 0x4eeb, { 0x83, 0x0f, 0xd8, 0xd0, 0x7a, 0xed, 0xeb, 0xc3 } };
+static const GUID IID_ICompositorPrivate4 =
+    { 0x9cbd9312, 0x070d, 0x4588, { 0x9b, 0xf3, 0xbb, 0xf5, 0x28, 0xcf, 0x3e, 0x84 } };
+static const GUID IID_ICompositorPrivate5 =
+    { 0x509eab63, 0x6a73, 0x4493, { 0xb7, 0xfe, 0x80, 0x00, 0x6d, 0xf8, 0x79, 0xc2 } };
+/* Queried by WUCBrushManager::EnsureResources after CreateGraphicsDevice. */
+static const GUID IID_ICompositorPrivate6 =
+    { 0xae47e78a, 0x7910, 0x4425, { 0xa4, 0x82, 0xa0, 0x5b, 0x75, 0x8a, 0xdc, 0xe9 } };
+static const GUID IID_ICompositorInterop_ =
+    { 0x25297d5c, 0x3ad4, 0x4c9c, { 0xb5, 0xcf, 0xe3, 0x6a, 0x38, 0x51, 0x23, 0x30 } };
+/* IDCompositionDeviceInternal, named from dcomp.pdb */
+static const GUID IID_IDCompositionDeviceInternal_private =
+    { 0x6b556968, 0x2d25, 0x11e2, { 0x99, 0xf6, 0x8b, 0xc3, 0x60, 0x88, 0x70, 0x9b } };
+/* Public IDCompositionDevice* — DCompositionCreateDevice3 asks for these. */
+static const GUID IID_IDCompositionDevice_ =
+    { 0xc37ea93a, 0xe7aa, 0x450d, { 0xb1, 0x6f, 0x97, 0x46, 0xcb, 0x04, 0x07, 0xf3 } };
+static const GUID IID_IDCompositionDevice2_ =
+    { 0x75f6468d, 0x1b8e, 0x447c, { 0x9b, 0xc6, 0x75, 0xfe, 0xa8, 0x0b, 0x5b, 0x25 } };
+static const GUID IID_IDCompositionDevice3_ =
+    { 0x0987cb06, 0xf916, 0x48bf, { 0x8d, 0x35, 0xce, 0x76, 0x41, 0x78, 0x1b, 0xd9 } };
+static const GUID IID_ICompositorWithCompositionIslands =
+    { 0xd1d6b44a, 0x72fa, 0x4fa1, { 0xba, 0x27, 0xa5, 0xf2, 0x07, 0xcb, 0x37, 0xca } };
+static const GUID IID_ICompositorDesktopInterop_ =
+    { 0x29e691fa, 0x4567, 0x4dca, { 0xb3, 0x19, 0xd0, 0xf2, 0x07, 0xeb, 0x68, 0x07 } };
+static const GUID IID_ICoreWindow_CompositionIslands =
+    { 0xa7ff5b48, 0x94e0, 0x40e6, { 0x8a, 0x80, 0x22, 0x84, 0x82, 0xb6, 0x88, 0xba } };
+static const GUID IID_ICompositionIsland_ =
+    { 0x9d031780, 0xae09, 0x5272, { 0x80, 0xe0, 0x50, 0xa2, 0x15, 0xc0, 0xba, 0xf0 } };
+static const GUID IID_IVisualTreeIslandPartner =
+    { 0x9f40e6a8, 0x1040, 0x54e9, { 0xa3, 0xbc, 0xcc, 0xed, 0xfe, 0xb9, 0xe8, 0x51 } };
+static const GUID IID_ICompositionTargetPartner =
+    { 0xda5d6502, 0x31dd, 0x5bfe, { 0xbd, 0x07, 0x99, 0xf4, 0xe5, 0xbb, 0x50, 0x98 } };
+static const GUID IID_IVisualIslandSite_ =
+    { 0x53ceb831, 0x5efc, 0x5d85, { 0xa4, 0x0a, 0xd2, 0x03, 0xa2, 0x2d, 0xcd, 0xc5 } };
+/* IInteropCompositorPartner — RealClose lives at vtbl+0x30 (slot 6). CloseAndReleaseInteropCompositor
+ * calls that slot on *(DCompTreeHost+0x200); when the host still holds the partner device the same
+ * offset is CreateVisual, which returns E_POINTER for a null out-param. */
+static const GUID IID_IInteropCompositorPartner =
+    { 0x0e779a72, 0x3f2a, 0x502d, { 0xa7, 0xa9, 0xbf, 0x99, 0x98, 0x8c, 0xfe, 0x4d } };
+static const GUID IID_IInteropVisual_private =
+    { 0xfe93b735, 0xe574, 0x4a5d, { 0xa2, 0x1a, 0xf7, 0x05, 0xc2, 0x19, 0x45, 0xfa } };
+/* DCompTreeHost::UpdateDebugSettings QIs the compositor for this and throws the failing hr
+ * through its raise helper; refusing it stowed an E_POINTER into every primitive submission. */
+static const GUID IID_ICompositorDebug_private =
+    { 0xa1a3c64a, 0x224f, 0x4a81, { 0x97, 0x73, 0x4f, 0x03, 0xa8, 0x9d, 0x3c, 0x6c } };
+static const GUID IID_IDCompositionVisual_ =
+    { 0x4d93059d, 0x097b, 0x4651, { 0x9a, 0x60, 0xf0, 0xf2, 0x51, 0x16, 0xe2, 0xf3 } };
+/* IIterable<Windows.UI.Composition.Visual>, from the VisualCollection interface table. */
+static const GUID IID_IIterableVisual_private =
+    { 0x4eed7dce, 0xe4ac, 0x5891, { 0x9b, 0x52, 0x79, 0x9d, 0x70, 0xdf, 0x47, 0xfe } };
+
+/* Interfaces the compositor has to answer for XAML to get as far as a composition device. Anything
+ * else is refused: answering every interface makes WinUI believe optional features (Mica and the
+ * rest of the system backdrops) are available, and it then fails hard instead of falling back.
+ * WINE_UWP_COMPOSITOR_PROBE=all answers everything, which is how the list below was found. */
+/* {36af3eb2-0371-49d7-9bb8-9c9414a9229c} (XAML's PointerSourceWrapper, the reveal lights' pointer tracking)
+ * is deliberately not answered: a probe there crashed XAML's light code, the refusal is only an ignored
+ * fail-fast per reveal brush. */
+static const GUID *const compositor_required_ifaces[] =
+{
+    &IID_IInteropCompositionDevice_private,
+    &IID_IInteropCompositionDevice2_private,
+    &IID_ICompositor2_private,
+    &IID_ICompositorPrivate1,
+    &IID_ICompositorPrivate2,
+    &IID_ICompositorPrivate3,
+    &IID_ICompositorPrivate4,
+    &IID_ICompositorPrivate5,
+    &IID_ICompositorPrivate6,
+    &IID_ICompositorInterop_,
+    &IID_IDCompositionDeviceInternal_private,
+    &IID_IInteropCompositorPartner,
+    &IID_ICompositorDebug_private,
+};
+
+static BOOL compositor_iface_required( REFIID iid )
+{
+    char buffer[16];
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(compositor_required_ifaces); i++)
+        if (IsEqualGUID( compositor_required_ifaces[i], iid )) return TRUE;
+
+    return GetEnvironmentVariableA( "WINE_UWP_COMPOSITOR_PROBE", buffer, sizeof(buffer) ) &&
+           !strcmp( buffer, "all" );
+}
+
+
+/*
+ * The interop composition device.
+ *
+ * {d14b6158-...} and {e7894c70-...} are IDCompositionDesktopDevicePartner revisions: dcomp.dll maps
+ * both onto one flattened vtable (IDCompositionDevice2, then IDCompositionDesktopDevice, then the
+ * partner extensions), recovered slot by slot from the InterfaceParts table of
+ * InteropCompositor::Api. XAML drives its whole visual tree through it, so the slots have to be
+ * named rather than probed: a Create* that returns S_OK without filling its out parameter crashes
+ * the caller, and one that returns E_NOTIMPL turns into a NullReferenceException inside .NET Native.
+ *
+ * The objects handed back are recording stand-ins: they accept any interface and every setter,
+ * because DirectComposition setters return S_OK and callers only check the HRESULT. Nothing is
+ * presented yet.
+ */
+/* XAML/island partners call well past the documented surface; undersized vtbls fall into
+ * adjacent .rdata (e.g. the "VisualTreeIsland" literal) and NX-fault. Island30/31's post-
+ * AddVisualIdentifier put_Size-shaped call on VisualIslandSite never entered our stub with
+ * 128 or 512 entries (info[0]=8 at the literal) — keep this very large. */
+#define COMP_OBJECT_SLOTS 4096
+
+#define COMP_MAP_ENTRIES 32
+struct comp_map_entry
+{
+    WCHAR key[64];
+    IUnknown *value;
+};
+
+/* struct comp_object's three fields are the shared prefix of every recording object in this file -
+ * kf_animation, comp_shape and the typed brushes all start with them and reuse comp_object_AddRef /
+ * comp_object_Release. Anything added here is read as those types' own fields, so the map below
+ * lives in its own allocation and is looked up by owner. */
+struct comp_object
+{
+    const void **vtbl;
+    const char *kind;
+    LONG ref;
+};
+
+static void *comp_object_vtbl[COMP_OBJECT_SLOTS];
+static void *expression_animation_vtbl[COMP_OBJECT_SLOTS];
+
+/* WinUI queries effect brushes (and other typed recording objects) for ICompositionObject and calls
+ * get_Compositor. Answered by the generic table, that call reached the default slot, which wrote another recording
+ * object into the "compositor" out pointer, and later calls through that fake compositor handed garbage to
+ * combase. Those objects hand out a small ICompositionObject view that knows the compositor instead. */
+static ICompositor *last_created_compositor;
+static HRESULT create_composition_object_view( IUnknown *owner, void **out );
+static LONG comp_object_vtbl_ready;
+static PVOID comp_object_veh;
+
+static HRESULT create_comp_object( const char *kind, void **out );
+
+/* Composition shapes (WinUI's AnimatedIcon draws the NavigationView pane toggle with them). The objects
+ * CreateSpriteShape / CreatePathGeometry / CreateContainerShape hand out are used directly as
+ * ICompositionSpriteShape / ICompositionPathGeometry / ICompositionContainerShape, so those layouts are
+ * the objects' main tables; ICompositionShape and ICompositionGeometry are views reached through QI. */
+struct visual;
+struct shape_transform
+{
+    Vector2 center, offset, scale;
+    float rotation;             /* radians */
+    Matrix3x2 matrix;
+    BOOL has_matrix;
+};
+/* A binding of a key-frame animation to a property of a visual or shape, and the controller XAML
+ * fetched for it (an AnimatedIcon drives the animation's progress through the controller's
+ * "Progress", an expression over the icon's property set). */
+struct kf_animation;
+struct anim_controller;
+struct anim_binding
+{
+    WCHAR prop[32];
+    struct kf_animation *kf;
+    struct anim_controller *controller;
+};
+#define ANIM_BINDINGS 8
+static struct anim_controller *anim_controller_from_any( void *object );
+static BOOL anim_controller_progress( struct anim_controller *ctrl, float *progress );
+static HRESULT anim_controller_for( IUnknown *owner, const WCHAR *prop, void **out );
+static struct anim_binding *anim_bind( struct anim_binding *bindings, unsigned int *count, const WCHAR *prop, struct kf_animation *kf );
+static struct anim_binding *anim_find( struct anim_binding *bindings, unsigned int count, const WCHAR *prop );
+static HRESULT create_anim_controller( void **out );
+struct comp_shape;
+static struct comp_shape *comp_shape_from_any( IInspectable *object );
+static void anim_binding_set_controller( struct anim_binding *binding, void *controller );
+#define SHAPE_CHILDREN 64
+struct comp_shape
+{
+    const void **vtbl;          /* generic layout: ICompositionSpriteShape or ICompositionContainerShape table */
+    const char *kind;
+    LONG ref;
+    const void **shape_vtbl;    /* ICompositionShape view */
+    const void **shapes_vtbl;   /* IVector<CompositionShape> view (container shapes) */
+    struct shape_transform xf;
+    BOOL is_container;
+    IUnknown *fill, *stroke, *geometry;
+    float stroke_thickness;
+    IInspectable *children[SHAPE_CHILDREN];
+    unsigned int child_count;
+    struct anim_binding bindings[ANIM_BINDINGS];
+    unsigned int binding_count;
+};
+struct path_geometry
+{
+    const void **vtbl;          /* generic layout: ICompositionPathGeometry table */
+    const char *kind;
+    LONG ref;
+    const void **geometry_vtbl; /* ICompositionGeometry view */
+    IUnknown *path;
+    float trim_start, trim_end, trim_offset;
+};
+struct composition_path
+{
+    const void **vtbl;
+    LONG ref;
+    IUnknown *source;
+};
+static const void *path_vtbl[];
+static void paint_shape_visual( HDC hdc, struct visual *impl, float x, float y, float dest_w, float dest_h );
+enum kf_kind { KF_COLOR, KF_SCALAR, KF_BOOLEAN, KF_VECTOR2, KF_VECTOR3 };
+#define KF_KEYS 96
+/* A DirectManipulation-driven position reaches a visual as an ExpressionAnimation on "TransformMatrix"
+ * whose reference parameter is (or leads to) the ManipulationTransform the interop compositor made
+ * from a shared IDCompositionMatrixTransform. dcomp runs no expressions; instead the typed objects
+ * below keep the links, and the painter reads the matrix transform's current matrix. */
+enum propset_type { PROP_COLOR, PROP_SCALAR, PROP_VECTOR2, PROP_VECTOR3, PROP_VECTOR4, PROP_MATRIX3X2, PROP_MATRIX4X4, PROP_BOOLEAN };
+struct propset_value
+{
+    WCHAR name[48];
+    enum propset_type type;
+    union { Color color; float scalar; Vector2 vector2; Vector3 vector3; Vector4 vector4; Matrix3x2 m32; Matrix4x4 m44; boolean flag; } u;
+};
+struct matrix_transform
+{
+    const void **vtbl;          /* generic composition object layout, must stay first */
+    const char *kind;
+    LONG ref;
+    D2D_MATRIX_3X2_F matrix;
+    BOOL has_matrix;
+};
+struct manip_transform
+{
+    const void **vtbl;
+    const char *kind;
+    LONG ref;
+    IUnknown *source;           /* the shared IDCompositionMatrixTransform */
+};
+#define EXPR_REFS 8
+struct expr_animation
+{
+    const void **vtbl;
+    const char *kind;
+    LONG ref;
+    const void **anim_vtbl;     /* ICompositionAnimation view */
+    IUnknown *refs[EXPR_REFS];
+    WCHAR ref_names[EXPR_REFS][32];
+    unsigned int ref_count;
+    WCHAR expression[256];
+    struct propset_value *params;   /* Set*Parameter values, referenced by bare name in the expression */
+    unsigned int param_count;
+    ICompositionPropertySet *properties; /* Properties: XAML binds it as "PS" and inserts X, Y, CenterX ... */
+};
+struct expr_animation;
+static BOOL expr_evaluate_matrix( struct expr_animation *expr, ICompositionPropertySet *local,
+                                  const D2D_MATRIX_3X2_F *dmanip, D2D_MATRIX_3X2_F *result );
+static struct expr_animation *expr_animation_from_any( void *animation );
+static struct matrix_transform *manip_matrix_from_animation( void *animation );
+static struct propset_value *expr_resolve_value( void *animation, enum propset_type type );
+static const char *debugstr_animation( void *animation );
+static BOOL expr_resolve_colorrgb( void *animation, Color *color );
+static HRESULT create_matrix_transform( void **out );
+struct visual;
+static struct visual *impl_from_visual_interop( void *iface );
+static struct visual *visual_from_interop( void *iface );
+static HRESULT create_expr_animation( void **out );
+static void *matrix_transform_vtbl[COMP_OBJECT_SLOTS];
+static void *manip_transform_vtbl[COMP_OBJECT_SLOTS];
+static void *expr_animation_vtbl[COMP_OBJECT_SLOTS];
+static void *kf_animation_vtbl[COMP_OBJECT_SLOTS];
+static void *sprite_shape_vtbl[COMP_OBJECT_SLOTS];
+static void *container_shape_vtbl[COMP_OBJECT_SLOTS];
+static void *path_geometry_vtbl[COMP_OBJECT_SLOTS];
+static HRESULT create_comp_shape( BOOL container, IUnknown *geometry, void **out );
+static HRESULT create_path_geometry( IUnknown *path, void **out );
+static HRESULT create_manip_transform( IUnknown *source, void **out );
+struct composition_object_view
+{
+    const void **vtbl;
+    LONG ref;
+    IUnknown *owner;
+    ICompositionPropertySet *properties;
+};
+static struct composition_object_view *impl_from_object_view( void *iface );
+static const void *object_view_vtbl[];
+struct kf_animation
+{
+    const void **vtbl;          /* generic composition object layout, must stay first */
+    const char *kind;
+    LONG ref;
+    const void **typed_vtbl;    /* IColorKeyFrameAnimation / IScalarKeyFrameAnimation / IBooleanKeyFrameAnimation */
+    const void **anim2_vtbl;    /* ICompositionAnimation2 view: the Target property */
+    WCHAR target[64];           /* CompositionAnimation.Target, as set through ICompositionAnimation2 */
+    enum kf_kind value_kind;
+    float last_key;
+    BOOL has_value;
+    Color color;
+    float scalar;
+    boolean flag;
+    Vector2 vector2;
+    Vector3 vector3;
+    unsigned int key_count;
+    float last_sampled;
+    BOOL sampled_once;
+    /* every key frame, for sampling at a controller's progress */
+    struct kf_key { float key; union { Color color; float scalar; boolean flag; Vector2 vector2; Vector3 vector3; } u; } keys[KF_KEYS];
+};
+static struct kf_animation *kf_animation_from( void *animation );
+static BOOL kf_sample( struct kf_animation *kf, float progress, struct kf_key *out );
+static HRESULT create_comp_object_vtbl( const char *kind, void **vtbl, void **out );
+
+/* Soft-return target for execute-at-nullish NX faults (rip < 0x10000). The call already
+ * pushed a return address; jumping here with rax=0 makes COM-style callers see S_OK and
+ * lets runaway CreateThread(start=2) workers exit cleanly. */
+static void WINAPI nx_soft_ret( void )
+{
+}
+
+static LONG CALLBACK comp_object_nx_veh( EXCEPTION_POINTERS *info )
+{
+    EXCEPTION_RECORD *rec = info->ExceptionRecord;
+    CONTEXT *ctx = info->ContextRecord;
+    void **words;
+    unsigned i;
+
+    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    if (rec->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    if (rec->ExceptionInformation[0] == 1) return EXCEPTION_CONTINUE_SEARCH;
+    /* A jump to a non-canonical address is reported as a read fault at that address. */
+    if (rec->ExceptionInformation[0] != 8 && !(rec->ExceptionInformation[1] >> 47)) return EXCEPTION_CONTINUE_SEARCH;
+
+    words = (void **)(ULONG_PTR)ctx->Rcx;
+    FIXME( "NX at %p rax %p rcx %p rdx %p rsp %p\n",
+           (void *)ctx->Rip, (void *)ctx->Rax, (void *)ctx->Rcx, (void *)ctx->Rdx, (void *)ctx->Rsp );
+    /* Dump rsp first: rcx is often null on these faults, and a single __TRY block around both
+     * used to abort before the return address was printed. */
+    __TRY
+    {
+        FIXME( "  [rsp]=%p [rsp+8]=%p [rsp+10]=%p [rsp+18]=%p\n",
+               ((void **)ctx->Rsp)[0], ((void **)ctx->Rsp)[1],
+               ((void **)ctx->Rsp)[2], ((void **)ctx->Rsp)[3] );
+    }
+    __EXCEPT_ALL
+    {
+        FIXME( "  (failed to dump rsp)\n" );
+    }
+    __ENDTRY
+    __TRY
+    {
+        unsigned char *ip = ((void **)ctx->Rsp)[0];
+        if ((ULONG_PTR)ip > 0x10000)
+        {
+            FIXME( "  call-site bytes:" );
+            for (i = 0; i < 16; i++) FIXME( " %02x", ip[-16 + i] );
+            FIXME( "\n" );
+        }
+    }
+    __EXCEPT_ALL
+    {
+        FIXME( "  (failed to dump call-site)\n" );
+    }
+    __ENDTRY
+    if (words)
+    {
+        __TRY
+        {
+            FIXME( "  [rcx]=%p [rcx+8]=%p [rcx+10]=%p  vtbl=%p\n",
+                   words[0], words[1], words[2], comp_object_vtbl );
+        }
+        __EXCEPT_ALL
+        {
+            FIXME( "  (failed to dump rcx)\n" );
+        }
+        __ENDTRY
+    }
+    /* rip in the null page: not a real code address. Soft-continue so the UI thread can
+     * keep running (Activate / SetWindow) instead of EXIT:5 from worker NX. */
+    if (ctx->Rip < 0x10000)
+    {
+        FIXME( "  soft-continuing via nx_soft_ret (was rip %p)\n", (void *)ctx->Rip );
+        ctx->Rax = 0;
+        ctx->Rip = (DWORD64)nx_soft_ret;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* ICompositionObject4 {0bb3784c-346b-4a7c-966b-7310966553d5}: slot 6 TryGetAnimationController(name, out).
+ * AnimatedIcon calls IAnimationController::Pause (slot 12) on the result without a NULL check, so hand out a
+ * recording AnimationController instead of letting the default slot leave the out pointer untouched. */
+static const GUID IID_ICompositionObject4_local = {0x0bb3784c,0x346b,0x4a7c,{0x96,0x6b,0x73,0x10,0x96,0x65,0x53,0xd5}};
+
+struct object4_view
+{
+    const void **vtbl;
+    LONG ref;
+    IUnknown *owner;
+};
+
+static HRESULT WINAPI object4_view_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct object4_view *view = CONTAINING_RECORD( iface, struct object4_view, vtbl );
+    return IUnknown_QueryInterface( view->owner, iid, out );
+}
+static ULONG WINAPI object4_view_AddRef( void *iface )
+{
+    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct object4_view, vtbl )->ref );
+}
+static ULONG WINAPI object4_view_Release( void *iface )
+{
+    struct object4_view *view = CONTAINING_RECORD( iface, struct object4_view, vtbl );
+    ULONG ref = InterlockedDecrement( &view->ref );
+
+    if (!ref)
+    {
+        IUnknown_Release( view->owner );
+        free( view );
+    }
+    return ref;
+}
+static HRESULT WINAPI object4_view_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI object4_view_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionObject";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI object4_view_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+static HRESULT WINAPI object4_view_TryGetAnimationController( void *iface, HSTRING name, void **out )
+{
+    scene_changed();
+    struct object4_view *view = CONTAINING_RECORD( iface, struct object4_view, vtbl );
+    const WCHAR *prop = WindowsGetStringRawBuffer( name, NULL );
+
+    TRACE( "%p, %s.\n", iface, debugstr_w( prop ) );
+    if (!out) return E_POINTER;
+    /* a controller means the caller drives the animation's progress itself (AnimatedIcon): the end
+     * value applied at StartAnimation is not the resting state, put the old value back */
+    return anim_controller_for( view->owner, prop, out );
+}
+
+static const void *object4_view_vtbl[] =
+{
+    object4_view_QueryInterface, object4_view_AddRef, object4_view_Release,
+    object4_view_GetIids, object4_view_GetRuntimeClassName, object4_view_GetTrustLevel,
+    object4_view_TryGetAnimationController,
+};
+
+static HRESULT create_object4_view( IUnknown *owner, void **out )
+{
+    struct object4_view *view;
+
+    *out = NULL;
+    if (!(view = calloc( 1, sizeof(*view) ))) return E_OUTOFMEMORY;
+    view->vtbl = object4_view_vtbl;
+    view->ref = 1;
+    IUnknown_AddRef( (view->owner = owner) );
+    *out = &view->vtbl;
+    return S_OK;
+}
+
+static const GUID IID_IMap_animations_local =
+    {0x4ba9aa1d,0x57ac,0x54de,{0xa8,0x07,0xb5,0x2e,0x68,0x9b,0xfc,0x04}};
+static HRESULT comp_map_for_owner( IUnknown *owner, void **out );
+static HRESULT WINAPI comp_object_GetRuntimeClassName( void *iface, HSTRING *name );
+
+static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+
+    TRACE( "%s %p, iid %s.\n", object->kind, object, debugstr_guid(iid) );
+
+    /* Generic recording objects keep answering ICompositionObject with themselves: XAML's expression conversion
+     * (WinRTExpressionConversionContext::CreateExpression) depends on that, and a separate view there made its next
+     * step fail with E_NOINTERFACE. The typed brush, factory and easing objects hand out a view instead. */
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
+        return create_object4_view( (IUnknown *)&object->vtbl, out );
+    /* Composition lights are the exception: XAML's reveal lights (Windows.UI.Xaml.Controls'
+     * RevealHoverLight) take the light's ICompositionObject, ask it for the compositor and build
+     * their animations from that; the recording view answered nothing and the light code then
+     * dereferenced the animation it never got. */
+    if (IsEqualGUID( iid, &IID_ICompositionObject ) && object->kind && strstr( object->kind, "Light" ))
+        return create_composition_object_view( (IUnknown *)&object->vtbl, out );
+    if (IsEqualGUID( iid, &IID_IMap_animations_local ))
+        return comp_map_for_owner( (IUnknown *)&object->vtbl, out );
+    InterlockedIncrement( &object->ref );
+    *out = &object->vtbl;
+    return S_OK;
+}
+
+static ULONG WINAPI comp_object_AddRef( void *iface )
+{
+    struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
+    return InterlockedIncrement( &object->ref );
+}
+
+static ULONG WINAPI comp_object_Release( void *iface )
+{
+    struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
+    ULONG ref = InterlockedDecrement( &object->ref );
+
+    if (!ref) free( object );
+    return ref;
+}
+
+/* IMap<HSTRING, ICompositionAnimationBase> {4ba9aa1d-57ac-54de-a807-b52e689bfc04}, and the
+ * IMapView reached through GetView. An ImplicitAnimationCollection really is a map and the Windows
+ * Community Toolkit round-trips through it: it inserts an animation keyed by the animation's Target
+ * and reads it back. Served by the generic slot handler, Insert recorded nothing and Lookup returned
+ * S_OK without writing an animation, so the Toolkit got null and XAML reported "Cannot add instance
+ * of type 'Vector3Animation' to a collection of type 'ImplicitAnimationSet'". Slots follow
+ * IMap`2 (Lookup, get_Size, HasKey, GetView, Insert, Remove, Clear) and IMapView`2 (Lookup,
+ * get_Size, HasKey, Split). */
+struct comp_map
+{
+    const void **vtbl;
+    const void **view_vtbl;
+    LONG ref;
+    IUnknown *owner;
+    unsigned int entry_count;
+    struct comp_map_entry entries[COMP_MAP_ENTRIES];
+};
+
+/* Owner -> map. A handful of implicit-animation collections exist at a time; the owner cannot hold
+ * the pointer itself because its struct prefix is shared (see struct comp_object). */
+#define COMP_MAPS 64
+static struct comp_map *comp_maps[COMP_MAPS];
+static CRITICAL_SECTION comp_maps_cs = { NULL, -1, 0, 0, 0, 0 };
+
+static struct comp_map_entry *comp_map_find( struct comp_map *map, HSTRING key )
+{
+    const WCHAR *str = key ? WindowsGetStringRawBuffer( key, NULL ) : NULL;
+    unsigned int i;
+
+    if (!str) str = L"";
+    for (i = 0; i < map->entry_count; i++)
+        if (!wcscmp( map->entries[i].key, str )) return &map->entries[i];
+    return NULL;
+}
+
+static struct comp_map *comp_from_map( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct comp_map, vtbl );
+}
+static struct comp_map *comp_from_mapview( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct comp_map, view_vtbl );
+}
+static HRESULT WINAPI comp_map_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct comp_map *map = comp_from_map( iface );
+    return IUnknown_QueryInterface( map->owner, iid, out );
+}
+static ULONG WINAPI comp_map_AddRef( void *iface )
+{
+    return InterlockedIncrement( &comp_from_map( iface )->ref );
+}
+static ULONG WINAPI comp_map_Release( void *iface )
+{
+    /* The map stays in the owner table for the life of the process: it is small, bounded, and the
+     * app asks for it again every time it touches the collection. */
+    return InterlockedDecrement( &comp_from_map( iface )->ref );
+}
+static HRESULT WINAPI comp_map_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI comp_map_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return comp_object_GetRuntimeClassName( &comp_from_map( iface )->owner, name );
+}
+static HRESULT WINAPI comp_map_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+static HRESULT WINAPI comp_map_Lookup( void *iface, HSTRING key, IUnknown **value )
+{
+    struct comp_map *map = comp_from_map( iface );
+    struct comp_map_entry *entry = comp_map_find( map, key );
+
+    TRACE( "%p, key %s -> %p.\n", map, debugstr_hstring( key ), entry ? entry->value : NULL );
+    if (!value) return E_POINTER;
+    if (!entry || !entry->value)
+    {
+        *value = NULL;
+        return E_BOUNDS;
+    }
+    IUnknown_AddRef( (*value = entry->value) );
+    return S_OK;
+}
+static HRESULT WINAPI comp_map_get_Size( void *iface, UINT32 *value )
+{
+    if (!value) return E_POINTER;
+    *value = comp_from_map( iface )->entry_count;
+    return S_OK;
+}
+static HRESULT WINAPI comp_map_HasKey( void *iface, HSTRING key, boolean *found )
+{
+    struct comp_map *map = comp_from_map( iface );
+
+    if (!found) return E_POINTER;
+    *found = comp_map_find( map, key ) != NULL;
+    TRACE( "%p, key %s -> %u.\n", map, debugstr_hstring( key ), *found );
+    return S_OK;
+}
+static HRESULT WINAPI comp_map_GetView( void *iface, void **view )
+{
+    struct comp_map *map = comp_from_map( iface );
+
+    if (!view) return E_POINTER;
+    InterlockedIncrement( &map->ref );
+    *view = &map->view_vtbl;
+    return S_OK;
+}
+static HRESULT WINAPI comp_map_Insert( void *iface, HSTRING key, IUnknown *value, boolean *replaced )
+{
+    struct comp_map *map = comp_from_map( iface );
+    struct comp_map_entry *entry = comp_map_find( map, key );
+    const WCHAR *str = key ? WindowsGetStringRawBuffer( key, NULL ) : NULL;
+
+    TRACE( "%p, key %s, value %p.\n", map, debugstr_hstring( key ), value );
+    if (replaced) *replaced = entry != NULL;
+    if (!entry)
+    {
+        if (map->entry_count >= COMP_MAP_ENTRIES) return E_OUTOFMEMORY;
+        entry = &map->entries[map->entry_count++];
+        lstrcpynW( entry->key, str ? str : L"", ARRAY_SIZE(entry->key) );
+    }
+    if (value) IUnknown_AddRef( value );
+    if (entry->value) IUnknown_Release( entry->value );
+    entry->value = value;
+    return S_OK;
+}
+static HRESULT WINAPI comp_map_Remove( void *iface, HSTRING key )
+{
+    struct comp_map *map = comp_from_map( iface );
+    struct comp_map_entry *entry = comp_map_find( map, key );
+
+    if (!entry) return E_BOUNDS;
+    if (entry->value) IUnknown_Release( entry->value );
+    *entry = map->entries[--map->entry_count];
+    return S_OK;
+}
+static HRESULT WINAPI comp_map_Clear( void *iface )
+{
+    struct comp_map *map = comp_from_map( iface );
+    unsigned int i;
+
+    for (i = 0; i < map->entry_count; i++)
+        if (map->entries[i].value) IUnknown_Release( map->entries[i].value );
+    map->entry_count = 0;
+    return S_OK;
+}
+static const void *comp_map_vtbl[] =
+{
+    comp_map_QueryInterface, comp_map_AddRef, comp_map_Release,
+    comp_map_GetIids, comp_map_GetRuntimeClassName, comp_map_GetTrustLevel,
+    comp_map_Lookup, comp_map_get_Size, comp_map_HasKey, comp_map_GetView,
+    comp_map_Insert, comp_map_Remove, comp_map_Clear,
+};
+
+static HRESULT WINAPI comp_mapview_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct comp_map *map = comp_from_mapview( iface );
+    return IUnknown_QueryInterface( map->owner, iid, out );
+}
+static ULONG WINAPI comp_mapview_AddRef( void *iface )
+{
+    return InterlockedIncrement( &comp_from_mapview( iface )->ref );
+}
+static ULONG WINAPI comp_mapview_Release( void *iface )
+{
+    return InterlockedDecrement( &comp_from_mapview( iface )->ref );
+}
+static HRESULT WINAPI comp_mapview_Lookup( void *iface, HSTRING key, IUnknown **value )
+{
+    return comp_map_Lookup( &comp_from_mapview( iface )->vtbl, key, value );
+}
+static HRESULT WINAPI comp_mapview_get_Size( void *iface, UINT32 *value )
+{
+    return comp_map_get_Size( &comp_from_mapview( iface )->vtbl, value );
+}
+static HRESULT WINAPI comp_mapview_HasKey( void *iface, HSTRING key, boolean *found )
+{
+    return comp_map_HasKey( &comp_from_mapview( iface )->vtbl, key, found );
+}
+static HRESULT WINAPI comp_mapview_Split( void *iface, void **first, void **second )
+{
+    if (first) *first = NULL;
+    if (second) *second = NULL;
+    return S_OK;
+}
+static const void *comp_mapview_vtbl[] =
+{
+    comp_mapview_QueryInterface, comp_mapview_AddRef, comp_mapview_Release,
+    comp_map_GetIids, comp_map_GetRuntimeClassName, comp_map_GetTrustLevel,
+    comp_mapview_Lookup, comp_mapview_get_Size, comp_mapview_HasKey, comp_mapview_Split,
+};
+
+static HRESULT comp_map_for_owner( IUnknown *owner, void **out )
+{
+    struct comp_map *map = NULL;
+    unsigned int i;
+
+    EnterCriticalSection( &comp_maps_cs );
+    for (i = 0; i < COMP_MAPS && comp_maps[i]; i++)
+        if (comp_maps[i]->owner == owner) { map = comp_maps[i]; break; }
+    if (!map && i < COMP_MAPS && (map = calloc( 1, sizeof(*map) )))
+    {
+        map->vtbl = comp_map_vtbl;
+        map->view_vtbl = comp_mapview_vtbl;
+        map->owner = owner;
+        comp_maps[i] = map;
+    }
+    LeaveCriticalSection( &comp_maps_cs );
+
+    if (!map) return E_OUTOFMEMORY;
+    InterlockedIncrement( &map->ref );
+    *out = &map->vtbl;
+    return S_OK;
+}
+
+/* Many island-site / partner slots are Create* or getters. Returning S_OK without filling a real
+ * out-pointer fail-fasts; treating float/handle args as out-pointers AVs. Only fill when a looks
+ * like an aligned pointer to a NULL slot. */
+static BOOL is_out_pointer( void *a )
+{
+    void *value;
+    ULONG_PTR p = (ULONG_PTR)a;
+    /* Reject NULL, unaligned, low and non-canonical values. Packed floats (a Size such as
+     * 1280x800 arrives as 0x4448000044a00000) are non-canonical and stop here; a low-dword float
+     * pattern must not be used as a reason, since user stack addresses like 0x7f98c018dfc0 have
+     * one, and rejecting them left XAML's out-pointers (ICompositionObject::get_Properties on an
+     * expression animation) unset. */
+    MEMORY_BASIC_INFORMATION mbi;
+    const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                           PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+
+    if (!p || (p & (sizeof(void *) - 1)) || p < 0x10000) return FALSE;
+    if (p >> 47) return FALSE; /* non-canonical user address on x86-64 */
+    /* Ask the memory manager rather than probing with a read. This used to be a dereference inside
+     * __TRY, which raises a real access violation for every argument that is not a pointer - about
+     * twenty per run. That was survivable while only XAML called in, but .NET Native installs
+     * RhpPInvokeExceptionGuard on its P/Invoke transition frames and turns *any* native exception
+     * taken underneath one into a fail-fast, so as soon as an app's managed code called a
+     * composition method directly (Media Player, once it got past the state repository) the probe
+     * itself killed the process. */
+    if (!VirtualQuery( a, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT) return FALSE;
+    if (!(mbi.Protect & readable) || (mbi.Protect & PAGE_GUARD)) return FALSE;
+    if ((ULONG_PTR)a + sizeof(void *) > (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize) return FALSE;
+    value = *(void **)a;
+    return !value;
+}
+
+/* A pointer to a COM object: readable, and its first word points into a loaded image (a vtable). */
+static BOOL is_object_pointer( void *p )
+{
+    ULONG_PTR v = (ULONG_PTR)p;
+    MEMORY_BASIC_INFORMATION mbi;
+    void *vtbl;
+    if (!v || (v & 7) || v < 0x10000 || (v >> 47)) return FALSE;
+    if (!VirtualQuery( p, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT) return FALSE;
+    vtbl = *(void **)p;
+    if ((ULONG_PTR)vtbl < 0x10000 || ((ULONG_PTR)vtbl >> 47)) return FALSE;
+    if (!VirtualQuery( vtbl, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT || !(mbi.Type & MEM_IMAGE)) return FALSE;
+    return TRUE;
+}
+
+static unsigned comp_object_caller_slot( void *iface )
+{
+    /* Decode `call [reg+disp32]` / `call [reg]` immediately before the return address. */
+    const unsigned char *ip = __builtin_return_address( 0 );
+    struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
+    void **vtbl = (void **)object->vtbl;
+    LONG_PTR disp;
+    unsigned i;
+
+    if (!ip) return 0;
+    __TRY
+    {
+        /* mov rax, [rax+disp]; call <guard dispatch thunk> (e8 rel32) */
+        if (ip[-5] == 0xe8)
+        {
+            if (ip[-9] == 0x48 && ip[-8] == 0x8b && ip[-7] == 0x40) return (unsigned char)ip[-6] / sizeof(void *);
+            if (ip[-12] == 0x48 && ip[-11] == 0x8b && ip[-10] == 0x80)
+            {
+                LONG32 d32;
+                memcpy( &d32, ip - 9, sizeof(d32) );
+                if (d32 >= 0 && d32 / sizeof(void *) < COMP_OBJECT_SLOTS) return d32 / sizeof(void *);
+            }
+        }
+        /* CFG: mov rax, [rax+disp]; call [rip+__guard_dispatch_icall_fptr] */
+        if (ip[-6] == 0xff && ip[-5] == 0x15)
+        {
+            if (ip[-10] == 0x48 && ip[-9] == 0x8b && ip[-8] == 0x40) return (unsigned char)ip[-7] / sizeof(void *);
+            if (ip[-13] == 0x48 && ip[-12] == 0x8b && ip[-11] == 0x80)
+            {
+                LONG32 d32;
+                memcpy( &d32, ip - 10, sizeof(d32) );
+                if (d32 >= 0 && d32 / sizeof(void *) < COMP_OBJECT_SLOTS) return d32 / sizeof(void *);
+            }
+        }
+        /* .NET Native's interop stubs load the slot then call the register:
+         *   mov rax, [rcx]; mov rax, [rax+disp]; call rax   (ff d0)
+         * Without this the slot always decodes as 0 and the trace cannot name the method. */
+        if (ip[-2] == 0xff && (ip[-1] & 0xf8) == 0xd0)
+        {
+            if ((ip[-6] == 0x48 || ip[-6] == 0x4c) && ip[-5] == 0x8b && (ip[-4] & 0xc0) == 0x40)
+                return (unsigned char)ip[-3] / sizeof(void *);
+            if ((ip[-9] == 0x48 || ip[-9] == 0x4c) && ip[-8] == 0x8b && (ip[-7] & 0xc0) == 0x80)
+            {
+                LONG32 d32;
+                memcpy( &d32, ip - 6, sizeof(d32) );
+                if (d32 >= 0 && d32 / (LONG32)sizeof(void *) < COMP_OBJECT_SLOTS) return d32 / sizeof(void *);
+            }
+        }
+        if (ip[-2] == 0xff && (ip[-1] & 0xf8) == 0x10) return 0; /* call [reg] */
+        if (ip[-6] == 0xff && (ip[-5] & 0xf8) == 0x90)
+        {
+            memcpy( &disp, ip - 4, sizeof(disp) );
+            disp = (LONG32)disp;
+            if (disp >= 0 && (disp % sizeof(void *)) == 0)
+            {
+                unsigned slot = (unsigned)(disp / sizeof(void *));
+                if (slot < COMP_OBJECT_SLOTS) return slot;
+            }
+        }
+        /* Fallback: match return address against nothing; scan not possible for shared stub. */
+        (void)vtbl; (void)i;
+    }
+    __EXCEPT_ALL {}
+    __ENDTRY
+    return 0;
+}
+
+static HRESULT comp_object_slot_call( unsigned slot, void *iface, void *a, void *b, void *c, void *d )
+{
+    struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
+
+    TRACE( "%s %p slot %u a %p b %p from %p: ignored.\n", object->kind, object, slot, a, b,
+           __builtin_return_address( 0 ) );
+    /* Fill the out-pointer with a recording object. Preserve a typed object's method layout across
+     * private-interface getters: XAML asks an ExpressionAnimation for an internal animation object
+     * before it calls ICompositionAnimationBase::CreateAnimatorPartner (slot 3) on that child. */
+    {
+        /* Statics such as VisualInteractionSource.Create(visual, &out) and
+         * InteractionTracker.CreateWithOwner(compositor, owner, &out) take objects first and the
+         * out-pointer after them; stop at the first argument that is neither, so a NULL field inside
+         * some other struct is not mistaken for an out-pointer. */
+        void *args[4] = { a, b, c, d };
+        unsigned int i;
+        for (i = 0; i < ARRAY_SIZE(args); i++)
+        {
+            if (is_out_pointer( args[i] ))
+            {
+                /* Typed objects (nine-grid and mask brushes, surfaces, easing functions) share this
+                 * default slot but not this struct: a clone carrying their table over a plain
+                 * recording struct is read as the larger type and crashes (WUCBrushManager::
+                 * GetNineGridBrush on hover). Only the two recording tables are cloned as such. */
+                if (object->vtbl == (const void **)comp_object_vtbl || object->vtbl == (const void **)expression_animation_vtbl)
+                    return create_comp_object_vtbl( object->kind, (void **)object->vtbl, (void **)args[i] );
+                /* A key frame animation's unknown slots are its IKeyFrameAnimation /
+                 * ICompositionAnimation property accessors, and those out-parameters are HSTRINGs,
+                 * TimeSpans and counts rather than objects. Handing back a fake object pointer makes
+                 * the caller read it as whatever it asked for: .NET Native marshals the HSTRING that
+                 * get_Target() never wrote, and memmove()s from the garbage pointer and length it
+                 * decodes, which fail-fasts the process through RhpPInvokeExceptionGuard. NULL is a
+                 * valid empty HSTRING, a zero TimeSpan and a zero count, so write that instead. */
+                if (object->vtbl == (const void **)kf_animation_vtbl)
+                {
+                    *(void **)args[i] = NULL;
+                    return S_OK;
+                }
+                return create_comp_object( object->kind, (void **)args[i] );
+            }
+            if (!is_object_pointer( args[i] )) break;
+        }
+    }
+    return S_OK;
+}
+
+static HRESULT WINAPI comp_object_default_slot( void *iface, void *a, void *b, void *c, void *d )
+{
+    return comp_object_slot_call( comp_object_caller_slot( iface ), iface, a, b, c, d );
+}
+
+/* One thunk per slot. Decoding the caller's `call [reg+disp]` only works for compilers that load the
+ * slot at the call site; .NET Native's interop stub takes the slot index as an argument
+ * (`movsxd rdi,r8d; mov rdi,[rdx+rdi*8]; call rax`), so the call site says nothing. A distinct
+ * function per slot is the only way to know which method an app actually called. */
+static HRESULT WINAPI comp_object_slot_00( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x00, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_01( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x01, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_02( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x02, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_03( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x03, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_04( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x04, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_05( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x05, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_06( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x06, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_07( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x07, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_08( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x08, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_09( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x09, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_0a( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x0a, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_0b( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x0b, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_0c( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x0c, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_0d( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x0d, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_0e( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x0e, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_0f( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x0f, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_10( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x10, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_11( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x11, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_12( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x12, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_13( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x13, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_14( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x14, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_15( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x15, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_16( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x16, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_17( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x17, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_18( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x18, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_19( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x19, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_1a( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x1a, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_1b( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x1b, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_1c( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x1c, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_1d( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x1d, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_1e( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x1e, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_1f( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x1f, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_20( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x20, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_21( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x21, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_22( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x22, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_23( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x23, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_24( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x24, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_25( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x25, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_26( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x26, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_27( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x27, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_28( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x28, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_29( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x29, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_2a( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x2a, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_2b( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x2b, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_2c( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x2c, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_2d( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x2d, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_2e( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x2e, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_2f( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x2f, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_30( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x30, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_31( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x31, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_32( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x32, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_33( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x33, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_34( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x34, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_35( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x35, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_36( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x36, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_37( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x37, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_38( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x38, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_39( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x39, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_3a( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x3a, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_3b( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x3b, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_3c( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x3c, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_3d( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x3d, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_3e( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x3e, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_3f( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x3f, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_40( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x40, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_41( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x41, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_42( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x42, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_43( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x43, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_44( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x44, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_45( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x45, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_46( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x46, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_47( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x47, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_48( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x48, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_49( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x49, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_4a( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x4a, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_4b( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x4b, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_4c( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x4c, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_4d( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x4d, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_4e( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x4e, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_4f( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x4f, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_50( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x50, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_51( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x51, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_52( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x52, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_53( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x53, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_54( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x54, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_55( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x55, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_56( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x56, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_57( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x57, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_58( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x58, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_59( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x59, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_5a( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x5a, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_5b( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x5b, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_5c( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x5c, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_5d( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x5d, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_5e( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x5e, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_5f( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x5f, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_60( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x60, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_61( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x61, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_62( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x62, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_63( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x63, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_64( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x64, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_65( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x65, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_66( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x66, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_67( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x67, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_68( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x68, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_69( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x69, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_6a( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x6a, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_6b( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x6b, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_6c( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x6c, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_6d( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x6d, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_6e( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x6e, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_6f( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x6f, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_70( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x70, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_71( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x71, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_72( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x72, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_73( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x73, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_74( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x74, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_75( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x75, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_76( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x76, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_77( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x77, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_78( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x78, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_79( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x79, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_7a( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x7a, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_7b( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x7b, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_7c( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x7c, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_7d( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x7d, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_7e( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x7e, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_7f( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x7f, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_80( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x80, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_81( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x81, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_82( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x82, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_83( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x83, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_84( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x84, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_85( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x85, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_86( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x86, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_87( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x87, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_88( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x88, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_89( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x89, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_8a( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x8a, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_8b( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x8b, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_8c( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x8c, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_8d( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x8d, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_8e( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x8e, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_8f( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x8f, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_90( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x90, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_91( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x91, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_92( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x92, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_93( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x93, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_94( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x94, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_95( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x95, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_96( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x96, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_97( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x97, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_98( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x98, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_99( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x99, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_9a( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x9a, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_9b( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x9b, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_9c( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x9c, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_9d( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x9d, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_9e( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x9e, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_9f( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0x9f, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_a0( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xa0, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_a1( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xa1, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_a2( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xa2, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_a3( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xa3, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_a4( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xa4, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_a5( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xa5, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_a6( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xa6, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_a7( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xa7, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_a8( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xa8, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_a9( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xa9, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_aa( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xaa, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_ab( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xab, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_ac( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xac, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_ad( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xad, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_ae( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xae, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_af( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xaf, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_b0( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xb0, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_b1( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xb1, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_b2( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xb2, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_b3( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xb3, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_b4( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xb4, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_b5( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xb5, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_b6( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xb6, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_b7( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xb7, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_b8( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xb8, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_b9( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xb9, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_ba( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xba, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_bb( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xbb, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_bc( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xbc, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_bd( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xbd, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_be( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xbe, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_bf( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xbf, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_c0( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xc0, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_c1( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xc1, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_c2( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xc2, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_c3( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xc3, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_c4( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xc4, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_c5( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xc5, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_c6( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xc6, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_c7( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xc7, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_c8( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xc8, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_c9( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xc9, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_ca( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xca, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_cb( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xcb, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_cc( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xcc, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_cd( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xcd, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_ce( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xce, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_cf( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xcf, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_d0( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xd0, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_d1( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xd1, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_d2( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xd2, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_d3( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xd3, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_d4( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xd4, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_d5( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xd5, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_d6( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xd6, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_d7( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xd7, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_d8( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xd8, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_d9( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xd9, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_da( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xda, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_db( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xdb, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_dc( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xdc, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_dd( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xdd, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_de( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xde, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_df( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xdf, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_e0( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xe0, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_e1( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xe1, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_e2( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xe2, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_e3( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xe3, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_e4( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xe4, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_e5( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xe5, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_e6( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xe6, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_e7( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xe7, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_e8( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xe8, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_e9( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xe9, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_ea( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xea, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_eb( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xeb, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_ec( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xec, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_ed( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xed, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_ee( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xee, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_ef( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xef, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_f0( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xf0, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_f1( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xf1, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_f2( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xf2, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_f3( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xf3, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_f4( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xf4, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_f5( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xf5, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_f6( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xf6, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_f7( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xf7, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_f8( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xf8, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_f9( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xf9, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_fa( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xfa, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_fb( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xfb, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_fc( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xfc, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_fd( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xfd, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_fe( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xfe, iface, a, b, c, d ); }
+static HRESULT WINAPI comp_object_slot_ff( void *iface, void *a, void *b, void *c, void *d )
+{ return comp_object_slot_call( 0xff, iface, a, b, c, d ); }
+
+static void *const comp_object_slot_thunks[] =
+{
+    comp_object_slot_00, comp_object_slot_01, comp_object_slot_02, comp_object_slot_03, comp_object_slot_04, comp_object_slot_05, comp_object_slot_06, comp_object_slot_07,
+    comp_object_slot_08, comp_object_slot_09, comp_object_slot_0a, comp_object_slot_0b, comp_object_slot_0c, comp_object_slot_0d, comp_object_slot_0e, comp_object_slot_0f,
+    comp_object_slot_10, comp_object_slot_11, comp_object_slot_12, comp_object_slot_13, comp_object_slot_14, comp_object_slot_15, comp_object_slot_16, comp_object_slot_17,
+    comp_object_slot_18, comp_object_slot_19, comp_object_slot_1a, comp_object_slot_1b, comp_object_slot_1c, comp_object_slot_1d, comp_object_slot_1e, comp_object_slot_1f,
+    comp_object_slot_20, comp_object_slot_21, comp_object_slot_22, comp_object_slot_23, comp_object_slot_24, comp_object_slot_25, comp_object_slot_26, comp_object_slot_27,
+    comp_object_slot_28, comp_object_slot_29, comp_object_slot_2a, comp_object_slot_2b, comp_object_slot_2c, comp_object_slot_2d, comp_object_slot_2e, comp_object_slot_2f,
+    comp_object_slot_30, comp_object_slot_31, comp_object_slot_32, comp_object_slot_33, comp_object_slot_34, comp_object_slot_35, comp_object_slot_36, comp_object_slot_37,
+    comp_object_slot_38, comp_object_slot_39, comp_object_slot_3a, comp_object_slot_3b, comp_object_slot_3c, comp_object_slot_3d, comp_object_slot_3e, comp_object_slot_3f,
+    comp_object_slot_40, comp_object_slot_41, comp_object_slot_42, comp_object_slot_43, comp_object_slot_44, comp_object_slot_45, comp_object_slot_46, comp_object_slot_47,
+    comp_object_slot_48, comp_object_slot_49, comp_object_slot_4a, comp_object_slot_4b, comp_object_slot_4c, comp_object_slot_4d, comp_object_slot_4e, comp_object_slot_4f,
+    comp_object_slot_50, comp_object_slot_51, comp_object_slot_52, comp_object_slot_53, comp_object_slot_54, comp_object_slot_55, comp_object_slot_56, comp_object_slot_57,
+    comp_object_slot_58, comp_object_slot_59, comp_object_slot_5a, comp_object_slot_5b, comp_object_slot_5c, comp_object_slot_5d, comp_object_slot_5e, comp_object_slot_5f,
+    comp_object_slot_60, comp_object_slot_61, comp_object_slot_62, comp_object_slot_63, comp_object_slot_64, comp_object_slot_65, comp_object_slot_66, comp_object_slot_67,
+    comp_object_slot_68, comp_object_slot_69, comp_object_slot_6a, comp_object_slot_6b, comp_object_slot_6c, comp_object_slot_6d, comp_object_slot_6e, comp_object_slot_6f,
+    comp_object_slot_70, comp_object_slot_71, comp_object_slot_72, comp_object_slot_73, comp_object_slot_74, comp_object_slot_75, comp_object_slot_76, comp_object_slot_77,
+    comp_object_slot_78, comp_object_slot_79, comp_object_slot_7a, comp_object_slot_7b, comp_object_slot_7c, comp_object_slot_7d, comp_object_slot_7e, comp_object_slot_7f,
+    comp_object_slot_80, comp_object_slot_81, comp_object_slot_82, comp_object_slot_83, comp_object_slot_84, comp_object_slot_85, comp_object_slot_86, comp_object_slot_87,
+    comp_object_slot_88, comp_object_slot_89, comp_object_slot_8a, comp_object_slot_8b, comp_object_slot_8c, comp_object_slot_8d, comp_object_slot_8e, comp_object_slot_8f,
+    comp_object_slot_90, comp_object_slot_91, comp_object_slot_92, comp_object_slot_93, comp_object_slot_94, comp_object_slot_95, comp_object_slot_96, comp_object_slot_97,
+    comp_object_slot_98, comp_object_slot_99, comp_object_slot_9a, comp_object_slot_9b, comp_object_slot_9c, comp_object_slot_9d, comp_object_slot_9e, comp_object_slot_9f,
+    comp_object_slot_a0, comp_object_slot_a1, comp_object_slot_a2, comp_object_slot_a3, comp_object_slot_a4, comp_object_slot_a5, comp_object_slot_a6, comp_object_slot_a7,
+    comp_object_slot_a8, comp_object_slot_a9, comp_object_slot_aa, comp_object_slot_ab, comp_object_slot_ac, comp_object_slot_ad, comp_object_slot_ae, comp_object_slot_af,
+    comp_object_slot_b0, comp_object_slot_b1, comp_object_slot_b2, comp_object_slot_b3, comp_object_slot_b4, comp_object_slot_b5, comp_object_slot_b6, comp_object_slot_b7,
+    comp_object_slot_b8, comp_object_slot_b9, comp_object_slot_ba, comp_object_slot_bb, comp_object_slot_bc, comp_object_slot_bd, comp_object_slot_be, comp_object_slot_bf,
+    comp_object_slot_c0, comp_object_slot_c1, comp_object_slot_c2, comp_object_slot_c3, comp_object_slot_c4, comp_object_slot_c5, comp_object_slot_c6, comp_object_slot_c7,
+    comp_object_slot_c8, comp_object_slot_c9, comp_object_slot_ca, comp_object_slot_cb, comp_object_slot_cc, comp_object_slot_cd, comp_object_slot_ce, comp_object_slot_cf,
+    comp_object_slot_d0, comp_object_slot_d1, comp_object_slot_d2, comp_object_slot_d3, comp_object_slot_d4, comp_object_slot_d5, comp_object_slot_d6, comp_object_slot_d7,
+    comp_object_slot_d8, comp_object_slot_d9, comp_object_slot_da, comp_object_slot_db, comp_object_slot_dc, comp_object_slot_dd, comp_object_slot_de, comp_object_slot_df,
+    comp_object_slot_e0, comp_object_slot_e1, comp_object_slot_e2, comp_object_slot_e3, comp_object_slot_e4, comp_object_slot_e5, comp_object_slot_e6, comp_object_slot_e7,
+    comp_object_slot_e8, comp_object_slot_e9, comp_object_slot_ea, comp_object_slot_eb, comp_object_slot_ec, comp_object_slot_ed, comp_object_slot_ee, comp_object_slot_ef,
+    comp_object_slot_f0, comp_object_slot_f1, comp_object_slot_f2, comp_object_slot_f3, comp_object_slot_f4, comp_object_slot_f5, comp_object_slot_f6, comp_object_slot_f7,
+    comp_object_slot_f8, comp_object_slot_f9, comp_object_slot_fa, comp_object_slot_fb, comp_object_slot_fc, comp_object_slot_fd, comp_object_slot_fe, comp_object_slot_ff,
+};
+
+static void *comp_object_slot_fn( unsigned slot )
+{
+    if (slot < ARRAY_SIZE(comp_object_slot_thunks)) return comp_object_slot_thunks[slot];
+    return comp_object_default_slot;
+}
+
+/* Install the fault logger once. Also called from DllMain so faults before the first composition object are seen. */
+void dcomp_install_fault_logger(void)
+{
+    if (!comp_object_veh)
+        comp_object_veh = AddVectoredExceptionHandler( 1, comp_object_nx_veh );
+}
+
+static BOOL is_out_pointer( void *a );
+/* IInspectable on the recording objects: the default slot used to answer these, and it fills the
+ * first NULL out-pointer it sees, i.e. GetIids' count or GetRuntimeClassName's string. */
+/* The recording table also answers IUnknown-based private interfaces (XAML's animation partners),
+ * whose slots 3-5 take other arguments; only write through arguments that look like pointers. */
+static BOOL is_writable_pointer( void *p )
+{
+    ULONG_PTR v = (ULONG_PTR)p;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!v || (v & 3) || v < 0x10000 || (v >> 47)) return FALSE;
+    if (!VirtualQuery( p, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT || !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
+        return FALSE;
+    return TRUE;
+}
+static HRESULT WINAPI comp_object_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    if (is_writable_pointer( count )) *count = 0;
+    if (is_out_pointer( iids )) *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI comp_object_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
+    /* Kinds that are recorded without the "Composition" class-name prefix. Language projections
+     * (.NET Native's RCW factory) pick the wrapper type from this name and choke on a bogus one. */
+    static const char *const prefixed[] = { "SurfaceBrush", "ColorBrush", "NineGridBrush", "MaskBrush",
+        "EffectBrush", "BackdropBrush", "LinearGradientBrush", "RadialGradientBrush", "PropertySet",
+        "ScopedBatch", "EffectFactory", "AnimationGroup", "EffectSourceParameter", "Target",
+        "GraphicsDevice", "DrawingSurface", "VirtualDrawingSurface", "ProjectedShadow",
+        "ProjectedShadowCaster", "ProjectedShadowReceiver", "Clip", "GeometricClip", "Shape",
+        "SpriteShape", "ContainerShape", "PathGeometry", "ViewBox", "CommitBatch" };
+    WCHAR buffer[128];
+    const char *prefix = "";
+    unsigned int i;
+
+    if (!is_out_pointer( name )) return S_OK;
+    for (i = 0; i < ARRAY_SIZE(prefixed); i++)
+        if (!strcmp( object->kind, prefixed[i] )) prefix = "Composition";
+    swprintf( buffer, ARRAY_SIZE(buffer), L"Windows.UI.Composition.%hs%hs", prefix, object->kind );
+    TRACE( "%s %p -> %s.\n", object->kind, object, debugstr_w(buffer) );
+    return WindowsCreateString( buffer, wcslen( buffer ), name );
+}
+static HRESULT WINAPI comp_object_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    if (is_writable_pointer( level )) *level = BaseTrust;
+    return S_OK;
+}
+static void comp_object_set_inspectable( void **vtbl )
+{
+    vtbl[3] = comp_object_GetIids;
+    vtbl[4] = comp_object_GetRuntimeClassName;
+    vtbl[5] = comp_object_GetTrustLevel;
+}
+
+static void ensure_comp_object_vtbl(void)
+{
+    unsigned i;
+    if (InterlockedCompareExchange( &comp_object_vtbl_ready, 1, 0 ) != 0)
+    {
+        while (!comp_object_vtbl[0]) Sleep( 0 );
+        return;
+    }
+    comp_object_vtbl[1] = comp_object_AddRef;
+    comp_object_vtbl[2] = comp_object_Release;
+    for (i = 3; i < COMP_OBJECT_SLOTS; i++)
+        comp_object_vtbl[i] = comp_object_slot_fn( i );
+    comp_object_set_inspectable( comp_object_vtbl );
+    /* Publish last so waiters do not observe a half-filled table. */
+    comp_object_vtbl[0] = comp_object_QueryInterface;
+    dcomp_install_fault_logger();
+}
+
+static HRESULT create_comp_object( const char *kind, void **out )
+{
+    struct comp_object *object;
+
+    if (!out) return E_POINTER;
+    ensure_comp_object_vtbl();
+    if (!(object = calloc( 1, sizeof(*object) ))) return E_OUTOFMEMORY;
+    object->vtbl = (const void **)comp_object_vtbl;
+    object->kind = kind;
+    object->ref = 1;
+
+    TRACE( "created %s %p.\n", kind, object );
+    *out = &object->vtbl;
+    return S_OK;
+}
+
+static HRESULT WINAPI surface_factory_CreateSurface( void *iface, UINT w, UINT h, UINT format,
+                                                     UINT alpha, void **out );
+static HRESULT WINAPI surface_factory_CreateVirtualSurface( void *iface, UINT w, UINT h,
+                                                            UINT format, UINT alpha, void **out );
+/* Same as create_comp_object but with a dedicated vtable, for comp objects the caller
+ * addresses by known slot order (surface factory, surfaces). */
+static void *surface_factory_vtbl[COMP_OBJECT_SLOTS];
+static void *surface_vtbl[COMP_OBJECT_SLOTS];
+static void *expression_animation_vtbl[COMP_OBJECT_SLOTS];
+static LONG typed_vtbls_ready;
+
+static HRESULT WINAPI expression_animation_CreateAnimatorPartner( void *iface, void *source,
+                                                                   void *context, void **out )
+{
+    TRACE( "iface %p, source %p, context %p, out %p.\n", iface, source, context, out );
+    if (!out) return E_POINTER;
+    return create_comp_object( "ExpressionAnimatorPartner", out );
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * Drawing surfaces
+ *
+ * XAML asks the surface factory for a surface per texture it wants to draw (DCompSurface::
+ * InitializeSurface -> IDCompositionSurfaceFactory::CreateSurface, then BeginDraw/EndDraw around
+ * D2D commands in DCompSurface::BeginDraw). Hand it a real D3D11 texture on the app's own device
+ * and a D2D device context targeting that texture, so the drawing actually lands somewhere. On
+ * any failure fall back to the recording stub, which is what this used to always return.
+ */
+struct drawing_surface
+{
+    /* must match struct comp_object: the shared QI/AddRef/Release helpers use these */
+    const void **vtbl;
+    const char *kind;
+    LONG ref;
+    UINT perf_seen_present;
+    BOOL notified;              /* swap chain surface: presents are reported by the swap chain */
+
+    UINT width, height, format, alpha;
+    ID3D11Texture2D *texture;
+    ID2D1DeviceContext *context;
+    ID2D1Bitmap1 *bitmap;
+    BOOL drawing;
+    /* CPU copy of the texture, refreshed after XAML draws into it. The painter reads every sprite's
+     * surface every frame, and a staging copy plus Map per sprite per frame (each a wined3d
+     * round trip) took seconds a frame once the Scientific keypad was up, starving input. */
+    BYTE *cache;                /* the DIB bits for BGRA, a plain buffer for A8 */
+    HBITMAP cache_dib;
+    UINT cache_w, cache_h, cache_bpp;
+    BOOL cache_valid;
+    /* CreateCompositionSurfaceForSwapChain: the texture is the swap chain's buffer 0, refreshed
+     * whenever the present count moves (the app renders on its own device). */
+    IDXGISwapChain *swapchain;
+    UINT presented;
+    ID3D11Texture2D *staging;   /* readback copy of the texture, kept across frames (surface_cached_pixels) */
+    /* Swap chains are read back on a worker thread: CopyResource + Map wait for the app's GPU work
+     * (5 ms of a drag frame on the UI thread). The worker fills back_cache and the UI thread swaps
+     * it in at its next sync; the painter never waits, at the cost of one frame of latency. */
+    BYTE *back_cache;
+    HBITMAP back_dib;
+    UINT back_w, back_h;
+    ID3D11Texture2D *worker_staging;
+    LONG readback_busy;         /* a job is queued or running */
+    UINT readback_target;       /* present count the queued job reads */
+    UINT readback_count;        /* present count of the finished back_cache */
+    BOOL readback_ready;        /* back_cache holds a finished frame, swap it in */
+    ULONG generation;           /* bumped whenever the CPU copy is refreshed; painters key their caches on it */
+    BOOL readback_queued;       /* in readback_pending, read back with the next frame's batch */
+    BOOL opaque, back_opaque;   /* every pixel of cache (back_cache) has alpha 255 */
+};
+
+static struct drawing_surface **swapchain_surfaces;
+static unsigned int swapchain_surface_count;
+static CRITICAL_SECTION swapchain_cs = { NULL, -1, 0, 0, 0, 0 };
+static void CALLBACK swapchain_timer_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD time );
+static HRESULT create_swapchain_surface( IUnknown *swapchain, void **result );
+
+/* Fetch the swap chain's current buffer 0 if the app presented since the last look. */
+static BOOL surface_alloc_cache( UINT w, UINT h, UINT bpp, BYTE **bits, HBITMAP *dib )
+{
+    *dib = NULL;
+    if (bpp == 4)
+    {
+        BITMAPINFO info = { { 0 } };
+        void *p = NULL;
+
+        info.bmiHeader.biSize = sizeof(info.bmiHeader);
+        info.bmiHeader.biWidth = w;
+        info.bmiHeader.biHeight = -(LONG)h;   /* top-down */
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        if (!(*dib = CreateDIBSection( NULL, &info, DIB_RGB_COLORS, &p, NULL, 0 ))) return FALSE;
+        *bits = p;
+        return TRUE;
+    }
+    return !!(*bits = malloc( (size_t)w * h ));
+}
+
+static void CALLBACK swapchain_readback_job( PTP_CALLBACK_INSTANCE instance, void *arg )
+{
+    struct drawing_surface *surface = arg;
+    ID3D11Texture2D *texture = NULL;
+    ID3D11DeviceContext *context;
+    D3D11_MAPPED_SUBRESOURCE map;
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11Device *device;
+    UINT count, row;
+    BOOL ok = FALSE;
+
+    LARGE_INTEGER rb_start, rb_end, rb_freq;
+
+    QueryPerformanceCounter( &rb_start );
+    count = surface->readback_target;
+    if (FAILED( IDXGISwapChain_GetBuffer( surface->swapchain, 0, &IID_ID3D11Texture2D, (void **)&texture ) ))
+    {
+        InterlockedExchange( &surface->readback_busy, 0 );
+        return;
+    }
+    ID3D11Texture2D_GetDesc( texture, &desc );
+    ID3D11Texture2D_GetDevice( texture, &device );
+    if (surface->worker_staging)
+    {
+        D3D11_TEXTURE2D_DESC have;
+        ID3D11Texture2D_GetDesc( surface->worker_staging, &have );
+        if (have.Width != desc.Width || have.Height != desc.Height || have.Format != desc.Format)
+        {
+            ID3D11Texture2D_Release( surface->worker_staging );
+            surface->worker_staging = NULL;
+        }
+    }
+    if (!surface->worker_staging)
+    {
+        D3D11_TEXTURE2D_DESC staging_desc = desc;
+        staging_desc.Usage = D3D11_USAGE_STAGING;
+        staging_desc.BindFlags = 0;
+        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging_desc.MiscFlags = 0;
+        if (FAILED( ID3D11Device_CreateTexture2D( device, &staging_desc, NULL, &surface->worker_staging ) ))
+            surface->worker_staging = NULL;
+    }
+    if (surface->back_cache && (surface->back_w != desc.Width || surface->back_h != desc.Height))
+    {
+        if (surface->back_dib) DeleteObject( surface->back_dib );
+        else free( surface->back_cache );
+        surface->back_cache = NULL;
+        surface->back_dib = NULL;
+    }
+    if (!surface->back_cache && surface_alloc_cache( desc.Width, desc.Height, 4, &surface->back_cache, &surface->back_dib ))
+    {
+        surface->back_w = desc.Width;
+        surface->back_h = desc.Height;
+    }
+    if (surface->worker_staging && surface->back_cache && desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM)
+    {
+        ID3D11Device_GetImmediateContext( device, &context );
+        ID3D11DeviceContext_CopyResource( context, (ID3D11Resource *)surface->worker_staging, (ID3D11Resource *)texture );
+        if (SUCCEEDED( ID3D11DeviceContext_Map( context, (ID3D11Resource *)surface->worker_staging, 0, D3D11_MAP_READ, 0, &map ) ))
+        {
+            for (row = 0; row < desc.Height; row++)
+                memcpy( surface->back_cache + (size_t)row * desc.Width * 4, (BYTE *)map.pData + (size_t)row * map.RowPitch,
+                        desc.Width * 4 );
+            ID3D11DeviceContext_Unmap( context, (ID3D11Resource *)surface->worker_staging, 0 );
+            surface->back_opaque = bits_opaque( surface->back_cache, desc.Width, desc.Height );
+            ok = TRUE;
+        }
+        ID3D11DeviceContext_Release( context );
+    }
+    ID3D11Device_Release( device );
+    ID3D11Texture2D_Release( texture );
+
+    EnterCriticalSection( &swapchain_cs );
+    QueryPerformanceCounter( &rb_end );
+    QueryPerformanceFrequency( &rb_freq );
+    {
+        double ms = (rb_end.QuadPart - rb_start.QuadPart) * 1000.0 / rb_freq.QuadPart;
+        perf.readbacks++;
+        perf.readback_ms += ms;
+        if (ms > perf.readback_max) perf.readback_max = ms;
+    }
+    if (ok)
+    {
+        surface->readback_ready = TRUE;
+        surface->readback_count = count;
+    }
+    else surface->presented = count;   /* nothing to show; do not spin on this frame */
+    LeaveCriticalSection( &swapchain_cs );
+    InterlockedExchange( &surface->readback_busy, 0 );
+    if (ok)
+    {
+        scene_changed();
+        /* the UI thread paints it; wineuwp's WM_PAINT handler repaints from dcomp */
+        if (surface->notified && last_desktop_hwnd)
+        {
+            static const RECT wake = { 0, 0, 1, 1 };
+            InvalidateRect( last_desktop_hwnd, &wake, FALSE );
+        }
+    }
+}
+
+/* UI thread: hand finished frames to the painter and queue the next readback. Never waits. */
+static void surface_sync_swapchain( struct drawing_surface *surface )
+{
+    UINT count = 0;
+
+    if (!surface->swapchain) return;
+    EnterCriticalSection( &swapchain_cs );
+    if (surface->readback_ready)
+    {
+        BYTE *bits = surface->cache;
+        HBITMAP dib = surface->cache_dib;
+        UINT w = surface->cache_w, h = surface->cache_h;
+
+        surface->cache = surface->back_cache;
+        surface->cache_dib = surface->back_dib;
+        surface->cache_w = surface->back_w;
+        surface->cache_h = surface->back_h;
+        surface->cache_bpp = 4;
+        surface->back_cache = bits;
+        surface->back_dib = dib;
+        surface->back_w = w;
+        surface->back_h = h;
+        {
+            BOOL opaque = surface->opaque;
+            surface->opaque = surface->back_opaque;
+            surface->back_opaque = opaque;
+        }
+        surface->cache_valid = TRUE;
+        surface->generation = InterlockedIncrement( &content_generation );
+        surface->presented = surface->readback_count;
+        surface->readback_ready = FALSE;
+        perf.swapchain_frames++;
+        TRACE( "surface %p: frame %u swapped in.\n", surface, surface->presented );
+    }
+    LeaveCriticalSection( &swapchain_cs );
+
+    /* No reference to the back buffer is kept between frames: DXGI refuses ResizeBuffers while one is
+     * outstanding, and the graph's swap chain then stayed at its old size after a window resize (drawn
+     * past the new canvas edge, under the translucent keypad). The painter uses the readback cache. */
+    if (FAILED( IDXGISwapChain_GetLastPresentCount( surface->swapchain, &count ) )) return;
+    if (count != surface->perf_seen_present)
+    {
+        perf.presents += count - surface->perf_seen_present;
+        surface->perf_seen_present = count;
+    }
+    if (count == surface->presented) return;
+    if (!InterlockedCompareExchange( &surface->readback_busy, 1, 0 ))
+    {
+        surface->readback_target = count;
+        /* a pool thread, not a new one: a fresh thread's DLL attach needs the loader lock, which
+         * deadlocked against the UI thread */
+        if (!TrySubmitThreadpoolCallback( swapchain_readback_job, surface, NULL ))
+            InterlockedExchange( &surface->readback_busy, 0 );
+    }
+}
+
+/* Present notifier registered on composition swap chains (dxgi's comp_swapchain_present calls method 3 on
+ * the presenting thread): start the readback at once. The finished readback invalidates the CoreWindow, and
+ * the UI thread's repaint swaps the frame in and queues the next one. */
+static const GUID IID_wine_composition_present_notify = {0x3f6a1b2e, 0x7d44, 0x4c8a, {0x9b, 0x1e, 0x52, 0x0d, 0x6e, 0x33, 0x81, 0xa7}};
+struct present_notify
+{
+    const void **vtbl;
+    LONG ref;
+    struct drawing_surface *surface;    /* swap chain surfaces are never freed */
+};
+static HRESULT WINAPI present_notify_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ))
+    {
+        InterlockedIncrement( &((struct present_notify *)iface)->ref );
+        *out = iface;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI present_notify_AddRef( void *iface )
+{
+    return InterlockedIncrement( &((struct present_notify *)iface)->ref );
+}
+static ULONG WINAPI present_notify_Release( void *iface )
+{
+    ULONG ref = InterlockedDecrement( &((struct present_notify *)iface)->ref );
+    if (!ref) free( iface );
+    return ref;
+}
+static void WINAPI present_notify_Presented( void *iface )
+{
+    struct drawing_surface *surface = ((struct present_notify *)iface)->surface;
+    UINT count;
+    BOOL submit = FALSE;
+
+    if (FAILED( IDXGISwapChain_GetLastPresentCount( surface->swapchain, &count ) )) return;
+    EnterCriticalSection( &swapchain_cs );
+    /* a frame read back but not swapped in yet: the UI thread queues the next readback after the swap */
+    if (count != surface->presented && !surface->readback_ready && !InterlockedCompareExchange( &surface->readback_busy, 1, 0 ))
+    {
+        surface->readback_target = count;
+        submit = TRUE;
+    }
+    LeaveCriticalSection( &swapchain_cs );
+    if (submit && !TrySubmitThreadpoolCallback( swapchain_readback_job, surface, NULL ))
+        InterlockedExchange( &surface->readback_busy, 0 );
+}
+static const void *present_notify_vtbl[] =
+{
+    present_notify_QueryInterface, present_notify_AddRef, present_notify_Release, present_notify_Presented,
+};
+static BOOL register_present_notify( struct drawing_surface *surface )
+{
+    struct present_notify *notify;
+    HRESULT hr;
+
+    if (!(notify = calloc( 1, sizeof(*notify) ))) return FALSE;
+    notify->vtbl = present_notify_vtbl;
+    notify->ref = 1;
+    notify->surface = surface;
+    hr = IDXGISwapChain_SetPrivateDataInterface( surface->swapchain, &IID_wine_composition_present_notify, (IUnknown *)notify );
+    present_notify_Release( notify );
+    return SUCCEEDED(hr);
+}
+
+/* Any swap chain presented since its surface was last painted? */
+static BOOL swapchain_surfaces_dirty( void )
+{
+    unsigned int i;
+    UINT count;
+    BOOL dirty = FALSE;
+
+    EnterCriticalSection( &swapchain_cs );
+    for (i = 0; i < swapchain_surface_count && !dirty; i++)
+    {
+        struct drawing_surface *surface = swapchain_surfaces[i];
+        if (SUCCEEDED( IDXGISwapChain_GetLastPresentCount( surface->swapchain, &count ) ) && count != surface->presented)
+            dirty = TRUE;
+    }
+    LeaveCriticalSection( &swapchain_cs );
+    return dirty;
+}
+
+/* Surfaces XAML drew into since the last frame. Reading each back on its own (staging copy + Map) is one
+ * round trip through wined3d's command thread per surface, ~0.2 ms each and 20-30 of them for a digit typed
+ * into the Standard page. The frame reads them back together: every one is copied into one staging atlas
+ * per format, and the atlas is mapped once (readback_batch). */
+static struct drawing_surface *readback_pending[512];
+static unsigned int readback_pending_count;
+static CRITICAL_SECTION readback_cs = { NULL, -1, 0, 0, 0, 0 };
+
+static void surface_invalidate_cache( struct drawing_surface *surface )
+{
+    surface->cache_valid = FALSE;
+    if (surface->swapchain || !surface->texture) return;
+    EnterCriticalSection( &readback_cs );
+    if (!surface->readback_queued && readback_pending_count < ARRAY_SIZE(readback_pending))
+    {
+        readback_pending[readback_pending_count++] = surface;
+        surface->readback_queued = TRUE;
+    }
+    LeaveCriticalSection( &readback_cs );
+}
+
+static void surface_free_cache( struct drawing_surface *surface );
+static ULONG WINAPI surface_Release( void *iface )
+{
+    struct drawing_surface *surface = CONTAINING_RECORD( iface, struct drawing_surface, vtbl );
+    ULONG ref = InterlockedDecrement( &surface->ref );
+    unsigned int i;
+
+    if (ref) return ref;
+    /* swap chain surfaces stay: the present notifier and the poll list point at them */
+    if (surface->swapchain) return 0;
+    EnterCriticalSection( &readback_cs );
+    for (i = 0; i < readback_pending_count; i++)
+        if (readback_pending[i] == surface) readback_pending[i] = readback_pending[--readback_pending_count];
+    LeaveCriticalSection( &readback_cs );
+    TRACE( "surface %p freed.\n", surface );
+    surface_free_cache( surface );
+    if (surface->staging) ID3D11Texture2D_Release( surface->staging );
+    if (surface->bitmap) ID2D1Bitmap1_Release( surface->bitmap );
+    if (surface->context) ID2D1DeviceContext_Release( surface->context );
+    if (surface->texture) ID3D11Texture2D_Release( surface->texture );
+    free( surface );
+    return 0;
+}
+static void surface_free_cache( struct drawing_surface *surface )
+{
+    if (surface->swapchain) return;   /* the readback thread owns these */
+    if (surface->cache_dib) DeleteObject( surface->cache_dib );
+    else free( surface->cache );
+    surface->cache_dib = NULL;
+    surface->cache = NULL;
+    surface->cache_valid = FALSE;
+    surface->cache_w = surface->cache_h = surface->cache_bpp = 0;
+}
+
+static void ensure_typed_vtbls( void );
+
+static ID3D11Device *interop_d3d_device;
+static ID2D1Device *interop_d2d_device;
+static ID2D1Factory1 *interop_d2d_factory;
+
+/* XAML passes its D3D11-backed rendering device to IDCompositionDesktopDevice::CreateSurfaceFactory.
+ * Drawing surfaces must live on that device: XAML copies into the textures BeginDraw hands out with its own
+ * device context, and a texture from another wined3d device trips wined3d's command-stream thread checks. */
+static void remember_rendering_device( IUnknown *rendering_device )
+{
+    ID3D11Device *device = NULL;
+    IDXGIDevice *dxgi_device;
+    ID2D1Device *d2d_device;
+    ID2D1Device2 *d2d_device2;
+
+    if (!rendering_device || interop_d3d_device) return;
+    if (SUCCEEDED( IUnknown_QueryInterface( rendering_device, &IID_ID3D11Device, (void **)&device ) ))
+        TRACE( "rendering device %p is a D3D11 device.\n", rendering_device );
+    else if (SUCCEEDED( IUnknown_QueryInterface( rendering_device, &IID_IDXGIDevice, (void **)&dxgi_device ) ))
+    {
+        IDXGIDevice_QueryInterface( dxgi_device, &IID_ID3D11Device, (void **)&device );
+        IDXGIDevice_Release( dxgi_device );
+    }
+    else if (SUCCEEDED( IUnknown_QueryInterface( rendering_device, &IID_ID2D1Device, (void **)&d2d_device ) ))
+    {
+        if (SUCCEEDED( ID2D1Device_QueryInterface( d2d_device, &IID_ID2D1Device2, (void **)&d2d_device2 ) ))
+        {
+            if (SUCCEEDED( ID2D1Device2_GetDxgiDevice( d2d_device2, &dxgi_device ) ))
+            {
+                IDXGIDevice_QueryInterface( dxgi_device, &IID_ID3D11Device, (void **)&device );
+                IDXGIDevice_Release( dxgi_device );
+            }
+            ID2D1Device2_Release( d2d_device2 );
+        }
+        if (device && !InterlockedCompareExchangePointer( (void **)&interop_d2d_device, d2d_device, NULL ))
+            TRACE( "using the app's D2D device %p.\n", d2d_device );
+        else
+            ID2D1Device_Release( d2d_device );
+    }
+    if (!device)
+    {
+        WARN( "rendering device %p has no D3D11 device.\n", rendering_device );
+        return;
+    }
+    if (InterlockedCompareExchangePointer( (void **)&interop_d3d_device, device, NULL ))
+        ID3D11Device_Release( device );
+    else
+        TRACE( "kept the app's D3D11 device %p for drawing surfaces.\n", device );
+}
+
+static HRESULT ensure_d2d_device( void )
+{
+    D2D1_FACTORY_OPTIONS options = { D2D1_DEBUG_LEVEL_NONE };
+    ID2D1Factory1 *factory = NULL;
+    IDXGIDevice *dxgi_device;
+    ID2D1Device *device;
+    HRESULT hr;
+
+    if (interop_d2d_device) return S_OK;
+    if (!interop_d3d_device)
+    {
+        /* XAML's interop compositor hands dcomp a rendering device that is not a D3D11 device, so draw
+         * surfaces on a device of our own. */
+        ID3D11Device *device;
+
+        if (FAILED( hr = D3D11CreateDevice( NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                            D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
+                                            D3D11_SDK_VERSION, &device, NULL, NULL ) ) &&
+            FAILED( hr = D3D11CreateDevice( NULL, D3D_DRIVER_TYPE_WARP, NULL,
+                                            D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
+                                            D3D11_SDK_VERSION, &device, NULL, NULL ) ))
+        {
+            WARN( "D3D11CreateDevice failed, hr %#lx.\n", hr );
+            return hr;
+        }
+        if (InterlockedCompareExchangePointer( (void **)&interop_d3d_device, device, NULL ))
+            ID3D11Device_Release( device );
+        else
+            TRACE( "created D3D11 device %p for drawing surfaces.\n", device );
+    }
+
+    if (FAILED( hr = D2D1CreateFactory( D2D1_FACTORY_TYPE_MULTI_THREADED, &IID_ID2D1Factory1,
+                                        &options, (void **)&factory ) ))
+    {
+        WARN( "D2D1CreateFactory failed, hr %#lx.\n", hr );
+        return hr;
+    }
+    if (FAILED( hr = ID3D11Device_QueryInterface( interop_d3d_device, &IID_IDXGIDevice,
+                                                  (void **)&dxgi_device ) ))
+    {
+        ID2D1Factory1_Release( factory );
+        return hr;
+    }
+    hr = ID2D1Factory1_CreateDevice( factory, dxgi_device, &device );
+    IDXGIDevice_Release( dxgi_device );
+    if (FAILED( hr ))
+    {
+        WARN( "ID2D1Factory1::CreateDevice failed, hr %#lx.\n", hr );
+        ID2D1Factory1_Release( factory );
+        return hr;
+    }
+    if (InterlockedCompareExchangePointer( (void **)&interop_d2d_device, device, NULL ))
+    {
+        ID2D1Device_Release( device );
+        ID2D1Factory1_Release( factory );
+    }
+    else
+    {
+        interop_d2d_factory = factory;
+        ERR( "D2D device %p on the app's D3D11 device %p.\n", device, interop_d3d_device );
+    }
+    return S_OK;
+}
+
+static HRESULT surface_ensure_target( struct drawing_surface *surface )
+{
+    D2D1_BITMAP_PROPERTIES1 properties = { { 0 } };
+    D3D11_TEXTURE2D_DESC desc = { 0 };
+    IDXGISurface *dxgi_surface;
+    HRESULT hr;
+
+    if (surface->bitmap) return S_OK;
+    if (FAILED( hr = ensure_d2d_device() )) return hr;
+
+    if (!surface->texture)
+    {
+        desc.Width = surface->width ? surface->width : 1;
+        desc.Height = surface->height ? surface->height : 1;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = surface->format ? surface->format : DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED( hr = ID3D11Device_CreateTexture2D( interop_d3d_device, &desc, NULL,
+                                                       &surface->texture ) ))
+        {
+            /* A8 surfaces cannot be shader resources on every driver; a render target is enough. */
+            desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+            if (FAILED( hr = ID3D11Device_CreateTexture2D( interop_d3d_device, &desc, NULL,
+                                                           &surface->texture ) ))
+            {
+                WARN( "CreateTexture2D %ux%u fmt %u failed, hr %#lx.\n", desc.Width, desc.Height,
+                      desc.Format, hr );
+                return hr;
+            }
+        }
+    }
+    if (!surface->context &&
+        FAILED( hr = ID2D1Device_CreateDeviceContext( interop_d2d_device,
+                                                      D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                                                      &surface->context ) ))
+    {
+        WARN( "CreateDeviceContext failed, hr %#lx.\n", hr );
+        return hr;
+    }
+    if (FAILED( hr = ID3D11Texture2D_QueryInterface( surface->texture, &IID_IDXGISurface,
+                                                     (void **)&dxgi_surface ) ))
+        return hr;
+
+    properties.pixelFormat.format = surface->format ? surface->format : DXGI_FORMAT_B8G8R8A8_UNORM;
+    properties.pixelFormat.alphaMode = surface->alpha ? D2D1_ALPHA_MODE_PREMULTIPLIED
+                                                      : D2D1_ALPHA_MODE_IGNORE;
+    properties.dpiX = properties.dpiY = 96.0f;
+    properties.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+    hr = ID2D1DeviceContext_CreateBitmapFromDxgiSurface( surface->context, dxgi_surface,
+                                                         &properties, &surface->bitmap );
+    IDXGISurface_Release( dxgi_surface );
+    if (FAILED( hr ))
+    {
+        WARN( "CreateBitmapFromDxgiSurface failed, hr %#lx.\n", hr );
+        return hr;
+    }
+    ID2D1DeviceContext_SetTarget( surface->context, (ID2D1Image *)surface->bitmap );
+    return S_OK;
+}
+
+static HRESULT WINAPI surface_BeginDraw( void *iface, const RECT *update_rect, REFIID iid,
+                                         void **update_object, POINT *update_offset )
+{
+    struct drawing_surface *surface = CONTAINING_RECORD( iface, struct drawing_surface, vtbl );
+    HRESULT hr;
+
+    TRACE( "surface %p rect %s iid %s.\n", surface, wine_dbgstr_rect( update_rect ),
+           debugstr_guid( iid ) );
+    if (update_offset)
+    {
+        update_offset->x = 0;
+        update_offset->y = 0;
+    }
+    if (!update_object) return S_OK;
+    *update_object = NULL;
+
+    if (SUCCEEDED( hr = surface_ensure_target( surface ) ) && !IsEqualGUID( iid, &IID_ID2D1DeviceContext ) &&
+        SUCCEEDED( ID3D11Texture2D_QueryInterface( surface->texture, iid, update_object ) ))
+    {
+        /* IDXGISurface / D3D11 texture callers (XAML image and atlas updates) write the texture directly. */
+        TRACE( "handing out the surface texture as %s.\n", debugstr_guid( iid ) );
+        return S_OK;
+    }
+    if (SUCCEEDED( hr ))
+    {
+        ID2D1DeviceContext_BeginDraw( surface->context );
+        surface->drawing = TRUE;
+        if (SUCCEEDED( hr = ID2D1DeviceContext_QueryInterface( surface->context, iid,
+                                                               update_object ) ))
+            return S_OK;
+        WARN( "the D2D context has no %s, hr %#lx.\n", debugstr_guid( iid ), hr );
+        ID2D1DeviceContext_EndDraw( surface->context, NULL, NULL );
+        surface->drawing = FALSE;
+    }
+    /* No usable target: hand back a recording object so the walk can still be observed. */
+    FIXME( "no drawing target for %s, hr %#lx; recording instead.\n", debugstr_guid( iid ), hr );
+    return create_comp_object( "surface d2d context", update_object );
+}
+static HRESULT WINAPI surface_EndDraw( void *iface )
+{
+    scene_changed();
+    struct drawing_surface *surface = CONTAINING_RECORD( iface, struct drawing_surface, vtbl );
+    HRESULT hr = S_OK;
+
+    TRACE( "surface %p.\n", surface );
+    if (surface->drawing)
+    {
+        hr = ID2D1DeviceContext_EndDraw( surface->context, NULL, NULL );
+        surface->drawing = FALSE;
+        surface_invalidate_cache( surface );
+        if (FAILED( hr )) WARN( "EndDraw failed, hr %#lx.\n", hr );
+    }
+    return hr;
+}
+/* The gutters pointer XAML passes is only an int-sized local, so it is never written. */
+static HRESULT WINAPI surface_BeginDrawWithGutters( void *iface, const RECT *update_rect, REFIID iid,
+                                                    void **update_object, POINT *update_offset, void *gutters )
+{
+    TRACE( "gutters %p.\n", gutters );
+    return surface_BeginDraw( iface, update_rect, iid, update_object, update_offset );
+}
+static HRESULT WINAPI surface_BeginDrawWithClear( void *iface, const RECT *update_rect, REFIID iid,
+                                                  void **update_object, POINT *update_offset )
+{
+    struct drawing_surface *surface = CONTAINING_RECORD( iface, struct drawing_surface, vtbl );
+    static const D2D1_COLOR_F transparent;
+    HRESULT hr;
+
+    if (FAILED( hr = surface_BeginDraw( iface, update_rect, iid, update_object, update_offset ) )) return hr;
+    if (surface->drawing) ID2D1DeviceContext_Clear( surface->context, &transparent );
+    return hr;
+}
+static HRESULT WINAPI surface_HasValidPixels( void *iface, BOOL *valid )
+{
+    struct drawing_surface *surface = CONTAINING_RECORD( iface, struct drawing_surface, vtbl );
+
+    if (!valid) return E_POINTER;
+    *valid = surface->context != NULL;
+    return S_OK;
+}
+static HRESULT WINAPI surface_Resize( void *iface, UINT width, UINT height )
+{
+    scene_changed();
+    struct drawing_surface *surface = CONTAINING_RECORD( iface, struct drawing_surface, vtbl );
+
+    TRACE( "surface %p %ux%u -> %ux%u.\n", surface, surface->width, surface->height, width, height );
+    if (surface->drawing) return 0x88980801; /* DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED */
+    if (surface->width == width && surface->height == height) return S_OK;
+    surface_free_cache( surface );
+    /* Drop the old target; the next BeginDraw creates one at the new size. */
+    if (surface->context) ID2D1DeviceContext_SetTarget( surface->context, NULL );
+    if (surface->bitmap)
+    {
+        ID2D1Bitmap1_Release( surface->bitmap );
+        surface->bitmap = NULL;
+    }
+    if (surface->texture)
+    {
+        if (surface->staging) ID3D11Texture2D_Release( surface->staging );
+        surface->staging = NULL;
+        ID3D11Texture2D_Release( surface->texture );
+        surface->texture = NULL;
+    }
+    surface->width = width;
+    surface->height = height;
+    return S_OK;
+}
+static HRESULT WINAPI surface_CopySurface( void *iface, IUnknown *destination, int x, int y, const RECT *source )
+{
+    scene_changed();
+    FIXME( "%p, %p, %d, %d, %s: stub.\n", iface, destination, x, y, wine_dbgstr_rect( source ) );
+    return E_NOTIMPL;
+}
+
+/* A CompositionSurfaceBrush that remembers which surface it paints, so the renderer can find the
+ * texture behind a sprite. Slots from ICompositionSurfaceBrush: 12 get_Surface, 13 put_Surface. */
+struct surface_brush
+{
+    const void **vtbl;
+    const char *kind;
+    LONG ref;
+    struct drawing_surface *surface;
+};
+
+static void *surface_brush_vtbl[COMP_OBJECT_SLOTS];
+
+static struct drawing_surface *surface_from_iface( void *iface )
+{
+    if (!iface || *(void ***)iface != (void **)surface_vtbl) return NULL;
+    return CONTAINING_RECORD( iface, struct drawing_surface, vtbl );
+}
+
+static HRESULT WINAPI surface_brush_get_Surface( void *iface, void **value )
+{
+    struct surface_brush *brush = CONTAINING_RECORD( iface, struct surface_brush, vtbl );
+
+    if (!value) return E_POINTER;
+    *value = brush->surface ? &brush->surface->vtbl : NULL;
+    if (*value) IUnknown_AddRef( (IUnknown *)*value );
+    return S_OK;
+}
+
+static HRESULT WINAPI surface_brush_put_Surface( void *iface, void *value )
+{
+    scene_changed();
+    struct surface_brush *brush = CONTAINING_RECORD( iface, struct surface_brush, vtbl );
+    struct drawing_surface *surface = surface_from_iface( value );
+
+    TRACE( "brush %p surface %p (%s).\n", brush, value, surface ? "ours" : "foreign" );
+    if (surface) IUnknown_AddRef( (IUnknown *)value );
+    if (brush->surface) IUnknown_Release( (IUnknown *)&brush->surface->vtbl );
+    brush->surface = surface;
+    return S_OK;
+}
+
+/* A DropShadow with real property storage. IDropShadow {cb977c07-a154-4851-85e7-a8924c84fad8} slots:
+ * 6 get_BlurRadius, 7 put_BlurRadius, 8 get_Color, 9 put_Color, 10 get_Mask, 11 put_Mask, 12 get_Offset,
+ * 13 put_Offset, 14 get_Opacity, 15 put_Opacity. XAML reads these back when it composes a sprite that
+ * carries the shadow; the generic recording object wrote an 8-byte object pointer into every out
+ * parameter, which overran 4-byte floats on XAML's stack. The shadow is stored, not drawn. */
+static void *drop_shadow_vtbl[COMP_OBJECT_SLOTS];
+struct drop_shadow
+{
+    const void **vtbl;          /* generic composition object layout, must stay first */
+    const char *kind;
+    LONG ref;
+    float blur_radius, opacity;
+    Color color;
+    Vector3 offset;
+    IUnknown *mask;
+};
+static struct drop_shadow *drop_shadow_from( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct drop_shadow, vtbl );
+}
+static HRESULT WINAPI drop_shadow_get_BlurRadius( void *iface, float *value )
+{
+    if (!value) return E_POINTER;
+    *value = drop_shadow_from( iface )->blur_radius;
+    return S_OK;
+}
+static HRESULT WINAPI drop_shadow_put_BlurRadius( void *iface, float value )
+{
+    TRACE( "shadow %p blur %g.\n", iface, value );
+    drop_shadow_from( iface )->blur_radius = value;
+    return S_OK;
+}
+static HRESULT WINAPI drop_shadow_get_Color( void *iface, Color *value )
+{
+    if (!value) return E_POINTER;
+    *value = drop_shadow_from( iface )->color;
+    return S_OK;
+}
+static HRESULT WINAPI drop_shadow_put_Color( void *iface, Color value )
+{
+    TRACE( "shadow %p color %u,%u,%u,%u.\n", iface, value.A, value.R, value.G, value.B );
+    drop_shadow_from( iface )->color = value;
+    return S_OK;
+}
+static HRESULT WINAPI drop_shadow_get_Mask( void *iface, IUnknown **value )
+{
+    struct drop_shadow *shadow = drop_shadow_from( iface );
+    if (!value) return E_POINTER;
+    if ((*value = shadow->mask)) IUnknown_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI drop_shadow_put_Mask( void *iface, IUnknown *value )
+{
+    struct drop_shadow *shadow = drop_shadow_from( iface );
+    TRACE( "shadow %p mask %p.\n", iface, value );
+    if (value) IUnknown_AddRef( value );
+    if (shadow->mask) IUnknown_Release( shadow->mask );
+    shadow->mask = value;
+    return S_OK;
+}
+static HRESULT WINAPI drop_shadow_get_Offset( void *iface, Vector3 *value )
+{
+    if (!value) return E_POINTER;
+    *value = drop_shadow_from( iface )->offset;
+    return S_OK;
+}
+static HRESULT WINAPI drop_shadow_put_Offset( void *iface, Vector3 value )
+{
+    TRACE( "shadow %p offset %g,%g,%g.\n", iface, value.X, value.Y, value.Z );
+    drop_shadow_from( iface )->offset = value;
+    return S_OK;
+}
+static HRESULT WINAPI drop_shadow_get_Opacity( void *iface, float *value )
+{
+    if (!value) return E_POINTER;
+    *value = drop_shadow_from( iface )->opacity;
+    return S_OK;
+}
+static HRESULT WINAPI drop_shadow_put_Opacity( void *iface, float value )
+{
+    TRACE( "shadow %p opacity %g.\n", iface, value );
+    drop_shadow_from( iface )->opacity = value;
+    return S_OK;
+}
+static ULONG WINAPI drop_shadow_Release( void *iface )
+{
+    struct drop_shadow *shadow = drop_shadow_from( iface );
+    ULONG ref = InterlockedDecrement( &shadow->ref );
+    if (!ref)
+    {
+        if (shadow->mask) IUnknown_Release( shadow->mask );
+        free( shadow );
+    }
+    return ref;
+}
+static HRESULT create_drop_shadow( void **out )
+{
+    struct drop_shadow *shadow;
+
+    if (!out) return E_POINTER;
+    ensure_typed_vtbls();
+    if (!(shadow = calloc( 1, sizeof(*shadow) ))) return E_OUTOFMEMORY;
+    shadow->vtbl = (const void **)drop_shadow_vtbl;
+    shadow->kind = "DropShadow";
+    shadow->ref = 1;
+    shadow->blur_radius = 9.0f;
+    shadow->opacity = 1.0f;
+    shadow->color.A = 255;
+    TRACE( "created DropShadow %p.\n", shadow );
+    *out = &shadow->vtbl;
+    return S_OK;
+}
+
+static HRESULT create_surface_brush( void *surface_iface, void **out )
+{
+    struct surface_brush *brush;
+
+    if (!out) return E_POINTER;
+    ensure_typed_vtbls();
+    if (!(brush = calloc( 1, sizeof(*brush) ))) return E_OUTOFMEMORY;
+    brush->vtbl = (const void **)surface_brush_vtbl;
+    brush->kind = "SurfaceBrush";
+    brush->ref = 1;
+    if ((brush->surface = surface_from_iface( surface_iface )))
+        IUnknown_AddRef( (IUnknown *)surface_iface );
+
+    TRACE( "created SurfaceBrush %p over surface %p.\n", brush, brush->surface );
+    *out = &brush->vtbl;
+    return S_OK;
+}
+
+/* The texture behind a brush, or NULL when the brush paints something else. */
+static struct drawing_surface *effect_brush_surface( void *brush_iface );
+
+static struct drawing_surface *brush_surface( void *brush_iface )
+{
+    struct surface_brush *brush;
+
+    if (brush_iface && *(void ***)brush_iface != (void **)surface_brush_vtbl) return effect_brush_surface( brush_iface );
+    if (!brush_iface) return NULL;
+    brush = CONTAINING_RECORD( brush_iface, struct surface_brush, vtbl );
+    return brush->surface && (brush->surface->texture || brush->surface->swapchain) ? brush->surface : NULL;
+}
+
+/* Copy what XAML drew into a surface onto the window. The texture lives on the GPU and the
+ * fallback renderer paints with GDI, so it goes through a staging copy. */
+/* Paint a surface's texture into dest_w x dest_h device pixels at x,y (0 = the texture's own size).
+ * XAML draws into premultiplied BGRA, so the copy is alpha-blended: icons and text sprites carry
+ * transparent backgrounds, and a plain copy painted those black. */
+/* The surface's pixels on the CPU (BGRA as a top-down DIB, A8 as a byte buffer), copied from the
+ * texture only when the cache is stale. */
+static BOOL surface_ensure_cache( struct drawing_surface *surface, UINT width, UINT height, UINT bpp )
+{
+    if (surface->cache && surface->cache_w == width && surface->cache_h == height && surface->cache_bpp == bpp) return TRUE;
+    surface_free_cache( surface );
+    if (bpp == 4)
+    {
+        BITMAPINFO info = { { 0 } };
+        void *bits = NULL;
+
+        info.bmiHeader.biSize = sizeof(info.bmiHeader);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -(LONG)height;   /* top-down */
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        if (!(surface->cache_dib = CreateDIBSection( NULL, &info, DIB_RGB_COLORS, &bits, NULL, 0 ))) return FALSE;
+        surface->cache = bits;
+    }
+    else if (!(surface->cache = malloc( (size_t)width * height ))) return FALSE;
+    surface->cache_w = width;
+    surface->cache_h = height;
+    surface->cache_bpp = bpp;
+    return TRUE;
+}
+
+/* Read back every queued surface of one format through one staging atlas (see readback_pending). Surfaces
+ * that do not fit, or live on another device, are left to surface_cached_pixels. */
+static void readback_batch_format( struct drawing_surface **list, unsigned int count, DXGI_FORMAT format, UINT bpp )
+{
+    static ID3D11Texture2D *atlases[2];
+    ID3D11Texture2D **atlas = &atlases[bpp == 4 ? 0 : 1];
+    ID3D11Device *device = NULL, *other;
+    ID3D11DeviceContext *context;
+    D3D11_TEXTURE2D_DESC desc, have;
+    D3D11_MAPPED_SUBRESOURCE map;
+    struct { struct drawing_surface *surface; UINT x, y, w, h; } placed[512];
+    UINT atlas_w = 1024, x = 0, y = 0, row_h = 0, needed_h, i, n = 0, row;
+
+    for (i = 0; i < count; i++)
+    {
+        struct drawing_surface *surface = list[i];
+        if (!surface->texture || surface->cache_valid) continue;
+        ID3D11Texture2D_GetDesc( surface->texture, &desc );
+        if (desc.Format != format || !desc.Width || !desc.Height || desc.Width > 4096 || desc.Height > 4096) continue;
+        ID3D11Texture2D_GetDevice( surface->texture, &other );
+        if (!device) device = other;
+        else ID3D11Device_Release( other );
+        if (other != device) continue;
+        if (desc.Width > atlas_w) atlas_w = desc.Width;
+        placed[n].surface = surface;
+        placed[n].w = desc.Width;
+        placed[n].h = desc.Height;
+        n++;
+    }
+    if (!n) return;
+    /* shelves, in queue order */
+    for (i = 0; i < n; i++)
+    {
+        if (x + placed[i].w > atlas_w) { x = 0; y += row_h; row_h = 0; }
+        placed[i].x = x;
+        placed[i].y = y;
+        x += placed[i].w;
+        if (placed[i].h > row_h) row_h = placed[i].h;
+    }
+    needed_h = y + row_h;
+    if (needed_h > 4096)
+    {
+        ID3D11Device_Release( device );
+        return;
+    }
+    if (*atlas)
+    {
+        ID3D11Texture2D_GetDesc( *atlas, &have );
+        if (have.Width < atlas_w || have.Height < needed_h)
+        {
+            atlas_w = max( atlas_w, have.Width );
+            needed_h = max( needed_h, have.Height );
+            ID3D11Texture2D_Release( *atlas );
+            *atlas = NULL;
+        }
+    }
+    if (!*atlas)
+    {
+        memset( &desc, 0, sizeof(desc) );
+        desc.Width = atlas_w;
+        desc.Height = 256;
+        while (desc.Height < needed_h) desc.Height *= 2;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = format;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED( ID3D11Device_CreateTexture2D( device, &desc, NULL, atlas ) ))
+        {
+            *atlas = NULL;
+            ID3D11Device_Release( device );
+            return;
+        }
+    }
+    ID3D11Device_GetImmediateContext( device, &context );
+    for (i = 0; i < n; i++)
+        ID3D11DeviceContext_CopySubresourceRegion( context, (ID3D11Resource *)*atlas, 0, placed[i].x, placed[i].y, 0,
+                                                   (ID3D11Resource *)placed[i].surface->texture, 0, NULL );
+    if (SUCCEEDED( ID3D11DeviceContext_Map( context, (ID3D11Resource *)*atlas, 0, D3D11_MAP_READ, 0, &map ) ))
+    {
+        for (i = 0; i < n; i++)
+        {
+            struct drawing_surface *surface = placed[i].surface;
+            if (!surface_ensure_cache( surface, placed[i].w, placed[i].h, bpp )) continue;
+            for (row = 0; row < placed[i].h; row++)
+                memcpy( surface->cache + (size_t)row * placed[i].w * bpp,
+                        (BYTE *)map.pData + (size_t)(placed[i].y + row) * map.RowPitch + placed[i].x * bpp, placed[i].w * bpp );
+            surface->opaque = bpp == 4 && bits_opaque( surface->cache, placed[i].w, placed[i].h );
+            surface->cache_valid = TRUE;
+            surface->generation = InterlockedIncrement( &content_generation );
+        }
+        ID3D11DeviceContext_Unmap( context, (ID3D11Resource *)*atlas, 0 );
+        perf.batched += n;
+        perf.batches++;
+    }
+    ID3D11DeviceContext_Release( context );
+    ID3D11Device_Release( device );
+}
+
+static void readback_batch( void )
+{
+    struct drawing_surface *list[512];
+    unsigned int i, count;
+
+    EnterCriticalSection( &readback_cs );
+    count = readback_pending_count;
+    memcpy( list, readback_pending, count * sizeof(*list) );
+    for (i = 0; i < count; i++) list[i]->readback_queued = FALSE;
+    readback_pending_count = 0;
+    /* keep the surfaces alive while they are read: Release waits for readback_cs to unlist them */
+    for (i = 0; i < count; i++) InterlockedIncrement( &list[i]->ref );
+    LeaveCriticalSection( &readback_cs );
+    if (!count) return;
+    readback_batch_format( list, count, DXGI_FORMAT_B8G8R8A8_UNORM, 4 );
+    readback_batch_format( list, count, DXGI_FORMAT_A8_UNORM, 1 );
+    for (i = 0; i < count; i++) surface_Release( &list[i]->vtbl );
+}
+
+static const BYTE *surface_cached_pixels( struct drawing_surface *surface, D3D11_TEXTURE2D_DESC *desc )
+{
+    LARGE_INTEGER rb0 = {{0}};
+    ID3D11DeviceContext *context = NULL;
+    D3D11_TEXTURE2D_DESC staging_desc;
+    ID3D11Texture2D *staging = NULL;
+    D3D11_MAPPED_SUBRESOURCE map;
+    unsigned int bpp, row;
+    BOOL copied = FALSE;
+
+    ID3D11Device *device;
+
+    if (surface) surface_sync_swapchain( surface );
+    if (!surface || (!surface->texture && !surface->swapchain)) return NULL;
+    if (surface->swapchain)
+    {
+        /* filled in by the readback thread; whatever frame is current, or nothing yet */
+        if (!surface->cache_valid || !surface->cache) return NULL;
+        memset( desc, 0, sizeof(*desc) );
+        desc->Width = surface->cache_w;
+        desc->Height = surface->cache_h;
+        desc->Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        return surface->cache;
+    }
+    ID3D11Texture2D_GetDesc( surface->texture, desc );
+    if (desc->Format == DXGI_FORMAT_B8G8R8A8_UNORM) bpp = 4;
+    else if (desc->Format == DXGI_FORMAT_A8_UNORM) bpp = 1;
+    else return NULL;
+    if (surface->cache_valid && surface->cache && surface->cache_w == desc->Width &&
+        surface->cache_h == desc->Height && surface->cache_bpp == bpp)
+        return surface->cache;
+
+    if (!surface_ensure_cache( surface, desc->Width, desc->Height, bpp )) return NULL;
+
+    /* the texture's own device: a swap chain's buffers live on the app's device */
+    ID3D11Texture2D_GetDevice( surface->texture, &device );
+    if (surface->staging)
+    {
+        D3D11_TEXTURE2D_DESC have;
+        ID3D11Texture2D_GetDesc( surface->staging, &have );
+        if (have.Width != desc->Width || have.Height != desc->Height || have.Format != desc->Format)
+        {
+            ID3D11Texture2D_Release( surface->staging );
+            surface->staging = NULL;
+        }
+    }
+    if (!surface->staging)
+    {
+        staging_desc = *desc;
+        staging_desc.Usage = D3D11_USAGE_STAGING;
+        staging_desc.BindFlags = 0;
+        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging_desc.MiscFlags = 0;
+        if (FAILED( ID3D11Device_CreateTexture2D( device, &staging_desc, NULL, &surface->staging ) ))
+        {
+            surface->staging = NULL;
+            ID3D11Device_Release( device );
+            return NULL;
+        }
+    }
+    staging = surface->staging;
+    ID3D11Device_GetImmediateContext( device, &context );
+    ID3D11Device_Release( device );
+    if (TRACE_ON(dcomp)) QueryPerformanceCounter( &rb0 );
+    ID3D11DeviceContext_CopyResource( context, (ID3D11Resource *)staging, (ID3D11Resource *)surface->texture );
+    if (SUCCEEDED( ID3D11DeviceContext_Map( context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map ) ))
+    {
+        for (row = 0; row < desc->Height; row++)
+            memcpy( surface->cache + (size_t)row * desc->Width * bpp, (BYTE *)map.pData + (size_t)row * map.RowPitch,
+                    desc->Width * bpp );
+        ID3D11DeviceContext_Unmap( context, (ID3D11Resource *)staging, 0 );
+        copied = TRUE;
+    }
+    if (TRACE_ON(dcomp))
+    {
+        LARGE_INTEGER rb1, freq;
+        QueryPerformanceCounter( &rb1 ); QueryPerformanceFrequency( &freq );
+        readback_ms += (rb1.QuadPart - rb0.QuadPart) * 1000.0 / freq.QuadPart;
+    }
+    ID3D11DeviceContext_Release( context );
+    if (!copied) return NULL;
+    surface->opaque = bpp == 4 && bits_opaque( surface->cache, desc->Width, desc->Height );
+    surface->cache_valid = TRUE;
+    surface->generation = InterlockedIncrement( &content_generation );
+    TRACE( "surface %p %ux%u cached.\n", surface, desc->Width, desc->Height );
+    return surface->cache;
+}
+
+/* One memory DC for every blend of a frame: creating and deleting one per glyph run was a good
+ * part of the frame time. The painter runs on the UI thread only. */
+static HDC scratch_dc( HDC hdc )
+{
+    static HDC dc;
+    if (!dc) dc = CreateCompatibleDC( hdc );
+    return dc;
+}
+
+static BOOL blit_surface_rect( HDC hdc, struct drawing_surface *surface, int x, int y, int dest_w, int dest_h )
+{
+    D3D11_TEXTURE2D_DESC desc;
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    HDC mem;
+    HBITMAP old;
+    BOOL done = FALSE;
+
+    surface_sync_swapchain( surface );
+    if (!surface->texture && !surface->swapchain) return FALSE;
+    if (!surface_cached_pixels( surface, &desc ) || !surface->cache_dib) return FALSE;   /* masks are not a picture */
+    if (dest_w <= 0) dest_w = desc.Width;
+    if (dest_h <= 0) dest_h = desc.Height;
+    if (dest_w == (int)desc.Width && dest_h == (int)desc.Height &&
+        soft_blend_opaque( hdc, x, y, desc.Width, desc.Height, surface->cache, desc.Width * 4, 255, surface, surface->generation,
+                           surface->opaque ))
+    {
+        TRACE( "blitted surface %p %ux%u directly at %d,%d.\n", surface, desc.Width, desc.Height, x, y );
+        return TRUE;
+    }
+    soft_stretch( x, y, dest_w, dest_h, surface->cache_dib, desc.Width, desc.Height, 255, surface, surface->generation );
+    done = TRUE;
+    (void)mem; (void)old; (void)blend;
+    if (done) TRACE( "blitted surface %p %ux%u to %dx%d at %d,%d.\n", surface, desc.Width, desc.Height, dest_w, dest_h, x, y );
+    return done;
+}
+
+static BOOL blit_surface_scaled( HDC hdc, struct drawing_surface *surface, int x, int y,
+                                 float scale_x, float scale_y )
+{
+    D3D11_TEXTURE2D_DESC desc;
+
+    surface_sync_swapchain( surface );
+    if (surface->swapchain)
+    {
+        if (!surface->cache_valid) return FALSE;
+        desc.Width = surface->cache_w;
+        desc.Height = surface->cache_h;
+    }
+    else if (!surface->texture) return FALSE;
+    else ID3D11Texture2D_GetDesc( surface->texture, &desc );
+    return blit_surface_rect( hdc, surface, x, y, (int)(desc.Width * (scale_x > 0.0f ? scale_x : 1.0f) + 0.5f),
+                              (int)(desc.Height * (scale_y > 0.0f ? scale_y : 1.0f) + 0.5f) );
+}
+
+static HRESULT WINAPI surface_SuspendDraw( void *iface )
+{
+    TRACE( "SuspendDraw.\n" );
+    return S_OK;
+}
+static HRESULT WINAPI surface_ResumeDraw( void *iface )
+{
+    TRACE( "ResumeDraw.\n" );
+    return S_OK;
+}
+static HRESULT WINAPI surface_Scroll( void *iface, const void *offset, const RECT *scroll_rect,
+                                      const RECT *clip_rect )
+{
+    scene_changed();
+    TRACE( "Scroll.\n" );
+    return S_OK;
+}
+
+/* Surfaces carry their own state, so they get a bigger allocation than the generic comp object;
+ * the shared QI/AddRef/Release helpers only touch the three fields the two structs share. */
+static HRESULT create_drawing_surface( UINT w, UINT h, UINT format, UINT alpha, void **out )
+{
+    struct drawing_surface *surface;
+
+    if (!out) return E_POINTER;
+    ensure_typed_vtbls();
+    if (!(surface = calloc( 1, sizeof(*surface) ))) return E_OUTOFMEMORY;
+    surface->vtbl = (const void **)surface_vtbl;
+    surface->kind = "surface";
+    surface->ref = 1;
+    surface->width = w;
+    surface->height = h;
+    surface->format = format;
+    surface->alpha = alpha;
+
+    TRACE( "created surface %p %ux%u fmt %u alpha %u.\n", surface, w, h, format, alpha );
+    *out = &surface->vtbl;
+    return S_OK;
+}
+
+static HRESULT WINAPI surface_factory_CreateSurface( void *iface, UINT w, UINT h, UINT format,
+                                                     UINT alpha, void **out )
+{
+    /* Call site in XAML EnsureResources (RVA 0x1c6548): rcx this, 1, 1, 0x41 in regs,
+     * one stack int (alpha), one stack pointer (out, pre-seeded local). Six args total. */
+    TRACE( "CreateSurface %ux%u fmt %u alpha %u.\n", w, h, format, alpha );
+    return create_drawing_surface( w, h, format, alpha, out );
+}
+
+static HRESULT WINAPI surface_factory_CreateVirtualSurface( void *iface, UINT w, UINT h,
+                                                            UINT format, UINT alpha, void **out )
+{
+    TRACE( "CreateVirtualSurface %ux%u fmt %u alpha %u.\n", w, h, format, alpha );
+    return create_comp_object_vtbl( "virtual surface", surface_vtbl, out );
+}
+
+/* CSurfaceFactory slot 6: Flush */
+static HRESULT WINAPI surface_factory_Flush( void *iface )
+{
+    TRACE( "Flush.\n" );
+    return S_OK;
+}
+
+/* CSurfaceFactory slot 7: the private CreateSurface(w, h, format, alpha, bool, out) overload XAML's
+ * DCompSurface::InitializeSurface uses for text and image surfaces; the bool is passed as a byte. */
+static HRESULT WINAPI surface_factory_CreateSurfaceEx( void *iface, UINT w, UINT h, UINT format,
+                                                       UINT alpha, BOOLEAN flag, void **out )
+{
+    TRACE( "CreateSurface %ux%u fmt %u alpha %u flag %u.\n", w, h, format, alpha, flag );
+    if (!out) return E_POINTER;
+    return create_drawing_surface( w, h, format, alpha, out );
+}
+
+static void ensure_typed_vtbls(void)
+{
+    unsigned i;
+
+    if (InterlockedCompareExchange( &typed_vtbls_ready, 1, 0 ) != 0)
+    {
+        while (!surface_vtbl[0]) Sleep( 0 );
+        return;
+    }
+    surface_factory_vtbl[0] = comp_object_QueryInterface;
+    surface_factory_vtbl[1] = comp_object_AddRef;
+    surface_factory_vtbl[2] = comp_object_Release;
+    /* CSurfaceFactory::CreateSurface(w, h, format, alpha, RemoteGDIContent, out) and
+     * CreateVirtualSurface, from dcomp.pdb; the 1x1 B8G8R8A8 probe call confirmed the
+     * argument order at runtime. */
+    surface_factory_vtbl[3] = surface_factory_CreateSurface;
+    surface_factory_vtbl[4] = surface_factory_CreateVirtualSurface;
+    for (i = 5; i < COMP_OBJECT_SLOTS; i++)
+        surface_factory_vtbl[i] = comp_object_slot_fn( i );
+    /* 5 CreateGradientSurface stays a default slot; 6 Flush, 7 private CreateSurface overload. */
+    surface_factory_vtbl[6] = surface_factory_Flush;
+    surface_factory_vtbl[7] = surface_factory_CreateSurfaceEx;
+
+    surface_vtbl[0] = comp_object_QueryInterface;
+    surface_vtbl[1] = comp_object_AddRef;
+    surface_vtbl[2] = surface_Release;
+    surface_vtbl[3] = surface_BeginDraw;
+    surface_vtbl[4] = surface_EndDraw;
+    surface_vtbl[5] = surface_SuspendDraw;
+    surface_vtbl[6] = surface_ResumeDraw;
+    surface_vtbl[7] = surface_Scroll;
+    for (i = 8; i < COMP_OBJECT_SLOTS; i++)
+        surface_vtbl[i] = comp_object_slot_fn( i );
+    /* IDCompositionSurfaceInternal {5680c979}, the interface XAML's DCompSurface draws through:
+     * slots 3-7 match IDCompositionSurface, then 8 BeginDrawWithGutters, 9 BeginDrawWithClear,
+     * 10 HasValidPixels, 11 Resize, 12 CopySurface (CCompositionSurface vtable in dcomp.pdb). */
+    surface_vtbl[8] = surface_BeginDrawWithGutters;
+    surface_vtbl[9] = surface_BeginDrawWithClear;
+    surface_vtbl[10] = surface_HasValidPixels;
+    surface_vtbl[11] = surface_Resize;
+    surface_vtbl[12] = surface_CopySurface;
+
+    surface_brush_vtbl[0] = comp_object_QueryInterface;
+    surface_brush_vtbl[1] = comp_object_AddRef;
+    surface_brush_vtbl[2] = comp_object_Release;
+    for (i = 3; i < COMP_OBJECT_SLOTS; i++)
+        surface_brush_vtbl[i] = comp_object_slot_fn( i );
+    comp_object_set_inspectable( surface_brush_vtbl );
+    surface_brush_vtbl[12] = surface_brush_get_Surface;
+    surface_brush_vtbl[13] = surface_brush_put_Surface;
+
+    drop_shadow_vtbl[0] = comp_object_QueryInterface;
+    drop_shadow_vtbl[1] = comp_object_AddRef;
+    drop_shadow_vtbl[2] = drop_shadow_Release;
+    for (i = 3; i < COMP_OBJECT_SLOTS; i++)
+        drop_shadow_vtbl[i] = comp_object_slot_fn( i );
+    comp_object_set_inspectable( drop_shadow_vtbl );
+    drop_shadow_vtbl[6] = drop_shadow_get_BlurRadius;
+    drop_shadow_vtbl[7] = drop_shadow_put_BlurRadius;
+    drop_shadow_vtbl[8] = drop_shadow_get_Color;
+    drop_shadow_vtbl[9] = drop_shadow_put_Color;
+    drop_shadow_vtbl[10] = drop_shadow_get_Mask;
+    drop_shadow_vtbl[11] = drop_shadow_put_Mask;
+    drop_shadow_vtbl[12] = drop_shadow_get_Offset;
+    drop_shadow_vtbl[13] = drop_shadow_put_Offset;
+    drop_shadow_vtbl[14] = drop_shadow_get_Opacity;
+    drop_shadow_vtbl[15] = drop_shadow_put_Opacity;
+
+    expression_animation_vtbl[0] = comp_object_QueryInterface;
+    expression_animation_vtbl[1] = comp_object_AddRef;
+    expression_animation_vtbl[2] = comp_object_Release;
+    expression_animation_vtbl[3] = expression_animation_CreateAnimatorPartner;
+    for (i = 4; i < COMP_OBJECT_SLOTS; i++)
+        expression_animation_vtbl[i] = comp_object_slot_fn( i );
+    /* Publish last so waiters never observe half-filled tables. */
+    surface_vtbl[0] = comp_object_QueryInterface;
+}
+
+static HRESULT create_comp_object_vtbl( const char *kind, void **vtbl, void **out )
+{
+    /* The typed objects share the recording layout only in their first three fields: clone them
+     * (the default slot's out-pointer answer) through their own constructors. */
+    if (vtbl == expr_animation_vtbl) return create_expr_animation( out );
+    if (vtbl == matrix_transform_vtbl) return create_matrix_transform( out );
+    if (vtbl == manip_transform_vtbl) return create_manip_transform( NULL, out );
+    if (vtbl == kf_animation_vtbl) return create_comp_object( kind, out );
+    if (vtbl == sprite_shape_vtbl) return create_comp_shape( FALSE, NULL, out );
+    if (vtbl == container_shape_vtbl) return create_comp_shape( TRUE, NULL, out );
+    if (vtbl == path_geometry_vtbl) return create_path_geometry( NULL, out );
+
+    struct comp_object *object;
+
+    if (!out) return E_POINTER;
+    if (!vtbl) return create_comp_object( kind, out );
+    ensure_typed_vtbls();
+    if (!(object = calloc( 1, sizeof(*object) ))) return E_OUTOFMEMORY;
+    object->vtbl = (const void **)vtbl;
+    object->kind = kind;
+    object->ref = 1;
+
+    TRACE( "created %s %p.\n", kind, object );
+    *out = &object->vtbl;
+    return S_OK;
+}
+
+/* Slots take their arguments by position: on x86-64 a float argument uses its own register class,
+ * so declaring one as a pointer only garbles that argument, never the position of the out one. */
+#define DEVICE_OK(name, args, ...)                                                                 \
+    static HRESULT WINAPI device_##name args                                                       \
+    {                                                                                              \
+        TRACE( #name ": ignored.\n" );                                                             \
+        return S_OK;                                                                               \
+    }
+#define DEVICE_STUB(name, args)                                                                    \
+    static HRESULT WINAPI device_##name args                                                       \
+    {                                                                                              \
+        FIXME( #name ": stub.\n" );                                                                \
+        return E_NOTIMPL;                                                                          \
+    }
+#define DEVICE_CREATE1(name)                                                                       \
+    static HRESULT WINAPI device_##name( void *iface, void **out )                                 \
+    {                                                                                              \
+        TRACE( #name ".\n" );                                                                      \
+        return create_comp_object( #name, out );                                                   \
+    }
+#define DEVICE_CREATE2(name)                                                                       \
+    static HRESULT WINAPI device_##name( void *iface, void *a, void **out )                        \
+    {                                                                                              \
+        TRACE( #name ".\n" );                                                                      \
+        return create_comp_object( #name, out );                                                   \
+    }
+#define DEVICE_CREATE3(name)                                                                       \
+    static HRESULT WINAPI device_##name( void *iface, void *a, void *b, void **out )               \
+    {                                                                                              \
+        TRACE( #name ".\n" );                                                                      \
+        return create_comp_object( #name, out );                                                   \
+    }
+#define DEVICE_CREATE5(name)                                                                       \
+    static HRESULT WINAPI device_##name( void *iface, void *a, void *b, void *c, void *d,          \
+                                         void **out )                                              \
+    {                                                                                              \
+        TRACE( #name ".\n" );                                                                      \
+        return create_comp_object( #name, out );                                                   \
+    }
+
+/* IDCompositionDeviceInternal {6b556968-...}: XAML's DCompTreeHost hints at the atlas size and
+ * tracks commit batches through it. Names and order come from InteropCompositor::Api's
+ * IDCompositionDeviceInternal vtable in dcomp.pdb. */
+static HRESULT WINAPI internal_QueryInterface( void *iface, REFIID iid, void **out );
+static ULONG WINAPI internal_AddRef( void *iface );
+static ULONG WINAPI internal_Release( void *iface );
+
+static HRESULT WINAPI internal_HintSize( void *iface, UINT width, UINT height )
+{
+    TRACE( "%ux%u: ignored.\n", width, height );
+    return S_OK;
+}
+
+static HRESULT WINAPI internal_HintTiles( void *iface, const RECT *rects, UINT count )
+{
+    TRACE( "%u rects: ignored.\n", count );
+    return S_OK;
+}
+
+static HRESULT WINAPI internal_SetCommitCompletionEvent( void *iface, HANDLE event )
+{
+    TRACE( "event %p.\n", event );
+    /* nothing is composed yet, so a commit is complete as soon as it is asked for */
+    if (event) SetEvent( event );
+    return S_OK;
+}
+
+static HRESULT WINAPI internal_TelemetrySetApplicationId( void *iface, USHORT id, const WCHAR *name )
+{
+    TRACE( "id %u, name %s: ignored.\n", id, debugstr_w(name) );
+    return S_OK;
+}
+
+static LONG internal_batch_id;
+
+static HRESULT WINAPI internal_GetCurrentBatchId( void *iface, ULONG *batch_id )
+{
+    if (!batch_id) return E_POINTER;
+    *batch_id = InterlockedIncrement( &internal_batch_id );
+    return S_OK;
+}
+
+static HRESULT WINAPI internal_GetFrameIdFromBatchId( void *iface, ULONG batch_id, UINT64 *frame_id )
+{
+    if (!frame_id) return E_POINTER;
+    *frame_id = batch_id;
+    return S_OK;
+}
+
+static const void *internal_device_vtbl[] =
+{
+    internal_QueryInterface, internal_AddRef, internal_Release,
+    internal_HintSize, internal_HintTiles, internal_SetCommitCompletionEvent,
+    internal_TelemetrySetApplicationId, internal_GetCurrentBatchId, internal_GetFrameIdFromBatchId,
+};
+
+static HRESULT WINAPI device_QueryInterface( void *iface, REFIID iid, void **out );
+static ULONG WINAPI device_AddRef( void *iface );
+static ULONG WINAPI device_Release( void *iface );
+
+static HRESULT WINAPI device_Commit( void *iface )
+{
+    TRACE( "Commit.\n" );
+    if (last_desktop_hwnd) present_desktop_hwnd( last_desktop_hwnd );
+    return S_OK;
+}
+DEVICE_OK( WaitForCommitCompletion, ( void *iface ) )
+
+static HRESULT WINAPI device_GetFrameStatistics( void *iface, DCOMPOSITION_FRAME_STATISTICS *stats )
+{
+    LARGE_INTEGER now, frequency;
+
+    TRACE( "stats %p.\n", stats );
+
+    if (!stats) return E_POINTER;
+    QueryPerformanceCounter( &now );
+    QueryPerformanceFrequency( &frequency );
+    stats->lastFrameTime = now;
+    stats->currentCompositionRate.Numerator = 60;
+    stats->currentCompositionRate.Denominator = 1;
+    stats->currentTime = now;
+    stats->timeFrequency = frequency;
+    stats->nextEstimatedFrameTime = now;
+    return S_OK;
+}
+
+/* CreateVisual is partner-device slot 6 (vtbl+0x30). CloseAndReleaseInteropCompositor calls that
+ * offset as RealClose with no out-pointer; returning E_POINTER there fail-fasts the view. */
+/* Interop IDCompositionVisual — OneCore XAML builds the HW tree with these, not WinRT sprites. */
+struct dcomp_visual
+{
+    const void **vtbl;
+    LONG ref;
+    float offset_x, offset_y, width, height, opacity;
+    float transform_x, transform_y;          /* translation from SetTransform(D2D_MATRIX_3X2_F) */
+    struct matrix_transform *manip;          /* "TransformMatrix" expression bound to a manipulation transform */
+    struct expr_animation *transform_expr;   /* "TransformMatrix" expression over property sets, evaluated when painting */
+    struct expr_animation *opacity_expr;     /* "Opacity" bound to a property ("PS.Opacity"), read when painting */
+    float scale_x, scale_y;                  /* axis-aligned scale from the same matrix; 0 = unset */
+    BOOL has_clip;
+    float clip_left, clip_top, clip_right, clip_bottom;   /* SetClip(D2D_RECT_F), local space */
+    IUnknown *content;
+    /* Children bottom-to-top. Each is an IDCompositionVisual of ours (dcv) or a public WinRT visual
+     * (pub, its private interop view); keeping both in one list preserves their relative z-order. */
+    struct dcv_child { struct dcomp_visual *dcv; void *pub; } *children;
+    unsigned int child_capacity;
+    unsigned child_count;
+    ICompositor *compositor;     /* owner of the device that created this visual, may be NULL */
+    const void **object_vtbl;    /* ICompositionObject view, see dcv_object_vtbl */
+    const void **ivisual_vtbl;   /* Windows.UI.Composition.IVisual view, see dcv_ivisual_vtbl */
+    const void **object2_vtbl;   /* ICompositionObject2 view, see dcv_object2_vtbl */
+    const void **closable_vtbl;  /* Windows.Foundation.IClosable view, see dcv_closable_vtbl */
+    HSTRING comment;
+    BOOL hidden;                 /* IVisual::put_IsVisible(FALSE) */
+    IUnknown *clip_object;       /* IVisual::put_Clip, kept for get_Clip, not applied */
+    Vector2 anchor;
+    Vector3 center, scale3, rotation_axis;
+    Quaternion orientation;
+    FLOAT rotation;
+    Matrix4x4 transform4;
+    ICompositionPropertySet *properties;
+};
+
+static HRESULT create_property_set( ICompositionPropertySet **out );
+
+static const void *dcomp_visual_vtbl[];
+static const void *visual_interop_vtbl[];
+static const void *dcv_ivisual_vtbl[];
+static const void *dcv_object_vtbl[];
+static const void *dcv_object2_vtbl[];
+static HRESULT inspectable_get_iids( ULONG *count, IID **iids );
+static HRESULT inspectable_trust( TrustLevel *level );
+
+/* Any interface pointer of one of our interop visuals: IDCompositionVisual, its IVisual view or its
+ * ICompositionObject view. XAML uses all three interchangeably. */
+static struct dcomp_visual *dcv_from_any( void *p )
+{
+    const void **vtbl;
+
+    if (!p) return NULL;
+    vtbl = *(const void ***)p;
+    if (vtbl == dcomp_visual_vtbl) return CONTAINING_RECORD( p, struct dcomp_visual, vtbl );
+    if (vtbl == dcv_ivisual_vtbl) return CONTAINING_RECORD( p, struct dcomp_visual, ivisual_vtbl );
+    if (vtbl == dcv_object_vtbl) return CONTAINING_RECORD( p, struct dcomp_visual, object_vtbl );
+    if (vtbl == dcv_object2_vtbl) return CONTAINING_RECORD( p, struct dcomp_visual, object2_vtbl );
+    return NULL;
+}
+
+static struct dcomp_visual *dcomp_visuals[512];
+static unsigned dcomp_visual_count;
+static CRITICAL_SECTION dcomp_visual_cs;
+static CRITICAL_SECTION_DEBUG dcomp_visual_cs_debug =
+{
+    0, 0, &dcomp_visual_cs,
+    { &dcomp_visual_cs_debug.ProcessLocksList, &dcomp_visual_cs_debug.ProcessLocksList },
+    0, 0, { (DWORD_PTR)(__FILE__ ": dcomp_visual_cs") }
+};
+static CRITICAL_SECTION dcomp_visual_cs = { &dcomp_visual_cs_debug, -1, 0, 0, 0, 0 };
+static BOOL dcomp_visual_has_parent[512];
+/* Root of the hwnd target (IDCompositionTarget::SetRoot); only this tree is shown when set. */
+static struct dcomp_visual *dcomp_target_root;
+
+static struct dcomp_visual *dcomp_visual_from( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct dcomp_visual, vtbl );
+}
+
+static const GUID IID_ILayerVisual_local =
+    { 0xaf843985, 0x0444, 0x4887, { 0x8e, 0x83, 0xb4, 0x0b, 0x25, 0x3f, 0x82, 0x2c } };
+static const GUID IID_ICompositionObject2_local =
+    { 0xef874ea1, 0x5cff, 0x4b68, { 0x9e, 0x30, 0xa1, 0x51, 0x9d, 0x08, 0xba, 0x03 } };
+
+static HRESULT WINAPI dcv_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    static const GUID IID_visual = { 0x4d93059d, 0x097b, 0x4651, { 0x9a, 0x60, 0xf0, 0xf2, 0x51, 0x16, 0xe2, 0xf3 } };
+    static const GUID IID_visual2 = { 0xe8de1639, 0x4331, 0x4b26, { 0xbc, 0x5f, 0x6a, 0x32, 0x1d, 0x34, 0x7a, 0x85 } };
+    static const GUID IID_partner_a = { 0xfa92376b, 0x164b, 0x432a, { 0xbf, 0x53, 0xc7, 0xfe, 0x2d, 0x51, 0xca, 0xbc } };
+    static const GUID IID_partner_b = { 0x117e202d, 0xa859, 0x4c89, { 0x87, 0x3b, 0xc2, 0xaa, 0x56, 0x67, 0x88, 0xe3 } };
+    static const GUID IID_partner_c = { 0x2c4eef28, 0x1bc0, 0x4736, { 0xb7, 0xdd, 0xb6, 0x26, 0x92, 0xf9, 0xbd, 0x67 } };
+    static const GUID IID_visual_dbg = { 0x5bad5172, 0x74e2, 0x4f57, { 0x8e, 0x5b, 0x8f, 0xad, 0x63, 0xe1, 0xd1, 0xb6 } };
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+
+    TRACE( "iid %s.\n", debugstr_guid(iid) );
+
+    /* ElementCompositionPreview hands the element's interop visual to WinUI, which asks it for
+     * ICompositionObject and calls get_Compositor. Answered with this vtable that call ran SetOffsetY
+     * (slot 6), left WinUI holding a NULL compositor, and crashed it at the first Create* call. Give
+     * that interface its own view. IVisual and everything else must stay this object: XAML queries its
+     * interop visuals for IVisual, keeps the result, and later queries that for private interfaces only
+     * the interop visual answers. */
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+    {
+        struct dcomp_visual *v = dcomp_visual_from( iface );
+
+        InterlockedIncrement( &v->ref );
+        *out = &v->object_vtbl;
+        return S_OK;
+    }
+    /* {117e202d} is Windows.UI.Composition.IVisual. XAML drives its interop visuals through it
+     * (put_Offset, put_Size, put_Clip, ...); answered with the IDCompositionVisual vtable, get_Clip
+     * landed on SetClip(rect), put_Clip on SetContent and put_Size on SetWidth, and every offset and
+     * size was lost. */
+    if (IsEqualGUID( iid, &IID_IVisual ))
+    {
+        struct dcomp_visual *v = dcomp_visual_from( iface );
+
+        InterlockedIncrement( &v->ref );
+        *out = &v->ivisual_vtbl;
+        return S_OK;
+    }
+    /* ILayerVisual {af843985}: native interop visuals are not layer visuals, and XAML's
+     * HWCompTreeNodeWinRT::UpdatePrimaryVisual branches on this query. */
+    if (IsEqualGUID( iid, &IID_ILayerVisual_local ))
+    {
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    /* ICompositionObject2 {ef874ea1}: answered with the IDCompositionVisual vtable, get_ImplicitAnimations
+     * (slot 8) ran SetTransform(matrix) on an out pointer. */
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_local ))
+    {
+        struct dcomp_visual *v = dcomp_visual_from( iface );
+
+        InterlockedIncrement( &v->ref );
+        *out = &v->object2_vtbl;
+        return S_OK;
+    }
+
+    /* IClosable: the catch-all below would hand out the IDCompositionVisual vtable, whose slot 6 is a
+     * setter, not Close. */
+    if (IsEqualGUID( iid, &IID_IClosable ))
+    {
+        struct dcomp_visual *v = dcomp_visual_from( iface );
+
+        InterlockedIncrement( &v->ref );
+        *out = &v->closable_vtbl;
+        return S_OK;
+    }
+    /* Accept any other IID: the old recording stub did this, and rejecting partner IIDs
+     * (e.g. {92179cc0}) fail-fasts with E_NOINTERFACE from CalculatorApp. */
+    (void)IID_visual; (void)IID_visual2; (void)IID_partner_a; (void)IID_partner_b;
+    (void)IID_partner_c; (void)IID_visual_dbg;
+    InterlockedIncrement( &dcomp_visual_from( iface )->ref );
+    *out = iface;
+    return S_OK;
+}
+static ULONG WINAPI dcv_AddRef( void *iface )
+{
+    return InterlockedIncrement( &dcomp_visual_from( iface )->ref );
+}
+static ULONG WINAPI dcv_Release( void *iface )
+{
+    struct dcomp_visual *v = dcomp_visual_from( iface );
+    ULONG ref = InterlockedDecrement( &v->ref );
+    if (!ref)
+    {
+        unsigned i;
+        if (v->content) IUnknown_Release( v->content );
+        if (v->manip) comp_object_Release( &v->manip->vtbl );
+        if (v->clip_object) IUnknown_Release( v->clip_object );
+        if (v->transform_expr) IUnknown_Release( (IUnknown *)&v->transform_expr->vtbl );
+        WindowsDeleteString( v->comment );
+        if (v->properties) ICompositionPropertySet_Release( v->properties );
+        if (v->compositor) ICompositor_Release( v->compositor );
+        for (i = 0; i < v->child_count; i++)
+        {
+            if (v->children[i].dcv) dcv_Release( &v->children[i].dcv->vtbl );
+            if (v->children[i].pub) IUnknown_Release( (IUnknown *)v->children[i].pub );
+        }
+        free( v->children );
+        free( v );
+    }
+    return ref;
+}
+static struct dcomp_visual *dcomp_visual_from_object( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct dcomp_visual, object_vtbl );
+}
+static HRESULT WINAPI dcv_object_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return dcv_QueryInterface( &dcomp_visual_from_object( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI dcv_object_AddRef( void *iface )
+{
+    return dcv_AddRef( &dcomp_visual_from_object( iface )->vtbl );
+}
+static ULONG WINAPI dcv_object_Release( void *iface )
+{
+    return dcv_Release( &dcomp_visual_from_object( iface )->vtbl );
+}
+static HRESULT WINAPI dcv_object_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_object_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.ContainerVisual";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI dcv_object_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+/* ICompositionObject::get_Compositor */
+static HRESULT WINAPI dcv_object_get_Compositor( void *iface, ICompositor **value )
+{
+    struct dcomp_visual *v = dcomp_visual_from_object( iface );
+
+    TRACE( "%p -> compositor %p.\n", v, v->compositor );
+    if (!value) return E_POINTER;
+    if ((*value = v->compositor)) ICompositor_AddRef( *value );
+    return S_OK;
+}
+/* ICompositionObject::get_Dispatcher */
+static HRESULT WINAPI dcv_object_get_Dispatcher( void *iface, void **value )
+{
+    if (!value) return E_POINTER;
+    *value = NULL;
+    return S_OK;
+}
+/* ICompositionObject::get_Properties */
+static HRESULT WINAPI dcv_object_get_Properties( void *iface, ICompositionPropertySet **value )
+{
+    struct dcomp_visual *v = dcomp_visual_from_object( iface );
+    ICompositionPropertySet *set;
+    HRESULT hr;
+
+    if (!value) return E_POINTER;
+    if (!v->properties)
+    {
+        if (FAILED(hr = create_property_set( &set ))) return hr;
+        if (InterlockedCompareExchangePointer( (void **)&v->properties, set, NULL ))
+            ICompositionPropertySet_Release( set );
+    }
+    ICompositionPropertySet_AddRef( (*value = v->properties) );
+    return S_OK;
+}
+/* ICompositionObject::StartAnimation / StopAnimation: accepted, not run */
+static HRESULT WINAPI dcv_object_StartAnimation( void *iface, HSTRING name, void *animation )
+{
+    scene_changed();
+    struct dcomp_visual *v = dcomp_visual_from_object( iface );
+    struct kf_animation *kf = kf_animation_from( animation );
+    const WCHAR *prop = WindowsGetStringRawBuffer( name, NULL );
+
+    TRACE( "%p, %s, %p.\n", iface, debugstr_w( prop ), animation );
+    TRACE_(dcompanim)( "dcomp visual %p %s <- %s\n", v, debugstr_w( prop ), debugstr_animation( animation ) );
+    if (kf && kf->has_value && kf->value_kind == KF_SCALAR && prop && !wcsicmp( prop, L"Opacity" )) v->opacity = kf->scalar;
+    /* XAML's storyboards drive an element's opacity through a property set: the visual's Opacity follows
+     * "PS.Opacity", which XAML sets to the target before starting the animation. NavigationView item selection
+     * indicators hide that way; dropping the binding left every indicator ever selected visible. */
+    if (prop && !wcsicmp( prop, L"Opacity" ))
+    {
+        struct expr_animation *expr = expr_animation_from_any( animation );
+        if (expr) IUnknown_AddRef( (IUnknown *)&expr->vtbl );
+        if (v->opacity_expr) IUnknown_Release( (IUnknown *)&v->opacity_expr->vtbl );
+        v->opacity_expr = expr;
+    }
+    if (kf && kf->has_value && kf->value_kind == KF_VECTOR3 && prop && !wcsicmp( prop, L"Offset" ))
+    {
+        v->offset_x = kf->vector3.X;
+        v->offset_y = kf->vector3.Y;
+    }
+    if (kf && kf->has_value && kf->value_kind == KF_SCALAR && prop && !wcsicmp( prop, L"Offset.X" )) v->offset_x = kf->scalar;
+    if (kf && kf->has_value && kf->value_kind == KF_SCALAR && prop && !wcsicmp( prop, L"Offset.Y" )) v->offset_y = kf->scalar;
+    if (prop && !wcsicmp( prop, L"TransformMatrix" ))
+    {
+        struct matrix_transform *m = manip_matrix_from_animation( animation );
+        struct expr_animation *expr = expr_animation_from_any( animation );
+        if (m)
+        {
+            InterlockedIncrement( &m->ref );
+            if (v->manip) comp_object_Release( &v->manip->vtbl );
+            v->manip = m;
+            TRACE( "visual %p follows manipulation transform %p.\n", v, m );
+        }
+        if (expr)
+        {
+            IUnknown_AddRef( (IUnknown *)&expr->vtbl );
+            if (v->transform_expr) IUnknown_Release( (IUnknown *)&v->transform_expr->vtbl );
+            v->transform_expr = expr;
+            TRACE( "visual %p transform follows expression %s.\n", v, debugstr_w( expr->expression ) );
+        }
+    }
+    return S_OK;
+}
+static void dcv_clear_opacity_expr( struct dcomp_visual *v )
+{
+    if (!v->opacity_expr) return;
+    IUnknown_Release( (IUnknown *)&v->opacity_expr->vtbl );
+    v->opacity_expr = NULL;
+}
+static HRESULT WINAPI dcv_object_StopAnimation( void *iface, HSTRING name )
+{
+    struct dcomp_visual *v = dcomp_visual_from_object( iface );
+    const WCHAR *prop = WindowsGetStringRawBuffer( name, NULL );
+
+    scene_changed();
+    if (prop && !wcsicmp( prop, L"Opacity" ) && v->opacity_expr)
+    {
+        /* the animation stops at its current value */
+        struct propset_value *value = expr_resolve_value( &v->opacity_expr->vtbl, PROP_SCALAR );
+        if (value) v->opacity = value->u.scalar;
+        dcv_clear_opacity_expr( v );
+    }
+    return S_OK;
+}
+
+static const void *dcv_object_vtbl[] =
+{
+    dcv_object_QueryInterface, dcv_object_AddRef, dcv_object_Release,
+    dcv_object_GetIids, dcv_object_GetRuntimeClassName, dcv_object_GetTrustLevel,
+    dcv_object_get_Compositor, dcv_object_get_Dispatcher, dcv_object_get_Properties,
+    dcv_object_StartAnimation, dcv_object_StopAnimation,
+};
+
+static HRESULT WINAPI dcv_ok( void *iface )
+{
+    /* Report which slot reached this no-op, decoded from the caller's call site. */
+    const unsigned char *ip = __builtin_return_address( 0 );
+    int slot = -1;
+
+    __TRY
+    {
+        if (ip[-5] == 0xe8)                                          /* mov rax,[rax+disp]; call guard thunk */
+        {
+            if (ip[-9] == 0x48 && ip[-8] == 0x8b && ip[-7] == 0x40) slot = ip[-6] / sizeof(void *);
+            else if (ip[-12] == 0x48 && ip[-11] == 0x8b && ip[-10] == 0x80)
+            {
+                LONG32 d32;
+                memcpy( &d32, ip - 9, sizeof(d32) );
+                slot = d32 / (int)sizeof(void *);
+            }
+        }
+        else if (ip[-6] == 0xff && ip[-5] == 0x15)                  /* CFG dispatch */
+        {
+            if (ip[-10] == 0x48 && ip[-9] == 0x8b && ip[-8] == 0x40) slot = ip[-7] / sizeof(void *);
+            else if (ip[-13] == 0x48 && ip[-12] == 0x8b && ip[-11] == 0x80)
+            {
+                LONG32 d32;
+                memcpy( &d32, ip - 10, sizeof(d32) );
+                slot = d32 / (int)sizeof(void *);
+            }
+        }
+        else if (ip[-3] == 0xff && (ip[-2] & 0xc7) == 0x50) slot = ip[-1] / sizeof(void *);   /* call [reg+disp8] */
+        else if (ip[-6] == 0xff && (ip[-5] & 0xc7) == 0x90)                                  /* call [reg+disp32] */
+        {
+            LONG32 d32;
+            memcpy( &d32, ip - 4, sizeof(d32) );
+            slot = d32 / (int)sizeof(void *);
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        slot = -2;
+    }
+    __ENDTRY
+    TRACE( "%p no-op slot %d.\n", iface, slot );
+    return S_OK;
+}
+static HRESULT WINAPI dcv_SetOffsetX( void *iface, float x )
+{
+    scene_changed();
+    dcomp_visual_from( iface )->offset_x = x;
+    TRACE( "%p x %f.\n", iface, x );
+    return S_OK;
+}
+static HRESULT WINAPI dcv_SetOffsetY( void *iface, float y )
+{
+    scene_changed();
+    dcomp_visual_from( iface )->offset_y = y;
+    TRACE( "%p y %f.\n", iface, y );
+    return S_OK;
+}
+static HRESULT WINAPI dcv_SetWidth( void *iface, float w )
+{
+    scene_changed();
+    dcomp_visual_from( iface )->width = w;
+    TRACE( "%p w %f.\n", iface, w );
+    return S_OK;
+}
+static HRESULT WINAPI dcv_SetHeight( void *iface, float h )
+{
+    scene_changed();
+    dcomp_visual_from( iface )->height = h;
+    TRACE( "%p h %f.\n", iface, h );
+    return S_OK;
+}
+static HRESULT WINAPI dcv_SetOpacity( void *iface, float o )
+{
+    scene_changed();
+    dcomp_visual_from( iface )->opacity = o;
+    dcv_clear_opacity_expr( dcomp_visual_from( iface ) );
+    return S_OK;
+}
+static HRESULT WINAPI dcv_SetContent( void *iface, IUnknown *content )
+{
+    scene_changed();
+    struct dcomp_visual *v = dcomp_visual_from( iface );
+    IDXGISwapChain *chain;
+    void *surface;
+
+    TRACE( "%p content %p.\n", iface, content );
+    if (content && SUCCEEDED( IUnknown_QueryInterface( content, &IID_IDXGISwapChain, (void **)&chain ) ))
+    {
+        /* XAML's SwapChainPanel hands the DXGI swap chain itself; the painter wants a surface */
+        HRESULT hr = create_swapchain_surface( content, &surface );
+        IDXGISwapChain_Release( chain );
+        if (FAILED( hr )) return hr;
+        if (v->content) IUnknown_Release( v->content );
+        v->content = surface;
+        return S_OK;
+    }
+    if (content) IUnknown_AddRef( content );
+    if (v->content) IUnknown_Release( v->content );
+    v->content = content;
+    return S_OK;
+}
+static int dcv_child_index( struct dcomp_visual *v, void *child )
+{
+    unsigned i;
+
+    if (!child) return -1;
+    for (i = 0; i < v->child_count; i++)
+        if ((v->children[i].dcv && v->children[i].dcv == dcv_from_any( child )) || v->children[i].pub == child)
+            return i;
+    return -1;
+}
+
+/* Insert an already referenced child at index (clamped). A child that is already present is moved: the
+ * stale entry is dropped together with the reference it held. */
+/* Room for one more child: XAML's Scientific keypad alone puts far more sprites under one container
+ * than any fixed array; a refused insert fail-fasts XAML's render walk on every tick. */
+static BOOL dcv_reserve_child( struct dcomp_visual *v )
+{
+    struct dcv_child *children;
+    unsigned int capacity;
+
+    if (v->child_count < v->child_capacity) return TRUE;
+    capacity = v->child_capacity ? v->child_capacity * 2 : 16;
+    if (!(children = realloc( v->children, capacity * sizeof(*children) ))) return FALSE;
+    v->children = children;
+    v->child_capacity = capacity;
+    return TRUE;
+}
+
+static void dcv_insert_child( struct dcomp_visual *v, struct dcomp_visual *dcv, void *pub, unsigned index )
+{
+    unsigned i;
+
+    if (!dcv_reserve_child( v )) return;
+
+    for (i = 0; i < v->child_count; i++)
+    {
+        if ((dcv && v->children[i].dcv == dcv) || (pub && v->children[i].pub == pub))
+        {
+            if (v->children[i].dcv) dcv_Release( &v->children[i].dcv->vtbl );
+            if (v->children[i].pub) IUnknown_Release( (IUnknown *)v->children[i].pub );
+            memmove( v->children + i, v->children + i + 1, (v->child_count - i - 1) * sizeof(*v->children) );
+            v->child_count--;
+            if (index > i) index--;
+            break;
+        }
+    }
+    if (index > v->child_count) index = v->child_count;
+    memmove( v->children + index + 1, v->children + index, (v->child_count - index) * sizeof(*v->children) );
+    v->children[index].dcv = dcv;
+    v->children[index].pub = pub;
+    v->child_count++;
+    if (dcv)
+    {
+        EnterCriticalSection( &dcomp_visual_cs );
+        for (i = 0; i < dcomp_visual_count; i++)
+            if (dcomp_visuals[i] == dcv) dcomp_visual_has_parent[i] = TRUE;
+        LeaveCriticalSection( &dcomp_visual_cs );
+    }
+}
+
+/* Resolve a child argument to our interop visual or a public visual's interop view, with a reference held. */
+static BOOL dcv_resolve_child( struct dcomp_visual *v, void *child, struct dcomp_visual **dcv, void **pub )
+{
+    *dcv = NULL;
+    *pub = NULL;
+    if ((*dcv = dcv_from_any( child )))
+    {
+        InterlockedIncrement( &(*dcv)->ref );
+        return TRUE;
+    }
+    if (*(const void ***)child == visual_interop_vtbl)
+    {
+        IUnknown_AddRef( (IUnknown *)child );
+        *pub = child;
+        return TRUE;
+    }
+    if (SUCCEEDED( IUnknown_QueryInterface( (IUnknown *)child, &IID_IInteropVisual_private, pub ) ))
+    {
+        /* One of our interop visuals behind some other interface: keep it as an interop child. */
+        if ((*dcv = dcv_from_any( *pub )))
+        {
+            *pub = NULL;
+            return TRUE;
+        }
+        TRACE( "owner %p resolved foreign child %p -> interop %p.\n", v, child, *pub );
+        return TRUE;
+    }
+    TRACE( "child %p uses foreign visual vtbl %p.\n", child, *(const void ***)child );
+    return FALSE;
+}
+
+/* IDCompositionVisual::AddVisual(visual, insertAbove, referenceVisual). With a reference the child goes
+ * directly above or below it; without one, insertAbove places it at the bottom and !insertAbove at the top. */
+static HRESULT WINAPI dcv_AddVisual( void *iface, void *child, BOOL insert_above, void *reference )
+{
+    scene_changed();
+    struct dcomp_visual *v = dcomp_visual_from( iface ), *dcv;
+    int ref_index;
+    unsigned index;
+    void *pub;
+
+    TRACE( "%p child %p above %d ref %p.\n", iface, child, insert_above, reference );
+    if (!child) return E_INVALIDARG;
+    if (!dcv_resolve_child( v, child, &dcv, &pub )) return S_OK;
+    ref_index = dcv_child_index( v, reference );
+    if (ref_index >= 0) index = insert_above ? ref_index + 1 : ref_index;
+    else index = insert_above ? 0 : v->child_count;
+    dcv_insert_child( v, dcv, pub, index );
+    return S_OK;
+}
+
+static void dcv_release_child_at( struct dcomp_visual *v, unsigned i )
+{
+    if (v->children[i].dcv) dcv_Release( &v->children[i].dcv->vtbl );
+    if (v->children[i].pub) IUnknown_Release( (IUnknown *)v->children[i].pub );
+    memmove( v->children + i, v->children + i + 1, (v->child_count - i - 1) * sizeof(*v->children) );
+    v->child_count--;
+}
+
+static HRESULT WINAPI dcv_RemoveVisual( void *iface, void *child )
+{
+    scene_changed();
+    struct dcomp_visual *v = dcomp_visual_from( iface );
+    void *interop = NULL;
+    int i = dcv_child_index( v, child );
+
+    if (i < 0 && child && SUCCEEDED( IUnknown_QueryInterface( (IUnknown *)child, &IID_IInteropVisual_private, &interop ) ))
+    {
+        i = dcv_child_index( v, interop );
+        IUnknown_Release( (IUnknown *)interop );
+    }
+    if (i >= 0) dcv_release_child_at( v, i );
+    else TRACE( "%p: child %p is not here.\n", v, child );
+    return S_OK;
+}
+static HRESULT WINAPI dcv_RemoveAllVisuals( void *iface )
+{
+    scene_changed();
+    struct dcomp_visual *v = dcomp_visual_from( iface );
+    while (v->child_count) dcv_release_child_at( v, v->child_count - 1 );
+    return S_OK;
+}
+
+struct dcv_visual_collection
+{
+    const void **vtbl;
+    const void **iterable_vtbl;
+    struct dcomp_visual *owner;
+    LONG ref;
+};
+
+static HRESULT WINAPI dcvc_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct dcv_visual_collection *collection = CONTAINING_RECORD( iface, struct dcv_visual_collection, vtbl );
+
+    if (!out) return E_POINTER;
+    TRACE( "collection %p iid %s.\n", collection, debugstr_guid( iid ) );
+    if (IsEqualGUID( iid, &IID_IIterableVisual_private ))
+    {
+        InterlockedIncrement( &collection->ref );
+        *out = &collection->iterable_vtbl;
+        return S_OK;
+    }
+    *out = iface;
+    InterlockedIncrement( &collection->ref );
+    return S_OK;
+}
+
+static ULONG WINAPI dcvc_AddRef( void *iface )
+{
+    struct dcv_visual_collection *collection = CONTAINING_RECORD( iface, struct dcv_visual_collection, vtbl );
+    return InterlockedIncrement( &collection->ref );
+}
+
+static ULONG WINAPI dcvc_Release( void *iface )
+{
+    struct dcv_visual_collection *collection = CONTAINING_RECORD( iface, struct dcv_visual_collection, vtbl );
+    ULONG ref = InterlockedDecrement( &collection->ref );
+
+    if (!ref)
+    {
+        dcv_Release( &collection->owner->vtbl );
+        free( collection );
+    }
+    return ref;
+}
+
+static HRESULT WINAPI dcvc_Insert( void *iface, void *child, void *reference, void *unused )
+{
+    scene_changed();
+    struct dcv_visual_collection *collection = CONTAINING_RECORD( iface, struct dcv_visual_collection, vtbl );
+
+    TRACE( "owner %p child %p reference %p.\n",
+           collection->owner, child, reference );
+    (void)unused; (void)reference;
+    {
+        struct dcomp_visual *owner = collection->owner, *dcv;
+        void *pub;
+
+        if (!child) return E_INVALIDARG;
+        if (dcv_resolve_child( owner, child, &dcv, &pub )) dcv_insert_child( owner, dcv, pub, owner->child_count );
+        return S_OK;
+    }
+}
+
+/* Slot 11 is the collection's Remove: it arrives with the child visual and the same two
+ * trailing arguments Insert gets (0x20, 0x30), and only while a tree is being taken apart. */
+static HRESULT WINAPI dcvc_Remove( void *iface, void *child, void *reference, void *unused )
+{
+    scene_changed();
+    struct dcv_visual_collection *collection = CONTAINING_RECORD( iface, struct dcv_visual_collection, vtbl );
+    struct dcomp_visual *owner = collection->owner;
+    unsigned int i;
+
+    TRACE( "owner %p child %p.\n", owner, child );
+    (void)reference; (void)unused;
+    if (!child) return E_INVALIDARG;
+    {
+        void *interop = NULL;
+        int index = dcv_child_index( owner, child );
+
+        if (index < 0 && SUCCEEDED( IUnknown_QueryInterface( (IUnknown *)child, &IID_IInteropVisual_private, &interop ) ))
+        {
+            index = dcv_child_index( owner, interop );
+            IUnknown_Release( (IUnknown *)interop );
+        }
+        if (index >= 0)
+        {
+            dcv_release_child_at( owner, index );
+            return S_OK;
+        }
+    }
+    (void)i;
+    TRACE( "child %p was not in owner %p.\n", child, owner );
+    return S_OK;
+}
+
+/* The collection XAML gets from GetVisualCollection is a WinRT IVisualCollection: 3-5 IInspectable, 6 get_Count,
+ * 7 InsertAbove(child, sibling), 8 InsertAtBottom(child), 9 InsertAtTop(child), 10 InsertBelow(child, sibling),
+ * 11 Remove(child), 12 RemoveAll. Slot 9 used to be a probe: XAML's 33 InsertAtTop calls (the button
+ * content) were dropped, and InsertAtBottom appended instead of prepending. */
+static HRESULT WINAPI dcvc_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI dcvc_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.VisualCollection";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI dcvc_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI dcvc_get_Count( void *iface, INT32 *value )
+{
+    struct dcv_visual_collection *collection = CONTAINING_RECORD( iface, struct dcv_visual_collection, vtbl );
+
+    if (!value) return E_POINTER;
+    *value = collection->owner->child_count;
+    return S_OK;
+}
+static HRESULT dcvc_insert( void *iface, void *child, void *sibling, int where, const char *how )
+{
+    struct dcv_visual_collection *collection = CONTAINING_RECORD( iface, struct dcv_visual_collection, vtbl );
+    struct dcomp_visual *owner = collection->owner, *dcv;
+    unsigned index;
+    int sib;
+    void *pub;
+
+    TRACE( "owner %p %s child %p sibling %p.\n", owner, how, child, sibling );
+    if (!child) return E_INVALIDARG;
+    if (!dcv_resolve_child( owner, child, &dcv, &pub )) return S_OK;
+    sib = dcv_child_index( owner, sibling );
+    switch (where)
+    {
+    case 0: index = 0; break;                                                    /* bottom */
+    case 1: index = owner->child_count; break;                                   /* top */
+    case 2: index = sib < 0 ? owner->child_count : sib + 1; break;               /* above sibling */
+    default: index = sib < 0 ? 0 : sib; break;                                   /* below sibling */
+    }
+    dcv_insert_child( owner, dcv, pub, index );
+    return S_OK;
+}
+static HRESULT WINAPI dcvc_InsertAbove( void *iface, void *child, void *sibling )
+{
+    scene_changed();
+    return dcvc_insert( iface, child, sibling, 2, "InsertAbove" );
+}
+static HRESULT WINAPI dcvc_InsertAtBottom( void *iface, void *child )
+{
+    scene_changed();
+    return dcvc_insert( iface, child, NULL, 0, "InsertAtBottom" );
+}
+static HRESULT WINAPI dcvc_InsertAtTop( void *iface, void *child )
+{
+    scene_changed();
+    return dcvc_insert( iface, child, NULL, 1, "InsertAtTop" );
+}
+static HRESULT WINAPI dcvc_InsertBelow( void *iface, void *child, void *sibling )
+{
+    scene_changed();
+    return dcvc_insert( iface, child, sibling, 3, "InsertBelow" );
+}
+static HRESULT WINAPI dcvc_RemoveAll( void *iface )
+{
+    scene_changed();
+    struct dcv_visual_collection *collection = CONTAINING_RECORD( iface, struct dcv_visual_collection, vtbl );
+
+    TRACE( "owner %p.\n", collection->owner );
+    return dcv_RemoveAllVisuals( &collection->owner->vtbl );
+}
+
+#define DCVC_PROBE_SLOT(n) \
+    static HRESULT WINAPI dcvc_slot_##n( void *iface, void *a, void *b, void *c ) \
+    { \
+        TRACE( "collection slot " #n " a %p b %p c %p.\n", a, b, c ); \
+        return S_OK; \
+    }
+DCVC_PROBE_SLOT(4)
+DCVC_PROBE_SLOT(5)
+DCVC_PROBE_SLOT(6)
+DCVC_PROBE_SLOT(7)
+DCVC_PROBE_SLOT(9)
+DCVC_PROBE_SLOT(10)
+
+static HRESULT inspectable_get_iids( ULONG *count, IID **iids );
+static HRESULT inspectable_trust( TrustLevel *level );
+/* IIterable<Visual> view over the interop collection: the render walk asks First through it
+ * (slot 6); leaving that as an unfilled probe handed it a garbage iterator to call through. */
+static HRESULT WINAPI dcvc_iterable_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct dcv_visual_collection *collection = CONTAINING_RECORD( iface, struct dcv_visual_collection, iterable_vtbl );
+    return dcvc_QueryInterface( &collection->vtbl, iid, out );
+}
+static ULONG WINAPI dcvc_iterable_AddRef( void *iface )
+{
+    struct dcv_visual_collection *collection = CONTAINING_RECORD( iface, struct dcv_visual_collection, iterable_vtbl );
+    return dcvc_AddRef( &collection->vtbl );
+}
+static ULONG WINAPI dcvc_iterable_Release( void *iface )
+{
+    struct dcv_visual_collection *collection = CONTAINING_RECORD( iface, struct dcv_visual_collection, iterable_vtbl );
+    return dcvc_Release( &collection->vtbl );
+}
+static HRESULT WINAPI dcvc_iterable_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI dcvc_iterable_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( L"", 0, name );
+}
+static HRESULT WINAPI dcvc_iterable_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+
+struct dcv_iterator
+{
+    const void **vtbl;
+    struct dcv_visual_collection *collection;
+    unsigned int index;
+    LONG ref;
+};
+static HRESULT WINAPI dcv_iterator_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct dcv_iterator *iterator = CONTAINING_RECORD( iface, struct dcv_iterator, vtbl );
+    if (!out) return E_POINTER;
+    if (!IsEqualGUID( iid, &IID_IUnknown ) && !IsEqualGUID( iid, &IID_IInspectable ) &&
+        !IsEqualGUID( iid, &IID_IAgileObject ))
+    {
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    InterlockedIncrement( &iterator->ref );
+    *out = &iterator->vtbl;
+    return S_OK;
+}
+static ULONG WINAPI dcv_iterator_AddRef( void *iface )
+{
+    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct dcv_iterator, vtbl )->ref );
+}
+static ULONG WINAPI dcv_iterator_Release( void *iface )
+{
+    struct dcv_iterator *iterator = CONTAINING_RECORD( iface, struct dcv_iterator, vtbl );
+    ULONG ref = InterlockedDecrement( &iterator->ref );
+    if (!ref)
+    {
+        dcvc_Release( &iterator->collection->vtbl );
+        free( iterator );
+    }
+    return ref;
+}
+static HRESULT WINAPI dcv_iterator_get_Current( void *iface, void **out )
+{
+    struct dcv_iterator *iterator = CONTAINING_RECORD( iface, struct dcv_iterator, vtbl );
+    struct dcv_visual_collection *collection = iterator->collection;
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (iterator->index >= collection->owner->child_count) return E_BOUNDS;
+    {
+        struct dcv_child *entry = &collection->owner->children[iterator->index];
+        *out = entry->dcv ? (void *)&entry->dcv->vtbl : entry->pub;
+        IUnknown_AddRef( (IUnknown *)*out );
+    }
+    return S_OK;
+}
+static HRESULT WINAPI dcv_iterator_get_HasCurrent( void *iface, boolean *value )
+{
+    struct dcv_iterator *iterator = CONTAINING_RECORD( iface, struct dcv_iterator, vtbl );
+    if (!value) return E_POINTER;
+    *value = iterator->index < iterator->collection->owner->child_count;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_iterator_MoveNext( void *iface, boolean *value )
+{
+    struct dcv_iterator *iterator = CONTAINING_RECORD( iface, struct dcv_iterator, vtbl );
+    if (iterator->index < iterator->collection->owner->child_count) iterator->index++;
+    if (value) *value = iterator->index < iterator->collection->owner->child_count;
+    return S_OK;
+}
+static const void *dcv_iterator_vtbl[] =
+{
+    dcv_iterator_QueryInterface, dcv_iterator_AddRef, dcv_iterator_Release,
+    dcv_iterator_QueryInterface /*GetIids-shaped slot, QI is fine*/, dcv_iterator_QueryInterface,
+    dcv_iterator_QueryInterface,
+    dcv_iterator_get_Current, dcv_iterator_get_HasCurrent, dcv_iterator_MoveNext,
+};
+static HRESULT WINAPI dcvc_iterable_First( void *iface, void **out )
+{
+    struct dcv_visual_collection *collection = CONTAINING_RECORD( iface, struct dcv_visual_collection, iterable_vtbl );
+    struct dcv_iterator *iterator;
+    if (!out) return E_POINTER;
+    if (!(iterator = calloc( 1, sizeof(*iterator) ))) return E_OUTOFMEMORY;
+    iterator->vtbl = dcv_iterator_vtbl;
+    iterator->collection = collection;
+    iterator->ref = 1;
+    dcvc_AddRef( &collection->vtbl );
+    TRACE( "dcv iterable %p First -> iterator %p.\n", collection, iterator );
+    *out = &iterator->vtbl;
+    return S_OK;
+}
+static const void *dcv_iterable_vtbl[] =
+{
+    dcvc_iterable_QueryInterface, dcvc_iterable_AddRef, dcvc_iterable_Release,
+    dcvc_iterable_GetIids, dcvc_iterable_GetRuntimeClassName, dcvc_iterable_GetTrustLevel,
+    dcvc_iterable_First,
+};
+
+/* The interop visual collection's vtable is longer than the slots we recognise, and a call to a
+ * slot past the end of this array read whatever static data followed it and jumped there (the
+ * "page fault on execute access to 0000000000000000" during the render walk).  Pad it out with
+ * numbered probes so an unknown slot reports itself instead. */
+DCVC_PROBE_SLOT(12)
+DCVC_PROBE_SLOT(13)
+DCVC_PROBE_SLOT(14)
+DCVC_PROBE_SLOT(15)
+DCVC_PROBE_SLOT(16)
+DCVC_PROBE_SLOT(17)
+DCVC_PROBE_SLOT(18)
+DCVC_PROBE_SLOT(19)
+DCVC_PROBE_SLOT(20)
+DCVC_PROBE_SLOT(21)
+DCVC_PROBE_SLOT(22)
+DCVC_PROBE_SLOT(23)
+DCVC_PROBE_SLOT(24)
+DCVC_PROBE_SLOT(25)
+DCVC_PROBE_SLOT(26)
+DCVC_PROBE_SLOT(27)
+DCVC_PROBE_SLOT(28)
+DCVC_PROBE_SLOT(29)
+DCVC_PROBE_SLOT(30)
+DCVC_PROBE_SLOT(31)
+DCVC_PROBE_SLOT(32)
+DCVC_PROBE_SLOT(33)
+DCVC_PROBE_SLOT(34)
+DCVC_PROBE_SLOT(35)
+DCVC_PROBE_SLOT(36)
+DCVC_PROBE_SLOT(37)
+DCVC_PROBE_SLOT(38)
+DCVC_PROBE_SLOT(39)
+
+static const void *dcv_visual_collection_vtbl[] =
+{
+    dcvc_QueryInterface, dcvc_AddRef, dcvc_Release, dcvc_GetIids,
+    dcvc_GetRuntimeClassName, dcvc_GetTrustLevel, dcvc_get_Count, dcvc_InsertAbove,
+    dcvc_InsertAtBottom, dcvc_InsertAtTop, dcvc_InsertBelow, dcvc_Remove,
+    dcvc_RemoveAll, dcvc_slot_13, dcvc_slot_14, dcvc_slot_15,
+    dcvc_slot_16, dcvc_slot_17, dcvc_slot_18, dcvc_slot_19,
+    dcvc_slot_20, dcvc_slot_21, dcvc_slot_22, dcvc_slot_23,
+    dcvc_slot_24, dcvc_slot_25, dcvc_slot_26, dcvc_slot_27,
+    dcvc_slot_28, dcvc_slot_29, dcvc_slot_30, dcvc_slot_31,
+    dcvc_slot_32, dcvc_slot_33, dcvc_slot_34, dcvc_slot_35,
+    dcvc_slot_36, dcvc_slot_37, dcvc_slot_38, dcvc_slot_39,
+};
+
+/* InteropVisual::Api vtbl order recovered from Windows dcomp.dll
+ * (??_7Api@InteropVisual@Composition@UI@Windows@@6B@). Float setters must take
+ * real float args so xmm0 is preserved. */
+static HRESULT WINAPI dcv_SetVisible( void *iface, BOOL visible )
+{
+    scene_changed();
+    struct dcomp_visual *v = dcomp_visual_from( iface );
+    if (!visible) v->opacity = 0.0f;
+    else if (v->opacity <= 0.0f) v->opacity = 1.0f;
+    TRACE( "%p visible %d.\n", iface, visible );
+    return S_OK;
+}
+static HRESULT WINAPI dcv_GetVisualCollection( void *iface, void **out )
+{
+    struct dcv_visual_collection *collection;
+
+    TRACE( "%p.\n", iface );
+    if (!out) return E_POINTER;
+    if (!(collection = calloc( 1, sizeof(*collection) ))) return E_OUTOFMEMORY;
+    collection->vtbl = dcv_visual_collection_vtbl;
+    collection->iterable_vtbl = dcv_iterable_vtbl;
+    collection->owner = dcomp_visual_from( iface );
+    collection->ref = 1;
+    dcv_AddRef( iface );
+    *out = &collection->vtbl;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_RealClose( void *iface )
+{
+    TRACE( "%p.\n", iface );
+    return S_OK;
+}
+
+/* Slot 8, SetTransform(const D2D_MATRIX_3X2_F *): the fallback renderer positions with GDI, so
+ * only the translation is honoured; anything else is logged once. */
+static HRESULT WINAPI dcv_SetTransformMatrix( void *iface, const D2D_MATRIX_3X2_F *matrix )
+{
+    scene_changed();
+    struct dcomp_visual *v = dcomp_visual_from( iface );
+    static int once;
+
+    if (!matrix) return E_POINTER;
+    v->transform_x = matrix->_31;
+    v->transform_y = matrix->_32;
+    v->scale_x = matrix->_11;
+    v->scale_y = matrix->_22;
+    if ((matrix->_12 != 0.0f || matrix->_21 != 0.0f) && !once++)
+        FIXME( "%p rotation/skew %g %g ignored; only translation and scale are painted.\n", iface,
+               matrix->_12, matrix->_21 );
+    TRACE( "%p translate %g,%g scale %g,%g.\n", iface, matrix->_31, matrix->_32, matrix->_11, matrix->_22 );
+    return S_OK;
+}
+
+/* Slot 14, SetClip(const D2D_RECT_F *), in the visual's own coordinate space. */
+static HRESULT WINAPI dcv_SetClipRect( void *iface, const D2D_RECT_F *rect )
+{
+    scene_changed();
+    struct dcomp_visual *v = dcomp_visual_from( iface );
+
+    if (!rect) return E_POINTER;
+    /* What XAML passes here does not always read as a rectangle: most calls give 0,0 followed by pointer
+     * bytes as floats (right 1.6e-21, bottom 4.6e-41). Applying that as a clip hid everything under the
+     * visual. Only a finite rectangle at least a pixel in size clips; anything else clears the clip. */
+    if (!(rect->left == rect->left && rect->top == rect->top && rect->right == rect->right &&
+          rect->bottom == rect->bottom) ||
+        rect->right - rect->left < 1.0f || rect->bottom - rect->top < 1.0f ||
+        fabs( rect->left ) > 1e6f || fabs( rect->top ) > 1e6f || fabs( rect->right ) > 1e7f ||
+        fabs( rect->bottom ) > 1e7f)
+    {
+        TRACE( "%p degenerate clip %g,%g-%g,%g ignored.\n", iface, rect->left, rect->top, rect->right, rect->bottom );
+        v->has_clip = FALSE;
+        return S_OK;
+    }
+    v->has_clip = TRUE;
+    v->clip_left = rect->left;
+    v->clip_top = rect->top;
+    v->clip_right = rect->right;
+    v->clip_bottom = rect->bottom;
+    TRACE( "%p clip %g,%g-%g,%g.\n", iface, rect->left, rect->top, rect->right, rect->bottom );
+    return S_OK;
+}
+
+static int clamp_coord( float value )
+{
+    if (value < -1000000.0f) return -1000000;
+    if (value > 1000000.0f) return 1000000;
+    return (int)value;
+}
+
+/* ICompositionObject2 view: 6 get_Comment, 7 put_Comment, 8 get_ImplicitAnimations, 9 put_ImplicitAnimations,
+ * 10 StartAnimationGroup, 11 StopAnimationGroup. Implicit animations are not run. */
+static struct dcomp_visual *impl_from_dcv_object2( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct dcomp_visual, object2_vtbl );
+}
+static HRESULT WINAPI dcv_object2_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return dcv_QueryInterface( &impl_from_dcv_object2( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI dcv_object2_AddRef( void *iface )
+{
+    return dcv_AddRef( &impl_from_dcv_object2( iface )->vtbl );
+}
+static ULONG WINAPI dcv_object2_Release( void *iface )
+{
+    return dcv_Release( &impl_from_dcv_object2( iface )->vtbl );
+}
+static HRESULT WINAPI dcv_object2_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI dcv_object2_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_ContainerVisual,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_ContainerVisual) - 1, name );
+}
+static HRESULT WINAPI dcv_object2_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI dcv_object2_get_Comment( void *iface, HSTRING *value )
+{
+    if (!value) return E_POINTER;
+    return WindowsDuplicateString( impl_from_dcv_object2( iface )->comment, value );
+}
+static HRESULT WINAPI dcv_object2_put_Comment( void *iface, HSTRING value )
+{
+    scene_changed();
+    struct dcomp_visual *v = impl_from_dcv_object2( iface );
+    HSTRING copy;
+    HRESULT hr;
+
+    if (FAILED(hr = WindowsDuplicateString( value, &copy ))) return hr;
+    WindowsDeleteString( v->comment );
+    v->comment = copy;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_object2_get_ImplicitAnimations( void *iface, void **value )
+{
+    if (!value) return E_POINTER;
+    *value = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_object2_put_ImplicitAnimations( void *iface, void *value )
+{
+    scene_changed();
+    TRACE( "%p implicit animations %p: not run.\n", iface, value );
+    return S_OK;
+}
+static HRESULT WINAPI dcv_object2_StartAnimationGroup( void *iface, void *value )
+{
+    scene_changed();
+    TRACE( "%p animation group %p: not run.\n", iface, value );
+    return S_OK;
+}
+static HRESULT WINAPI dcv_object2_StopAnimationGroup( void *iface, void *value )
+{
+    scene_changed();
+    return S_OK;
+}
+
+static const void *dcv_object2_vtbl[] =
+{
+    dcv_object2_QueryInterface, dcv_object2_AddRef, dcv_object2_Release,
+    dcv_object2_GetIids, dcv_object2_GetRuntimeClassName, dcv_object2_GetTrustLevel,
+    dcv_object2_get_Comment, dcv_object2_put_Comment, dcv_object2_get_ImplicitAnimations,
+    dcv_object2_put_ImplicitAnimations, dcv_object2_StartAnimationGroup, dcv_object2_StopAnimationGroup,
+};
+
+/* IClosable view of an interop visual. XAML closes the visuals it handed in or off when an element leaves
+ * the tree (CUIElement::ForceCloseHandInAndHandOffVisuals); the visual is refcounted, so Close has nothing
+ * to release early. */
+static struct dcomp_visual *dcomp_visual_from_closable( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct dcomp_visual, closable_vtbl );
+}
+static HRESULT WINAPI dcv_closable_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return dcv_QueryInterface( &dcomp_visual_from_closable( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI dcv_closable_AddRef( void *iface )
+{
+    return dcv_AddRef( &dcomp_visual_from_closable( iface )->vtbl );
+}
+static ULONG WINAPI dcv_closable_Release( void *iface )
+{
+    return dcv_Release( &dcomp_visual_from_closable( iface )->vtbl );
+}
+static HRESULT WINAPI dcv_closable_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI dcv_closable_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_ContainerVisual,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_ContainerVisual) - 1, name );
+}
+static HRESULT WINAPI dcv_closable_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI dcv_closable_Close( void *iface )
+{
+    TRACE( "interop visual %p.\n", dcomp_visual_from_closable( iface ) );
+    return S_OK;
+}
+static const void *dcv_closable_vtbl[] =
+{
+    dcv_closable_QueryInterface, dcv_closable_AddRef, dcv_closable_Release,
+    dcv_closable_GetIids, dcv_closable_GetRuntimeClassName, dcv_closable_GetTrustLevel,
+    dcv_closable_Close,
+};
+
+/* Windows.UI.Composition.IVisual view of an interop visual. Slots 6-38 in IDL order: AnchorPoint,
+ * BackfaceVisibility, BorderMode, CenterPoint, Clip (14/15), CompositeMode, IsVisible (18/19), Offset (20/21),
+ * Opacity (22/23), Orientation, Parent (26), RotationAngle, RotationAngleInDegrees, RotationAxis, Scale,
+ * Size (35/36), TransformMatrix (37/38). */
+static struct dcomp_visual *impl_from_dcv_ivisual( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct dcomp_visual, ivisual_vtbl );
+}
+static HRESULT WINAPI dcv_ivisual_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return dcv_QueryInterface( &impl_from_dcv_ivisual( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI dcv_ivisual_AddRef( void *iface )
+{
+    return dcv_AddRef( &impl_from_dcv_ivisual( iface )->vtbl );
+}
+static ULONG WINAPI dcv_ivisual_Release( void *iface )
+{
+    return dcv_Release( &impl_from_dcv_ivisual( iface )->vtbl );
+}
+static HRESULT WINAPI dcv_ivisual_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI dcv_ivisual_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_ContainerVisual,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_ContainerVisual) - 1, name );
+}
+static HRESULT WINAPI dcv_ivisual_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI dcv_ivisual_get_AnchorPoint( void *iface, Vector2 *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_dcv_ivisual( iface )->anchor;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_put_AnchorPoint( void *iface, Vector2 value )
+{
+    scene_changed();
+    impl_from_dcv_ivisual( iface )->anchor = value;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_get_enum( void *iface, INT32 *value )
+{
+    if (!value) return E_POINTER;
+    *value = 0;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_put_enum( void *iface, INT32 value )
+{
+    scene_changed();
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_get_CenterPoint( void *iface, Vector3 *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_dcv_ivisual( iface )->center;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_put_CenterPoint( void *iface, Vector3 value )
+{
+    scene_changed();
+    impl_from_dcv_ivisual( iface )->center = value;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_get_Clip( void *iface, IUnknown **value )
+{
+    struct dcomp_visual *v = impl_from_dcv_ivisual( iface );
+
+    if (!value) return E_POINTER;
+    if ((*value = v->clip_object)) IUnknown_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_put_Clip( void *iface, IUnknown *value )
+{
+    scene_changed();
+    struct dcomp_visual *v = impl_from_dcv_ivisual( iface );
+
+    TRACE( "%p clip %p.\n", v, value );
+    if (value) IUnknown_AddRef( value );
+    if (v->clip_object) IUnknown_Release( v->clip_object );
+    v->clip_object = value;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_get_IsVisible( void *iface, boolean *value )
+{
+    if (!value) return E_POINTER;
+    *value = !impl_from_dcv_ivisual( iface )->hidden;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_put_IsVisible( void *iface, boolean value )
+{
+    scene_changed();
+    struct dcomp_visual *v = impl_from_dcv_ivisual( iface );
+    TRACE( "%p visible %u.\n", v, value );
+    v->hidden = !value;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_get_Offset( void *iface, Vector3 *value )
+{
+    struct dcomp_visual *v = impl_from_dcv_ivisual( iface );
+
+    if (!value) return E_POINTER;
+    value->X = v->offset_x;
+    value->Y = v->offset_y;
+    value->Z = 0.0f;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_put_Offset( void *iface, Vector3 value )
+{
+    scene_changed();
+    struct dcomp_visual *v = impl_from_dcv_ivisual( iface );
+
+    TRACE( "%p offset %g,%g,%g.\n", v, value.X, value.Y, value.Z );
+    v->offset_x = value.X;
+    v->offset_y = value.Y;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_get_Opacity( void *iface, FLOAT *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_dcv_ivisual( iface )->opacity;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_put_Opacity( void *iface, FLOAT value )
+{
+    scene_changed();
+    impl_from_dcv_ivisual( iface )->opacity = value;
+    dcv_clear_opacity_expr( impl_from_dcv_ivisual( iface ) );
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_get_Orientation( void *iface, Quaternion *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_dcv_ivisual( iface )->orientation;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_put_Orientation( void *iface, Quaternion value )
+{
+    scene_changed();
+    impl_from_dcv_ivisual( iface )->orientation = value;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_get_Parent( void *iface, void **value )
+{
+    if (!value) return E_POINTER;
+    *value = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_get_float( void *iface, FLOAT *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_dcv_ivisual( iface )->rotation;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_put_float( void *iface, FLOAT value )
+{
+    scene_changed();
+    impl_from_dcv_ivisual( iface )->rotation = value;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_get_RotationAxis( void *iface, Vector3 *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_dcv_ivisual( iface )->rotation_axis;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_put_RotationAxis( void *iface, Vector3 value )
+{
+    scene_changed();
+    impl_from_dcv_ivisual( iface )->rotation_axis = value;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_get_Scale( void *iface, Vector3 *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_dcv_ivisual( iface )->scale3;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_put_Scale( void *iface, Vector3 value )
+{
+    scene_changed();
+    impl_from_dcv_ivisual( iface )->scale3 = value;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_get_Size( void *iface, Vector2 *value )
+{
+    struct dcomp_visual *v = impl_from_dcv_ivisual( iface );
+
+    if (!value) return E_POINTER;
+    value->X = v->width;
+    value->Y = v->height;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_put_Size( void *iface, Vector2 value )
+{
+    scene_changed();
+    struct dcomp_visual *v = impl_from_dcv_ivisual( iface );
+
+    TRACE( "%p size %gx%g.\n", v, value.X, value.Y );
+    v->width = value.X;
+    v->height = value.Y;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_get_TransformMatrix( void *iface, Matrix4x4 *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_dcv_ivisual( iface )->transform4;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_ivisual_put_TransformMatrix( void *iface, Matrix4x4 value )
+{
+    scene_changed();
+    struct dcomp_visual *v = impl_from_dcv_ivisual( iface );
+    TRACE( "%p scale %g,%g translate %g,%g.\n", v, value.M11, value.M22, value.M41, value.M42 );
+    v->transform4 = value;
+    return S_OK;
+}
+
+static const void *dcv_ivisual_vtbl[] =
+{
+    /* 0-5 */   dcv_ivisual_QueryInterface, dcv_ivisual_AddRef, dcv_ivisual_Release,
+                dcv_ivisual_GetIids, dcv_ivisual_GetRuntimeClassName, dcv_ivisual_GetTrustLevel,
+    /* 6-7 */   dcv_ivisual_get_AnchorPoint, dcv_ivisual_put_AnchorPoint,
+    /* 8-11 */  dcv_ivisual_get_enum, dcv_ivisual_put_enum, dcv_ivisual_get_enum, dcv_ivisual_put_enum,
+    /* 12-13 */ dcv_ivisual_get_CenterPoint, dcv_ivisual_put_CenterPoint,
+    /* 14-15 */ dcv_ivisual_get_Clip, dcv_ivisual_put_Clip,
+    /* 16-17 */ dcv_ivisual_get_enum, dcv_ivisual_put_enum,
+    /* 18-19 */ dcv_ivisual_get_IsVisible, dcv_ivisual_put_IsVisible,
+    /* 20-21 */ dcv_ivisual_get_Offset, dcv_ivisual_put_Offset,
+    /* 22-23 */ dcv_ivisual_get_Opacity, dcv_ivisual_put_Opacity,
+    /* 24-25 */ dcv_ivisual_get_Orientation, dcv_ivisual_put_Orientation,
+    /* 26 */    dcv_ivisual_get_Parent,
+    /* 27-30 */ dcv_ivisual_get_float, dcv_ivisual_put_float, dcv_ivisual_get_float, dcv_ivisual_put_float,
+    /* 31-32 */ dcv_ivisual_get_RotationAxis, dcv_ivisual_put_RotationAxis,
+    /* 33-34 */ dcv_ivisual_get_Scale, dcv_ivisual_put_Scale,
+    /* 35-36 */ dcv_ivisual_get_Size, dcv_ivisual_put_Size,
+    /* 37-38 */ dcv_ivisual_get_TransformMatrix, dcv_ivisual_put_TransformMatrix,
+};
+
+/* Like dcv_ok, but shows the first three arguments: XAML calls slots 43, 47 and 50 on every interop
+ * visual each frame and the values tell what they are. */
+static HRESULT WINAPI dcv_ok_args( void *iface, void *a, void *b, void *c )
+{
+    TRACE( "%p slot? a %p b %p c %p.\n", iface, a, b, c );
+    return S_OK;
+}
+static const void *dcomp_visual_vtbl[] =
+{
+    /* 0-2 */ dcv_QueryInterface, dcv_AddRef, dcv_Release,
+    /* 3-4 */ dcv_ok /*SetOffsetX anim*/, dcv_SetOffsetX,
+    /* 5-6 */ dcv_ok /*SetOffsetY anim*/, dcv_SetOffsetY,
+    /* 7-9 */ dcv_ok /*SetTransform object*/, dcv_SetTransformMatrix, dcv_ok /*SetTransformParent*/,
+    /* 10 */ dcv_ok, /* SetEffect */
+    /* 11-12 */ dcv_ok, dcv_ok, /* SetBitmapInterpolationMode, SetBorderMode */
+    /* 13-14 */ dcv_ok /*SetClip object*/, dcv_SetClipRect,
+    /* 15 */ dcv_SetContent,
+    /* 16-18 */ dcv_AddVisual, dcv_RemoveVisual, dcv_RemoveAllVisuals,
+    /* 19 */ dcv_ok, /* SetCompositeMode */
+    /* 20 */ dcv_ok, /* SetOpacityMode */
+    /* 21 */ dcv_ok, /* SetBackFaceVisibility */
+    /* 22-25 */ dcv_ok, dcv_ok, dcv_ok, dcv_ok, /* HeatMap / RedrawRegions */
+    /* 26 */ dcv_ok, /* SetDepthMode */
+    /* 27-28 */ dcv_ok, dcv_ok, /* SetOffsetZ* */
+    /* 29-30 */ dcv_SetOpacity, dcv_ok, /* SetOpacity float / anim */
+    /* 31-32 */ dcv_ok, dcv_ok, /* SetTransform matrix variants */
+    /* 33 */ dcv_SetVisible,
+    /* 34 */ dcv_ok, /* SetTransformMode */
+    /* 35 */ dcv_ok, /* SetInput */
+    /* 36-37 */ dcv_SetWidth, dcv_SetHeight,
+    /* 38-41 */ dcv_ok, dcv_ok, dcv_ok, dcv_ok, /* Relative offset/size */
+    /* 42-44 */ dcv_ok, dcv_ok_args, dcv_ok, /* Interaction / Transparent / RasterScale */
+    /* 45 */ dcv_GetVisualCollection,
+    /* 46 */ dcv_RealClose,
+    /* 47-51 */ dcv_ok_args, dcv_ok, dcv_ok, dcv_ok_args, dcv_ok,
+};
+
+/* sx, sy: the scale the ancestors apply (SetTransform matrices, XAML's Viewbox and RenderTransform scale go
+ * through them). The visual's own matrix scale compounds into csx, csy for its content and children. */
+static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float oy, float sx, float sy )
+{
+    RECT rc;
+    HBRUSH brush;
+    unsigned i;
+    float x = ox + (v->offset_x + v->transform_x + v->transform4.M41) * sx;
+    float y = oy + (v->offset_y + v->transform_y + v->transform4.M42) * sy;
+    /* the SetTransform matrix and XAML's IVisual TransformMatrix (an identity M11/M22 of 0 means unset) */
+    float csx = sx * (v->scale_x != 0.0f ? v->scale_x : 1.0f) * (v->transform4.M11 != 0.0f ? v->transform4.M11 : 1.0f);
+    float csy = sy * (v->scale_y != 0.0f ? v->scale_y : 1.0f) * (v->transform4.M22 != 0.0f ? v->transform4.M22 : 1.0f);
+    float w = v->width * csx, h = v->height * csy;
+    int saved = 0;
+    RECT saved_clip;
+
+    if (v->hidden) return;
+    if (v->opacity_expr)
+    {
+        struct propset_value *value = expr_resolve_value( &v->opacity_expr->vtbl, PROP_SCALAR );
+        if (value) v->opacity = value->u.scalar;
+    }
+    /* a transparent visual hides its subtree */
+    if (v->opacity <= 0.01f) return;
+    if (v->transform_expr)
+    {
+        D2D_MATRIX_3X2_F m;
+        if (expr_evaluate_matrix( v->transform_expr, v->properties,
+                                  v->manip && v->manip->has_matrix ? &v->manip->matrix : NULL, &m ))
+        {
+            /* axis-aligned only: the painter positions and stretches, it does not rotate */
+            x += m._31 * sx;
+            y += m._32 * sy;
+            csx *= m._11;
+            csy *= m._22;
+            w = v->width * csx;
+            h = v->height * csy;
+        }
+        else if (v->manip && v->manip->has_matrix)
+        {
+            x += v->manip->matrix._31 * sx;
+            y += v->manip->matrix._32 * sy;
+        }
+    }
+    else if (v->manip && v->manip->has_matrix)
+    {
+        x += v->manip->matrix._31 * sx;
+        y += v->manip->matrix._32 * sy;
+    }
+
+    perf.visits++;
+    TRACE( "visit dcomp %p size %gx%g at %g,%g children %u content %p opacity %g\n", v, w, h, x, y,
+           v->child_count, v->content, v->opacity );
+    /* the content root: XAML offsets it by the title bar row and it covers the rest of the window */
+    if (v->offset_y > 0.5f && v->width >= back_w - 1.0f && v->offset_y + v->height >= back_h - 1.0f &&
+        v->height > back_h / 2.0f)
+    {
+        xaml_content_dy = v->offset_y;
+        xaml_content_branch = paint_branch;
+    }
+
+    saved_clip = paint_clip;
+    if (v->has_clip)
+    {
+        RECT r;
+        SetRect( &r, clamp_coord( x + v->clip_left * csx ), clamp_coord( y + v->clip_top * csy ),
+                 clamp_coord( x + v->clip_right * csx ), clamp_coord( y + v->clip_bottom * csy ) );
+        if (!IntersectRect( &paint_clip, &paint_clip, &r )) SetRectEmpty( &paint_clip );
+        saved = 1;
+    }
+    else if (v->clip_object) saved = apply_inset_clip( hdc, v->clip_object, x, y, w, h );
+
+    /* Content set through IDCompositionVisual::SetContent is a surface XAML drew into
+     * (DCompVisual::SetContentInternal); paint the texture itself. It carries its own size, and
+     * these visuals often have none. */
+    if (v->opacity > 0.01f && surface_from_iface( v->content ) &&
+        blit_surface_scaled( hdc, surface_from_iface( v->content ), (int)x, (int)y, csx, csy ))
+    {
+        TRACE( "painted interop visual %p from surface content %p.\n", v, v->content );
+    }
+    /* No debug fill for visuals without drawable content: now that XAML's IVisual sizes reach these
+     * visuals, the blue placeholder covered the real UI underneath. */
+    (void)rc; (void)brush;
+    for (i = 0; i < v->child_count; i++)
+    {
+        TRACE( "child %u of dcomp %p is %s %p\n", i, v, v->children[i].pub ? "public" : "dcomp",
+               v->children[i].pub ? (void *)impl_from_visual_interop( v->children[i].pub ) : (void *)v->children[i].dcv );
+        if (v->children[i].pub) paint_public_visual( hdc, v->children[i].pub, x, y, w, h, csx, csy );
+        else if (v->children[i].dcv) paint_dcomp_visual( hdc, v->children[i].dcv, x, y, csx, csy );
+    }
+    if (saved) paint_clip = saved_clip;
+}
+
+static void present_dcomp_visuals( HDC hdc )
+{
+    unsigned i;
+    xaml_island_container = NULL;
+    paint_branch = NULL;
+    EnterCriticalSection( &dcomp_visual_cs );
+    if (dcomp_target_root)
+    {
+        paint_dcomp_visual( hdc, dcomp_target_root, 0.0f, 0.0f, 1.0f, 1.0f );
+        LeaveCriticalSection( &dcomp_visual_cs );
+        return;
+    }
+    for (i = 0; i < dcomp_visual_count; i++)
+    {
+        struct dcomp_visual *v = dcomp_visuals[i];
+        if (v && !dcomp_visual_has_parent[i])
+            paint_dcomp_visual( hdc, v, 0.0f, 0.0f, 1.0f, 1.0f );
+    }
+    LeaveCriticalSection( &dcomp_visual_cs );
+}
+
+static HRESULT WINAPI device_CreateVisual( void *iface, void **out )
+{
+    struct dcomp_visual *v;
+
+    /* This slot is not only CreateVisual: DCompTreeHost::CloseAndReleaseInteropCompositor calls
+     * it as part of tearing the compositor down, with no out pointer (NULL, a small integer, or
+     * an unaligned value). Writing through that would fault, and failing it is worse - XAML
+     * fail-fasts on a failure from that shutdown call and takes CCoreServices with it - so
+     * report success and do nothing. */
+    if (!out)
+    {
+        TRACE( "CreateVisual as RealClose (null out): ignored.\n" );
+        return S_OK;
+    }
+    if ((ULONG_PTR)out < 0x10000 || ((ULONG_PTR)out & (sizeof(void *) - 1)))
+    {
+        TRACE( "CreateVisual as RealClose (out %p is not a pointer): ignored.\n", out );
+        return S_OK;
+    }
+    TRACE( "CreateVisual.\n" );
+    if (!(v = calloc( 1, sizeof(*v) ))) return E_OUTOFMEMORY;
+    v->vtbl = dcomp_visual_vtbl;
+    v->ref = 1;
+    v->opacity = 1.0f;
+    v->object_vtbl = dcv_object_vtbl;
+    v->ivisual_vtbl = dcv_ivisual_vtbl;
+    v->object2_vtbl = dcv_object2_vtbl;
+    v->closable_vtbl = dcv_closable_vtbl;
+    v->scale3.X = v->scale3.Y = v->scale3.Z = 1.0f;
+    v->rotation_axis.Z = 1.0f;
+    v->orientation.W = 1.0f;
+    v->transform4.M11 = v->transform4.M22 = v->transform4.M33 = v->transform4.M44 = 1.0f;
+    {
+        /* the interop device is the device_vtbl member of a compositor */
+        struct compositor *owner = CONTAINING_RECORD( iface, struct compositor, device_vtbl );
+        ICompositor_AddRef( (v->compositor = &owner->ICompositor_iface) );
+    }
+    EnterCriticalSection( &dcomp_visual_cs );
+    if (dcomp_visual_count < ARRAY_SIZE(dcomp_visuals))
+        dcomp_visuals[dcomp_visual_count++] = v;
+    LeaveCriticalSection( &dcomp_visual_cs );
+    *out = &v->vtbl;
+    return S_OK;
+}
+static HRESULT WINAPI device_CreateSurfaceFactory( void *iface, IUnknown *rendering_device, void **out )
+{
+    TRACE( "CreateSurfaceFactory rendering device %p.\n", rendering_device );
+    remember_rendering_device( rendering_device );
+    return create_comp_object_vtbl( "CreateSurfaceFactory", surface_factory_vtbl, out );
+}
+static HRESULT WINAPI device_CreateSurface( void *iface, void *a, void *b, void *c, void *d,
+                                            void **out )
+{
+    TRACE( "CreateSurface %ux%u fmt %u.\n", (unsigned)(uintptr_t)a, (unsigned)(uintptr_t)b,
+           (unsigned)(uintptr_t)c );
+    return create_drawing_surface( (UINT)(uintptr_t)a, (UINT)(uintptr_t)b, (UINT)(uintptr_t)c,
+                                   (UINT)(uintptr_t)d, out );
+}
+static HRESULT WINAPI device_CreateVirtualSurface( void *iface, void *a, void *b, void *c, void *d,
+                                                   void **out )
+{
+    TRACE( "CreateVirtualSurface %ux%u fmt %u.\n", (unsigned)(uintptr_t)a, (unsigned)(uintptr_t)b,
+           (unsigned)(uintptr_t)c );
+    return create_comp_object_vtbl( "virtual surface", surface_vtbl, out );
+}
+DEVICE_CREATE1( CreateTranslateTransform )
+DEVICE_CREATE1( CreateScaleTransform )
+DEVICE_CREATE1( CreateRotateTransform )
+DEVICE_CREATE1( CreateSkewTransform )
+static HRESULT WINAPI device_CreateMatrixTransform( void *iface, void **out )
+{
+    TRACE( "CreateMatrixTransform.\n" );
+    return create_matrix_transform( out );
+}
+DEVICE_CREATE3( CreateTransformGroup )
+DEVICE_CREATE1( CreateTranslateTransform3D )
+DEVICE_CREATE1( CreateScaleTransform3D )
+DEVICE_CREATE1( CreateRotateTransform3D )
+DEVICE_CREATE1( CreateMatrixTransform3D )
+DEVICE_CREATE3( CreateTransform3DGroup )
+DEVICE_CREATE1( CreateEffectGroup )
+DEVICE_CREATE1( CreateRectangleClip )
+DEVICE_CREATE1( CreateAnimation )
+/* IDCompositionTarget: 3 SetRoot(IDCompositionVisual *). Everything else stays a recording slot. */
+static void *dcomp_target_vtbl[COMP_OBJECT_SLOTS];
+
+static HRESULT WINAPI dcomp_target_SetRoot( void *iface, void *visual )
+{
+    scene_changed();
+    struct dcomp_visual *root = NULL;
+
+    if (visual && *(const void ***)visual == dcomp_visual_vtbl) root = dcomp_visual_from( visual );
+    TRACE( "target %p root %p (%s).\n", iface, visual, root ? "interop visual" : visual ? "foreign" : "none" );
+    EnterCriticalSection( &dcomp_visual_cs );
+    if (root) dcv_AddRef( visual );
+    if (dcomp_target_root) dcv_Release( &dcomp_target_root->vtbl );
+    dcomp_target_root = root;
+    LeaveCriticalSection( &dcomp_visual_cs );
+    return S_OK;
+}
+
+static HRESULT WINAPI device_CreateTargetForHwnd( void *iface, void *hwnd, void *topmost, void **out )
+{
+    unsigned int i;
+
+    TRACE( "CreateTargetForHwnd hwnd %p topmost %p.\n", hwnd, topmost );
+    if (!dcomp_target_vtbl[3])
+    {
+        for (i = 0; i < COMP_OBJECT_SLOTS; i++) dcomp_target_vtbl[i] = comp_object_slot_fn( i );
+        dcomp_target_vtbl[1] = comp_object_AddRef;
+        dcomp_target_vtbl[2] = comp_object_Release;
+        dcomp_target_vtbl[3] = dcomp_target_SetRoot;
+        dcomp_target_vtbl[0] = comp_object_QueryInterface;
+    }
+    return create_comp_object_vtbl( "CreateTargetForHwnd", dcomp_target_vtbl, out );
+}
+DEVICE_CREATE2( CreateSurfaceFromHandle )
+DEVICE_CREATE2( CreateSurfaceFromHwnd )
+DEVICE_STUB( CreateSharedResource, ( void *iface, void *a, void *b, void **out ) )
+DEVICE_STUB( OpenSharedResourceHandle, ( void *iface, void *a, void *b ) )
+DEVICE_STUB( OpenSharedResource, ( void *iface, void *a, void *b, void **out ) )
+DEVICE_STUB( CreateAnimationTrigger, ( void *iface, void *a, void **out ) )
+DEVICE_STUB( CreateGradientSurface, ( void *iface, void *a, void *b, void *c, void **out ) )
+DEVICE_OK( EnableWhitePixelOptimization, ( void *iface, BOOL enable ) )
+DEVICE_OK( OfferSurfaceResources, ( void *iface ) )
+DEVICE_OK( ReclaimSurfaceResources, ( void *iface, BOOL *discarded ) )
+DEVICE_OK( DisableD2DStatePreservation, ( void *iface ) )
+DEVICE_OK( Flush, ( void *iface ) )
+DEVICE_STUB( CreateSurfaceFromVisualSnapshot, ( void *iface, void *a, void **out ) )
+DEVICE_STUB( CreateInteraction, ( void *iface, void **out ) )
+DEVICE_STUB( CreateTouchInteractionConfiguration, ( void *iface, void **out ) )
+DEVICE_STUB( CreateTouchpadInteractionConfiguration, ( void *iface, void **out ) )
+DEVICE_STUB( CreatePenInteractionConfiguration, ( void *iface, void **out ) )
+DEVICE_STUB( CreateMouseInteractionConfiguration, ( void *iface, void **out ) )
+DEVICE_STUB( OpenSharedResource2, ( void *iface, void *a, void *b, void **out ) )
+DEVICE_STUB( CreateDesktopTree, ( void *iface, void *a, void **out ) )
+
+static LONG device_batch_id;
+
+static HRESULT WINAPI device_GetCurrentBatchID( void *iface, ULONG *batch_id )
+{
+    if (!batch_id) return E_POINTER;
+    *batch_id = InterlockedIncrement( &device_batch_id );
+    TRACE( "batch %lu.\n", *batch_id );
+    return S_OK;
+}
+
+static HRESULT WINAPI device_GetLastConfirmedBatchId( void *iface, ULONG *batch_id )
+{
+    if (!batch_id) return E_POINTER;
+    *batch_id = device_batch_id;
+    TRACE( "batch %lu.\n", *batch_id );
+    return S_OK;
+}
+
+DEVICE_CREATE1( CreateGaussianBlurEffect )
+DEVICE_CREATE3( CreateManipulationTransform )
+DEVICE_CREATE1( CreateBrightnessEffect )
+DEVICE_CREATE1( CreateColorMatrixEffect )
+DEVICE_CREATE1( CreateShadowEffect )
+DEVICE_CREATE1( CreateHueRotationEffect )
+DEVICE_CREATE1( CreateSaturationEffect )
+DEVICE_CREATE1( CreateTurbulenceEffect )
+DEVICE_CREATE1( CreateLinearTransferEffect )
+DEVICE_CREATE1( CreateTableTransferEffect )
+DEVICE_OK( RegisterCallbackThread, ( void *iface ) )
+DEVICE_CREATE1( CreateCompositeEffect )
+DEVICE_OK( SnapAnimationReadBackTime, ( void *iface ) )
+
+/* Partner extensions past SnapAnimationReadBackTime are not named yet.
+ * DCompTreeHost::CommitMainDevice calls slot 69 (vtbl+0x228); E_NOTIMPL there
+ * tears the tree down. Slot 69 is the per-frame commit for the partner device. */
+#define DEVICE_UNNAMED(n)                                                                          \
+    static HRESULT WINAPI device_slot_##n( void *iface )                                           \
+    {                                                                                              \
+        TRACE( "interop device slot %u: ignored.\n", (n) );                                        \
+        return S_OK;                                                                               \
+    }
+DEVICE_UNNAMED(60) DEVICE_UNNAMED(61) DEVICE_UNNAMED(62) DEVICE_UNNAMED(63)
+DEVICE_UNNAMED(64) DEVICE_UNNAMED(65) DEVICE_UNNAMED(66) DEVICE_UNNAMED(67)
+DEVICE_UNNAMED(68)
+static void notify_partner_dirty( void );
+
+static HRESULT WINAPI device_slot_69( void *iface )
+{
+    TRACE( "interop device CommitMainDevice (slot 69).\n" );
+    perf.commits++;
+    if (last_desktop_hwnd) present_desktop_hwnd( last_desktop_hwnd );
+    /* Telling XAML the composition is dirty after every commit keeps it scheduling frames forever.
+     * Only a commit that changed the scene asks for the next frame: XAML's own animations change the
+     * scene on every tick they run, and stop asking once they settle. (A fixed two seconds after any
+     * change had XAML commit ~120 times a second with nothing moving.) */
+    {
+        static LONG notified_generation = -1;
+        LONG generation = scene_generation;
+        if (generation != notified_generation)
+        {
+            notified_generation = generation;
+            notify_partner_dirty();
+        }
+    }
+    return S_OK;
+}
+DEVICE_UNNAMED(70) DEVICE_UNNAMED(71)
+DEVICE_UNNAMED(72) DEVICE_UNNAMED(73) DEVICE_UNNAMED(74) DEVICE_UNNAMED(75)
+
+static const void *interop_device_vtbl[] =
+{
+    device_QueryInterface, device_AddRef, device_Release,
+    device_Commit, device_WaitForCommitCompletion, device_GetFrameStatistics,
+    device_CreateVisual, device_CreateSurfaceFactory, device_CreateSurface,
+    device_CreateVirtualSurface, device_CreateTranslateTransform, device_CreateScaleTransform,
+    device_CreateRotateTransform, device_CreateSkewTransform, device_CreateMatrixTransform,
+    device_CreateTransformGroup, device_CreateTranslateTransform3D, device_CreateScaleTransform3D,
+    device_CreateRotateTransform3D, device_CreateMatrixTransform3D, device_CreateTransform3DGroup,
+    device_CreateEffectGroup, device_CreateRectangleClip, device_CreateAnimation,
+    device_CreateTargetForHwnd, device_CreateSurfaceFromHandle, device_CreateSurfaceFromHwnd,
+    device_CreateSharedResource, device_OpenSharedResourceHandle, device_OpenSharedResource,
+    device_CreateAnimationTrigger, device_CreateGradientSurface, device_EnableWhitePixelOptimization,
+    device_OfferSurfaceResources, device_ReclaimSurfaceResources, device_DisableD2DStatePreservation,
+    device_Flush, device_CreateSurfaceFromVisualSnapshot, device_CreateInteraction,
+    device_CreateTouchInteractionConfiguration, device_CreateTouchpadInteractionConfiguration,
+    device_CreatePenInteractionConfiguration, device_CreateMouseInteractionConfiguration,
+    device_OpenSharedResource2, device_CreateDesktopTree, device_GetCurrentBatchID,
+    device_GetLastConfirmedBatchId, device_CreateGaussianBlurEffect, device_CreateManipulationTransform,
+    device_CreateBrightnessEffect, device_CreateColorMatrixEffect, device_CreateShadowEffect,
+    device_CreateHueRotationEffect, device_CreateSaturationEffect, device_CreateTurbulenceEffect,
+    device_CreateLinearTransferEffect, device_CreateTableTransferEffect, device_RegisterCallbackThread,
+    device_CreateCompositeEffect, device_SnapAnimationReadBackTime,
+    device_slot_60, device_slot_61, device_slot_62, device_slot_63,
+    device_slot_64, device_slot_65, device_slot_66, device_slot_67,
+    device_slot_68, device_slot_69, device_slot_70, device_slot_71,
+    device_slot_72, device_slot_73, device_slot_74, device_slot_75,
+};
+
+/* {e7894c70-af56-4f52-b382-4b3cd263dc6f}: the interop compositor partner XAML gets from the WinRT
+ * Compositor (DCompTreeHost::EnsureDCompDevice, DManipDataWinRT::SetSharedContentTransforms). Layout from
+ * dcomp.pdb, InteropCompositor::Api vtable: 3 MarkDirty, 4 ClearCallback, 5 CreateManipulationTransform
+ * (IUnknown *transform, REFIID, void **), 6 RealClose. */
+static HRESULT WINAPI icp_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, icp_vtbl );
+    return compositor_QueryInterface( &impl->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI icp_AddRef( void *iface )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, icp_vtbl );
+    return compositor_AddRef( &impl->ICompositor_iface );
+}
+static ULONG WINAPI icp_Release( void *iface )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, icp_vtbl );
+    return compositor_Release( &impl->ICompositor_iface );
+}
+static HRESULT WINAPI icp_MarkDirty( void *iface )
+{
+    TRACE( "partner %p.\n", iface );
+    return S_OK;
+}
+static HRESULT WINAPI icp_ClearCallback( void *iface )
+{
+    scene_changed();
+    TRACE( "partner %p.\n", iface );
+    return S_OK;
+}
+static HRESULT WINAPI icp_CreateManipulationTransform( void *iface, IUnknown *transform, REFIID iid, void **out )
+{
+    TRACE( "partner %p, transform %p, iid %s, out %p.\n", iface, transform, debugstr_guid(iid), out );
+    return create_manip_transform( transform, out );
+}
+static HRESULT WINAPI icp_RealClose( void *iface )
+{
+    TRACE( "partner %p.\n", iface );
+    return S_OK;
+}
+static const void *icp_vtbl_impl[] =
+{
+    icp_QueryInterface, icp_AddRef, icp_Release,
+    icp_MarkDirty, icp_ClearCallback, icp_CreateManipulationTransform, icp_RealClose,
+};
+
+static HRESULT WINAPI device_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, device_vtbl );
+    return compositor_QueryInterface( &impl->ICompositor_iface, iid, out );
+}
+
+static ULONG WINAPI device_AddRef( void *iface )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, device_vtbl );
+    return compositor_AddRef( &impl->ICompositor_iface );
+}
+
+static ULONG WINAPI device_Release( void *iface )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, device_vtbl );
+    return compositor_Release( &impl->ICompositor_iface );
+}
+
+static HRESULT WINAPI internal_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, internal_vtbl );
+    return compositor_QueryInterface( &impl->ICompositor_iface, iid, out );
+}
+
+static ULONG WINAPI internal_AddRef( void *iface )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, internal_vtbl );
+    return compositor_AddRef( &impl->ICompositor_iface );
+}
+
+static ULONG WINAPI internal_Release( void *iface )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, internal_vtbl );
+    return compositor_Release( &impl->ICompositor_iface );
+}
+
+static HRESULT get_probe( struct compositor *owner, REFIID iid, void **out )
+{
+    struct probe *probe = NULL;
+    unsigned int i;
+
+    if (!compositor_iface_required( iid ))
+    {
+        TRACE( "compositor: %s not implemented.\n", debugstr_guid(iid) );
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+
+    EnterCriticalSection( &probe_cs );
+    for (i = 0; i < probe_count; i++)
+        if (probes[i]->owner == owner && IsEqualGUID( &probes[i]->iid, iid )) probe = probes[i];
+    if (!probe && probe_count < MAX_PROBES && (probe = calloc( 1, sizeof(*probe) )))
+    {
+        probe->vtbl = probe_vtbl;
+        probe->iid = *iid;
+        probe->owner = owner;
+        probes[probe_count++] = probe;
+    }
+    LeaveCriticalSection( &probe_cs );
+
+    if (!probe)
+    {
+        *out = NULL;
+        return E_OUTOFMEMORY;
+    }
+
+    {   /* once per interface: XAML asks for the same two every tick */
+        static GUID seen[32];
+        static unsigned int seen_count;
+        unsigned int i;
+        for (i = 0; i < seen_count; i++) if (IsEqualGUID( &seen[i], iid )) break;
+        if (i == seen_count)
+        {
+            if (seen_count < ARRAY_SIZE(seen)) seen[seen_count++] = *iid;
+            FIXME( "compositor: %s answered with a probe.\n", debugstr_guid(iid) );
+        }
+        else TRACE( "compositor: %s answered with a probe.\n", debugstr_guid(iid) );
+    }
+    probe_AddRef( &probe->vtbl );
+    *out = &probe->vtbl;
+    return S_OK;
+}
+
+/* {22118adf-...} slot 6 */
+/* XAML's partner callback (DCompInteropCompositorPartnerCallback: 3 NotifyDirty, 4 NotifyDeferralState). XAML
+ * only schedules another frame when the compositor tells it that composition became dirty. */
+static IUnknown *partner_callback;
+
+static void notify_partner_dirty( void )
+{
+    IUnknown *callback = partner_callback;
+
+    if (!callback) return;
+    TRACE( "NotifyDirty on partner callback %p.\n", callback );
+    ((HRESULT (WINAPI *)(IUnknown *))(*(void ***)callback)[3])( callback );
+}
+
+/* XAML's DCompTreeHost::CreateWinRTInteropCompositionDevice passes NULL for the device and its
+ * DCompInteropCompositorPartnerCallback (NotifyDirty, NotifyDeferralState) as the second pointer. */
+static HRESULT WINAPI compositor_factory_CreateInteropDevice( void *iface, IUnknown *rendering_device,
+                                                              IUnknown *callback, REFIID iid, void **out )
+{
+    FIXME( "rendering_device %p, callback %p, iid %s, out %p: semi-stub.\n", rendering_device, callback,
+           debugstr_guid(iid), out );
+
+    if (!out) return E_POINTER;
+    remember_rendering_device( rendering_device );
+    if (callback)
+    {
+        IUnknown_AddRef( callback );
+        if ((callback = InterlockedExchangePointer( (void **)&partner_callback, callback )))
+            IUnknown_Release( callback );
+    }
+    return create_compositor( iid, out );
+}
+
+static HRESULT WINAPI compositor_factory_private_QueryInterface( void *iface, REFIID iid, void **out );
+static ULONG WINAPI compositor_factory_private_AddRef( void *iface ) { return 2; }
+static ULONG WINAPI compositor_factory_private_Release( void *iface ) { return 1; }
+static HRESULT WINAPI compositor_factory_private_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI compositor_factory_private_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_Compositor,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_Compositor) - 1, name );
+}
+static HRESULT WINAPI compositor_factory_private_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+
+static const void *compositor_factory_private_vtbl[] =
+{
+    compositor_factory_private_QueryInterface,
+    compositor_factory_private_AddRef,
+    compositor_factory_private_Release,
+    compositor_factory_private_GetIids,
+    compositor_factory_private_GetRuntimeClassName,
+    compositor_factory_private_GetTrustLevel,
+    compositor_factory_CreateInteropDevice,
+};
+
+/* an object whose only member is its vtable pointer, so &compositor_factory_private can be handed
+ * out as the interface itself */
+static const void *const *compositor_factory_private = compositor_factory_private_vtbl;
+
+
+static const void *compositor2_vtbl[];
+static const void *compositor3_vtbl[];
+/* ICompositor3 {c9dd8ef0-6eb1-4e3c-a658-675d9c64d4ab}: slot 6 CreateHostBackdropBrush. WinUI's AcrylicBrush
+ * (the CalendarView flyout's background) throws hresult_no_interface out of a noexcept callback when the
+ * compositor refuses it. */
+static const GUID IID_ICompositor3_private =
+    { 0xc9dd8ef0, 0x6eb1, 0x4e3c, { 0xa6, 0x58, 0x67, 0x5d, 0x9c, 0x64, 0xd4, 0xab } };
+static const void *compositor5_vtbl[];
+static const void *compositor6_vtbl[];
+static const void *compositor4_vtbl[];
+static const void *compositor7_vtbl[];
+static const GUID IID_ICompositor7_local =
+    { 0xd3483fad, 0x9a12, 0x53ba, { 0xbf, 0xc8, 0x88, 0xb7, 0xff, 0x79, 0x77, 0xc6 } };
+static const void *compositor_shadow_vtbl[];
+static const GUID IID_ICompositorWithProjectedShadow_local =
+    { 0xa2e6330e, 0x8a60, 0x5a38, { 0xbb, 0x85, 0xb4, 0x4e, 0xa9, 0x01, 0x67, 0x7c } };
+
+static inline struct compositor *impl_from_ICompositor( ICompositor *iface )
+{
+    return CONTAINING_RECORD( iface, struct compositor, ICompositor_iface );
+}
+
+static HRESULT WINAPI compositor_QueryInterface( ICompositor *iface, REFIID iid, void **out )
+{
+    struct compositor *impl = impl_from_ICompositor( iface );
+
+    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) ||
+        IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) ||
+        IsEqualGUID( iid, &IID_ICompositor ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = &impl->ICompositor_iface;
+        return S_OK;
+    }
+
+    /* {e7894c70} is not a device revision: InteropCompositor::Api's InterfaceParts table gives it its own
+     * vtable (MarkDirty, ClearCallback, CreateManipulationTransform, RealClose). Answered with the device
+     * vtable, XAML's CreateManipulationTransform call landed on GetFrameStatistics, which wrote frame
+     * statistics over the transform object passed in. */
+    if (IsEqualGUID( iid, &IID_IInteropCompositionDevice2_private ))
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->icp_vtbl = icp_vtbl_impl;
+        *out = &impl->icp_vtbl;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IInteropCompositionDevice_private ) ||
+        IsEqualGUID( iid, &IID_IDCompositionDevice_ ) ||
+        IsEqualGUID( iid, &IID_IDCompositionDevice2_ ) ||
+        IsEqualGUID( iid, &IID_IDCompositionDevice3_ ))
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->device_vtbl = interop_device_vtbl;
+        *out = &impl->device_vtbl;
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_IDCompositionDeviceInternal_private ))
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->internal_vtbl = internal_device_vtbl;
+        *out = &impl->internal_vtbl;
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_ICompositorInterop ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = &impl->ICompositorInterop_iface;
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_ICompositorWithCompositionIslands ))
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->islands_vtbl = compositor_islands_vtbl;
+        *out = &impl->islands_vtbl;
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_ICompositorDesktopInterop_ ))
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->desktop_vtbl = compositor_desktop_vtbl;
+        *out = &impl->desktop_vtbl;
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_IInteropCompositorPartner ))
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->partner_vtbl = compositor_partner_vtbl;
+        *out = &impl->partner_vtbl;
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_ICompositorPrivate2 )) /* ICompositor5 */
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->compositor5_vtbl = compositor5_vtbl;
+        *out = &impl->compositor5_vtbl;
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_ICompositor7_local ))
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->compositor7_vtbl = compositor7_vtbl;
+        *out = &impl->compositor7_vtbl;
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_ICompositorWithProjectedShadow_local ))
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->shadow_vtbl = compositor_shadow_vtbl;
+        *out = &impl->shadow_vtbl;
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_ICompositorPrivate6 )) /* ICompositor4 */
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->compositor4_vtbl = compositor4_vtbl;
+        *out = &impl->compositor4_vtbl;
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_ICompositorPrivate3 )) /* ICompositor6 */
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->compositor6_vtbl = compositor6_vtbl;
+        *out = &impl->compositor6_vtbl;
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_ICompositor2_private ))
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->compositor2_vtbl = compositor2_vtbl;
+        *out = &impl->compositor2_vtbl;
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_ICompositor3_private ))
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->compositor3_vtbl = compositor3_vtbl;
+        *out = &impl->compositor3_vtbl;
+        return S_OK;
+    }
+
+    return get_probe( impl, iid, out );
+}
+
+static ULONG WINAPI compositor_AddRef( ICompositor *iface )
+{
+    return InterlockedIncrement( &impl_from_ICompositor( iface )->ref );
+}
+
+static ULONG WINAPI compositor_Release( ICompositor *iface )
+{
+    struct compositor *impl = impl_from_ICompositor( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+
+    if (!ref) free( impl );
+    return ref;
+}
+
+static HRESULT WINAPI compositor_GetIids( ICompositor *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+
+static HRESULT WINAPI compositor_GetRuntimeClassName( ICompositor *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_Compositor,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_Compositor) - 1, name );
+}
+
+static HRESULT WINAPI compositor_GetTrustLevel( ICompositor *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+
+/*
+ * WinRT visuals / brushes / targets. XAML's DCompTreeHost stores ICompositor at offset 0x1c8 and
+ * builds the tree through ICompositor::CreateContainerVisual (slot 9). Returning E_NOTIMPL there
+ * is why the window stays blank: the interop device CreateVisual path only wraps a couple of
+ * DCompVisual helpers, not the actual UI tree.
+ */
+
+enum visual_kind
+{
+    VISUAL_CONTAINER,
+    VISUAL_SPRITE,
+};
+
+struct visual;
+
+struct visual;
+static ULONG visual_addref( struct visual *impl );
+static ULONG visual_release( struct visual *impl );
+
+struct visual_collection
+{
+    IVisualCollection IVisualCollection_iface;
+    const void **iterable_vtbl;
+    struct visual *owner;
+    IInspectable **children;
+    unsigned int count;
+    unsigned int capacity;
+    LONG ref;
+};
+
+struct visual
+{
+    IContainerVisual IContainerVisual_iface;
+    ISpriteVisual ISpriteVisual_iface;
+    IVisual IVisual_iface;
+    ICompositionObject ICompositionObject_iface;
+    const void **interop_vtbl; /* private InteropVisual, GetVisualCollection at slot 45 */
+    const void **closable_vtbl; /* Windows.Foundation.IClosable, see visual_closable_vtbl */
+    const void **sprite2_vtbl;  /* ISpriteVisual2 (Shadow), see visual_sprite2_vtbl */
+    IUnknown *shadow;           /* the CompositionShadow set through ISpriteVisual2, kept but not drawn */
+    Vector2 relative_offset, relative_size; /* InteropVisual SetRelativeOffset/Width/Height, fractions of the parent */
+    BOOL has_relative_size;
+    const void **shape_vtbl;   /* IShapeVisual, only set for ShapeVisual */
+    const void **shapes_vtbl;  /* IVector<CompositionShape> returned by get_Shapes */
+    IInspectable *shapes[64];
+    unsigned int shape_count;
+    ICompositor *compositor;
+    struct visual_collection collection;
+    ICompositionBrush *brush;
+    ICompositionPropertySet *properties;
+    ICompositionClip *clip;
+    struct visual_collection *parent;  /* the collection currently holding this visual, if any */
+    /* what the last key-frame animation replaced: an AnimatedIcon fetches a controller for the property
+     * right after StartAnimation (its layers are driven by Progress), and the end value is undone then */
+    WCHAR animated_prop[32];
+    Vector3 saved_offset, saved_scale, saved_center;
+    Vector2 saved_size;
+    float saved_opacity;
+    BOOL saved_visible;
+    struct anim_binding bindings[ANIM_BINDINGS];
+    unsigned int binding_count;
+    struct drawing_surface *shape_surface; /* ShapeVisual: the texture its shapes are rasterised into */
+    ULONGLONG shape_signature;  /* of what shape_surface holds (shape_signature) */
+    BOOL shape_drawn;
+    Vector2 anchor, size;
+    Vector3 offset, center, scale, rotation_axis;
+    Quaternion orientation;
+    Matrix4x4 transform;
+    FLOAT opacity, rotation, rotation_deg;
+    boolean visible;
+    enum visual_kind kind;
+    LONG ref;
+};
+
+struct color_brush
+{
+    ICompositionColorBrush ICompositionColorBrush_iface;
+    ICompositionObject ICompositionObject_iface;
+    const void **partner_vtbl;      /* {83112a11} composition object partner, see brush_partner_vtbl */
+    ICompositor *compositor;
+    Color color;
+    LONG ref;
+    void *color_expr;   /* the expression animating Color, re-read whenever the colour is used (theme changes) */
+};
+static const void *brush_partner_vtbl[];
+static const GUID IID_ICompositionObjectPartner_local =
+    { 0x83112a11, 0x8e47, 0x4b0c, { 0xa5, 0x61, 0x9e, 0x33, 0x4d, 0x8f, 0x88, 0xe3 } };
+
+struct composition_target
+{
+    ICompositionTarget ICompositionTarget_iface;
+    ICompositionObject ICompositionObject_iface;
+    ICompositor *compositor;
+    IVisual *root;
+    HWND hwnd; /* set for ICompositorDesktopInterop::CreateDesktopWindowTarget */
+    LONG ref;
+};
+
+#define PROPSET_VALUES 32
+#define PROPSET_BINDINGS 8
+struct property_set
+{
+    ICompositionPropertySet ICompositionPropertySet_iface;
+    const void **set2_vtbl;     /* ICompositionPropertySet2: InsertBoolean, TryGetBoolean (WinUI's Pivot/SwipeControl) */
+    LONG ref;
+    struct matrix_transform *manip; /* set when an expression bound to a manipulation transform animates a property */
+    struct propset_value values[PROPSET_VALUES];
+    unsigned int value_count;
+    /* expressions started on properties of this set (StartAnimation("Matrix", expr)); the evaluator follows them */
+    struct { WCHAR name[48]; struct expr_animation *expr; } bindings[PROPSET_BINDINGS];
+    unsigned int binding_count;
+};
+
+static HRESULT create_property_set( ICompositionPropertySet **out );
+static HRESULT create_visual( ICompositor *compositor, enum visual_kind kind, void **out );
+
+static HRESULT inspectable_get_iids( ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+
+static HRESULT inspectable_trust( TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+
+static HRESULT WINAPI collection_QueryInterface( IVisualCollection *iface, REFIID iid, void **out )
+{
+    struct visual_collection *impl = CONTAINING_RECORD( iface, struct visual_collection, IVisualCollection_iface );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IVisualCollection ))
+    {
+        visual_addref( impl->owner );
+        *out = &impl->IVisualCollection_iface;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IIterableVisual_private ))
+    {
+        visual_addref( impl->owner );
+        *out = &impl->iterable_vtbl;
+        return S_OK;
+    }
+    TRACE( "visual collection: no interface %s.\n", debugstr_guid(iid) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+/* The collection is embedded in its visual, so it shares the visual's lifetime; the visual releases the
+ * children when it goes away. Counting it separately let a caller's last Release free the children while
+ * the visual, and the painter walking it, still held the pointers. */
+static ULONG WINAPI collection_AddRef( IVisualCollection *iface )
+{
+    struct visual_collection *impl = CONTAINING_RECORD( iface, struct visual_collection, IVisualCollection_iface );
+    return visual_addref( impl->owner );
+}
+
+static ULONG WINAPI collection_Release( IVisualCollection *iface )
+{
+    struct visual_collection *impl = CONTAINING_RECORD( iface, struct visual_collection, IVisualCollection_iface );
+    return visual_release( impl->owner );
+}
+
+static HRESULT WINAPI collection_GetIids( IVisualCollection *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+
+static HRESULT WINAPI collection_GetRuntimeClassName( IVisualCollection *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_VisualCollection,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_VisualCollection) - 1, name );
+}
+
+static HRESULT WINAPI collection_GetTrustLevel( IVisualCollection *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+
+static HRESULT WINAPI collection_get_Count( IVisualCollection *iface, INT32 *value )
+{
+    struct visual_collection *impl = CONTAINING_RECORD( iface, struct visual_collection, IVisualCollection_iface );
+    if (!value) return E_POINTER;
+    *value = impl->count;
+    return S_OK;
+}
+
+/* Children are kept bottom-to-top: index 0 is painted first. InsertAtBottom/InsertBelow must not append, or a
+ * full-window background inserted at the bottom ends up painted over everything else. */
+/* Children are stored as whichever interface pointer the caller passed; compare objects, not pointers. */
+static struct visual *public_visual_from( IInspectable *object )
+{
+    void *view = NULL;
+    struct visual *impl;
+    MEMORY_BASIC_INFORMATION mbi;
+    void **vtbl;
+
+    if (!object) return NULL;
+    vtbl = *(void ***)object;
+    if ((ULONG_PTR)vtbl < 0x10000 || !VirtualQuery( vtbl, &mbi, sizeof(mbi) ) || !(mbi.Type & MEM_IMAGE)) return NULL;
+    if (FAILED( IInspectable_QueryInterface( object, &IID_IInteropVisual_private, &view ) )) return NULL;
+    /* dcomp (interop) visuals answer this interface too; treating one as a public visual computed a
+     * struct visual inside a struct dcomp_visual, and writing its parent link corrupted that visual. */
+    impl = visual_from_interop( view );
+    IUnknown_Release( (IUnknown *)view );
+    return impl;
+}
+static int collection_index_of( struct visual_collection *impl, IVisual *child )
+{
+    struct visual *wanted = public_visual_from( (IInspectable *)child );
+    unsigned int i;
+
+    for (i = 0; i < impl->count; i++)
+    {
+        if (impl->children[i] == (IInspectable *)child) return i;
+        if (wanted && public_visual_from( impl->children[i] ) == wanted) return i;
+    }
+    return -1;
+}
+static void collection_detach( struct visual_collection *impl, IVisual *child )
+{
+    struct visual *v = public_visual_from( (IInspectable *)child );
+    int i = collection_index_of( impl, child );
+    if (i < 0)
+    {
+        TRACE( "owner %p: child %p is not here.\n", impl->owner, child );
+        return;
+    }
+    if (v && v->parent == impl) v->parent = NULL;
+    IInspectable_Release( impl->children[i] );
+    memmove( impl->children + i, impl->children + i + 1, (impl->count - i - 1) * sizeof(*impl->children) );
+    impl->count--;
+}
+
+static HRESULT collection_insert_at( struct visual_collection *impl, IVisual *child, unsigned int index,
+                                     const char *how )
+{
+    int existing;
+
+    if (!child) return E_INVALIDARG;
+    /* A visual has a single parent: inserting a child that is already in this collection moves it. XAML
+     * re-inserts its window background sprite with InsertAtBottom; keeping each insert as a new entry left
+     * stale copies above the content inserted later. */
+    if ((existing = collection_index_of( impl, child )) >= 0)
+    {
+        memmove( impl->children + existing, impl->children + existing + 1,
+                 (impl->count - existing - 1) * sizeof(*impl->children) );
+        impl->count--;
+        if (index > (unsigned int)existing) index--;
+        if (index > impl->count) index = impl->count;
+        TRACE( "owner %p %s child %p moved from %d to %u.\n", impl->owner, how, child, existing, index );
+        memmove( impl->children + index + 1, impl->children + index,
+                 (impl->count - index) * sizeof(*impl->children) );
+        impl->children[index] = (IInspectable *)child;   /* keeps the reference it already held */
+        impl->count++;
+        return S_OK;
+    }
+    if (impl->count >= impl->capacity)
+    {
+        unsigned int capacity = impl->capacity ? impl->capacity * 2 : 16;
+        IInspectable **children = realloc( impl->children, capacity * sizeof(*children) );
+        if (!children) return E_OUTOFMEMORY;
+        impl->children = children;
+        impl->capacity = capacity;
+    }
+    if (index > impl->count) index = impl->count;
+    TRACE( "owner %p %s child %p at %u of %u.\n", impl->owner, how, child, index, impl->count );
+    /* A visual has one parent. XAML moves its text sprites under the DirectManipulation content
+     * container without our seeing a Remove for the old parent, and a child painted from both
+     * parents shows up twice (the result digits at the top left of Calculator's window). */
+    {
+        struct visual *v = public_visual_from( (IInspectable *)child );
+        if (v && v->parent && v->parent != impl)
+        {
+            TRACE( "child %p leaves collection of %p.\n", child, v->parent->owner );
+            collection_detach( v->parent, child );
+        }
+        if (v) v->parent = impl;
+    }
+    memmove( impl->children + index + 1, impl->children + index,
+             (impl->count - index) * sizeof(*impl->children) );
+    IInspectable_AddRef( (impl->children[index] = (IInspectable *)child) );
+    impl->count++;
+    if (dcv_from_any( child ))
+    {
+        struct dcomp_visual *dcv = dcv_from_any( child );
+        unsigned i;
+
+        EnterCriticalSection( &dcomp_visual_cs );
+        for (i = 0; i < dcomp_visual_count; i++)
+            if (dcomp_visuals[i] == dcv) dcomp_visual_has_parent[i] = TRUE;
+        LeaveCriticalSection( &dcomp_visual_cs );
+    }
+    return S_OK;
+}
+
+static HRESULT WINAPI collection_InsertAbove( IVisualCollection *iface, IVisual *child, IVisual *sibling )
+{
+    scene_changed();
+    struct visual_collection *impl = CONTAINING_RECORD( iface, struct visual_collection, IVisualCollection_iface );
+    int index = collection_index_of( impl, sibling );
+
+    return collection_insert_at( impl, child, index < 0 ? impl->count : index + 1, "InsertAbove" );
+}
+
+static HRESULT WINAPI collection_InsertAtBottom( IVisualCollection *iface, IVisual *child )
+{
+    scene_changed();
+    struct visual_collection *impl = CONTAINING_RECORD( iface, struct visual_collection, IVisualCollection_iface );
+    return collection_insert_at( impl, child, 0, "InsertAtBottom" );
+}
+
+static HRESULT WINAPI collection_InsertAtTop( IVisualCollection *iface, IVisual *child )
+{
+    scene_changed();
+    struct visual_collection *impl = CONTAINING_RECORD( iface, struct visual_collection, IVisualCollection_iface );
+    return collection_insert_at( impl, child, impl->count, "InsertAtTop" );
+}
+
+static HRESULT WINAPI collection_InsertBelow( IVisualCollection *iface, IVisual *child, IVisual *sibling )
+{
+    scene_changed();
+    struct visual_collection *impl = CONTAINING_RECORD( iface, struct visual_collection, IVisualCollection_iface );
+    int index = collection_index_of( impl, sibling );
+
+    return collection_insert_at( impl, child, index < 0 ? 0 : index, "InsertBelow" );
+}
+
+static HRESULT WINAPI collection_Remove( IVisualCollection *iface, IVisual *child )
+{
+    scene_changed();
+    struct visual_collection *impl = CONTAINING_RECORD( iface, struct visual_collection, IVisualCollection_iface );
+    struct visual *v = public_visual_from( (IInspectable *)child );
+    TRACE( "owner %p child %p.\n", impl->owner, child );
+    if (v && v->parent == impl) v->parent = NULL;
+    collection_detach( impl, child );
+    return S_OK;
+}
+static HRESULT WINAPI collection_RemoveAll( IVisualCollection *iface )
+{
+    scene_changed();
+    struct visual_collection *impl = CONTAINING_RECORD( iface, struct visual_collection, IVisualCollection_iface );
+    unsigned int i;
+    TRACE( "owner %p.\n", impl->owner );
+    for (i = 0; i < impl->count; i++)
+    {
+        struct visual *v = public_visual_from( impl->children[i] );
+        if (v && v->parent == impl) v->parent = NULL;
+        if (impl->children[i]) IInspectable_Release( impl->children[i] );
+    }
+    impl->count = 0;
+    return S_OK;
+}
+static const struct IVisualCollectionVtbl collection_vtbl =
+{
+    collection_QueryInterface, collection_AddRef, collection_Release,
+    collection_GetIids, collection_GetRuntimeClassName, collection_GetTrustLevel,
+    collection_get_Count, collection_InsertAbove, collection_InsertAtBottom,
+    collection_InsertAtTop, collection_InsertBelow, collection_Remove, collection_RemoveAll,
+};
+
+struct visual_iterator
+{
+    const void **vtbl;
+    struct visual_collection *collection;
+    unsigned int index;
+    LONG ref;
+};
+
+static HRESULT WINAPI iterable_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct visual_collection *impl = CONTAINING_RECORD( iface, struct visual_collection, iterable_vtbl );
+    return collection_QueryInterface( &impl->IVisualCollection_iface, iid, out );
+}
+static ULONG WINAPI iterable_AddRef( void *iface )
+{
+    struct visual_collection *impl = CONTAINING_RECORD( iface, struct visual_collection, iterable_vtbl );
+    return collection_AddRef( &impl->IVisualCollection_iface );
+}
+static ULONG WINAPI iterable_Release( void *iface )
+{
+    struct visual_collection *impl = CONTAINING_RECORD( iface, struct visual_collection, iterable_vtbl );
+    return collection_Release( &impl->IVisualCollection_iface );
+}
+static HRESULT WINAPI iterator_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct visual_iterator *impl = CONTAINING_RECORD( iface, struct visual_iterator, vtbl );
+    if (!out) return E_POINTER;
+    if (!IsEqualGUID( iid, &IID_IUnknown ) && !IsEqualGUID( iid, &IID_IInspectable ) &&
+        !IsEqualGUID( iid, &IID_IAgileObject ))
+    {
+        TRACE( "visual iterator: no interface %s.\n", debugstr_guid(iid) );
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    InterlockedIncrement( &impl->ref );
+    *out = &impl->vtbl;
+    return S_OK;
+}
+static ULONG WINAPI iterator_AddRef( void *iface )
+{
+    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct visual_iterator, vtbl )->ref );
+}
+static ULONG WINAPI iterator_Release( void *iface )
+{
+    struct visual_iterator *impl = CONTAINING_RECORD( iface, struct visual_iterator, vtbl );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref)
+    {
+        collection_Release( &impl->collection->IVisualCollection_iface );
+        free( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI iterator_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI iterator_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( L"", 0, name );
+}
+static HRESULT WINAPI iterator_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI iterator_get_Current( void *iface, IVisual **out )
+{
+    struct visual_iterator *impl = CONTAINING_RECORD( iface, struct visual_iterator, vtbl );
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (impl->index >= impl->collection->count) return E_BOUNDS;
+    IInspectable_AddRef( impl->collection->children[impl->index] );
+    *out = (IVisual *)impl->collection->children[impl->index];
+    return S_OK;
+}
+static HRESULT WINAPI iterator_get_HasCurrent( void *iface, boolean *value )
+{
+    struct visual_iterator *impl = CONTAINING_RECORD( iface, struct visual_iterator, vtbl );
+    if (!value) return E_POINTER;
+    *value = impl->index < impl->collection->count;
+    return S_OK;
+}
+static HRESULT WINAPI iterator_MoveNext( void *iface, boolean *value )
+{
+    struct visual_iterator *impl = CONTAINING_RECORD( iface, struct visual_iterator, vtbl );
+    if (impl->index < impl->collection->count) impl->index++;
+    if (value) *value = impl->index < impl->collection->count;
+    return S_OK;
+}
+static HRESULT WINAPI iterator_GetMany( void *iface, unsigned int capacity, IVisual **items,
+                                        unsigned int *actual )
+{
+    struct visual_iterator *impl = CONTAINING_RECORD( iface, struct visual_iterator, vtbl );
+    unsigned int count = 0;
+    if (!actual) return E_POINTER;
+    while (count < capacity && impl->index < impl->collection->count)
+    {
+        items[count] = (IVisual *)impl->collection->children[impl->index++];
+        IVisual_AddRef( items[count++] );
+    }
+    *actual = count;
+    return S_OK;
+}
+static const void *iterator_vtbl[] =
+{
+    iterator_QueryInterface, iterator_AddRef, iterator_Release,
+    iterator_GetIids, iterator_GetRuntimeClassName, iterator_GetTrustLevel,
+    iterator_get_Current, iterator_get_HasCurrent, iterator_MoveNext, iterator_GetMany,
+};
+static HRESULT WINAPI iterable_First( void *iface, void **out )
+{
+    struct visual_collection *collection = CONTAINING_RECORD( iface, struct visual_collection, iterable_vtbl );
+    struct visual_iterator *iterator;
+    if (!out) return E_POINTER;
+    if (!(iterator = calloc( 1, sizeof(*iterator) ))) return E_OUTOFMEMORY;
+    iterator->vtbl = iterator_vtbl;
+    iterator->collection = collection;
+    iterator->ref = 1;
+    collection_AddRef( &collection->IVisualCollection_iface );
+    *out = &iterator->vtbl;
+    return S_OK;
+}
+static const void *iterable_vtbl[] =
+{
+    iterable_QueryInterface, iterable_AddRef, iterable_Release,
+    collection_GetIids, collection_GetRuntimeClassName, collection_GetTrustLevel,
+    iterable_First,
+};
+
+static inline struct visual *impl_from_container( IContainerVisual *iface )
+{
+    return CONTAINING_RECORD( iface, struct visual, IContainerVisual_iface );
+}
+
+static inline struct visual *impl_from_sprite( ISpriteVisual *iface )
+{
+    return CONTAINING_RECORD( iface, struct visual, ISpriteVisual_iface );
+}
+
+static inline struct visual *impl_from_ivisual( IVisual *iface )
+{
+    return CONTAINING_RECORD( iface, struct visual, IVisual_iface );
+}
+
+static inline struct visual *impl_from_visual_obj( ICompositionObject *iface )
+{
+    return CONTAINING_RECORD( iface, struct visual, ICompositionObject_iface );
+}
+
+static HRESULT visual_qi( struct visual *impl, REFIID iid, void **out );
+static ULONG visual_addref( struct visual *impl );
+static ULONG visual_release( struct visual *impl );
+
+static inline struct visual *impl_from_visual_interop( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct visual, interop_vtbl );
+}
+
+/* Every object in this file answers an unknown IID with its own vtbl and S_OK, so QI-ing for
+ * IID_IInteropVisual_private and assuming the result is a visual's interop view is not safe:
+ * "it is not a dcomp_visual" does not make it a struct visual. CONTAINING_RECORD on the wrong
+ * object put bindings[] and binding_count past the end of a smaller allocation, and the scan in
+ * anim_find then walked into unmapped memory. Check the vtbl instead. */
+static struct visual *visual_from_interop( void *iface )
+{
+    if (!iface || *(const void ***)iface != visual_interop_vtbl) return NULL;
+    return impl_from_visual_interop( iface );
+}
+
+static HRESULT WINAPI visual_interop_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return visual_qi( impl_from_visual_interop( iface ), iid, out );
+}
+
+static ULONG WINAPI visual_interop_AddRef( void *iface )
+{
+    return visual_addref( impl_from_visual_interop( iface ) );
+}
+
+static ULONG WINAPI visual_interop_Release( void *iface )
+{
+    return visual_release( impl_from_visual_interop( iface ) );
+}
+
+static HRESULT WINAPI visual_interop_ok( void *iface )
+{
+    return S_OK;
+}
+
+static HRESULT WINAPI visual_interop_GetVisualCollection( void *iface, void **out )
+{
+    struct visual *impl = impl_from_visual_interop( iface );
+
+    if (!out) return E_POINTER;
+    IVisualCollection_AddRef( &impl->collection.IVisualCollection_iface );
+    *out = &impl->collection.IVisualCollection_iface;
+    TRACE( "%p -> %p.\n", iface, *out );
+    return S_OK;
+}
+
+/* InteropVisual::Api layout from dcomp.pdb/native dcomp: IUnknown followed by setters,
+ * with GetVisualCollection at slot 45.  The setters are recording no-ops for now. */
+/* InteropVisual setters XAML positions its public visuals with (native Api@InteropVisual vtable):
+ * 4 SetOffsetX(float), 6 SetOffsetY(float), 8 SetTransform(const D2D_MATRIX_3X2_F &), 30 SetOpacity(float),
+ * 33 SetVisible(BOOL), 36 SetWidth(float), 37 SetHeight(float). The animation and object overloads next to
+ * them stay no-ops. */
+static HRESULT WINAPI visual_interop_SetOffsetX( void *iface, float x )
+{
+    scene_changed();
+    impl_from_visual_interop( iface )->offset.X = x;
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_SetOffsetY( void *iface, float y )
+{
+    scene_changed();
+    impl_from_visual_interop( iface )->offset.Y = y;
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_SetTransformMatrix( void *iface, const D2D_MATRIX_3X2_F *matrix )
+{
+    scene_changed();
+    struct visual *impl = impl_from_visual_interop( iface );
+
+    if (!matrix) return E_POINTER;
+    /* Only the translation is used by the painter. */
+    impl->transform.M41 = matrix->_31;
+    impl->transform.M42 = matrix->_32;
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_SetOpacity( void *iface, float opacity )
+{
+    scene_changed();
+    impl_from_visual_interop( iface )->opacity = opacity;
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_SetVisible( void *iface, BOOL visible )
+{
+    scene_changed();
+    impl_from_visual_interop( iface )->visible = !!visible;
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_SetWidth( void *iface, float width )
+{
+    scene_changed();
+    TRACE( "visual %p width %g.\n", impl_from_visual_interop( iface ), width );
+    impl_from_visual_interop( iface )->size.X = width;
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_SetHeight( void *iface, float height )
+{
+    scene_changed();
+    TRACE( "visual %p height %g.\n", impl_from_visual_interop( iface ), height );
+    impl_from_visual_interop( iface )->size.Y = height;
+    return S_OK;
+}
+/* 38 SetRelativeOffsetX, 39 SetRelativeOffsetY, 40 SetRelativeWidth, 41 SetRelativeHeight: fractions of the parent. */
+static HRESULT WINAPI visual_interop_SetRelativeOffsetX( void *iface, float value )
+{
+    scene_changed();
+    impl_from_visual_interop( iface )->relative_offset.X = value;
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_SetRelativeOffsetY( void *iface, float value )
+{
+    scene_changed();
+    impl_from_visual_interop( iface )->relative_offset.Y = value;
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_SetRelativeWidth( void *iface, float value )
+{
+    scene_changed();
+    struct visual *impl = impl_from_visual_interop( iface );
+    impl->relative_size.X = value;
+    impl->has_relative_size = TRUE;
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_SetRelativeHeight( void *iface, float value )
+{
+    scene_changed();
+    struct visual *impl = impl_from_visual_interop( iface );
+    impl->relative_size.Y = value;
+    impl->has_relative_size = TRUE;
+    return S_OK;
+}
+
+static const void *visual_interop_vtbl[] =
+{
+    visual_interop_QueryInterface, visual_interop_AddRef, visual_interop_Release, visual_interop_ok,
+    visual_interop_SetOffsetX, visual_interop_ok, visual_interop_SetOffsetY, visual_interop_ok,
+    visual_interop_SetTransformMatrix, visual_interop_ok, visual_interop_ok, visual_interop_ok,
+    visual_interop_ok, visual_interop_ok, visual_interop_ok, visual_interop_ok,
+    visual_interop_ok, visual_interop_ok, visual_interop_ok, visual_interop_ok,
+    visual_interop_ok, visual_interop_ok, visual_interop_ok, visual_interop_ok,
+    visual_interop_ok, visual_interop_ok, visual_interop_ok, visual_interop_ok,
+    visual_interop_ok, visual_interop_ok, visual_interop_SetOpacity, visual_interop_ok,
+    visual_interop_ok, visual_interop_SetVisible, visual_interop_ok, visual_interop_ok,
+    visual_interop_SetWidth, visual_interop_SetHeight, visual_interop_SetRelativeOffsetX, visual_interop_SetRelativeOffsetY,
+    visual_interop_SetRelativeWidth, visual_interop_SetRelativeHeight, visual_interop_ok, visual_interop_ok,
+    visual_interop_ok, visual_interop_GetVisualCollection, visual_interop_ok, visual_interop_ok,
+    visual_interop_ok, visual_interop_ok, visual_interop_ok, visual_interop_ok,
+};
+
+/* sx/sy: the scale the ancestors apply to this visual's coordinates. A visual's own Scale (about its
+ * CenterPoint) applies to its content and its children, which is how XAML sizes a 48px AnimatedIcon
+ * visual down to the 16px icon. */
+/* Apply the bindings whose controller has a progress: the animation's value at that progress replaces the
+ * property (an AnimatedIcon's layers at the icon's current state). */
+static void visual_apply_controlled( struct visual *impl )
+{
+    unsigned int i;
+    for (i = 0; i < impl->binding_count; i++)
+    {
+        struct anim_binding *b = &impl->bindings[i];
+        struct kf_key v;
+        float progress;
+        if (!b->kf || !b->kf->key_count || !anim_controller_progress( b->controller, &progress )) continue;
+        if (!kf_sample( b->kf, progress, &v )) continue;
+        if (b->kf->value_kind == KF_BOOLEAN && !wcsicmp( b->prop, L"IsVisible" )) impl->visible = v.u.flag;
+        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Opacity" )) impl->opacity = v.u.scalar;
+        else if (b->kf->value_kind == KF_VECTOR3 && !wcsicmp( b->prop, L"Offset" )) impl->offset = v.u.vector3;
+        else if (b->kf->value_kind == KF_VECTOR3 && !wcsicmp( b->prop, L"Scale" )) impl->scale = v.u.vector3;
+        else if (b->kf->value_kind == KF_VECTOR3 && !wcsicmp( b->prop, L"CenterPoint" )) impl->center = v.u.vector3;
+        else if (b->kf->value_kind == KF_VECTOR2 && !wcsicmp( b->prop, L"Size" )) impl->size = v.u.vector2;
+        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Offset.X" )) impl->offset.X = v.u.scalar;
+        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Offset.Y" )) impl->offset.Y = v.u.scalar;
+        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Scale.X" )) impl->scale.X = v.u.scalar;
+        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Scale.Y" )) impl->scale.Y = v.u.scalar;
+    }
+}
+static void shape_apply_controlled( struct comp_shape *shape )
+{
+    unsigned int i;
+    for (i = 0; i < shape->binding_count; i++)
+    {
+        struct anim_binding *b = &shape->bindings[i];
+        struct kf_key v;
+        float progress;
+        /* an animation whose key frames were expressions (inserted on the generic view) has none to sample */
+        if (!b->kf || !b->kf->key_count || !anim_controller_progress( b->controller, &progress )) continue;
+        if (!kf_sample( b->kf, progress, &v )) continue;
+        if (b->kf->last_sampled != progress || !b->kf->sampled_once)
+        {
+            b->kf->sampled_once = TRUE;
+            TRACE( "shape %p %s at progress %g -> %g / %g,%g (%u keys).\n", shape, debugstr_w( b->prop ), progress,
+                   v.u.scalar, v.u.vector2.X, v.u.vector2.Y, b->kf->key_count );
+            b->kf->last_sampled = progress;
+        }
+        if (b->kf->value_kind == KF_VECTOR2 && !wcsicmp( b->prop, L"Offset" )) shape->xf.offset = v.u.vector2;
+        else if (b->kf->value_kind == KF_VECTOR2 && !wcsicmp( b->prop, L"Scale" )) shape->xf.scale = v.u.vector2;
+        else if (b->kf->value_kind == KF_VECTOR2 && !wcsicmp( b->prop, L"CenterPoint" )) shape->xf.center = v.u.vector2;
+        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"RotationAngleInDegrees" )) shape->xf.rotation = v.u.scalar * 3.14159265f / 180.0f;
+        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"RotationAngle" )) shape->xf.rotation = v.u.scalar;
+        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Offset.X" )) shape->xf.offset.X = v.u.scalar;
+        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Offset.Y" )) shape->xf.offset.Y = v.u.scalar;
+        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Scale.X" )) shape->xf.scale.X = v.u.scalar;
+        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Scale.Y" )) shape->xf.scale.Y = v.u.scalar;
+        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"CenterPoint.X" )) shape->xf.center.X = v.u.scalar;
+        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"CenterPoint.Y" )) shape->xf.center.Y = v.u.scalar;
+    }
+}
+static const struct IContainerVisualVtbl container_vtbl;
+static const struct ISpriteVisualVtbl sprite_vtbl;
+static const struct IVisualVtbl ivisual_vtbl;
+static const void *visual_interop_vtbl[];
+static BOOL branch_is_window_space_dcv( struct dcomp_visual *v, unsigned int depth );
+static struct visual *visual_from_known_iface( IInspectable *object );
+/* XAML positions a popup either in window coordinates or in the content root's, and the two are a title
+ * bar row apart. A popup hosted in its own window-sized visual (the CalendarDatePicker flyout, whose
+ * dimming layer covers the window) is already absolute; a ComboBox popup's subtree has no window-sized
+ * visual in it and is content relative. */
+static BOOL branch_is_window_space_pub( struct visual *impl, unsigned int depth )
+{
+    unsigned int i;
+
+    if (!impl || depth > 8) return FALSE;
+    for (i = 0; i < impl->collection.count; i++)
+    {
+        IInspectable *child = impl->collection.children[i];
+        struct dcomp_visual *dcv;
+        struct visual *known;
+
+        if (!child) continue;
+        if ((known = visual_from_known_iface( child )))
+        {
+            if (branch_is_window_space_pub( known, depth + 1 )) return TRUE;
+        }
+        else if ((dcv = dcv_from_any( child )) && branch_is_window_space_dcv( dcv, depth + 1 )) return TRUE;
+    }
+    return FALSE;
+}
+static BOOL branch_is_window_space_dcv( struct dcomp_visual *v, unsigned int depth )
+{
+    unsigned int i;
+
+    if (!v || depth > 8) return FALSE;
+    if (v->width >= back_w - 1.0f && v->height >= back_h - 1.0f) return TRUE;
+    for (i = 0; i < v->child_count; i++)
+    {
+        if (v->children[i].dcv && branch_is_window_space_dcv( v->children[i].dcv, depth + 1 )) return TRUE;
+        if (v->children[i].pub &&
+            branch_is_window_space_pub( impl_from_visual_interop( v->children[i].pub ), depth + 1 )) return TRUE;
+    }
+    return FALSE;
+}
+static struct visual *visual_from_known_iface( IInspectable *object )
+{
+    void *vtbl = *(void **)object;
+    if (vtbl == &container_vtbl) return CONTAINING_RECORD( object, struct visual, IContainerVisual_iface );
+    if (vtbl == &sprite_vtbl) return CONTAINING_RECORD( object, struct visual, ISpriteVisual_iface );
+    if (vtbl == &ivisual_vtbl) return CONTAINING_RECORD( object, struct visual, IVisual_iface );
+    if (vtbl == (void *)visual_interop_vtbl) return CONTAINING_RECORD( object, struct visual, interop_vtbl );
+    return NULL;
+}
+static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float parent_width,
+                                 float parent_height, float sx, float sy )
+{
+    struct visual *impl = impl_from_visual_interop( iface );
+    RECT clip, rect;
+    float csx, csy;
+    visual_apply_controlled( impl );
+    csx = sx * impl->scale.X; csy = sy * impl->scale.Y;
+    float x = ox + (impl->offset.X + impl->transform.M41) * sx + impl->relative_offset.X * parent_width
+              + impl->center.X * sx * (1.0f - impl->scale.X);
+    float y = oy + (impl->offset.Y + impl->transform.M42) * sy + impl->relative_offset.Y * parent_height
+              + impl->center.Y * sy * (1.0f - impl->scale.Y);
+    float width = impl->size.X * csx + impl->relative_size.X * parent_width;
+    float height = impl->size.Y * csy + impl->relative_size.Y * parent_height;
+    unsigned int i;
+    int saved = 0;
+    RECT saved_clip = paint_clip;
+
+    /* Composition sizes default to 0 and a sprite of size 0 draws nothing; filling the parent instead put
+     * XAML's black window-background sprite (size 0, inserted below the content, which is later inserted at
+     * the bottom again) over the whole UI. Only containers without a size still pass their parent's size
+     * on to children, since XAML sizes those through relative size or not at all. */
+    perf.visits++;
+    TRACE( "visit public %s %p size %gx%g rel %gx%g visible %d opacity %g children %u\n",
+           impl->kind == VISUAL_SPRITE ? "sprite" : "container", impl, width, height,
+           impl->relative_size.X, impl->relative_size.Y, impl->visible, impl->opacity, impl->collection.count );
+    /* IsVisible = false hides the whole subtree (XAML collapses e.g. the NavigationView back button's
+     * AnimatedIcon this way); so does zero opacity. */
+    if (!impl->visible || impl->opacity <= 0.01f) return;
+    if (!xaml_island_container && impl->kind != VISUAL_SPRITE) xaml_island_container = impl;
+    saved = apply_inset_clip( hdc, impl->clip, x, y, width, height );
+    if (impl->kind != VISUAL_SPRITE && (width < 0.5f || height < 0.5f))
+    {
+        clip = paint_clip;
+        if (width < 0.5f) width = parent_width > 0.5f ? parent_width : clip.right - clip.left;
+        if (height < 0.5f) height = parent_height > 0.5f ? parent_height : clip.bottom - clip.top;
+    }
+    if (impl->kind == VISUAL_SPRITE && impl->brush && impl->visible && impl->opacity > 0.01f &&
+        width > 0.5f && height > 0.5f)
+    {
+        struct drawing_surface *surface = brush_surface( impl->brush );
+        BOOL matched;
+        COLORREF col;
+        HBRUSH brush;
+        Color c;
+
+        /* A sprite whose brush is a surface carries real drawn content; paint that instead of
+         * guessing a colour. */
+        if (surface && blit_surface_rect( hdc, surface, (int)x, (int)y, (int)width, (int)height ))
+        {
+            TRACE( "painted public sprite %p from surface %p at %d,%d.\n", impl, surface,
+                   (int)x, (int)y );
+            goto children;
+        }
+        if (paint_mask_brush( hdc, impl->brush, (int)x, (int)y, (int)width, (int)height, impl->opacity ))
+        {
+            TRACE( "painted public sprite %p with mask brush at %d,%d.\n", impl, (int)x, (int)y );
+            goto children;
+        }
+        matched = brush_solid_color( impl->brush, &c );
+        /* Colour brushes carry alpha: a transparent (A=0) fill is XAML's default for unset
+         * backgrounds and hover/pressed overlays and must not cover what is below. Brushes we
+         * cannot resolve are not painted at all rather than guessed. */
+        col = matched ? RGB( c.R, c.G, c.B ) : RGB( 0xe8, 0xe8, 0xf0 );
+        if (!matched || !c.A || impl->opacity <= 0.01f)
+        {
+            TRACE( "skipped public sprite %p %gx%g at %d,%d matched %d alpha %u.\n", impl, width, height,
+                   (int)x, (int)y, matched, matched ? c.A : 0 );
+            goto children;
+        }
+        SetRect( &rect, (int)x, (int)y, (int)(x + width), (int)(y + height) );
+        soft_fill( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, c,
+                   (BYTE)(impl->opacity * 255.0f + 0.5f) );
+        (void)brush; (void)col;
+        TRACE( "painted public sprite %p %gx%g at %d,%d color %02x%02x%02x%02x.\n",
+               impl, width, height, (int)x, (int)y, c.A, c.R, c.G, c.B );
+    }
+    if (impl->shape_vtbl && impl->shape_count) paint_shape_visual( hdc, impl, x, y, width, height );
+children:
+    for (i = 0; i < impl->collection.count; i++)
+    {
+        void *child = NULL;
+        MEMORY_BASIC_INFORMATION mbi;
+        void **vtbl;
+        struct visual *known;
+        struct dcomp_visual *dcv;
+
+        if (!impl->collection.children[i]) continue;
+        /* our own visuals, recognised by their tables: no system call or QueryInterface per child per frame */
+        if ((known = visual_from_known_iface( impl->collection.children[i] )))
+        {
+            paint_public_visual( hdc, &known->interop_vtbl, x, y, width, height, csx, csy );
+            continue;
+        }
+        /* Skip a child whose vtable is not in an image rather than faulting on it. */
+        vtbl = *(void ***)impl->collection.children[i];
+        /* XAML also parents its interop IDCompositionVisual trees under public visuals. */
+        if ((dcv = dcv_from_any( impl->collection.children[i] )))
+        {
+            struct dcomp_visual *saved_branch = paint_branch;
+            /* a popup root, a sibling of the content root under the island root, is positioned in
+             * content coordinates */
+            float dy = (impl == xaml_island_container && dcv != xaml_content_branch &&
+                        !branch_is_window_space_dcv( dcv, 0 )) ? xaml_content_dy : 0.0f;
+            TRACE( "child %u of %s %p is dcomp %p\n", i, impl->kind == VISUAL_SPRITE ? "sprite" : "container", impl,
+                   dcv );
+            if (impl == xaml_island_container) paint_branch = dcv;
+            paint_dcomp_visual( hdc, dcv, x, y + dy * csy, csx, csy );
+            paint_branch = saved_branch;
+            continue;
+        }
+        if ((ULONG_PTR)vtbl < 0x10000 || !VirtualQuery( vtbl, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT ||
+            !(mbi.Type & MEM_IMAGE))
+        {
+            WARN( "visual %p child %u has a bad vtable %p.\n", impl, i, vtbl );
+            continue;
+        }
+        if (SUCCEEDED( IInspectable_QueryInterface( impl->collection.children[i],
+                                                    &IID_IInteropVisual_private, &child ) ))
+        {
+            TRACE( "child %u of %s %p is public %p\n", i, impl->kind == VISUAL_SPRITE ? "sprite" : "container", impl,
+                   impl_from_visual_interop( child ) );
+            paint_public_visual( hdc, child, x, y, width, height, csx, csy );
+            IUnknown_Release( (IUnknown *)child );
+        }
+    }
+    if (saved) paint_clip = saved_clip;
+}
+
+static const GUID IID_IShapeVisual_local = {0xf2bd13c3,0xba7e,0x4b0f,{0x91,0x26,0xff,0xb7,0x53,0x6b,0x81,0x76}};
+
+/* ISpriteVisual2 {588c9664-997a-4850-91fe-53cb58f81ce9}: 6 get_Shadow, 7 put_Shadow. The graphing
+ * calculator's trace pointer hangs a DropShadow on a sprite; the shadow is kept, not rendered. */
+static const GUID IID_ISpriteVisual2_local = { 0x588c9664, 0x997a, 0x4850, { 0x91, 0xfe, 0x53, 0xcb, 0x58, 0xf8, 0x1c, 0xe9 } };
+
+static struct visual *impl_from_sprite2( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct visual, sprite2_vtbl );
+}
+static HRESULT WINAPI sprite2_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return visual_qi( impl_from_sprite2( iface ), iid, out );
+}
+static ULONG WINAPI sprite2_AddRef( void *iface )
+{
+    return ISpriteVisual_AddRef( &impl_from_sprite2( iface )->ISpriteVisual_iface );
+}
+static ULONG WINAPI sprite2_Release( void *iface )
+{
+    return ISpriteVisual_Release( &impl_from_sprite2( iface )->ISpriteVisual_iface );
+}
+static HRESULT WINAPI sprite2_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return ISpriteVisual_GetIids( &impl_from_sprite2( iface )->ISpriteVisual_iface, count, iids );
+}
+static HRESULT WINAPI sprite2_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return ISpriteVisual_GetRuntimeClassName( &impl_from_sprite2( iface )->ISpriteVisual_iface, name );
+}
+static HRESULT WINAPI sprite2_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return ISpriteVisual_GetTrustLevel( &impl_from_sprite2( iface )->ISpriteVisual_iface, level );
+}
+static HRESULT WINAPI sprite2_get_Shadow( void *iface, IUnknown **value )
+{
+    struct visual *impl = impl_from_sprite2( iface );
+    TRACE( "visual %p.\n", impl );
+    if (!value) return E_POINTER;
+    if ((*value = impl->shadow)) IUnknown_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI sprite2_put_Shadow( void *iface, IUnknown *value )
+{
+    struct visual *impl = impl_from_sprite2( iface );
+    TRACE( "visual %p, shadow %p.\n", impl, value );
+    if (value) IUnknown_AddRef( value );
+    if (impl->shadow) IUnknown_Release( impl->shadow );
+    impl->shadow = value;
+    return S_OK;
+}
+static const void *visual_sprite2_vtbl[] =
+{
+    sprite2_QueryInterface, sprite2_AddRef, sprite2_Release,
+    sprite2_GetIids, sprite2_GetRuntimeClassName, sprite2_GetTrustLevel,
+    sprite2_get_Shadow, sprite2_put_Shadow,
+};
+
+static HRESULT visual_qi( struct visual *impl, REFIID iid, void **out )
+{
+    static const GUID IID_visual_private2 = { 0x3b3e3dcf, 0xf20f, 0x4a83,
+                                               { 0x9b, 0xf2, 0x76, 0x84, 0xcd, 0xe0, 0x78, 0x61 } };
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ))
+        *out = (impl->kind == VISUAL_SPRITE) ? (void *)&impl->ISpriteVisual_iface
+                                             : (void *)&impl->IContainerVisual_iface;
+    else if (IsEqualGUID( iid, &IID_IContainerVisual )) /* SpriteVisual and ShapeVisual derive from ContainerVisual */
+        *out = &impl->IContainerVisual_iface;
+    else if (IsEqualGUID( iid, &IID_ISpriteVisual ) && impl->kind == VISUAL_SPRITE)
+        *out = &impl->ISpriteVisual_iface;
+    else if (IsEqualGUID( iid, &IID_ISpriteVisual2_local ) && impl->kind == VISUAL_SPRITE)
+        *out = &impl->sprite2_vtbl;
+    else if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
+        return create_object4_view( (IUnknown *)&impl->IVisual_iface, out );
+    else if (IsEqualGUID( iid, &IID_IShapeVisual_local ) && impl->shape_vtbl)
+        *out = &impl->shape_vtbl;
+    else if (IsEqualGUID( iid, &IID_IVisual ))
+        *out = &impl->IVisual_iface;
+    else if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        *out = &impl->ICompositionObject_iface;
+    else if (IsEqualGUID( iid, &IID_IClosable ))
+        *out = &impl->closable_vtbl;
+    else if (IsEqualGUID( iid, &IID_IInteropVisual_private ) ||
+             IsEqualGUID( iid, &IID_visual_private2 ) ||
+             IsEqualGUID( iid, &IID_IDCompositionVisual_ ))
+        *out = &impl->interop_vtbl;
+    else if (IsEqualGUID( iid, &IID_ICompositionIsland_ ) ||
+             IsEqualGUID( iid, &IID_IVisualTreeIslandPartner ))
+        *out = (impl->kind == VISUAL_SPRITE) ? (void *)&impl->ISpriteVisual_iface
+                                             : (void *)&impl->IContainerVisual_iface;
+    else
+    {
+        TRACE( "visual: no interface %s.\n", debugstr_guid(iid) );
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    IUnknown_AddRef( (IUnknown *)*out );
+    return S_OK;
+}
+
+static ULONG visual_addref( struct visual *impl )
+{
+    return InterlockedIncrement( &impl->ref );
+}
+
+static ULONG visual_release( struct visual *impl )
+{
+    ULONG ref = InterlockedDecrement( &impl->ref );
+
+    if (!ref)
+    {
+        unsigned int i;
+        for (i = 0; i < impl->shape_count; i++) IInspectable_Release( impl->shapes[i] );
+        if (impl->shape_surface) comp_object_Release( &impl->shape_surface->vtbl );
+        for (i = 0; i < impl->collection.count; i++)
+        {
+            struct visual *child = public_visual_from( impl->collection.children[i] );
+            /* the child's parent link must not outlive this collection */
+            if (child && child->parent == &impl->collection) child->parent = NULL;
+            if (impl->collection.children[i]) IInspectable_Release( impl->collection.children[i] );
+        }
+        impl->collection.count = 0;
+        free( impl->collection.children );
+        if (impl->brush) ICompositionBrush_Release( impl->brush );
+        if (impl->shadow) IUnknown_Release( impl->shadow );
+        if (impl->clip) ICompositionClip_Release( impl->clip );
+        if (impl->properties) ICompositionPropertySet_Release( impl->properties );
+        ICompositor_Release( impl->compositor );
+        TRACE( "freed visual %p.\n", impl );
+        free( impl );
+    }
+    return ref;
+}
+
+static HRESULT WINAPI container_QueryInterface( IContainerVisual *iface, REFIID iid, void **out )
+{
+    return visual_qi( impl_from_container( iface ), iid, out );
+}
+static ULONG WINAPI container_AddRef( IContainerVisual *iface )
+{
+    return visual_addref( impl_from_container( iface ) );
+}
+static ULONG WINAPI container_Release( IContainerVisual *iface )
+{
+    return visual_release( impl_from_container( iface ) );
+}
+static HRESULT WINAPI container_GetIids( IContainerVisual *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI container_GetRuntimeClassName( IContainerVisual *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_ContainerVisual,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_ContainerVisual) - 1, name );
+}
+static HRESULT WINAPI container_GetTrustLevel( IContainerVisual *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI container_get_Children( IContainerVisual *iface, IVisualCollection **value )
+{
+    struct visual *impl = impl_from_container( iface );
+    if (!value) return E_POINTER;
+    IVisualCollection_AddRef( (*value = &impl->collection.IVisualCollection_iface) );
+    return S_OK;
+}
+
+static const struct IContainerVisualVtbl container_vtbl =
+{
+    container_QueryInterface, container_AddRef, container_Release,
+    container_GetIids, container_GetRuntimeClassName, container_GetTrustLevel,
+    container_get_Children,
+};
+
+static HRESULT WINAPI sprite_QueryInterface( ISpriteVisual *iface, REFIID iid, void **out )
+{
+    return visual_qi( impl_from_sprite( iface ), iid, out );
+}
+static ULONG WINAPI sprite_AddRef( ISpriteVisual *iface )
+{
+    return visual_addref( impl_from_sprite( iface ) );
+}
+static ULONG WINAPI sprite_Release( ISpriteVisual *iface )
+{
+    return visual_release( impl_from_sprite( iface ) );
+}
+static HRESULT WINAPI sprite_GetIids( ISpriteVisual *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI sprite_GetRuntimeClassName( ISpriteVisual *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_SpriteVisual,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_SpriteVisual) - 1, name );
+}
+static HRESULT WINAPI sprite_GetTrustLevel( ISpriteVisual *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI sprite_get_Brush( ISpriteVisual *iface, ICompositionBrush **value )
+{
+    struct visual *impl = impl_from_sprite( iface );
+    if (!value) return E_POINTER;
+    if ((*value = impl->brush)) ICompositionBrush_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI sprite_put_Brush( ISpriteVisual *iface, ICompositionBrush *value )
+{
+    scene_changed();
+    struct visual *impl = impl_from_sprite( iface );
+    TRACE( "public sprite %p brush %p.\n", impl, value );
+    if (value) ICompositionBrush_AddRef( value );
+    if (impl->brush) ICompositionBrush_Release( impl->brush );
+    impl->brush = value;
+    return S_OK;
+}
+
+static const struct ISpriteVisualVtbl sprite_vtbl =
+{
+    sprite_QueryInterface, sprite_AddRef, sprite_Release,
+    sprite_GetIids, sprite_GetRuntimeClassName, sprite_GetTrustLevel,
+    sprite_get_Brush, sprite_put_Brush,
+};
+
+static HRESULT WINAPI ivisual_QueryInterface( IVisual *iface, REFIID iid, void **out )
+{
+    return visual_qi( impl_from_ivisual( iface ), iid, out );
+}
+static ULONG WINAPI ivisual_AddRef( IVisual *iface )
+{
+    return visual_addref( impl_from_ivisual( iface ) );
+}
+static ULONG WINAPI ivisual_Release( IVisual *iface )
+{
+    return visual_release( impl_from_ivisual( iface ) );
+}
+static HRESULT WINAPI ivisual_GetIids( IVisual *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI ivisual_GetRuntimeClassName( IVisual *iface, HSTRING *name )
+{
+    struct visual *impl = impl_from_ivisual( iface );
+    const WCHAR *class = (impl->kind == VISUAL_SPRITE)
+            ? RuntimeClass_Windows_UI_Composition_SpriteVisual
+            : RuntimeClass_Windows_UI_Composition_ContainerVisual;
+    return WindowsCreateString( class, wcslen( class ), name );
+}
+static HRESULT WINAPI ivisual_GetTrustLevel( IVisual *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+
+#define VISUAL_VEC2_GET( name, field )                                                             \
+    static HRESULT WINAPI ivisual_get_##name( IVisual *iface, Vector2 *value )                     \
+    {                                                                                              \
+        if (!value) return E_POINTER;                                                              \
+        *value = impl_from_ivisual( iface )->field;                                                \
+        return S_OK;                                                                               \
+    }
+#define VISUAL_VEC2_PUT( name, field )                                                             \
+    static HRESULT WINAPI ivisual_put_##name( IVisual *iface, Vector2 value )                      \
+    {                                                                                              \
+        struct visual *impl = impl_from_ivisual( iface );                                          \
+        scene_changed();\
+        impl->field = value;                                                                       \
+        TRACE( "public visual %p " #name " %f,%f.\n", impl, value.X, value.Y );     \
+        return S_OK;                                                                               \
+    }
+#define VISUAL_VEC3_GET( name, field )                                                             \
+    static HRESULT WINAPI ivisual_get_##name( IVisual *iface, Vector3 *value )                     \
+    {                                                                                              \
+        if (!value) return E_POINTER;                                                              \
+        *value = impl_from_ivisual( iface )->field;                                                \
+        return S_OK;                                                                               \
+    }
+#define VISUAL_VEC3_PUT( name, field )                                                             \
+    static HRESULT WINAPI ivisual_put_##name( IVisual *iface, Vector3 value )                      \
+    {                                                                                              \
+        struct visual *impl = impl_from_ivisual( iface );                                          \
+        scene_changed();\
+        impl->field = value;                                                                       \
+        TRACE( "public visual %p " #name " %f,%f,%f.\n",                          \
+               impl, value.X, value.Y, value.Z );                                                  \
+        return S_OK;                                                                               \
+    }
+#define VISUAL_FLOAT_GET( name, field )                                                            \
+    static HRESULT WINAPI ivisual_get_##name( IVisual *iface, FLOAT *value )                       \
+    {                                                                                              \
+        if (!value) return E_POINTER;                                                              \
+        *value = impl_from_ivisual( iface )->field;                                                \
+        return S_OK;                                                                               \
+    }
+#define VISUAL_FLOAT_PUT( name, field )                                                            \
+    static HRESULT WINAPI ivisual_put_##name( IVisual *iface, FLOAT value )                        \
+    {                                                                                              \
+        struct visual *impl = impl_from_ivisual( iface );                                          \
+        scene_changed();\
+        impl->field = value;                                                                       \
+        TRACE( "public visual %p " #name " %f.\n", impl, value );                   \
+        return S_OK;                                                                               \
+    }
+
+VISUAL_VEC2_GET( AnchorPoint, anchor ) VISUAL_VEC2_PUT( AnchorPoint, anchor )
+VISUAL_VEC3_GET( CenterPoint, center ) VISUAL_VEC3_PUT( CenterPoint, center )
+VISUAL_VEC3_GET( Offset, offset )      VISUAL_VEC3_PUT( Offset, offset )
+VISUAL_FLOAT_GET( Opacity, opacity )   VISUAL_FLOAT_PUT( Opacity, opacity )
+VISUAL_FLOAT_GET( RotationAngle, rotation ) VISUAL_FLOAT_PUT( RotationAngle, rotation )
+VISUAL_FLOAT_GET( RotationAngleInDegrees, rotation_deg ) VISUAL_FLOAT_PUT( RotationAngleInDegrees, rotation_deg )
+VISUAL_VEC3_GET( RotationAxis, rotation_axis ) VISUAL_VEC3_PUT( RotationAxis, rotation_axis )
+VISUAL_VEC3_GET( Scale, scale )        VISUAL_VEC3_PUT( Scale, scale )
+VISUAL_VEC2_GET( Size, size )          VISUAL_VEC2_PUT( Size, size )
+
+static HRESULT WINAPI ivisual_get_BackfaceVisibility( IVisual *iface, CompositionBackfaceVisibility *value )
+{
+    if (!value) return E_POINTER;
+    *value = CompositionBackfaceVisibility_Inherit;
+    return S_OK;
+}
+static HRESULT WINAPI ivisual_put_BackfaceVisibility( IVisual *iface, CompositionBackfaceVisibility value ) { return S_OK; }
+static HRESULT WINAPI ivisual_get_BorderMode( IVisual *iface, CompositionBorderMode *value )
+{
+    if (!value) return E_POINTER;
+    *value = CompositionBorderMode_Inherit;
+    return S_OK;
+}
+static HRESULT WINAPI ivisual_put_BorderMode( IVisual *iface, CompositionBorderMode value ) { return S_OK; }
+static HRESULT WINAPI ivisual_get_Clip( IVisual *iface, ICompositionClip **value )
+{
+    struct visual *impl = impl_from_ivisual( iface );
+    if (!value) return E_POINTER;
+    if ((*value = impl->clip)) ICompositionClip_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI ivisual_put_Clip( IVisual *iface, ICompositionClip *value )
+{
+    scene_changed();
+    struct visual *impl = impl_from_ivisual( iface );
+    if (value) ICompositionClip_AddRef( value );
+    if (impl->clip) ICompositionClip_Release( impl->clip );
+    impl->clip = value;
+    return S_OK;
+}
+static HRESULT WINAPI ivisual_get_CompositeMode( IVisual *iface, CompositionCompositeMode *value )
+{
+    if (!value) return E_POINTER;
+    *value = CompositionCompositeMode_Inherit;
+    return S_OK;
+}
+static HRESULT WINAPI ivisual_put_CompositeMode( IVisual *iface, CompositionCompositeMode value ) { return S_OK; }
+static HRESULT WINAPI ivisual_get_IsVisible( IVisual *iface, boolean *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_ivisual( iface )->visible;
+    return S_OK;
+}
+static HRESULT WINAPI ivisual_put_IsVisible( IVisual *iface, boolean value )
+{
+    scene_changed();
+    TRACE( "public visual %p visible %u.\n", impl_from_ivisual( iface ), value );
+    impl_from_ivisual( iface )->visible = value;
+    return S_OK;
+}
+static HRESULT WINAPI ivisual_get_Orientation( IVisual *iface, Quaternion *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_ivisual( iface )->orientation;
+    return S_OK;
+}
+static HRESULT WINAPI ivisual_put_Orientation( IVisual *iface, Quaternion value )
+{
+    scene_changed();
+    impl_from_ivisual( iface )->orientation = value;
+    return S_OK;
+}
+static HRESULT WINAPI ivisual_get_Parent( IVisual *iface, IContainerVisual **value )
+{
+    struct visual *impl = impl_from_ivisual( iface );
+
+    if (!value) return E_POINTER;
+    /* XAML's CUIElement::ClearPCRenderData (an element leaving the scene, e.g. collapsed) asks each of
+     * its sprites for its parent and removes the sprite from that parent's children. With no parent
+     * answered the sprites of collapsed text stayed painted. */
+    *value = NULL;
+    if (impl->parent && impl->parent->owner && impl->parent->owner->kind == VISUAL_CONTAINER)
+    {
+        *value = &impl->parent->owner->IContainerVisual_iface;
+        IContainerVisual_AddRef( *value );
+    }
+    TRACE( "visual %p -> parent %p.\n", impl, *value ? (void *)impl->parent->owner : NULL );
+    return S_OK;
+}
+static HRESULT WINAPI ivisual_get_TransformMatrix( IVisual *iface, Matrix4x4 *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_ivisual( iface )->transform;
+    return S_OK;
+}
+static HRESULT WINAPI ivisual_put_TransformMatrix( IVisual *iface, Matrix4x4 value )
+{
+    scene_changed();
+    impl_from_ivisual( iface )->transform = value;
+    return S_OK;
+}
+
+static const struct IVisualVtbl ivisual_vtbl =
+{
+    ivisual_QueryInterface, ivisual_AddRef, ivisual_Release,
+    ivisual_GetIids, ivisual_GetRuntimeClassName, ivisual_GetTrustLevel,
+    ivisual_get_AnchorPoint, ivisual_put_AnchorPoint,
+    ivisual_get_BackfaceVisibility, ivisual_put_BackfaceVisibility,
+    ivisual_get_BorderMode, ivisual_put_BorderMode,
+    ivisual_get_CenterPoint, ivisual_put_CenterPoint,
+    ivisual_get_Clip, ivisual_put_Clip,
+    ivisual_get_CompositeMode, ivisual_put_CompositeMode,
+    ivisual_get_IsVisible, ivisual_put_IsVisible,
+    ivisual_get_Offset, ivisual_put_Offset,
+    ivisual_get_Opacity, ivisual_put_Opacity,
+    ivisual_get_Orientation, ivisual_put_Orientation,
+    ivisual_get_Parent,
+    ivisual_get_RotationAngle, ivisual_put_RotationAngle,
+    ivisual_get_RotationAngleInDegrees, ivisual_put_RotationAngleInDegrees,
+    ivisual_get_RotationAxis, ivisual_put_RotationAxis,
+    ivisual_get_Scale, ivisual_put_Scale,
+    ivisual_get_Size, ivisual_put_Size,
+    ivisual_get_TransformMatrix, ivisual_put_TransformMatrix,
+};
+
+static HRESULT WINAPI visual_obj_QueryInterface( ICompositionObject *iface, REFIID iid, void **out )
+{
+    return visual_qi( impl_from_visual_obj( iface ), iid, out );
+}
+static ULONG WINAPI visual_obj_AddRef( ICompositionObject *iface )
+{
+    return visual_addref( impl_from_visual_obj( iface ) );
+}
+static ULONG WINAPI visual_obj_Release( ICompositionObject *iface )
+{
+    return visual_release( impl_from_visual_obj( iface ) );
+}
+static HRESULT WINAPI visual_obj_GetIids( ICompositionObject *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI visual_obj_GetRuntimeClassName( ICompositionObject *iface, HSTRING *name )
+{
+    return ivisual_GetRuntimeClassName( &impl_from_visual_obj( iface )->IVisual_iface, name );
+}
+static HRESULT WINAPI visual_obj_GetTrustLevel( ICompositionObject *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI visual_obj_get_Compositor( ICompositionObject *iface, ICompositor **value )
+{
+    struct visual *impl = impl_from_visual_obj( iface );
+    if (!value) return E_POINTER;
+    ICompositor_AddRef( (*value = impl->compositor) );
+    return S_OK;
+}
+static HRESULT WINAPI visual_obj_get_Dispatcher( ICompositionObject *iface, ICoreDispatcher **value )
+{
+    if (!value) return E_POINTER;
+    *value = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI visual_obj_get_Properties( ICompositionObject *iface, ICompositionPropertySet **value )
+{
+    struct visual *impl = impl_from_visual_obj( iface );
+    HRESULT hr;
+
+    if (!value) return E_POINTER;
+    if (!impl->properties && FAILED(hr = create_property_set( &impl->properties ))) return hr;
+    ICompositionPropertySet_AddRef( (*value = impl->properties) );
+    return S_OK;
+}
+static HRESULT WINAPI visual_obj_StartAnimation( ICompositionObject *iface, HSTRING name, ICompositionAnimation *animation )
+{
+    scene_changed();
+    struct visual *impl = CONTAINING_RECORD( iface, struct visual, ICompositionObject_iface );
+    struct kf_animation *kf = kf_animation_from( animation );
+    const WCHAR *prop = WindowsGetStringRawBuffer( name, NULL );
+
+    TRACE( "visual %p, name %s, animation %p.\n", impl, debugstr_hstring(name), animation );
+    TRACE_(dcompanim)( "visual %p %s <- %s\n", impl, debugstr_hstring( name ), debugstr_animation( animation ) );
+    if (!kf || !kf->has_value || !prop) return S_OK;
+    anim_bind( impl->bindings, &impl->binding_count, prop, kf );
+    lstrcpynW( impl->animated_prop, prop, ARRAY_SIZE(impl->animated_prop) );
+    impl->saved_offset = impl->offset; impl->saved_scale = impl->scale; impl->saved_center = impl->center;
+    impl->saved_size = impl->size; impl->saved_opacity = impl->opacity; impl->saved_visible = impl->visible;
+    /* the end value of the animation is applied at once (no animation clock runs here) */
+    if (kf->value_kind == KF_SCALAR && !wcsicmp( prop, L"Opacity" )) impl->opacity = kf->scalar;
+    /* A single-key boolean is XAML's Visibility change (Collapsed elements stay in the tree, hidden);
+     * multi-key ones are Lottie layer switches driven by an AnimatedIcon's Progress and are left alone,
+     * since which key applies depends on the icon's state. */
+    else if (kf->value_kind == KF_BOOLEAN && !wcsicmp( prop, L"IsVisible" ) && kf->key_count == 1) impl->visible = kf->flag;
+    else if (kf->value_kind == KF_VECTOR3 && !wcsicmp( prop, L"Offset" )) impl->offset = kf->vector3;
+    else if (kf->value_kind == KF_VECTOR3 && !wcsicmp( prop, L"Scale" )) impl->scale = kf->vector3;
+    else if (kf->value_kind == KF_VECTOR3 && !wcsicmp( prop, L"CenterPoint" )) impl->center = kf->vector3;
+    else if (kf->value_kind == KF_VECTOR2 && !wcsicmp( prop, L"Size" )) impl->size = kf->vector2;
+    else if (kf->value_kind == KF_SCALAR && !wcsicmp( prop, L"Offset.X" )) impl->offset.X = kf->scalar;
+    else if (kf->value_kind == KF_SCALAR && !wcsicmp( prop, L"Offset.Y" )) impl->offset.Y = kf->scalar;
+    else if (kf->value_kind == KF_SCALAR && !wcsicmp( prop, L"Scale.X" )) impl->scale.X = kf->scalar;
+    else if (kf->value_kind == KF_SCALAR && !wcsicmp( prop, L"Scale.Y" )) impl->scale.Y = kf->scalar;
+    else if (kf->value_kind == KF_SCALAR && !wcsicmp( prop, L"CenterPoint.X" )) impl->center.X = kf->scalar;
+    else if (kf->value_kind == KF_SCALAR && !wcsicmp( prop, L"CenterPoint.Y" )) impl->center.Y = kf->scalar;
+    else if (kf->value_kind == KF_SCALAR && !wcsicmp( prop, L"Size.X" )) impl->size.X = kf->scalar;
+    else if (kf->value_kind == KF_SCALAR && !wcsicmp( prop, L"Size.Y" )) impl->size.Y = kf->scalar;
+    else TRACE( "visual %p: %s of kind %d not applied.\n", impl, debugstr_w( prop ), kf->value_kind );
+    return S_OK;
+}
+static void visual_undo_animation( struct visual *impl, const WCHAR *prop )
+{
+    if (!impl || wcsicmp( impl->animated_prop, prop )) return;
+    TRACE( "visual %p: %s controlled, end value undone.\n", impl, debugstr_w( prop ) );
+    impl->offset = impl->saved_offset; impl->scale = impl->saved_scale; impl->center = impl->saved_center;
+    impl->size = impl->saved_size; impl->opacity = impl->saved_opacity; impl->visible = impl->saved_visible;
+    impl->animated_prop[0] = 0;
+}
+/* The controller for an object's animated property: a real one bound to the recorded animation when the
+ * object is a visual or shape with such a binding (its progress then drives the property), a plain one
+ * otherwise. A visual's end value is undone first: the controller decides the resting state. */
+static HRESULT anim_controller_for( IUnknown *owner, const WCHAR *prop, void **out )
+{
+    void *interop = NULL;
+    struct anim_binding *binding = NULL;
+    struct comp_shape *shape = owner ? comp_shape_from_any( (IInspectable *)owner ) : NULL;
+    HRESULT hr;
+
+    if (!out) return E_POINTER;
+    if (shape && prop) binding = anim_find( shape->bindings, shape->binding_count, prop );
+    else if (owner && prop && SUCCEEDED( IUnknown_QueryInterface( owner, &IID_IInteropVisual_private, &interop ) ))
+    {
+        struct visual *impl = visual_from_interop( interop );
+        if (impl)
+        {
+            visual_undo_animation( impl, prop );
+            binding = anim_find( impl->bindings, impl->binding_count, prop );
+        }
+        IUnknown_Release( (IUnknown *)interop );
+    }
+    if (FAILED( hr = create_anim_controller( out ) )) return hr;
+    if (binding) anim_binding_set_controller( binding, *out );
+    return S_OK;
+}
+static HRESULT WINAPI visual_obj_StopAnimation( ICompositionObject *iface, HSTRING name )
+{
+    scene_changed();
+    return S_OK;
+}
+
+static const struct ICompositionObjectVtbl visual_obj_vtbl =
+{
+    visual_obj_QueryInterface, visual_obj_AddRef, visual_obj_Release,
+    visual_obj_GetIids, visual_obj_GetRuntimeClassName, visual_obj_GetTrustLevel,
+    visual_obj_get_Compositor, visual_obj_get_Dispatcher, visual_obj_get_Properties,
+    visual_obj_StartAnimation, visual_obj_StopAnimation,
+};
+
+/* ShapeVisual: IShapeVisual {f2bd13c3-...} is 6 get_Shapes, 7 get_ViewBox, 8 put_ViewBox. XAML uses the pointer
+ * CreateShapeVisual returns as IShapeVisual directly, so it must not be IContainerVisual (whose slot 6 is get_Children).
+ * Shapes are kept but not drawn. */
+static struct visual *impl_from_shape_visual( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct visual, shape_vtbl );
+}
+static HRESULT WINAPI shape_visual_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return visual_qi( impl_from_shape_visual( iface ), iid, out );
+}
+static ULONG WINAPI shape_visual_AddRef( void *iface )
+{
+    return visual_addref( impl_from_shape_visual( iface ) );
+}
+static ULONG WINAPI shape_visual_Release( void *iface )
+{
+    return visual_release( impl_from_shape_visual( iface ) );
+}
+static HRESULT WINAPI shape_visual_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI shape_visual_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.ShapeVisual";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI shape_visual_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI shape_visual_get_Shapes( void *iface, void **value )
+{
+    struct visual *impl = impl_from_shape_visual( iface );
+
+    TRACE( "%p.\n", impl );
+    if (!value) return E_POINTER;
+    *value = &impl->shapes_vtbl;
+    visual_addref( impl );
+    return S_OK;
+}
+static HRESULT WINAPI shape_visual_get_ViewBox( void *iface, void **value )
+{
+    if (!value) return E_POINTER;
+    return create_comp_object( "CompositionViewBox", value );
+}
+static HRESULT WINAPI shape_visual_put_ViewBox( void *iface, void *value )
+{
+    scene_changed();
+    TRACE( "%p, %p: ignored.\n", iface, value );
+    return S_OK;
+}
+
+static const void *shape_visual_vtbl[] =
+{
+    shape_visual_QueryInterface, shape_visual_AddRef, shape_visual_Release,
+    shape_visual_GetIids, shape_visual_GetRuntimeClassName, shape_visual_GetTrustLevel,
+    shape_visual_get_Shapes, shape_visual_get_ViewBox, shape_visual_put_ViewBox,
+};
+
+/* IVector<CompositionShape>: 6 GetAt, 7 get_Size, 8 GetView, 9 IndexOf, 10 SetAt, 11 InsertAt, 12 RemoveAt,
+ * 13 Append, 14 RemoveAtEnd, 15 Clear, 16 GetMany, 17 ReplaceAll. */
+static struct visual *impl_from_shapes( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct visual, shapes_vtbl );
+}
+static HRESULT WINAPI shapes_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct visual *impl = impl_from_shapes( iface );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ))
+    {
+        visual_addref( impl );
+        *out = iface;
+        return S_OK;
+    }
+    TRACE( "shapes %p: no interface %s.\n", impl, debugstr_guid(iid) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI shapes_AddRef( void *iface )
+{
+    return visual_addref( impl_from_shapes( iface ) );
+}
+static ULONG WINAPI shapes_Release( void *iface )
+{
+    return visual_release( impl_from_shapes( iface ) );
+}
+static HRESULT WINAPI shapes_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionShapeCollection";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI shapes_GetAt( void *iface, UINT32 index, IInspectable **value )
+{
+    struct visual *impl = impl_from_shapes( iface );
+
+    if (!value) return E_POINTER;
+    if (index >= impl->shape_count) return E_BOUNDS;
+    IInspectable_AddRef( (*value = impl->shapes[index]) );
+    return S_OK;
+}
+static HRESULT WINAPI shapes_get_Size( void *iface, UINT32 *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_shapes( iface )->shape_count;
+    return S_OK;
+}
+static HRESULT WINAPI shapes_GetView( void *iface, void **value )
+{
+    FIXME( "%p: stub\n", iface );
+    if (value) *value = NULL;
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI shapes_IndexOf( void *iface, IInspectable *shape, UINT32 *index, boolean *found )
+{
+    struct visual *impl = impl_from_shapes( iface );
+    unsigned int i;
+
+    if (!index || !found) return E_POINTER;
+    for (i = 0; i < impl->shape_count; i++)
+        if (impl->shapes[i] == shape) break;
+    *found = i < impl->shape_count;
+    *index = *found ? i : 0;
+    return S_OK;
+}
+static HRESULT WINAPI shapes_SetAt( void *iface, UINT32 index, IInspectable *shape )
+{
+    scene_changed();
+    struct visual *impl = impl_from_shapes( iface );
+
+    if (index >= impl->shape_count) return E_BOUNDS;
+    if (shape) IInspectable_AddRef( shape );
+    if (impl->shapes[index]) IInspectable_Release( impl->shapes[index] );
+    impl->shapes[index] = shape;
+    return S_OK;
+}
+static HRESULT WINAPI shapes_InsertAt( void *iface, UINT32 index, IInspectable *shape )
+{
+    scene_changed();
+    struct visual *impl = impl_from_shapes( iface );
+
+    TRACE( "%p, %u, %p.\n", impl, index, shape );
+    if (index > impl->shape_count) return E_BOUNDS;
+    if (impl->shape_count == ARRAY_SIZE(impl->shapes)) return E_OUTOFMEMORY;
+    memmove( impl->shapes + index + 1, impl->shapes + index, (impl->shape_count - index) * sizeof(*impl->shapes) );
+    if (shape) IInspectable_AddRef( shape );
+    impl->shapes[index] = shape;
+    impl->shape_count++;
+    return S_OK;
+}
+static HRESULT WINAPI shapes_RemoveAt( void *iface, UINT32 index )
+{
+    scene_changed();
+    struct visual *impl = impl_from_shapes( iface );
+
+    if (index >= impl->shape_count) return E_BOUNDS;
+    if (impl->shapes[index]) IInspectable_Release( impl->shapes[index] );
+    impl->shape_count--;
+    memmove( impl->shapes + index, impl->shapes + index + 1, (impl->shape_count - index) * sizeof(*impl->shapes) );
+    return S_OK;
+}
+static HRESULT WINAPI shapes_Append( void *iface, IInspectable *shape )
+{
+    return shapes_InsertAt( iface, impl_from_shapes( iface )->shape_count, shape );
+}
+static HRESULT WINAPI shapes_RemoveAtEnd( void *iface )
+{
+    scene_changed();
+    struct visual *impl = impl_from_shapes( iface );
+
+    if (!impl->shape_count) return E_BOUNDS;
+    return shapes_RemoveAt( iface, impl->shape_count - 1 );
+}
+static HRESULT WINAPI shapes_Clear( void *iface )
+{
+    scene_changed();
+    struct visual *impl = impl_from_shapes( iface );
+
+    while (impl->shape_count) shapes_RemoveAt( iface, impl->shape_count - 1 );
+    return S_OK;
+}
+static HRESULT WINAPI shapes_GetMany( void *iface, UINT32 start, UINT32 capacity, IInspectable **items, UINT32 *actual )
+{
+    struct visual *impl = impl_from_shapes( iface );
+    UINT32 i;
+
+    if (!actual) return E_POINTER;
+    for (i = 0; start + i < impl->shape_count && i < capacity; i++)
+        IInspectable_AddRef( (items[i] = impl->shapes[start + i]) );
+    *actual = i;
+    return S_OK;
+}
+static HRESULT WINAPI shapes_ReplaceAll( void *iface, UINT32 count, IInspectable **items )
+{
+    UINT32 i;
+    HRESULT hr;
+
+    shapes_Clear( iface );
+    for (i = 0; i < count; i++)
+        if (FAILED(hr = shapes_Append( iface, items[i] ))) return hr;
+    return S_OK;
+}
+
+static const void *shapes_vtbl[] =
+{
+    shapes_QueryInterface, shapes_AddRef, shapes_Release,
+    shape_visual_GetIids, shapes_GetRuntimeClassName, shape_visual_GetTrustLevel,
+    shapes_GetAt, shapes_get_Size, shapes_GetView, shapes_IndexOf, shapes_SetAt, shapes_InsertAt,
+    shapes_RemoveAt, shapes_Append, shapes_RemoveAtEnd, shapes_Clear, shapes_GetMany, shapes_ReplaceAll,
+};
+
+static HRESULT create_visual( ICompositor *compositor, enum visual_kind kind, void **out );
+
+static HRESULT create_shape_visual( ICompositor *compositor, void **out )
+{
+    struct visual *impl;
+    void *container;
+    HRESULT hr;
+
+    if (FAILED(hr = create_visual( compositor, VISUAL_CONTAINER, &container ))) return hr;
+    impl = CONTAINING_RECORD( container, struct visual, IContainerVisual_iface );
+    impl->shape_vtbl = shape_visual_vtbl;
+    impl->shapes_vtbl = shapes_vtbl;
+    *out = &impl->shape_vtbl;
+    return S_OK;
+}
+
+/* IClosable on public visuals: without it ForceCloseHandInAndHandOffVisuals fail-fasts with E_NOINTERFACE
+ * and then calls Close through the NULL result. */
+static struct visual *impl_from_visual_closable( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct visual, closable_vtbl );
+}
+static HRESULT WINAPI visual_closable_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return visual_qi( impl_from_visual_closable( iface ), iid, out );
+}
+static ULONG WINAPI visual_closable_AddRef( void *iface )
+{
+    return visual_addref( impl_from_visual_closable( iface ) );
+}
+static ULONG WINAPI visual_closable_Release( void *iface )
+{
+    return visual_release( impl_from_visual_closable( iface ) );
+}
+static HRESULT WINAPI visual_closable_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI visual_closable_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return IVisual_GetRuntimeClassName( &impl_from_visual_closable( iface )->IVisual_iface, name );
+}
+static HRESULT WINAPI visual_closable_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI visual_closable_Close( void *iface )
+{
+    TRACE( "visual %p.\n", impl_from_visual_closable( iface ) );
+    return S_OK;
+}
+static const void *visual_closable_vtbl[] =
+{
+    visual_closable_QueryInterface, visual_closable_AddRef, visual_closable_Release,
+    visual_closable_GetIids, visual_closable_GetRuntimeClassName, visual_closable_GetTrustLevel,
+    visual_closable_Close,
+};
+
+static HRESULT create_visual( ICompositor *compositor, enum visual_kind kind, void **out )
+{
+    struct visual *impl;
+
+    if (!out) return E_POINTER;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->IContainerVisual_iface.lpVtbl = &container_vtbl;
+    impl->ISpriteVisual_iface.lpVtbl = &sprite_vtbl;
+    impl->IVisual_iface.lpVtbl = &ivisual_vtbl;
+    impl->ICompositionObject_iface.lpVtbl = &visual_obj_vtbl;
+    impl->interop_vtbl = visual_interop_vtbl;
+    impl->closable_vtbl = visual_closable_vtbl;
+    impl->sprite2_vtbl = visual_sprite2_vtbl;
+    impl->collection.IVisualCollection_iface.lpVtbl = &collection_vtbl;
+    impl->collection.iterable_vtbl = iterable_vtbl;
+    impl->collection.owner = impl;
+    impl->collection.ref = 1;
+    impl->kind = kind;
+    impl->ref = 1;
+    impl->visible = TRUE;
+    impl->opacity = 1.0f;
+    impl->scale.X = impl->scale.Y = impl->scale.Z = 1.0f;
+    impl->rotation_axis.Z = 1.0f;
+    impl->orientation.W = 1.0f;
+    impl->transform.M11 = impl->transform.M22 = impl->transform.M33 = impl->transform.M44 = 1.0f;
+    ICompositor_AddRef( (impl->compositor = compositor) );
+
+    TRACE( "created %s visual %p.\n", kind == VISUAL_SPRITE ? "sprite" : "container", impl );
+    if (kind == VISUAL_SPRITE)
+        *out = &impl->ISpriteVisual_iface;
+    else
+        *out = &impl->IContainerVisual_iface;
+    return S_OK;
+}
+
+static const GUID IID_ICompositionPropertySet2_local = { 0xde80731e, 0xa211, 0x4455, { 0x88, 0x80, 0x7d, 0x0f, 0x3f, 0x6a, 0x44, 0xfd } };
+/* {83112a11} on a property set: XAML's CTimeManager hands the storyboard animations of the values its
+ * RenderTransform expressions read (a dialog's ScaleX from 0.92 to 1, a NavigationView pane's offset) to
+ * slot 3, CreateAnimatorPartner(property name, key-frame animation, out partner). Nothing runs them, so a
+ * scalar one settles at its end value; the rest of the table is the recording one XAML walks. */
+struct propset_partner
+{
+    const void **vtbl;          /* must match struct comp_object */
+    const char *kind;
+    LONG ref;
+    ICompositionPropertySet *set;
+};
+static const char propset_partner_kind[] = "PropertySetPartner";
+static void *propset_partner_vtbl[COMP_OBJECT_SLOTS];
+static ULONG WINAPI propset_partner_Release( void *iface )
+{
+    struct propset_partner *impl = iface;
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref)
+    {
+        ICompositionPropertySet_Release( impl->set );
+        free( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI propset_partner_CreateAnimatorPartner( void *iface, void *source, void *context, void **out )
+{
+    struct propset_partner *impl = iface;
+    struct property_set *set = CONTAINING_RECORD( impl->set, struct property_set, ICompositionPropertySet_iface );
+    struct kf_animation *kf = kf_animation_from( context );
+    WCHAR name[32];
+    unsigned int i, n = 0;
+
+    __TRY
+    {
+        const WCHAR *str = source;
+        while (str && n + 1 < ARRAY_SIZE(name) && (iswalnum( str[n] ) || str[n] == '_')) { name[n] = str[n]; n++; }
+        if (!str || str[n]) n = 0;
+    }
+    __EXCEPT_ALL { n = 0; }
+    __ENDTRY
+    name[n] = 0;
+    TRACE( "set %p, source %p %s, animation %p, out %p.\n", set, source, debugstr_w( name ), context, out );
+    TRACE_(dcompanim)( "partner set %p %s <- %s\n", set, debugstr_w( name ), debugstr_animation( context ) );
+    if (n && kf && kf->has_value && kf->value_kind == KF_SCALAR)
+    {
+        for (i = 0; i < set->value_count; i++)
+            if (!wcsicmp( set->values[i].name, name ) && set->values[i].type == PROP_SCALAR)
+            {
+                TRACE( "set %p %s settles at %g.\n", set, debugstr_w( name ), kf->scalar );
+                set->values[i].u.scalar = kf->scalar;
+                scene_changed();
+                break;
+            }
+    }
+    if (!out) return E_POINTER;
+    return create_comp_object( "ExpressionAnimatorPartner", out );
+}
+static HRESULT create_propset_partner( struct property_set *set, void **out )
+{
+    struct propset_partner *impl;
+    void *probe;
+
+    if (!propset_partner_vtbl[0])
+    {
+        /* the recording table is filled when the first recording object is made */
+        if (SUCCEEDED( create_comp_object_vtbl( "ExpressionAnimation", expression_animation_vtbl, &probe ) ))
+            IUnknown_Release( (IUnknown *)probe );
+        memcpy( propset_partner_vtbl, expression_animation_vtbl, sizeof(propset_partner_vtbl) );
+        propset_partner_vtbl[2] = propset_partner_Release;
+        propset_partner_vtbl[3] = propset_partner_CreateAnimatorPartner;
+    }
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->vtbl = (const void **)propset_partner_vtbl;
+    impl->kind = propset_partner_kind;
+    impl->ref = 1;
+    ICompositionPropertySet_AddRef( (impl->set = &set->ICompositionPropertySet_iface) );
+    *out = impl;
+    return S_OK;
+}
+
+static HRESULT WINAPI propset_QueryInterface( ICompositionPropertySet *iface, REFIID iid, void **out )
+{
+    struct property_set *impl = CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ICompositionPropertySet ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = &impl->ICompositionPropertySet_iface;
+        return S_OK;
+    }
+    /* CompositionPropertySet is a CompositionObject: XAML's expression conversion and WinUI query property sets
+     * for ICompositionObject, and fail on E_NOINTERFACE. */
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&impl->ICompositionPropertySet_iface, out );
+    /* WinUI's AnimatedVisualPlayer (the converters' ProgressRing) asks its progress property set for
+     * ICompositionObject4 and calls TryGetAnimationController on the result without a NULL check. */
+    if (IsEqualGUID( iid, &IID_ICompositionPropertySet2_local ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = &impl->set2_vtbl;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
+        return create_object4_view( (IUnknown *)&impl->ICompositionPropertySet_iface, out );
+    /* XAML's expression conversion walks an expression's Properties into its private partner and
+     * fail-fasts on E_NOINTERFACE; a recording object takes the calls. */
+    if (IsEqualGUID( iid, &IID_ICompositionObjectPartner_local ))
+        return create_propset_partner( impl, out );
+    WARN( "property set: no interface %s.\n", debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI propset_AddRef( ICompositionPropertySet *iface )
+{
+    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface )->ref );
+}
+static ULONG WINAPI propset_Release( ICompositionPropertySet *iface )
+{
+    struct property_set *impl = CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref)
+    {
+        unsigned int i;
+        for (i = 0; i < impl->binding_count; i++)
+            if (impl->bindings[i].expr) IUnknown_Release( (IUnknown *)&impl->bindings[i].expr->vtbl );
+        free( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI propset_GetIids( ICompositionPropertySet *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI propset_GetRuntimeClassName( ICompositionPropertySet *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_CompositionPropertySet,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_CompositionPropertySet) - 1, name );
+}
+static HRESULT WINAPI propset_GetTrustLevel( ICompositionPropertySet *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static struct propset_value *propset_find( struct property_set *set, HSTRING name, BOOL create )
+{
+    const WCHAR *key = WindowsGetStringRawBuffer( name, NULL );
+    unsigned int i;
+    if (!key) return NULL;
+    for (i = 0; i < set->value_count; i++)
+        if (!wcsicmp( set->values[i].name, key )) return &set->values[i];
+    if (!create || set->value_count == PROPSET_VALUES) return NULL;
+    lstrcpynW( set->values[set->value_count].name, key, ARRAY_SIZE(set->values[0].name) );
+    return &set->values[set->value_count++];
+}
+#define PROPSET_INSERT( fn, ctype, tag, field ) \
+    static HRESULT WINAPI propset_Insert##fn( ICompositionPropertySet *iface, HSTRING name, ctype value ) \
+    { \
+        struct property_set *set = CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface ); \
+        struct propset_value *v = propset_find( set, name, TRUE ); \
+        TRACE( "set %p %s\n", set, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ) ); \
+        scene_changed(); \
+        if (!v) return E_OUTOFMEMORY; \
+        v->type = tag; v->u.field = value; \
+        return S_OK; \
+    }
+PROPSET_INSERT( Color, Color, PROP_COLOR, color )
+static HRESULT WINAPI propset_InsertScalar( ICompositionPropertySet *iface, HSTRING name, FLOAT value )
+{
+    scene_changed();
+    struct property_set *set = CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface );
+    struct propset_value *v = propset_find( set, name, TRUE );
+    TRACE( "set %p %s = %g\n", set, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ), value );
+    if (!v) return E_OUTOFMEMORY;
+    v->type = PROP_SCALAR; v->u.scalar = value;
+    return S_OK;
+}
+PROPSET_INSERT( Vector2, Vector2, PROP_VECTOR2, vector2 )
+PROPSET_INSERT( Vector3, Vector3, PROP_VECTOR3, vector3 )
+PROPSET_INSERT( Vector4, Vector4, PROP_VECTOR4, vector4 )
+static HRESULT WINAPI propset_InsertMatrix3x2( ICompositionPropertySet *iface, HSTRING name, Matrix3x2 value )
+{
+    scene_changed();
+    struct property_set *set = CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface );
+    struct propset_value *v = propset_find( set, name, TRUE );
+    TRACE( "set %p %s scale %g,%g offset %g,%g\n", set, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ),
+           value.M11, value.M22, value.M31, value.M32 );
+    if (!v) return E_OUTOFMEMORY;
+    v->type = PROP_MATRIX3X2; v->u.m32 = value;
+    return S_OK;
+}
+static HRESULT WINAPI propset_InsertMatrix4x4( ICompositionPropertySet *iface, HSTRING name, Matrix4x4 value )
+{
+    scene_changed();
+    struct property_set *set = CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface );
+    struct propset_value *v = propset_find( set, name, TRUE );
+    TRACE( "set %p %s scale %g,%g offset %g,%g\n", set, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ),
+           value.M11, value.M22, value.M41, value.M42 );
+    if (!v) return E_OUTOFMEMORY;
+    v->type = PROP_MATRIX4X4; v->u.m44 = value;
+    return S_OK;
+}
+#undef PROPSET_INSERT
+static HRESULT WINAPI propset_InsertQuaternion( ICompositionPropertySet *iface, HSTRING name, Quaternion value ) { return S_OK; }
+static HRESULT propset_not_found( CompositionGetValueStatus *result )
+{
+    if (!result) return E_POINTER;
+    *result = CompositionGetValueStatus_NotFound;
+    return S_OK;
+}
+static HRESULT WINAPI propset_TryGetColor( ICompositionPropertySet *iface, HSTRING name, Color *value, CompositionGetValueStatus *result )
+{
+    struct property_set *set = CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface );
+    struct propset_value *v = propset_find( set, name, FALSE );
+    if (!v || v->type != PROP_COLOR) return propset_not_found( result );
+    if (value) *value = v->u.color;
+    if (result) *result = CompositionGetValueStatus_Succeeded;
+    return S_OK;
+}
+static HRESULT WINAPI propset_TryGetMatrix3x2( ICompositionPropertySet *iface, HSTRING name, Matrix3x2 *value, CompositionGetValueStatus *result )
+{ return propset_not_found( result ); }
+static HRESULT WINAPI propset_TryGetMatrix4x4( ICompositionPropertySet *iface, HSTRING name, Matrix4x4 *value, CompositionGetValueStatus *result )
+{ return propset_not_found( result ); }
+static HRESULT WINAPI propset_TryGetQuaternion( ICompositionPropertySet *iface, HSTRING name, Quaternion *value, CompositionGetValueStatus *result )
+{ return propset_not_found( result ); }
+static HRESULT WINAPI propset_TryGetScalar( ICompositionPropertySet *iface, HSTRING name, FLOAT *value, CompositionGetValueStatus *result )
+{
+    struct property_set *set = CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface );
+    struct propset_value *v = propset_find( set, name, FALSE );
+    if (!v || v->type != PROP_SCALAR) return propset_not_found( result );
+    if (value) *value = v->u.scalar;
+    if (result) *result = CompositionGetValueStatus_Succeeded;
+    return S_OK;
+}
+static HRESULT WINAPI propset_TryGetVector2( ICompositionPropertySet *iface, HSTRING name, Vector2 *value, CompositionGetValueStatus *result )
+{
+    struct property_set *set = CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface );
+    struct propset_value *v = propset_find( set, name, FALSE );
+    if (!v || v->type != PROP_VECTOR2) return propset_not_found( result );
+    if (value) *value = v->u.vector2;
+    if (result) *result = CompositionGetValueStatus_Succeeded;
+    return S_OK;
+}
+static HRESULT WINAPI propset_TryGetVector3( ICompositionPropertySet *iface, HSTRING name, Vector3 *value, CompositionGetValueStatus *result )
+{
+    struct property_set *set = CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface );
+    struct propset_value *v = propset_find( set, name, FALSE );
+    if (!v || v->type != PROP_VECTOR3) return propset_not_found( result );
+    if (value) *value = v->u.vector3;
+    if (result) *result = CompositionGetValueStatus_Succeeded;
+    return S_OK;
+}
+static HRESULT WINAPI propset_TryGetVector4( ICompositionPropertySet *iface, HSTRING name, Vector4 *value, CompositionGetValueStatus *result )
+{
+    struct property_set *set = CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface );
+    struct propset_value *v = propset_find( set, name, FALSE );
+    if (!v || v->type != PROP_VECTOR4) return propset_not_found( result );
+    if (value) *value = v->u.vector4;
+    if (result) *result = CompositionGetValueStatus_Succeeded;
+    return S_OK;
+}
+
+static const struct ICompositionPropertySetVtbl propset_vtbl =
+{
+    propset_QueryInterface, propset_AddRef, propset_Release,
+    propset_GetIids, propset_GetRuntimeClassName, propset_GetTrustLevel,
+    propset_InsertColor, propset_InsertMatrix3x2, propset_InsertMatrix4x4, propset_InsertQuaternion,
+    propset_InsertScalar, propset_InsertVector2, propset_InsertVector3, propset_InsertVector4,
+    propset_TryGetColor, propset_TryGetMatrix3x2, propset_TryGetMatrix4x4, propset_TryGetQuaternion,
+    propset_TryGetScalar, propset_TryGetVector2, propset_TryGetVector3, propset_TryGetVector4,
+};
+
+static struct property_set *propset_from_set2( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct property_set, set2_vtbl );
+}
+static HRESULT WINAPI propset2_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return ICompositionPropertySet_QueryInterface( &propset_from_set2( iface )->ICompositionPropertySet_iface, iid, out );
+}
+static ULONG WINAPI propset2_AddRef( void *iface )
+{
+    return ICompositionPropertySet_AddRef( &propset_from_set2( iface )->ICompositionPropertySet_iface );
+}
+static ULONG WINAPI propset2_Release( void *iface )
+{
+    return ICompositionPropertySet_Release( &propset_from_set2( iface )->ICompositionPropertySet_iface );
+}
+static HRESULT WINAPI propset2_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return ICompositionPropertySet_GetIids( &propset_from_set2( iface )->ICompositionPropertySet_iface, count, iids );
+}
+static HRESULT WINAPI propset2_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return ICompositionPropertySet_GetRuntimeClassName( &propset_from_set2( iface )->ICompositionPropertySet_iface, name );
+}
+static HRESULT WINAPI propset2_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return ICompositionPropertySet_GetTrustLevel( &propset_from_set2( iface )->ICompositionPropertySet_iface, level );
+}
+static HRESULT WINAPI propset2_InsertBoolean( void *iface, HSTRING name, boolean value )
+{
+    struct property_set *set = propset_from_set2( iface );
+    struct propset_value *v = propset_find( set, name, TRUE );
+    TRACE( "set %p %s = %d\n", set, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ), value );
+    if (!v) return E_OUTOFMEMORY;
+    v->type = PROP_BOOLEAN; v->u.flag = value;
+    return S_OK;
+}
+static HRESULT WINAPI propset2_TryGetBoolean( void *iface, HSTRING name, boolean *value, CompositionGetValueStatus *result )
+{
+    struct property_set *set = propset_from_set2( iface );
+    struct propset_value *v = propset_find( set, name, FALSE );
+    if (!v || v->type != PROP_BOOLEAN) return propset_not_found( result );
+    if (value) *value = v->u.flag;
+    if (result) *result = CompositionGetValueStatus_Succeeded;
+    return S_OK;
+}
+static const void *propset2_vtbl[] =
+{
+    propset2_QueryInterface, propset2_AddRef, propset2_Release,
+    propset2_GetIids, propset2_GetRuntimeClassName, propset2_GetTrustLevel,
+    propset2_InsertBoolean, propset2_TryGetBoolean,
+};
+
+static HRESULT create_property_set( ICompositionPropertySet **out )
+{
+    struct property_set *impl;
+    if (!out) return E_POINTER;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->ICompositionPropertySet_iface.lpVtbl = &propset_vtbl;
+    impl->set2_vtbl = propset2_vtbl;
+    impl->ref = 1;
+    *out = &impl->ICompositionPropertySet_iface;
+    return S_OK;
+}
+
+static HRESULT WINAPI color_brush_QueryInterface( ICompositionColorBrush *iface, REFIID iid, void **out );
+static ULONG WINAPI color_brush_AddRef( ICompositionColorBrush *iface );
+static ULONG WINAPI color_brush_Release( ICompositionColorBrush *iface );
+
+static inline struct color_brush *impl_from_color_brush( ICompositionColorBrush *iface )
+{
+    return CONTAINING_RECORD( iface, struct color_brush, ICompositionColorBrush_iface );
+}
+
+static HRESULT WINAPI color_brush_QueryInterface( ICompositionColorBrush *iface, REFIID iid, void **out )
+{
+    struct color_brush *impl = impl_from_color_brush( iface );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ICompositionColorBrush ) ||
+        IsEqualGUID( iid, &IID_ICompositionBrush ))
+        *out = &impl->ICompositionColorBrush_iface;
+    else if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        *out = &impl->ICompositionObject_iface;
+    else if (IsEqualGUID( iid, &IID_ICompositionObjectPartner_local ))
+        *out = &impl->partner_vtbl;
+    else
+    {
+        TRACE( "color brush %p: no interface %s.\n", impl, debugstr_guid( iid ) );
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    IUnknown_AddRef( (IUnknown *)*out );
+    return S_OK;
+}
+static ULONG WINAPI color_brush_AddRef( ICompositionColorBrush *iface )
+{
+    return InterlockedIncrement( &impl_from_color_brush( iface )->ref );
+}
+static ULONG WINAPI color_brush_Release( ICompositionColorBrush *iface )
+{
+    struct color_brush *impl = impl_from_color_brush( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref)
+    {
+        if (impl->color_expr) IUnknown_Release( (IUnknown *)impl->color_expr );
+        ICompositor_Release( impl->compositor );
+        free( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI color_brush_GetIids( ICompositionColorBrush *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI color_brush_GetRuntimeClassName( ICompositionColorBrush *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_CompositionColorBrush,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_CompositionColorBrush) - 1, name );
+}
+static HRESULT WINAPI color_brush_GetTrustLevel( ICompositionColorBrush *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI color_brush_get_Color( ICompositionColorBrush *iface, Color *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_color_brush( iface )->color;
+    return S_OK;
+}
+static HRESULT WINAPI color_brush_put_Color( ICompositionColorBrush *iface, Color value )
+{
+    scene_changed();
+    TRACE( "color brush %p A=%u R=%u G=%u B=%u.\n", impl_from_color_brush( iface ), value.A, value.R, value.G, value.B );
+    impl_from_color_brush( iface )->color = value;
+    return S_OK;
+}
+
+static const struct ICompositionColorBrushVtbl color_brush_vtbl =
+{
+    color_brush_QueryInterface, color_brush_AddRef, color_brush_Release,
+    color_brush_GetIids, color_brush_GetRuntimeClassName, color_brush_GetTrustLevel,
+    color_brush_get_Color, color_brush_put_Color,
+};
+static BOOL effect_brush_tint( void *brush_iface, Color *color );
+static BOOL brush_solid_color( ICompositionBrush *brush, Color *color )
+{
+    struct color_brush *impl;
+
+    if (!brush) return FALSE;
+    if (*(void ***)brush != (void *)&color_brush_vtbl) return effect_brush_tint( brush, color );
+    impl = impl_from_color_brush( (ICompositionColorBrush *)brush );
+    if (impl->color_expr)
+    {
+        struct propset_value *v = expr_resolve_value( impl->color_expr, PROP_COLOR );
+        Color c;
+        if (v) impl->color = v->u.color;
+        else if (expr_resolve_colorrgb( impl->color_expr, &c )) impl->color = c;
+    }
+    *color = impl->color;
+    return TRUE;
+}
+
+
+static HRESULT WINAPI brush_obj_QueryInterface( ICompositionObject *iface, REFIID iid, void **out )
+{
+    struct color_brush *impl = CONTAINING_RECORD( iface, struct color_brush, ICompositionObject_iface );
+    return color_brush_QueryInterface( &impl->ICompositionColorBrush_iface, iid, out );
+}
+static ULONG WINAPI brush_obj_AddRef( ICompositionObject *iface )
+{
+    struct color_brush *impl = CONTAINING_RECORD( iface, struct color_brush, ICompositionObject_iface );
+    return color_brush_AddRef( &impl->ICompositionColorBrush_iface );
+}
+static ULONG WINAPI brush_obj_Release( ICompositionObject *iface )
+{
+    struct color_brush *impl = CONTAINING_RECORD( iface, struct color_brush, ICompositionObject_iface );
+    return color_brush_Release( &impl->ICompositionColorBrush_iface );
+}
+static HRESULT WINAPI brush_obj_GetIids( ICompositionObject *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI brush_obj_GetRuntimeClassName( ICompositionObject *iface, HSTRING *name )
+{
+    struct color_brush *impl = CONTAINING_RECORD( iface, struct color_brush, ICompositionObject_iface );
+    return color_brush_GetRuntimeClassName( &impl->ICompositionColorBrush_iface, name );
+}
+static HRESULT WINAPI brush_obj_GetTrustLevel( ICompositionObject *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI brush_obj_get_Compositor( ICompositionObject *iface, ICompositor **value )
+{
+    struct color_brush *impl = CONTAINING_RECORD( iface, struct color_brush, ICompositionObject_iface );
+    if (!value) return E_POINTER;
+    ICompositor_AddRef( (*value = impl->compositor) );
+    return S_OK;
+}
+static HRESULT WINAPI brush_obj_get_Dispatcher( ICompositionObject *iface, ICoreDispatcher **value )
+{
+    if (!value) return E_POINTER;
+    *value = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI brush_obj_get_Properties( ICompositionObject *iface, ICompositionPropertySet **value )
+{
+    return create_property_set( value );
+}
+static HRESULT WINAPI brush_obj_StartAnimation( ICompositionObject *iface, HSTRING name, ICompositionAnimation *animation )
+{
+    scene_changed();
+    struct color_brush *impl = CONTAINING_RECORD( iface, struct color_brush, ICompositionObject_iface );
+    struct kf_animation *kf = kf_animation_from( animation );
+    const WCHAR *prop = WindowsGetStringRawBuffer( name, NULL );
+
+    TRACE( "brush %p, %s, animation %p.\n", impl, debugstr_w( prop ), animation );
+    if (kf && kf->has_value && kf->value_kind == KF_COLOR && prop && !wcsicmp( prop, L"Color" ))
+        impl->color = kf->color;
+    else if (prop && !wcsicmp( prop, L"Color" ))
+    {
+        struct propset_value *v = expr_resolve_value( animation, PROP_COLOR );
+        Color color;
+        if (v) impl->color = v->u.color;
+        else if (expr_resolve_colorrgb( animation, &color )) impl->color = color;
+        else return S_OK;
+        /* keep the expression: the theme's property set changes later (app theme switch) */
+        if (animation) IUnknown_AddRef( (IUnknown *)animation );
+        if (impl->color_expr) IUnknown_Release( (IUnknown *)impl->color_expr );
+        impl->color_expr = animation;
+        TRACE( "brush %p colour from expression: %02x%02x%02x%02x\n", impl, impl->color.A, impl->color.R, impl->color.G, impl->color.B );
+    }
+    return S_OK;
+}
+static HRESULT WINAPI brush_obj_StopAnimation( ICompositionObject *iface, HSTRING name ) { return S_OK; }
+
+/* {83112a11-8e47-4b0c-a561-9e334d8f88e3}: the private composition object partner XAML's
+ * CTimeManager::StartWUCAnimation drives theme and visual-state animations through. Slot 3 is
+ * StartAnimation(name, animation, out controller); the controller's slots are called afterwards
+ * (a recording object takes them). The colour brush answered E_NOINTERFACE and XAML used the NULL
+ * when the app theme changed. Every other slot succeeds without doing anything. */
+static struct color_brush *brush_from_partner( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct color_brush, partner_vtbl );
+}
+static HRESULT WINAPI brush_partner_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return color_brush_QueryInterface( &brush_from_partner( iface )->ICompositionColorBrush_iface, iid, out );
+}
+static ULONG WINAPI brush_partner_AddRef( void *iface )
+{
+    return color_brush_AddRef( &brush_from_partner( iface )->ICompositionColorBrush_iface );
+}
+static ULONG WINAPI brush_partner_Release( void *iface )
+{
+    return color_brush_Release( &brush_from_partner( iface )->ICompositionColorBrush_iface );
+}
+static HRESULT WINAPI brush_partner_StartAnimation( void *iface, HSTRING name, ICompositionAnimation *animation, void **controller )
+{
+    scene_changed();
+    struct color_brush *impl = brush_from_partner( iface );
+    HRESULT hr;
+
+    TRACE( "brush %p, %s, animation %p, controller %p.\n", impl, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ),
+           animation, controller );
+    hr = brush_obj_StartAnimation( &impl->ICompositionObject_iface, name, animation );
+    if (controller) create_comp_object( "AnimationController", controller );
+    return hr;
+}
+static HRESULT WINAPI brush_partner_noop( void *iface, void *a, void *b, void *c )
+{
+    TRACE( "brush %p: partner slot accepted.\n", brush_from_partner( iface ) );
+    return S_OK;
+}
+static const void *brush_partner_vtbl[] =
+{
+    brush_partner_QueryInterface, brush_partner_AddRef, brush_partner_Release,
+    brush_partner_StartAnimation,
+    brush_partner_noop, brush_partner_noop, brush_partner_noop, brush_partner_noop,
+    brush_partner_noop, brush_partner_noop, brush_partner_noop, brush_partner_noop,
+    brush_partner_noop, brush_partner_noop, brush_partner_noop, brush_partner_noop,
+    brush_partner_noop, brush_partner_noop, brush_partner_noop, brush_partner_noop,
+    brush_partner_noop, brush_partner_noop, brush_partner_noop, brush_partner_noop,
+    brush_partner_noop, brush_partner_noop, brush_partner_noop, brush_partner_noop,
+    brush_partner_noop, brush_partner_noop, brush_partner_noop, brush_partner_noop,
+};
+
+static const struct ICompositionObjectVtbl brush_obj_vtbl =
+{
+    brush_obj_QueryInterface, brush_obj_AddRef, brush_obj_Release,
+    brush_obj_GetIids, brush_obj_GetRuntimeClassName, brush_obj_GetTrustLevel,
+    brush_obj_get_Compositor, brush_obj_get_Dispatcher, brush_obj_get_Properties,
+    brush_obj_StartAnimation, brush_obj_StopAnimation,
+};
+
+static HRESULT create_color_brush( ICompositor *compositor, Color color, ICompositionColorBrush **out )
+{
+    struct color_brush *impl;
+    if (!out) return E_POINTER;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->ICompositionColorBrush_iface.lpVtbl = &color_brush_vtbl;
+    impl->ICompositionObject_iface.lpVtbl = &brush_obj_vtbl;
+    impl->partner_vtbl = brush_partner_vtbl;
+    impl->color = color;
+    impl->ref = 1;
+    ICompositor_AddRef( (impl->compositor = compositor) );
+    TRACE( "created color brush %p A=%u R=%u G=%u B=%u.\n", impl, color.A, color.R, color.G, color.B );
+    *out = &impl->ICompositionColorBrush_iface;
+    return S_OK;
+}
+
+static HRESULT WINAPI target_QueryInterface( ICompositionTarget *iface, REFIID iid, void **out );
+static ULONG WINAPI target_AddRef( ICompositionTarget *iface );
+static ULONG WINAPI target_Release( ICompositionTarget *iface );
+
+static inline struct composition_target *impl_from_target( ICompositionTarget *iface )
+{
+    return CONTAINING_RECORD( iface, struct composition_target, ICompositionTarget_iface );
+}
+
+static HRESULT WINAPI target_QueryInterface( ICompositionTarget *iface, REFIID iid, void **out )
+{
+    struct composition_target *impl = impl_from_target( iface );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ICompositionTarget ) ||
+        IsEqualGUID( iid, &IID_ICompositionTargetPartner ))
+        *out = &impl->ICompositionTarget_iface;
+    else if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        *out = &impl->ICompositionObject_iface;
+    else
+    {
+        TRACE( "target: no interface %s.\n", debugstr_guid(iid) );
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    IUnknown_AddRef( (IUnknown *)*out );
+    return S_OK;
+}
+static ULONG WINAPI target_AddRef( ICompositionTarget *iface )
+{
+    return InterlockedIncrement( &impl_from_target( iface )->ref );
+}
+static ULONG WINAPI target_Release( ICompositionTarget *iface )
+{
+    struct composition_target *impl = impl_from_target( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref)
+    {
+        if (impl->root) IVisual_Release( impl->root );
+        ICompositor_Release( impl->compositor );
+        free( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI target_GetIids( ICompositionTarget *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI target_GetRuntimeClassName( ICompositionTarget *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_CompositionTarget,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_CompositionTarget) - 1, name );
+}
+static HRESULT WINAPI target_GetTrustLevel( ICompositionTarget *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI target_get_Root( ICompositionTarget *iface, IVisual **value )
+{
+    struct composition_target *impl = impl_from_target( iface );
+    if (!value) return E_POINTER;
+    if ((*value = impl->root)) IVisual_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI target_put_Root( ICompositionTarget *iface, IVisual *value )
+{
+    scene_changed();
+    struct composition_target *impl = impl_from_target( iface );
+    TRACE( "root %p.\n", value );
+    if (value) IVisual_AddRef( value );
+    if (impl->root) IVisual_Release( impl->root );
+    impl->root = value;
+    if (impl->hwnd)
+    {
+        last_desktop_root = value;
+        present_desktop_hwnd( impl->hwnd );
+    }
+    return S_OK;
+}
+
+static const struct ICompositionTargetVtbl target_vtbl =
+{
+    target_QueryInterface, target_AddRef, target_Release,
+    target_GetIids, target_GetRuntimeClassName, target_GetTrustLevel,
+    target_get_Root, target_put_Root,
+};
+
+static HRESULT WINAPI target_obj_QueryInterface( ICompositionObject *iface, REFIID iid, void **out )
+{
+    struct composition_target *impl = CONTAINING_RECORD( iface, struct composition_target, ICompositionObject_iface );
+    return target_QueryInterface( &impl->ICompositionTarget_iface, iid, out );
+}
+static ULONG WINAPI target_obj_AddRef( ICompositionObject *iface )
+{
+    struct composition_target *impl = CONTAINING_RECORD( iface, struct composition_target, ICompositionObject_iface );
+    return target_AddRef( &impl->ICompositionTarget_iface );
+}
+static ULONG WINAPI target_obj_Release( ICompositionObject *iface )
+{
+    struct composition_target *impl = CONTAINING_RECORD( iface, struct composition_target, ICompositionObject_iface );
+    return target_Release( &impl->ICompositionTarget_iface );
+}
+static HRESULT WINAPI target_obj_GetIids( ICompositionObject *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI target_obj_GetRuntimeClassName( ICompositionObject *iface, HSTRING *name )
+{
+    struct composition_target *impl = CONTAINING_RECORD( iface, struct composition_target, ICompositionObject_iface );
+    return target_GetRuntimeClassName( &impl->ICompositionTarget_iface, name );
+}
+static HRESULT WINAPI target_obj_GetTrustLevel( ICompositionObject *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI target_obj_get_Compositor( ICompositionObject *iface, ICompositor **value )
+{
+    struct composition_target *impl = CONTAINING_RECORD( iface, struct composition_target, ICompositionObject_iface );
+    if (!value) return E_POINTER;
+    ICompositor_AddRef( (*value = impl->compositor) );
+    return S_OK;
+}
+static HRESULT WINAPI target_obj_get_Dispatcher( ICompositionObject *iface, ICoreDispatcher **value )
+{
+    if (!value) return E_POINTER;
+    *value = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI target_obj_get_Properties( ICompositionObject *iface, ICompositionPropertySet **value )
+{
+    return create_property_set( value );
+}
+static HRESULT WINAPI target_obj_StartAnimation( ICompositionObject *iface, HSTRING name, ICompositionAnimation *animation ) {
+    return S_OK; }
+static HRESULT WINAPI target_obj_StopAnimation( ICompositionObject *iface, HSTRING name ) { return S_OK; }
+
+static const struct ICompositionObjectVtbl target_obj_vtbl =
+{
+    target_obj_QueryInterface, target_obj_AddRef, target_obj_Release,
+    target_obj_GetIids, target_obj_GetRuntimeClassName, target_obj_GetTrustLevel,
+    target_obj_get_Compositor, target_obj_get_Dispatcher, target_obj_get_Properties,
+    target_obj_StartAnimation, target_obj_StopAnimation,
+};
+
+static HRESULT create_target( ICompositor *compositor, ICompositionTarget **out )
+{
+    struct composition_target *impl;
+    if (!out) return E_POINTER;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->ICompositionTarget_iface.lpVtbl = &target_vtbl;
+    impl->ICompositionObject_iface.lpVtbl = &target_obj_vtbl;
+    impl->ref = 1;
+    ICompositor_AddRef( (impl->compositor = compositor) );
+    TRACE( "created composition target %p.\n", impl );
+    *out = &impl->ICompositionTarget_iface;
+    return S_OK;
+}
+
+#define COMPOSITOR_STUB( name, args, ... )                                                         \
+    static HRESULT WINAPI compositor_##name args                                                   \
+    {                                                                                              \
+        FIXME( "iface %p: stub.\n", iface );                                                       \
+        __VA_ARGS__;                                                                               \
+        return E_NOTIMPL;                                                                          \
+    }
+
+/* Key-frame animations. dcomp runs no animation clock; a typed object remembers the key frame with
+ * the highest key, and StartAnimation applies that end value to the target property at once
+ * (colour brushes' Color, visuals' Opacity / IsVisible). XAML animates button visual states this
+ * way, and ignoring them left hovered and pressed buttons stuck with the transient fill. Any other
+ * interface these objects are asked for is still answered by the generic recording vtable. */
+static const GUID IID_IColorKeyFrameAnimation_ =
+    { 0x93adb5e9, 0x8e05, 0x4593, { 0x84, 0xa3, 0xdc, 0xa1, 0x52, 0x78, 0x1e, 0x56 } };
+static const GUID IID_IScalarKeyFrameAnimation_ =
+    { 0xae288fa9, 0x252c, 0x4b95, { 0xa7, 0x25, 0xbf, 0x85, 0xe3, 0x80, 0x00, 0xa1 } };
+static const GUID IID_IBooleanKeyFrameAnimation_ =
+    { 0x95e23a08, 0xd1f4, 0x4972, { 0x97, 0x70, 0x3e, 0xfe, 0x68, 0xd8, 0x2e, 0x14 } };
+static void *kf_animation_vtbl[COMP_OBJECT_SLOTS];
+static LONG kf_animation_vtbl_ready;
+static const void *kf_color_vtbl[], *kf_scalar_vtbl[], *kf_boolean_vtbl[], *kf_vector2_vtbl[], *kf_vector3_vtbl[];
+static const GUID IID_IVector2KeyFrameAnimation_ =
+    { 0xdf414515, 0x4e29, 0x4f11, { 0xb5, 0x5e, 0xbf, 0x2a, 0x6e, 0xb3, 0x62, 0x94 } };
+static const GUID IID_IVector3KeyFrameAnimation_ =
+    { 0xc8039daa, 0xa281, 0x43c2, { 0xa7, 0x3d, 0xb6, 0x8e, 0x3c, 0x53, 0x3c, 0x40 } };
+
+/*
+ * ICompositionAnimation2 {369b603e-a80f-4948-93e3-ed23fb38c6cb}: SetBooleanParameter, get_Target,
+ * put_Target. Target matters because the Windows Community Toolkit keys the implicit-animation map
+ * by it - ImplicitAnimationCollection is an IMap<HSTRING, ICompositionAnimationBase> - so an
+ * animation whose Target does not survive the round trip is inserted under an empty key and XAML
+ * reports "Cannot add instance of type 'Vector3Animation' to a collection of type
+ * 'ImplicitAnimationSet'". The generic slot handler cannot serve this: slot 7 is get_Target here and
+ * put_DelayTime on IKeyFrameAnimation, so it needs a vtable of its own.
+ */
+static const GUID IID_ICompositionAnimation2_local =
+    {0x369b603e,0xa80f,0x4948,{0x93,0xe3,0xed,0x23,0xfb,0x38,0xc6,0xcb}};
+
+static HRESULT WINAPI kf_animation_QueryInterface( void *iface, REFIID iid, void **out );
+
+static struct kf_animation *kf_from_anim2( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct kf_animation, anim2_vtbl );
+}
+static HRESULT WINAPI kf_anim2_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return kf_animation_QueryInterface( &kf_from_anim2( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI kf_anim2_AddRef( void *iface )
+{
+    return comp_object_AddRef( &kf_from_anim2( iface )->vtbl );
+}
+static ULONG WINAPI kf_anim2_Release( void *iface )
+{
+    return comp_object_Release( &kf_from_anim2( iface )->vtbl );
+}
+static HRESULT WINAPI kf_anim2_SetBooleanParameter( void *iface, HSTRING key, boolean value )
+{
+    TRACE( "%p, key %s, value %u: ignored.\n", iface, debugstr_hstring( key ), value );
+    return S_OK;
+}
+static HRESULT WINAPI kf_anim2_get_Target( void *iface, HSTRING *value )
+{
+    struct kf_animation *impl = kf_from_anim2( iface );
+
+    TRACE( "%p -> %s.\n", impl, debugstr_w( impl->target ) );
+    if (!value) return E_POINTER;
+    if (!impl->target[0])
+    {
+        *value = NULL;  /* a NULL HSTRING is the empty string */
+        return S_OK;
+    }
+    return WindowsCreateString( impl->target, wcslen( impl->target ), value );
+}
+static HRESULT WINAPI kf_anim2_put_Target( void *iface, HSTRING value )
+{
+    struct kf_animation *impl = kf_from_anim2( iface );
+    const WCHAR *str = value ? WindowsGetStringRawBuffer( value, NULL ) : NULL;
+
+    TRACE( "%p, value %s.\n", impl, debugstr_w( str ) );
+    if (!str) impl->target[0] = 0;
+    else lstrcpynW( impl->target, str, ARRAY_SIZE(impl->target) );
+    return S_OK;
+}
+static HRESULT WINAPI kf_anim2_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI kf_anim2_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return comp_object_GetRuntimeClassName( &kf_from_anim2( iface )->vtbl, name );
+}
+static HRESULT WINAPI kf_anim2_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+static const void *kf_anim2_vtbl[] =
+{
+    kf_anim2_QueryInterface, kf_anim2_AddRef, kf_anim2_Release,
+    kf_anim2_GetIids, kf_anim2_GetRuntimeClassName, kf_anim2_GetTrustLevel,
+    kf_anim2_SetBooleanParameter, kf_anim2_get_Target, kf_anim2_put_Target,
+};
+
+static HRESULT WINAPI kf_animation_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct kf_animation *impl = CONTAINING_RECORD( iface, struct kf_animation, vtbl );
+
+    TRACE( "%s %p, iid %s.\n", impl->kind, impl, debugstr_guid( iid ) );
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&impl->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
+        return create_object4_view( (IUnknown *)&impl->vtbl, out );
+    InterlockedIncrement( &impl->ref );
+    if (IsEqualGUID( iid, &IID_ICompositionAnimation2_local ))
+    {
+        *out = &impl->anim2_vtbl;
+        return S_OK;
+    }
+    if ((impl->value_kind == KF_COLOR && IsEqualGUID( iid, &IID_IColorKeyFrameAnimation_ )) ||
+        (impl->value_kind == KF_SCALAR && IsEqualGUID( iid, &IID_IScalarKeyFrameAnimation_ )) ||
+        (impl->value_kind == KF_BOOLEAN && IsEqualGUID( iid, &IID_IBooleanKeyFrameAnimation_ )) ||
+        (impl->value_kind == KF_VECTOR2 && IsEqualGUID( iid, &IID_IVector2KeyFrameAnimation_ )) ||
+        (impl->value_kind == KF_VECTOR3 && IsEqualGUID( iid, &IID_IVector3KeyFrameAnimation_ )))
+        *out = &impl->typed_vtbl;
+    else
+        *out = &impl->vtbl;
+    return S_OK;
+}
+static struct kf_animation *kf_from_typed( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct kf_animation, typed_vtbl );
+}
+static HRESULT WINAPI kf_typed_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return kf_animation_QueryInterface( &kf_from_typed( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI kf_typed_AddRef( void *iface )
+{
+    return comp_object_AddRef( &kf_from_typed( iface )->vtbl );
+}
+static ULONG WINAPI kf_typed_Release( void *iface )
+{
+    return comp_object_Release( &kf_from_typed( iface )->vtbl );
+}
+static HRESULT WINAPI kf_typed_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI kf_typed_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR color[] = L"Windows.UI.Composition.ColorKeyFrameAnimation";
+    static const WCHAR scalar[] = L"Windows.UI.Composition.ScalarKeyFrameAnimation";
+    static const WCHAR flag[] = L"Windows.UI.Composition.BooleanKeyFrameAnimation";
+    enum kf_kind kind = kf_from_typed( iface )->value_kind;
+    const WCHAR *n = kind == KF_COLOR ? color : kind == KF_SCALAR ? scalar : flag;
+    return WindowsCreateString( n, wcslen( n ), name );
+}
+static HRESULT WINAPI kf_typed_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+static BOOL kf_take_key( struct kf_animation *impl, float key )
+{
+    impl->key_count++;
+    if (impl->key_count <= KF_KEYS) impl->keys[impl->key_count - 1].key = key;
+    if (impl->has_value && key < impl->last_key) return FALSE;
+    impl->last_key = key;
+    impl->has_value = TRUE;
+    return TRUE;
+}
+/* IColorKeyFrameAnimation */
+static HRESULT WINAPI kf_color_get_InterpolationColorSpace( void *iface, int *value )
+{
+    if (!value) return E_POINTER;
+    *value = 0;
+    return S_OK;
+}
+static HRESULT WINAPI kf_color_put_InterpolationColorSpace( void *iface, int value )
+{
+    scene_changed();
+    return S_OK;
+}
+static HRESULT WINAPI kf_color_InsertKeyFrame( void *iface, FLOAT key, Color value )
+{
+    scene_changed();
+    struct kf_animation *impl = kf_from_typed( iface );
+    TRACE( "%p, key %f, colour %02x%02x%02x%02x.\n", impl, key, value.A, value.R, value.G, value.B );
+    if (kf_take_key( impl, key )) impl->color = value;
+    if (impl->key_count <= KF_KEYS) impl->keys[impl->key_count - 1].u.color = value;
+    return S_OK;
+}
+static HRESULT WINAPI kf_color_InsertKeyFrameWithEasingFunction( void *iface, FLOAT key, Color value, void *function )
+{
+    scene_changed();
+    return kf_color_InsertKeyFrame( iface, key, value );
+}
+static const void *kf_color_vtbl[] =
+{
+    kf_typed_QueryInterface, kf_typed_AddRef, kf_typed_Release,
+    kf_typed_GetIids, kf_typed_GetRuntimeClassName, kf_typed_GetTrustLevel,
+    kf_color_get_InterpolationColorSpace, kf_color_put_InterpolationColorSpace,
+    kf_color_InsertKeyFrame, kf_color_InsertKeyFrameWithEasingFunction,
+};
+/* IScalarKeyFrameAnimation */
+static HRESULT WINAPI kf_scalar_InsertKeyFrame( void *iface, FLOAT key, FLOAT value )
+{
+    scene_changed();
+    struct kf_animation *impl = kf_from_typed( iface );
+    TRACE( "%p, key %f, value %f.\n", impl, key, value );
+    if (kf_take_key( impl, key )) impl->scalar = value;
+    if (impl->key_count <= KF_KEYS) impl->keys[impl->key_count - 1].u.scalar = value;
+    return S_OK;
+}
+static HRESULT WINAPI kf_scalar_InsertKeyFrameWithEasingFunction( void *iface, FLOAT key, FLOAT value, void *function )
+{
+    scene_changed();
+    return kf_scalar_InsertKeyFrame( iface, key, value );
+}
+static const void *kf_scalar_vtbl[] =
+{
+    kf_typed_QueryInterface, kf_typed_AddRef, kf_typed_Release,
+    kf_typed_GetIids, kf_typed_GetRuntimeClassName, kf_typed_GetTrustLevel,
+    kf_scalar_InsertKeyFrame, kf_scalar_InsertKeyFrameWithEasingFunction,
+};
+/* IBooleanKeyFrameAnimation */
+static HRESULT WINAPI kf_boolean_InsertKeyFrame( void *iface, FLOAT key, boolean value )
+{
+    scene_changed();
+    struct kf_animation *impl = kf_from_typed( iface );
+    TRACE( "%p, key %f, value %u.\n", impl, key, value );
+    if (kf_take_key( impl, key )) impl->flag = value;
+    if (impl->key_count <= KF_KEYS) impl->keys[impl->key_count - 1].u.flag = value;
+    return S_OK;
+}
+static const void *kf_boolean_vtbl[] =
+{
+    kf_typed_QueryInterface, kf_typed_AddRef, kf_typed_Release,
+    kf_typed_GetIids, kf_typed_GetRuntimeClassName, kf_typed_GetTrustLevel,
+    kf_boolean_InsertKeyFrame,
+};
+/* Vector2 (8 bytes) travels in a register, Vector3 by reference; the compiler follows the MS ABI for both. */
+static HRESULT WINAPI kf_vector2_InsertKeyFrame( void *iface, FLOAT key, Vector2 value )
+{
+    scene_changed();
+    struct kf_animation *impl = kf_from_typed( iface );
+    TRACE( "%p, key %f, value %g,%g.\n", impl, key, value.X, value.Y );
+    if (kf_take_key( impl, key )) impl->vector2 = value;
+    if (impl->key_count <= KF_KEYS) impl->keys[impl->key_count - 1].u.vector2 = value;
+    return S_OK;
+}
+static HRESULT WINAPI kf_vector2_InsertKeyFrameWithEasingFunction( void *iface, FLOAT key, Vector2 value, void *function )
+{
+    scene_changed();
+    return kf_vector2_InsertKeyFrame( iface, key, value );
+}
+static const void *kf_vector2_vtbl[] =
+{
+    kf_typed_QueryInterface, kf_typed_AddRef, kf_typed_Release,
+    kf_typed_GetIids, kf_typed_GetRuntimeClassName, kf_typed_GetTrustLevel,
+    kf_vector2_InsertKeyFrame, kf_vector2_InsertKeyFrameWithEasingFunction,
+};
+static HRESULT WINAPI kf_vector3_InsertKeyFrame( void *iface, FLOAT key, Vector3 value )
+{
+    scene_changed();
+    struct kf_animation *impl = kf_from_typed( iface );
+    TRACE( "%p, key %f, value %g,%g,%g.\n", impl, key, value.X, value.Y, value.Z );
+    if (kf_take_key( impl, key )) impl->vector3 = value;
+    if (impl->key_count <= KF_KEYS) impl->keys[impl->key_count - 1].u.vector3 = value;
+    return S_OK;
+}
+static HRESULT WINAPI kf_vector3_InsertKeyFrameWithEasingFunction( void *iface, FLOAT key, Vector3 value, void *function )
+{
+    scene_changed();
+    return kf_vector3_InsertKeyFrame( iface, key, value );
+}
+static const void *kf_vector3_vtbl[] =
+{
+    kf_typed_QueryInterface, kf_typed_AddRef, kf_typed_Release,
+    kf_typed_GetIids, kf_typed_GetRuntimeClassName, kf_typed_GetTrustLevel,
+    kf_vector3_InsertKeyFrame, kf_vector3_InsertKeyFrameWithEasingFunction,
+};
+
+static HRESULT create_kf_animation( enum kf_kind kind, void **out )
+{
+    struct kf_animation *impl;
+    unsigned int i;
+
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!kf_animation_vtbl_ready)
+    {
+        kf_animation_vtbl[1] = comp_object_AddRef;
+        kf_animation_vtbl[2] = comp_object_Release;
+        for (i = 3; i < COMP_OBJECT_SLOTS; i++) kf_animation_vtbl[i] = comp_object_slot_fn( i );
+        kf_animation_vtbl[0] = kf_animation_QueryInterface;
+        comp_object_set_inspectable( kf_animation_vtbl );
+        InterlockedExchange( &kf_animation_vtbl_ready, 1 );
+    }
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->vtbl = (const void **)kf_animation_vtbl;
+    impl->kind = kind == KF_COLOR ? "ColorKeyFrameAnimation" : kind == KF_SCALAR ? "ScalarKeyFrameAnimation" :
+                 kind == KF_BOOLEAN ? "BooleanKeyFrameAnimation" : kind == KF_VECTOR2 ? "Vector2KeyFrameAnimation" :
+                 "Vector3KeyFrameAnimation";
+    impl->ref = 1;
+    impl->value_kind = kind;
+    impl->typed_vtbl = kind == KF_COLOR ? kf_color_vtbl : kind == KF_SCALAR ? kf_scalar_vtbl :
+                       kind == KF_BOOLEAN ? kf_boolean_vtbl : kind == KF_VECTOR2 ? kf_vector2_vtbl : kf_vector3_vtbl;
+    impl->anim2_vtbl = kf_anim2_vtbl;
+    /* CreateBooleanKeyFrameAnimation's default interface is IBooleanKeyFrameAnimation itself and XAML
+     * inserts its key frames through that pointer without a QI, so the generic view swallows them.
+     * That is deliberate for now: applying the last key's IsVisible hid the AnimatedIcon layers the
+     * hamburger is drawn with (which layer shows depends on the icon's Progress state), so only
+     * single-key boolean animations are applied. The vector and boolean animations' default
+     * interface is the typed one and XAML inserts their key frames without a QI. */
+    *out = kind == KF_VECTOR2 || kind == KF_VECTOR3 || kind == KF_BOOLEAN ? (void *)&impl->typed_vtbl : (void *)&impl->vtbl;
+    return S_OK;
+}
+
+/* InsetClip: the one composition clip XAML's ScrollViewer puts on its viewport visuals (and the only kind the
+ * painter applies). IInsetClip {1e73e647-84c7-477a-b474-5880e0442e15}; ICompositionClip's centre/scale/offset
+ * and ICompositionClip2's anchor point go to the generic recording view and are not applied. */
+static const GUID IID_IInsetClip_local = { 0x1e73e647, 0x84c7, 0x477a, { 0xb4, 0x74, 0x58, 0x80, 0xe0, 0x44, 0x2e, 0x15 } };
+struct inset_clip
+{
+    const void **vtbl;          /* generic composition object layout, must stay first */
+    const char *kind;
+    LONG ref;
+    const void **typed_vtbl;    /* IInsetClip */
+    float left, top, right, bottom;
+};
+static void *inset_clip_vtbl[COMP_OBJECT_SLOTS];
+static LONG inset_clip_vtbl_ready;
+static const void *inset_clip_typed_vtbl[];
+
+static struct inset_clip *inset_clip_from_any( void *iface )
+{
+    if (!iface) return NULL;
+    if (*(void ***)iface == (void **)inset_clip_vtbl) return CONTAINING_RECORD( iface, struct inset_clip, vtbl );
+    if (*(void ***)iface == (void **)inset_clip_typed_vtbl) return CONTAINING_RECORD( iface, struct inset_clip, typed_vtbl );
+    return NULL;
+}
+static HRESULT WINAPI inset_clip_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct inset_clip *impl = CONTAINING_RECORD( iface, struct inset_clip, vtbl );
+
+    TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&impl->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
+        return create_object4_view( (IUnknown *)&impl->vtbl, out );
+    InterlockedIncrement( &impl->ref );
+    *out = IsEqualGUID( iid, &IID_IInsetClip_local ) ? (void *)&impl->typed_vtbl : (void *)&impl->vtbl;
+    return S_OK;
+}
+static struct inset_clip *inset_clip_from_typed( void *iface ) { return CONTAINING_RECORD( iface, struct inset_clip, typed_vtbl ); }
+static HRESULT WINAPI inset_typed_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return inset_clip_QueryInterface( &inset_clip_from_typed( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI inset_typed_AddRef( void *iface ) { return comp_object_AddRef( &inset_clip_from_typed( iface )->vtbl ); }
+static ULONG WINAPI inset_typed_Release( void *iface ) { return comp_object_Release( &inset_clip_from_typed( iface )->vtbl ); }
+static HRESULT WINAPI inset_typed_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    if (!count || !iids) return E_POINTER;
+    *count = 0; *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI inset_typed_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR nameW[] = L"Windows.UI.Composition.InsetClip";
+    return WindowsCreateString( nameW, ARRAY_SIZE(nameW) - 1, name );
+}
+static HRESULT WINAPI inset_typed_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    if (!level) return E_POINTER;
+    *level = BaseTrust;
+    return S_OK;
+}
+#define INSET_CLIP_PROP( name, field ) \
+    static HRESULT WINAPI inset_get_##name( void *iface, FLOAT *value ) \
+    { if (!value) return E_POINTER; *value = inset_clip_from_typed( iface )->field; return S_OK; } \
+    static HRESULT WINAPI inset_put_##name( void *iface, FLOAT value ) \
+    { TRACE( "%p %s %g\n", inset_clip_from_typed( iface ), #name, value ); scene_changed(); inset_clip_from_typed( iface )->field = value; return S_OK; }
+INSET_CLIP_PROP( BottomInset, bottom )
+INSET_CLIP_PROP( LeftInset, left )
+INSET_CLIP_PROP( RightInset, right )
+INSET_CLIP_PROP( TopInset, top )
+static const void *inset_clip_typed_vtbl[] =
+{
+    inset_typed_QueryInterface, inset_typed_AddRef, inset_typed_Release,
+    inset_typed_GetIids, inset_typed_GetRuntimeClassName, inset_typed_GetTrustLevel,
+    inset_get_BottomInset, inset_put_BottomInset, inset_get_LeftInset, inset_put_LeftInset,
+    inset_get_RightInset, inset_put_RightInset, inset_get_TopInset, inset_put_TopInset,
+};
+static HRESULT create_inset_clip( float left, float top, float right, float bottom, void **out )
+{
+    struct inset_clip *impl;
+    unsigned int i;
+
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!inset_clip_vtbl_ready)
+    {
+        inset_clip_vtbl[1] = comp_object_AddRef;
+        inset_clip_vtbl[2] = comp_object_Release;
+        for (i = 3; i < COMP_OBJECT_SLOTS; i++) inset_clip_vtbl[i] = comp_object_slot_fn( i );
+        inset_clip_vtbl[0] = inset_clip_QueryInterface;
+        comp_object_set_inspectable( inset_clip_vtbl );
+        InterlockedExchange( &inset_clip_vtbl_ready, 1 );
+    }
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->vtbl = (const void **)inset_clip_vtbl;
+    impl->kind = "InsetClip";
+    impl->ref = 1;
+    impl->typed_vtbl = inset_clip_typed_vtbl;
+    impl->left = left; impl->top = top; impl->right = right; impl->bottom = bottom;
+    /* the default interface is IInsetClip: XAML sets the insets through it without a QI */
+    *out = &impl->typed_vtbl;
+    TRACE( "created InsetClip %p.\n", impl );
+    return S_OK;
+}
+
+/* Clip a visual's subtree to its inset clip: narrows paint_clip; the caller restores the returned previous
+ * clip when this returns TRUE. */
+static int apply_inset_clip( HDC hdc, void *clip_iface, float x, float y, float width, float height )
+{
+    struct inset_clip *clip = inset_clip_from_any( clip_iface );
+    RECT r;
+
+    if (!clip || width <= 0.0f || height <= 0.0f) return 0;
+    SetRect( &r, (int)(x + clip->left), (int)(y + clip->top),
+             (int)(x + width - clip->right + 0.5f), (int)(y + height - clip->bottom + 0.5f) );
+    if (!IntersectRect( &paint_clip, &paint_clip, &r )) SetRectEmpty( &paint_clip );
+    return 1;
+}
+
+/* Composition batches. No animation runs here, so a batch's work is "done" as soon as it is ended (scoped) or
+ * committed: Completed is raised from a timer on the ending thread, the way the compositor's completion
+ * callback arrives on the UI thread on Windows. XAML's storyboards that run as composition animations
+ * (SplitView opening and closing its pane, visual-state transitions) finish on this event; without it the
+ * NavigationView pane never closed after picking an item. */
+static const GUID IID_ICompositionScopedBatch_local =
+    { 0x0d00dad0, 0xfb07, 0x46fd, { 0x8c, 0x72, 0x62, 0x80, 0xd1, 0xa3, 0xd1, 0xdd } };
+static const GUID IID_ICompositionCommitBatch_local =
+    { 0x0d00dad0, 0xca07, 0x4400, { 0x8c, 0x8e, 0xcb, 0x5d, 0xb0, 0x85, 0x59, 0xcc } };
+#define BATCH_HANDLERS 8
+struct comp_batch
+{
+    const void **vtbl;          /* generic composition object layout, must stay first */
+    const char *kind;
+    LONG ref;
+    const void **typed_vtbl;    /* ICompositionScopedBatch or ICompositionCommitBatch */
+    BOOL scoped;
+    BOOL active;
+    BOOL ended;
+    BOOL pending;               /* Completed scheduled */
+    IUnknown *handlers[BATCH_HANDLERS];
+    INT64 tokens[BATCH_HANDLERS];
+    INT64 next_token;
+    struct comp_batch *next_pending;
+};
+static void *comp_batch_vtbl[COMP_OBJECT_SLOTS];
+static LONG comp_batch_vtbl_ready;
+static const void *scoped_batch_typed_vtbl[], *commit_batch_typed_vtbl[];
+static CRITICAL_SECTION batch_cs = { NULL, -1, 0, 0, 0, 0 };
+static struct comp_batch *pending_batches;
+
+static struct comp_batch *batch_from_typed( void *iface ) { return CONTAINING_RECORD( iface, struct comp_batch, typed_vtbl ); }
+static void batch_release_handlers( struct comp_batch *batch )
+{
+    unsigned int i;
+    for (i = 0; i < BATCH_HANDLERS; i++)
+    {
+        if (batch->handlers[i]) IUnknown_Release( batch->handlers[i] );
+        batch->handlers[i] = NULL;
+    }
+}
+static ULONG WINAPI comp_batch_Release( void *iface )
+{
+    struct comp_batch *batch = CONTAINING_RECORD( iface, struct comp_batch, vtbl );
+    ULONG ref = InterlockedDecrement( &batch->ref );
+    if (!ref)
+    {
+        batch_release_handlers( batch );
+        free( batch );
+    }
+    return ref;
+}
+static HRESULT WINAPI comp_batch_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct comp_batch *batch = CONTAINING_RECORD( iface, struct comp_batch, vtbl );
+
+    TRACE( "%s %p, iid %s.\n", batch->kind, batch, debugstr_guid( iid ) );
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&batch->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
+        return create_object4_view( (IUnknown *)&batch->vtbl, out );
+    InterlockedIncrement( &batch->ref );
+    if ((batch->scoped && IsEqualGUID( iid, &IID_ICompositionScopedBatch_local )) ||
+        (!batch->scoped && IsEqualGUID( iid, &IID_ICompositionCommitBatch_local )))
+        *out = &batch->typed_vtbl;
+    else
+        *out = &batch->vtbl;
+    return S_OK;
+}
+static HRESULT WINAPI batch_typed_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return comp_batch_QueryInterface( &batch_from_typed( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI batch_typed_AddRef( void *iface ) { return InterlockedIncrement( &batch_from_typed( iface )->ref ); }
+static ULONG WINAPI batch_typed_Release( void *iface ) { return comp_batch_Release( &batch_from_typed( iface )->vtbl ); }
+static HRESULT WINAPI batch_typed_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    if (!count || !iids) return E_POINTER;
+    *count = 0; *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI batch_typed_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR scopedW[] = L"Windows.UI.Composition.CompositionScopedBatch";
+    static const WCHAR commitW[] = L"Windows.UI.Composition.CompositionCommitBatch";
+    if (batch_from_typed( iface )->scoped) return WindowsCreateString( scopedW, ARRAY_SIZE(scopedW) - 1, name );
+    return WindowsCreateString( commitW, ARRAY_SIZE(commitW) - 1, name );
+}
+static HRESULT WINAPI batch_typed_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    if (!level) return E_POINTER;
+    *level = BaseTrust;
+    return S_OK;
+}
+static HRESULT WINAPI batch_get_IsActive( void *iface, boolean *value )
+{
+    if (!value) return E_POINTER;
+    *value = batch_from_typed( iface )->active;
+    return S_OK;
+}
+static HRESULT WINAPI batch_get_IsEnded( void *iface, boolean *value )
+{
+    if (!value) return E_POINTER;
+    *value = batch_from_typed( iface )->ended;
+    return S_OK;
+}
+
+/* ITypedEventHandler<IInspectable*, CompositionBatchCompletedEventArgs*>::Invoke is slot 3. */
+static void batch_fire_completed( struct comp_batch *batch )
+{
+    IUnknown *handlers[BATCH_HANDLERS];
+    unsigned int i;
+    void *args = NULL;
+
+    EnterCriticalSection( &batch_cs );
+    for (i = 0; i < BATCH_HANDLERS; i++)
+    {
+        if ((handlers[i] = batch->handlers[i])) IUnknown_AddRef( handlers[i] );
+    }
+    LeaveCriticalSection( &batch_cs );
+    create_comp_object( "BatchCompletedEventArgs", &args );
+    for (i = 0; i < BATCH_HANDLERS; i++)
+    {
+        HRESULT (STDMETHODCALLTYPE *invoke)( IUnknown *, IUnknown *, void * );
+        if (!handlers[i]) continue;
+        invoke = (*(void ***)handlers[i])[3];
+        TRACE( "%s %p: Completed -> handler %p.\n", batch->kind, batch, handlers[i] );
+        invoke( handlers[i], (IUnknown *)&batch->vtbl, args );
+        IUnknown_Release( handlers[i] );
+    }
+    if (args) IUnknown_Release( (IUnknown *)args );
+}
+static void CALLBACK batch_timer_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD time )
+{
+    struct comp_batch *list, *batch;
+
+    KillTimer( hwnd, id );
+    EnterCriticalSection( &batch_cs );
+    list = pending_batches;
+    pending_batches = NULL;
+    LeaveCriticalSection( &batch_cs );
+    /* the list was built newest first; complete in the order the batches were ended */
+    for (batch = list; batch; )
+    {
+        struct comp_batch *next = batch->next_pending;
+        batch->next_pending = NULL;
+        batch->pending = FALSE;
+        batch_fire_completed( batch );
+        comp_batch_Release( &batch->vtbl );
+        batch = next;
+    }
+}
+static void batch_schedule_completion( struct comp_batch *batch )
+{
+    EnterCriticalSection( &batch_cs );
+    if (batch->pending)
+    {
+        LeaveCriticalSection( &batch_cs );
+        return;
+    }
+    batch->pending = TRUE;
+    InterlockedIncrement( &batch->ref );
+    /* append, so that Completed arrives in End order */
+    if (!pending_batches) pending_batches = batch;
+    else
+    {
+        struct comp_batch *tail = pending_batches;
+        while (tail->next_pending) tail = tail->next_pending;
+        tail->next_pending = batch;
+    }
+    LeaveCriticalSection( &batch_cs );
+    SetTimer( NULL, 0, 16, batch_timer_proc );
+}
+static HRESULT WINAPI batch_End( void *iface )
+{
+    struct comp_batch *batch = batch_from_typed( iface );
+    TRACE( "%p.\n", batch );
+    batch->ended = TRUE;
+    batch->active = FALSE;
+    batch_schedule_completion( batch );
+    return S_OK;
+}
+static HRESULT WINAPI batch_Resume( void *iface )
+{
+    struct comp_batch *batch = batch_from_typed( iface );
+    TRACE( "%p.\n", batch );
+    if (!batch->ended) batch->active = TRUE;
+    return S_OK;
+}
+static HRESULT WINAPI batch_Suspend( void *iface )
+{
+    struct comp_batch *batch = batch_from_typed( iface );
+    TRACE( "%p.\n", batch );
+    batch->active = FALSE;
+    return S_OK;
+}
+static HRESULT WINAPI batch_add_Completed( void *iface, IUnknown *handler, EventRegistrationToken *token )
+{
+    struct comp_batch *batch = batch_from_typed( iface );
+    unsigned int i;
+
+    TRACE( "%p, handler %p.\n", batch, handler );
+    if (!handler) return E_POINTER;
+    EnterCriticalSection( &batch_cs );
+    for (i = 0; i < BATCH_HANDLERS; i++) if (!batch->handlers[i]) break;
+    if (i == BATCH_HANDLERS)
+    {
+        LeaveCriticalSection( &batch_cs );
+        return E_OUTOFMEMORY;
+    }
+    IUnknown_AddRef( (batch->handlers[i] = handler) );
+    batch->tokens[i] = ++batch->next_token;
+    if (token) token->value = batch->tokens[i];
+    LeaveCriticalSection( &batch_cs );
+    /* a batch ended before anyone listened (a commit batch is ended at once) still completes */
+    if (batch->ended) batch_schedule_completion( batch );
+    return S_OK;
+}
+static HRESULT WINAPI batch_remove_Completed( void *iface, EventRegistrationToken token )
+{
+    struct comp_batch *batch = batch_from_typed( iface );
+    unsigned int i;
+
+    TRACE( "%p, token %I64d.\n", batch, token.value );
+    EnterCriticalSection( &batch_cs );
+    for (i = 0; i < BATCH_HANDLERS; i++)
+    {
+        if (!batch->handlers[i] || batch->tokens[i] != token.value) continue;
+        IUnknown_Release( batch->handlers[i] );
+        batch->handlers[i] = NULL;
+    }
+    LeaveCriticalSection( &batch_cs );
+    return S_OK;
+}
+static const void *scoped_batch_typed_vtbl[] =
+{
+    batch_typed_QueryInterface, batch_typed_AddRef, batch_typed_Release,
+    batch_typed_GetIids, batch_typed_GetRuntimeClassName, batch_typed_GetTrustLevel,
+    batch_get_IsActive, batch_get_IsEnded, batch_End, batch_Resume, batch_Suspend,
+    batch_add_Completed, batch_remove_Completed,
+};
+static const void *commit_batch_typed_vtbl[] =
+{
+    batch_typed_QueryInterface, batch_typed_AddRef, batch_typed_Release,
+    batch_typed_GetIids, batch_typed_GetRuntimeClassName, batch_typed_GetTrustLevel,
+    batch_get_IsActive, batch_get_IsEnded, batch_add_Completed, batch_remove_Completed,
+};
+static HRESULT create_comp_batch( BOOL scoped, void **out )
+{
+    struct comp_batch *batch;
+    unsigned int i;
+
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!comp_batch_vtbl_ready)
+    {
+        comp_batch_vtbl[1] = comp_object_AddRef;
+        comp_batch_vtbl[2] = comp_batch_Release;
+        for (i = 3; i < COMP_OBJECT_SLOTS; i++) comp_batch_vtbl[i] = comp_object_slot_fn( i );
+        comp_batch_vtbl[0] = comp_batch_QueryInterface;
+        comp_object_set_inspectable( comp_batch_vtbl );
+        InterlockedExchange( &comp_batch_vtbl_ready, 1 );
+    }
+    if (!(batch = calloc( 1, sizeof(*batch) ))) return E_OUTOFMEMORY;
+    batch->vtbl = (const void **)comp_batch_vtbl;
+    batch->kind = scoped ? "ScopedBatch" : "CommitBatch";
+    batch->ref = 1;
+    batch->scoped = scoped;
+    batch->typed_vtbl = scoped ? scoped_batch_typed_vtbl : commit_batch_typed_vtbl;
+    batch->active = scoped;
+    batch->ended = !scoped;     /* a commit batch is complete at the next commit, which is now */
+    *out = &batch->typed_vtbl;
+    TRACE( "created %s %p.\n", batch->kind, batch );
+    return S_OK;
+}
+
+/* Sample the animation at a progress in 0..1: booleans and colours hold the last key at or before it,
+ * numbers and vectors interpolate linearly between the neighbouring keys (easing functions ignored). */
+static BOOL kf_sample( struct kf_animation *kf, float progress, struct kf_key *out )
+{
+    unsigned int n = min( kf->key_count, KF_KEYS ), i, lo = ~0u, hi = ~0u;
+    float t;
+
+    memset( out, 0, sizeof(*out) );
+    if (!n) return FALSE;
+    for (i = 0; i < n; i++)
+    {
+        if (kf->keys[i].key <= progress && (lo == ~0u || kf->keys[i].key >= kf->keys[lo].key)) lo = i;
+        if (kf->keys[i].key > progress && (hi == ~0u || kf->keys[i].key < kf->keys[hi].key)) hi = i;
+    }
+    /* before the first key the property keeps its static value (Lottie layers start hidden that way) */
+    if (lo == ~0u) return FALSE;
+    if (hi == ~0u || kf->value_kind == KF_BOOLEAN || kf->value_kind == KF_COLOR) { *out = kf->keys[lo]; return TRUE; }
+    t = (progress - kf->keys[lo].key) / (kf->keys[hi].key - kf->keys[lo].key);
+    *out = kf->keys[lo];
+    switch (kf->value_kind)
+    {
+    case KF_SCALAR: out->u.scalar += t * (kf->keys[hi].u.scalar - kf->keys[lo].u.scalar); break;
+    case KF_VECTOR2:
+        out->u.vector2.X += t * (kf->keys[hi].u.vector2.X - kf->keys[lo].u.vector2.X);
+        out->u.vector2.Y += t * (kf->keys[hi].u.vector2.Y - kf->keys[lo].u.vector2.Y);
+        break;
+    case KF_VECTOR3:
+        out->u.vector3.X += t * (kf->keys[hi].u.vector3.X - kf->keys[lo].u.vector3.X);
+        out->u.vector3.Y += t * (kf->keys[hi].u.vector3.Y - kf->keys[lo].u.vector3.Y);
+        out->u.vector3.Z += t * (kf->keys[hi].u.vector3.Z - kf->keys[lo].u.vector3.Z);
+        break;
+    default: break;
+    }
+    return TRUE;
+}
+
+/* Windows.UI.Composition.AnimationController. IAnimationController {c1f7fc48-...}: 6/7 PlaybackRate, 8/9 Progress,
+ * 10/11 ProgressBehavior, 12 Pause, 13 Resume. XAML animates Progress through the object's ICompositionObject
+ * view ("_.Progress" over the AnimatedIcon's property set), which is remembered and evaluated when painting. */
+static const GUID IID_IAnimationController_local =
+    { 0xc1f7fc48, 0x91ea, 0x4fc2, { 0xb2, 0xa7, 0x51, 0xd3, 0xc8, 0x2a, 0x11, 0xec } };
+struct anim_controller
+{
+    const void **vtbl;          /* generic composition object layout, must stay first */
+    const char *kind;
+    LONG ref;
+    const void **typed_vtbl;    /* IAnimationController */
+    float progress;
+    BOOL has_progress;
+    struct expr_animation *progress_expr;
+};
+static void *anim_controller_vtbl[COMP_OBJECT_SLOTS];
+static LONG anim_controller_vtbl_ready;
+static const void *anim_controller_typed_vtbl[];
+
+static struct anim_controller *anim_controller_from_any( void *object )
+{
+    if (!object) return NULL;
+    if (*(void ***)object == (void **)anim_controller_vtbl) return CONTAINING_RECORD( object, struct anim_controller, vtbl );
+    if (*(void ***)object == (void **)anim_controller_typed_vtbl) return CONTAINING_RECORD( object, struct anim_controller, typed_vtbl );
+    return NULL;
+}
+static HRESULT WINAPI anim_controller_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct anim_controller *ctrl = CONTAINING_RECORD( iface, struct anim_controller, vtbl );
+
+    TRACE( "%p, iid %s.\n", ctrl, debugstr_guid( iid ) );
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&ctrl->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
+        return create_object4_view( (IUnknown *)&ctrl->vtbl, out );
+    InterlockedIncrement( &ctrl->ref );
+    *out = IsEqualGUID( iid, &IID_IAnimationController_local ) ? (void *)&ctrl->typed_vtbl : (void *)&ctrl->vtbl;
+    return S_OK;
+}
+static ULONG WINAPI anim_controller_Release( void *iface )
+{
+    struct anim_controller *ctrl = CONTAINING_RECORD( iface, struct anim_controller, vtbl );
+    ULONG ref = InterlockedDecrement( &ctrl->ref );
+    if (!ref)
+    {
+        if (ctrl->progress_expr) IUnknown_Release( (IUnknown *)&ctrl->progress_expr->vtbl );
+        free( ctrl );
+    }
+    return ref;
+}
+static struct anim_controller *ctrl_from_typed( void *iface ) { return CONTAINING_RECORD( iface, struct anim_controller, typed_vtbl ); }
+static HRESULT WINAPI ctrl_typed_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return anim_controller_QueryInterface( &ctrl_from_typed( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI ctrl_typed_AddRef( void *iface ) { return InterlockedIncrement( &ctrl_from_typed( iface )->ref ); }
+static ULONG WINAPI ctrl_typed_Release( void *iface ) { return anim_controller_Release( &ctrl_from_typed( iface )->vtbl ); }
+static HRESULT WINAPI ctrl_typed_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    if (!count || !iids) return E_POINTER;
+    *count = 0; *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI ctrl_typed_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR nameW[] = L"Windows.UI.Composition.AnimationController";
+    return WindowsCreateString( nameW, ARRAY_SIZE(nameW) - 1, name );
+}
+static HRESULT WINAPI ctrl_typed_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    if (!level) return E_POINTER;
+    *level = BaseTrust;
+    return S_OK;
+}
+static HRESULT WINAPI ctrl_get_PlaybackRate( void *iface, FLOAT *value ) { if (!value) return E_POINTER; *value = 1.0f; return S_OK; }
+static HRESULT WINAPI ctrl_put_PlaybackRate( void *iface, FLOAT value ) { return S_OK; }
+static HRESULT WINAPI ctrl_get_Progress( void *iface, FLOAT *value )
+{
+    struct anim_controller *ctrl = ctrl_from_typed( iface );
+    if (!value) return E_POINTER;
+    if (!anim_controller_progress( ctrl, value )) *value = 0.0f;
+    return S_OK;
+}
+static HRESULT WINAPI ctrl_put_Progress( void *iface, FLOAT value )
+{
+    scene_changed();
+    struct anim_controller *ctrl = ctrl_from_typed( iface );
+    TRACE( "%p progress %g.\n", ctrl, value );
+    ctrl->progress = value;
+    ctrl->has_progress = TRUE;
+    return S_OK;
+}
+static HRESULT WINAPI ctrl_get_ProgressBehavior( void *iface, int *value ) { if (!value) return E_POINTER; *value = 0; return S_OK; }
+static HRESULT WINAPI ctrl_put_ProgressBehavior( void *iface, int value ) { return S_OK; }
+static HRESULT WINAPI ctrl_Pause( void *iface ) { TRACE( "%p.\n", ctrl_from_typed( iface ) ); return S_OK; }
+static HRESULT WINAPI ctrl_Resume( void *iface ) { TRACE( "%p.\n", ctrl_from_typed( iface ) ); return S_OK; }
+static const void *anim_controller_typed_vtbl[] =
+{
+    ctrl_typed_QueryInterface, ctrl_typed_AddRef, ctrl_typed_Release,
+    ctrl_typed_GetIids, ctrl_typed_GetRuntimeClassName, ctrl_typed_GetTrustLevel,
+    ctrl_get_PlaybackRate, ctrl_put_PlaybackRate, ctrl_get_Progress, ctrl_put_Progress,
+    ctrl_get_ProgressBehavior, ctrl_put_ProgressBehavior, ctrl_Pause, ctrl_Resume,
+};
+static HRESULT create_anim_controller( void **out )
+{
+    struct anim_controller *ctrl;
+    unsigned int i;
+
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!anim_controller_vtbl_ready)
+    {
+        anim_controller_vtbl[1] = comp_object_AddRef;
+        anim_controller_vtbl[2] = anim_controller_Release;
+        for (i = 3; i < COMP_OBJECT_SLOTS; i++) anim_controller_vtbl[i] = comp_object_slot_fn( i );
+        anim_controller_vtbl[0] = anim_controller_QueryInterface;
+        comp_object_set_inspectable( anim_controller_vtbl );
+        InterlockedExchange( &anim_controller_vtbl_ready, 1 );
+    }
+    if (!(ctrl = calloc( 1, sizeof(*ctrl) ))) return E_OUTOFMEMORY;
+    ctrl->vtbl = (const void **)anim_controller_vtbl;
+    ctrl->kind = "AnimationController";
+    ctrl->ref = 1;
+    ctrl->typed_vtbl = anim_controller_typed_vtbl;
+    *out = &ctrl->typed_vtbl;
+    TRACE( "created AnimationController %p.\n", ctrl );
+    return S_OK;
+}
+static struct property_set *propset_from_object( IUnknown *object );
+/* "REF.Prop" over the expression's references (the AnimatedIcon's property set), or a plain number. */
+static BOOL expr_evaluate_scalar_simple( struct expr_animation *expr, float *out )
+{
+    WCHAR ref[48], prop[48];
+    const WCHAR *p = expr->expression, *dot;
+    unsigned int i, n;
+    WCHAR *end;
+
+    while (*p == ' ') p++;
+    if (iswdigit( *p ) || *p == '-' || *p == '.')
+    {
+        *out = wcstof( p, &end );
+        return end != p;
+    }
+    if (!(dot = wcschr( p, '.' ))) return FALSE;
+    if ((n = dot - p) >= ARRAY_SIZE(ref)) return FALSE;
+    lstrcpynW( ref, p, n + 1 );
+    lstrcpynW( prop, dot + 1, ARRAY_SIZE(prop) );
+    for (i = 0; i < expr->ref_count; i++)
+    {
+        struct property_set *set = !wcsicmp( expr->ref_names[i], ref ) ? propset_from_object( expr->refs[i] ) : NULL;
+        unsigned int k;
+        if (!set) continue;
+        for (k = 0; k < set->value_count; k++)
+            if (set->values[k].type == PROP_SCALAR && !wcsicmp( set->values[k].name, prop ))
+            {
+                *out = set->values[k].u.scalar;
+                return TRUE;
+            }
+    }
+    return FALSE;
+}
+static BOOL anim_controller_progress( struct anim_controller *ctrl, float *progress )
+{
+    if (!ctrl) return FALSE;
+    if (ctrl->progress_expr && expr_evaluate_scalar_simple( ctrl->progress_expr, progress )) return TRUE;
+    if (ctrl->has_progress) { *progress = ctrl->progress; return TRUE; }
+    return FALSE;
+}
+/* Add or replace the binding of a property to a key-frame animation. */
+static struct anim_binding *anim_bind( struct anim_binding *bindings, unsigned int *count, const WCHAR *prop, struct kf_animation *kf )
+{
+    unsigned int i;
+    for (i = 0; i < *count; i++) if (!wcsicmp( bindings[i].prop, prop )) break;
+    if (i == *count)
+    {
+        if (i == ANIM_BINDINGS) return NULL;
+        (*count)++;
+        memset( &bindings[i], 0, sizeof(bindings[i]) );
+        lstrcpynW( bindings[i].prop, prop, ARRAY_SIZE(bindings[i].prop) );
+    }
+    if (kf) InterlockedIncrement( &kf->ref );
+    if (bindings[i].kf) comp_object_Release( &bindings[i].kf->vtbl );
+    bindings[i].kf = kf;
+    if (bindings[i].controller) anim_controller_Release( &bindings[i].controller->vtbl );
+    bindings[i].controller = NULL;
+    return &bindings[i];
+}
+static void anim_binding_set_controller( struct anim_binding *binding, void *controller )
+{
+    struct anim_controller *ctrl = anim_controller_from_any( controller );
+    if (ctrl) InterlockedIncrement( &ctrl->ref );
+    if (binding->controller) anim_controller_Release( &binding->controller->vtbl );
+    binding->controller = ctrl;
+}
+static struct anim_binding *anim_find( struct anim_binding *bindings, unsigned int count, const WCHAR *prop )
+{
+    unsigned int i;
+    for (i = 0; i < count; i++) if (!wcsicmp( bindings[i].prop, prop )) return &bindings[i];
+    return NULL;
+}
+
+/* The animation handed to StartAnimation is the generic view: that is what CreateXxxKeyFrameAnimation
+ * returned and what the object's QI answers for ICompositionAnimation. */
+static struct kf_animation *kf_animation_from( void *animation )
+{
+    if (!animation) return NULL;
+    if (*(void ***)animation == (void **)kf_color_vtbl || *(void ***)animation == (void **)kf_scalar_vtbl ||
+        *(void ***)animation == (void **)kf_boolean_vtbl || *(void ***)animation == (void **)kf_vector2_vtbl ||
+        *(void ***)animation == (void **)kf_vector3_vtbl)
+        return kf_from_typed( animation );
+    if (*(void ***)animation != (void **)kf_animation_vtbl) return NULL;
+    return CONTAINING_RECORD( animation, struct kf_animation, vtbl );
+}
+
+static void *matrix_transform_vtbl[COMP_OBJECT_SLOTS];
+static void *manip_transform_vtbl[COMP_OBJECT_SLOTS];
+static void *expr_animation_vtbl[COMP_OBJECT_SLOTS];
+static LONG manip_vtbls_ready;
+static const void *expr_anim_view_vtbl[];
+static const GUID IID_IDependencyObject_ = { 0x5c526665, 0xf60e, 0x4912, { 0xaf, 0x59, 0x5f, 0xe0, 0x68, 0x0f, 0x08, 0x9d } };
+static const GUID IID_winui_private_1 = { 0x02dd3ad0, 0xb9de, 0x4b55, { 0xa0, 0xc3, 0x50, 0x72, 0x35, 0xea, 0xe8, 0xea } };
+static const GUID IID_winui_private_2 = { 0x64bd43f8, 0xbfee, 0x4ec4, { 0xb7, 0xeb, 0x29, 0x35, 0x15, 0x8d, 0xae, 0x21 } };
+static const GUID IID_IExpressionAnimation_ =
+    { 0x6acc5431, 0x7d3d, 0x4bf3, { 0xab, 0xb6, 0xf4, 0x4b, 0xdc, 0x48, 0x88, 0xc1 } };
+static const GUID IID_ICompositionAnimation_ =
+    { 0x464c4c2c, 0x1caa, 0x4061, { 0x9b, 0x40, 0xe1, 0x3f, 0xde, 0x15, 0x03, 0xca } };
+
+static void init_typed_vtbls( void )
+{
+    unsigned int i;
+    if (manip_vtbls_ready) return;
+    for (i = 3; i < COMP_OBJECT_SLOTS; i++)
+        matrix_transform_vtbl[i] = manip_transform_vtbl[i] = expr_animation_vtbl[i] = comp_object_slot_fn( i );
+    matrix_transform_vtbl[1] = manip_transform_vtbl[1] = expr_animation_vtbl[1] = comp_object_AddRef;
+    matrix_transform_vtbl[2] = manip_transform_vtbl[2] = expr_animation_vtbl[2] = comp_object_Release;
+    InterlockedExchange( &manip_vtbls_ready, 1 );
+}
+
+/* IDCompositionMatrixTransform slot 3 */
+static HRESULT WINAPI matrix_transform_SetMatrix( void *iface, const D2D_MATRIX_3X2_F *matrix )
+{
+    scene_changed();
+    struct matrix_transform *impl = CONTAINING_RECORD( iface, struct matrix_transform, vtbl );
+    if (!matrix) return E_POINTER;
+    TRACE( "%p: %g %g %g %g %g %g\n", impl, matrix->_11, matrix->_12, matrix->_21, matrix->_22, matrix->_31, matrix->_32 );
+    impl->matrix = *matrix;
+    impl->has_matrix = TRUE;
+    return S_OK;
+}
+static HRESULT WINAPI matrix_transform_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct matrix_transform *impl = CONTAINING_RECORD( iface, struct matrix_transform, vtbl );
+    TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
+    InterlockedIncrement( &impl->ref );
+    *out = &impl->vtbl;
+    return S_OK;
+}
+static HRESULT create_matrix_transform( void **out )
+{
+    struct matrix_transform *impl;
+    init_typed_vtbls();
+    matrix_transform_vtbl[0] = matrix_transform_QueryInterface;
+    matrix_transform_vtbl[3] = matrix_transform_SetMatrix;
+    if (!out) return E_POINTER;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->vtbl = (const void **)matrix_transform_vtbl;
+    impl->kind = "MatrixTransform";
+    impl->ref = 1;
+    *out = &impl->vtbl;
+    return S_OK;
+}
+/* For directmanipulation: the shared content transform must be one of these so the painter can read it
+ * back, and the device XAML hands it is the flattened partner table, not an IDCompositionDevice. */
+HRESULT WINAPI __wine_dcomp_create_matrix_transform( void **out )
+{
+    return create_matrix_transform( out );
+}
+static struct matrix_transform *matrix_transform_from( IUnknown *object )
+{
+    if (!object || *(void ***)object != (void **)matrix_transform_vtbl) return NULL;
+    return CONTAINING_RECORD( object, struct matrix_transform, vtbl );
+}
+
+static HRESULT WINAPI manip_transform_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct manip_transform *impl = CONTAINING_RECORD( iface, struct manip_transform, vtbl );
+    TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
+        return create_object4_view( (IUnknown *)&impl->vtbl, out );
+    InterlockedIncrement( &impl->ref );
+    *out = &impl->vtbl;
+    return S_OK;
+}
+static HRESULT create_manip_transform( IUnknown *source, void **out )
+{
+    struct manip_transform *impl;
+    init_typed_vtbls();
+    manip_transform_vtbl[0] = manip_transform_QueryInterface;
+    if (!out) return E_POINTER;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->vtbl = (const void **)manip_transform_vtbl;
+    impl->kind = "ManipulationTransform";
+    impl->ref = 1;
+    if ((impl->source = source)) IUnknown_AddRef( source );
+    *out = &impl->vtbl;
+    return S_OK;
+}
+
+/* ExpressionAnimation with an ICompositionAnimation view that records reference parameters. */
+static struct expr_animation *expr_from_anim_view( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct expr_animation, anim_vtbl );
+}
+static HRESULT WINAPI expr_animation_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct expr_animation *impl = CONTAINING_RECORD( iface, struct expr_animation, vtbl );
+    TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
+    /* ICompositionObject stays the generic table, as for every recording object: XAML's expression
+     * conversion walks Properties and private partner interfaces from there, which only the
+     * recording table survives. */
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
+        return create_object4_view( (IUnknown *)&impl->vtbl, out );
+    /* A real ICompositionObject view: WinUI calls get_Compositor on it, which on this table would be
+     * get_Expression. Its Properties are a recording object (see object_view_get_Properties). */
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&impl->vtbl, out );
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
+        IsEqualGUID( iid, &IID_IExpressionAnimation_ ) || IsEqualGUID( iid, &IID_ICompositionAnimation_ ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = IsEqualGUID( iid, &IID_ICompositionAnimation_ ) ? (void *)&impl->anim_vtbl : (void *)&impl->vtbl;
+        return S_OK;
+    }
+    /* WinUI asks a composition animation whether it is a XAML object (IDependencyObject and two of
+     * its own); saying yes made it drive the object as one. */
+    if (IsEqualGUID( iid, &IID_IDependencyObject_ ) || IsEqualGUID( iid, &IID_winui_private_1 ) ||
+        IsEqualGUID( iid, &IID_winui_private_2 ))
+    {
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    /* Anything else (XAML asks for several private animation interfaces) gets the recording table
+     * with the animator-partner slot, not this table whose slots 6/7 are get/put_Expression. */
+    return create_comp_object_vtbl( "ExpressionAnimation", expression_animation_vtbl, out );
+}
+static HRESULT WINAPI expr_view_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return expr_animation_QueryInterface( &expr_from_anim_view( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI expr_view_AddRef( void *iface )
+{
+    return comp_object_AddRef( &expr_from_anim_view( iface )->vtbl );
+}
+static ULONG WINAPI expr_view_Release( void *iface )
+{
+    return comp_object_Release( &expr_from_anim_view( iface )->vtbl );
+}
+static HRESULT WINAPI expr_view_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI expr_view_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.ExpressionAnimation";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI expr_view_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+static HRESULT WINAPI expr_view_ok( void *iface )
+{
+    return S_OK;
+}
+static HRESULT WINAPI expr_view_SetReferenceParameter( void *iface, HSTRING key, IUnknown *object )
+{
+    scene_changed();
+    struct expr_animation *impl = expr_from_anim_view( iface );
+    TRACE( "%p, %s, %p.\n", impl, debugstr_w( WindowsGetStringRawBuffer( key, NULL ) ), object );
+    if (object && impl->ref_count < EXPR_REFS)
+    {
+        IUnknown_AddRef( object );
+        lstrcpynW( impl->ref_names[impl->ref_count], WindowsGetStringRawBuffer( key, NULL ), ARRAY_SIZE(impl->ref_names[0]) );
+        impl->refs[impl->ref_count++] = object;
+    }
+    return S_OK;
+}
+/* Value parameters: XAML's DManip glue binds "transform*manipTransform.Matrix" with
+ * SetMatrix4x4Parameter("transform", offset) for the scroll offset it applies itself. */
+static struct propset_value *expr_param( struct expr_animation *impl, HSTRING key, BOOL create )
+{
+    const WCHAR *name = WindowsGetStringRawBuffer( key, NULL );
+    struct propset_value *params;
+    unsigned int i;
+
+    if (!name) return NULL;
+    for (i = 0; i < impl->param_count; i++)
+        if (!wcsicmp( impl->params[i].name, name )) return &impl->params[i];
+    if (!create) return NULL;
+    if (!(params = realloc( impl->params, (impl->param_count + 1) * sizeof(*params) ))) return NULL;
+    impl->params = params;
+    memset( &params[impl->param_count], 0, sizeof(*params) );
+    lstrcpynW( params[impl->param_count].name, name, ARRAY_SIZE(params[0].name) );
+    return &params[impl->param_count++];
+}
+static HRESULT WINAPI expr_view_SetScalarParameter( void *iface, HSTRING key, FLOAT value )
+{
+    scene_changed();
+    struct expr_animation *impl = expr_from_anim_view( iface );
+    struct propset_value *v = expr_param( impl, key, TRUE );
+    TRACE( "%p, %s, %g.\n", impl, debugstr_w( WindowsGetStringRawBuffer( key, NULL ) ), value );
+    if (!v) return E_OUTOFMEMORY;
+    v->type = PROP_SCALAR; v->u.scalar = value;
+    return S_OK;
+}
+static HRESULT WINAPI expr_view_SetVector2Parameter( void *iface, HSTRING key, Vector2 value )
+{
+    scene_changed();
+    struct expr_animation *impl = expr_from_anim_view( iface );
+    struct propset_value *v = expr_param( impl, key, TRUE );
+    TRACE( "%p, %s, %g,%g.\n", impl, debugstr_w( WindowsGetStringRawBuffer( key, NULL ) ), value.X, value.Y );
+    if (!v) return E_OUTOFMEMORY;
+    v->type = PROP_VECTOR2; v->u.vector2 = value;
+    return S_OK;
+}
+static HRESULT WINAPI expr_view_SetVector3Parameter( void *iface, HSTRING key, Vector3 value )
+{
+    scene_changed();
+    struct expr_animation *impl = expr_from_anim_view( iface );
+    struct propset_value *v = expr_param( impl, key, TRUE );
+    TRACE( "%p, %s, %g,%g,%g.\n", impl, debugstr_w( WindowsGetStringRawBuffer( key, NULL ) ), value.X, value.Y, value.Z );
+    if (!v) return E_OUTOFMEMORY;
+    v->type = PROP_VECTOR3; v->u.vector3 = value;
+    return S_OK;
+}
+static HRESULT WINAPI expr_view_SetMatrix3x2Parameter( void *iface, HSTRING key, Matrix3x2 value )
+{
+    scene_changed();
+    struct expr_animation *impl = expr_from_anim_view( iface );
+    struct propset_value *v = expr_param( impl, key, TRUE );
+    TRACE( "%p, %s, %g %g %g %g %g %g.\n", impl, debugstr_w( WindowsGetStringRawBuffer( key, NULL ) ),
+           value.M11, value.M12, value.M21, value.M22, value.M31, value.M32 );
+    if (!v) return E_OUTOFMEMORY;
+    v->type = PROP_MATRIX3X2; v->u.m32 = value;
+    return S_OK;
+}
+static HRESULT WINAPI expr_view_SetMatrix4x4Parameter( void *iface, HSTRING key, Matrix4x4 value )
+{
+    scene_changed();
+    struct expr_animation *impl = expr_from_anim_view( iface );
+    struct propset_value *v = expr_param( impl, key, TRUE );
+    TRACE( "%p, %s, scale %g,%g offset %g,%g.\n", impl, debugstr_w( WindowsGetStringRawBuffer( key, NULL ) ),
+           value.M11, value.M22, value.M41, value.M42 );
+    if (!v) return E_OUTOFMEMORY;
+    v->type = PROP_MATRIX4X4; v->u.m44 = value;
+    return S_OK;
+}
+/* IExpressionAnimation slots 6/7 on the main table */
+static HRESULT WINAPI expr_get_Expression( void *iface, HSTRING *value )
+{
+    struct expr_animation *impl = CONTAINING_RECORD( iface, struct expr_animation, vtbl );
+    if (!value) return E_POINTER;
+    return WindowsCreateString( impl->expression, wcslen( impl->expression ), value );
+}
+static HRESULT WINAPI expr_put_Expression( void *iface, HSTRING value )
+{
+    scene_changed();
+    struct expr_animation *impl = CONTAINING_RECORD( iface, struct expr_animation, vtbl );
+    lstrcpynW( impl->expression, WindowsGetStringRawBuffer( value, NULL ), ARRAY_SIZE(impl->expression) );
+    TRACE( "%p %s\n", impl, debugstr_w( impl->expression ) );
+    return S_OK;
+}
+static const void *expr_anim_view_vtbl[] =
+{
+    expr_view_QueryInterface, expr_view_AddRef, expr_view_Release,
+    expr_view_GetIids, expr_view_GetRuntimeClassName, expr_view_GetTrustLevel,
+    expr_view_ok /* ClearAllParameters */, expr_view_ok /* ClearParameter */, expr_view_ok /* SetColorParameter */,
+    expr_view_SetMatrix3x2Parameter, expr_view_SetMatrix4x4Parameter, expr_view_ok /* SetQuaternionParameter */,
+    expr_view_SetReferenceParameter, expr_view_SetScalarParameter, expr_view_SetVector2Parameter,
+    expr_view_SetVector3Parameter, expr_view_ok /* SetVector4Parameter */,
+};
+static HRESULT create_expr_animation( void **out )
+{
+    struct expr_animation *impl;
+    init_typed_vtbls();
+    expr_animation_vtbl[0] = expr_animation_QueryInterface;
+    expr_animation_vtbl[6] = expr_get_Expression;
+    expr_animation_vtbl[7] = expr_put_Expression;
+    expr_animation_vtbl[3] = expression_animation_CreateAnimatorPartner; /* XAML's internal animator partner */
+    if (!out) return E_POINTER;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->vtbl = (const void **)expr_animation_vtbl;
+    impl->kind = "ExpressionAnimation";
+    impl->ref = 1;
+    impl->anim_vtbl = expr_anim_view_vtbl;
+    *out = &impl->vtbl;
+    return S_OK;
+}
+
+/* Follow an expression's reference parameters to a manipulation transform's matrix transform:
+ * directly, through the ICompositionObject view of one, or through a property set that an earlier
+ * expression bound to one. */
+static struct matrix_transform *manip_matrix_from_object( IUnknown *object, unsigned int depth )
+{
+    void **vtbl = object ? *(void ***)object : NULL;
+    if (!object || depth > 4) return NULL;
+    if (vtbl == (void **)manip_transform_vtbl)
+        return matrix_transform_from( CONTAINING_RECORD( object, struct manip_transform, vtbl )->source );
+    if (vtbl == (void **)object_view_vtbl)
+        return manip_matrix_from_object( impl_from_object_view( object )->owner, depth + 1 );
+    if (vtbl == (void **)&propset_vtbl)
+        return CONTAINING_RECORD( object, struct property_set, ICompositionPropertySet_iface )->manip;
+    if (vtbl == (void **)expr_animation_vtbl || vtbl == (void **)expr_anim_view_vtbl)
+    {
+        /* StartAnimation gets the ICompositionAnimation view, references the generic pointer */
+        struct expr_animation *expr = vtbl == (void **)expr_animation_vtbl ?
+            CONTAINING_RECORD( object, struct expr_animation, vtbl ) : CONTAINING_RECORD( object, struct expr_animation, anim_vtbl );
+        struct matrix_transform *found;
+        unsigned int i;
+        for (i = 0; i < expr->ref_count; i++)
+            if ((found = manip_matrix_from_object( expr->refs[i], depth + 1 ))) return found;
+    }
+    return NULL;
+}
+static struct matrix_transform *manip_matrix_from_animation( void *animation )
+{
+    return manip_matrix_from_object( (IUnknown *)animation, 0 );
+}
+static struct property_set *propset_from_object( IUnknown *object );
+static struct expr_animation *expr_animation_from_any( void *animation )
+{
+    void **vtbl = animation ? *(void ***)animation : NULL;
+    if (vtbl == (void **)expr_animation_vtbl) return CONTAINING_RECORD( animation, struct expr_animation, vtbl );
+    if (vtbl == (void **)expr_anim_view_vtbl) return CONTAINING_RECORD( animation, struct expr_animation, anim_vtbl );
+    return NULL;
+}
+
+/* A small evaluator for the matrix expressions XAML binds to TransformMatrix: products of
+ * Matrix3x2.CreateFromTranslation(v) / CreateFromScale(v), Matrix4x4(m), matrix properties of referenced
+ * property sets (PS.Matrix, LOCAL.Render, PS.Scale ...), with vector2(a, b) / vector properties and unary
+ * minus for the vectors. LOCAL is the animated object's own property set; LOCAL.DManip is the visual's
+ * manipulation transform. Anything else makes the evaluation fail and the transform is not applied. */
+struct expr_ctx
+{
+    struct expr_animation *expr;
+    struct property_set *local;
+    const D2D_MATRIX_3X2_F *dmanip;
+    const WCHAR *p;
+    unsigned int depth;
+};
+
+static void expr_skip_space( struct expr_ctx *c ) { while (*c->p == ' ') c->p++; }
+static BOOL expr_accept( struct expr_ctx *c, const WCHAR *tok )
+{
+    size_t n = wcslen( tok );
+    expr_skip_space( c );
+    if (wcsnicmp( c->p, tok, n )) return FALSE;
+    c->p += n;
+    return TRUE;
+}
+static BOOL expr_ident( struct expr_ctx *c, WCHAR *out, unsigned int size )
+{
+    unsigned int n = 0;
+    expr_skip_space( c );
+    while ((iswalnum( c->p[n] ) || c->p[n] == '_') && n + 1 < size) { out[n] = c->p[n]; n++; }
+    out[n] = 0;
+    c->p += n;
+    return n > 0;
+}
+/* "ref.prop", or a bare "name" (a Set*Parameter value, else a LOCAL property) */
+static BOOL expr_name( struct expr_ctx *c, WCHAR *ref, unsigned int ref_size, WCHAR *prop, unsigned int prop_size )
+{
+    if (!expr_ident( c, ref, ref_size )) return FALSE;
+    if (expr_accept( c, L"." )) return expr_ident( c, prop, prop_size );
+    lstrcpynW( prop, ref, prop_size );
+    ref[0] = 0;
+    return TRUE;
+}
+static struct propset_value *expr_property( struct expr_ctx *c, const WCHAR *ref, const WCHAR *prop )
+{
+    struct property_set *set = NULL;
+    unsigned int i;
+
+    if (!*ref)
+    {
+        for (i = 0; i < c->expr->param_count; i++)
+            if (!wcsicmp( c->expr->params[i].name, prop )) return &c->expr->params[i];
+        set = c->local;
+    }
+    else
+    {
+        /* XAML passes LOCAL as a reference parameter of its own (a property set holding Render and DManip);
+         * only without one is it the animated object's property set. */
+        for (i = 0; i < c->expr->ref_count; i++)
+            if (!wcsicmp( c->expr->ref_names[i], ref )) { set = propset_from_object( c->expr->refs[i] ); break; }
+        if (!set && !wcsicmp( ref, L"LOCAL" )) set = c->local;
+    }
+    if (!set) return NULL;
+    for (i = 0; i < set->value_count; i++)
+        if (!wcsicmp( set->values[i].name, prop )) return &set->values[i];
+    return NULL;
+}
+static BOOL expr_scalar( struct expr_ctx *c, float *out );
+/* "V.Offset", "primaryVisual.Translation": a referenced visual's own vector properties. Translation not
+ * in its property set is zero. */
+static BOOL expr_visual_vector( struct expr_ctx *c, const WCHAR *ref, const WCHAR *prop, float *x, float *y )
+{
+    void *interop = NULL;
+    unsigned int i;
+    BOOL ret = FALSE;
+
+    for (i = 0; *ref && i < c->expr->ref_count; i++)
+        if (!wcsicmp( c->expr->ref_names[i], ref )) break;
+    if (!*ref || i == c->expr->ref_count || !c->expr->refs[i]) return FALSE;
+    {
+        void **vtbl = *(void ***)c->expr->refs[i];
+        if (vtbl == (void **)&propset_vtbl || vtbl == (void **)manip_transform_vtbl || vtbl == (void **)matrix_transform_vtbl ||
+            vtbl == (void **)expr_animation_vtbl || vtbl == (void **)expr_anim_view_vtbl || vtbl == (void **)kf_animation_vtbl ||
+            vtbl == (void **)object_view_vtbl)
+            return FALSE;
+    }
+    if (FAILED( IUnknown_QueryInterface( c->expr->refs[i], &IID_IInteropVisual_private, &interop ) )) return FALSE;
+    if (!wcsicmp( prop, L"Offset" ))
+    {
+        struct dcomp_visual *dcv = dcv_from_any( interop );
+        struct visual *pub = dcv ? NULL : visual_from_interop( interop );
+        if (dcv) { *x = dcv->offset_x; *y = dcv->offset_y; ret = TRUE; }
+        else if (pub) { *x = pub->offset.X; *y = pub->offset.Y; ret = TRUE; }
+    }
+    else if (!wcsicmp( prop, L"Translation" ))
+    {
+        *x = *y = 0.0f;
+        ret = TRUE;
+    }
+    IUnknown_Release( (IUnknown *)interop );
+    return ret;
+}
+static BOOL expr_vector( struct expr_ctx *c, float *x, float *y )
+{
+    WCHAR ref[48], prop[48];
+    BOOL negate = FALSE;
+    struct propset_value *v;
+    float factor = 1.0f;
+    WCHAR *end;
+
+    expr_skip_space( c );
+    /* "-1 * primaryVisual.Translation" */
+    if (iswdigit( *c->p ) || *c->p == '-' || *c->p == '.')
+    {
+        float f = wcstof( c->p, &end );
+        const WCHAR *save = c->p;
+        if (end != c->p)
+        {
+            c->p = end;
+            if (expr_accept( c, L"*" )) factor = f;
+            else c->p = save;
+        }
+    }
+    expr_skip_space( c );
+    if (*c->p == '-') { negate = TRUE; c->p++; }
+    if (expr_accept( c, L"vector2(" ))
+    {
+        if (!expr_scalar( c, x ) || !expr_accept( c, L"," ) || !expr_scalar( c, y ) || !expr_accept( c, L")" )) return FALSE;
+    }
+    else
+    {
+        if (!expr_name( c, ref, ARRAY_SIZE(ref), prop, ARRAY_SIZE(prop) )) return FALSE;
+        if ((v = expr_property( c, ref, prop )) && v->type == PROP_VECTOR2) { *x = v->u.vector2.X; *y = v->u.vector2.Y; }
+        else if (v && v->type == PROP_VECTOR3) { *x = v->u.vector3.X; *y = v->u.vector3.Y; }
+        else if (v || !expr_visual_vector( c, ref, prop, x, y )) return FALSE;
+    }
+    if (negate) { *x = -*x; *y = -*y; }
+    *x *= factor;
+    *y *= factor;
+    return TRUE;
+}
+static BOOL expr_scalar( struct expr_ctx *c, float *out )
+{
+    WCHAR ref[48], prop[48];
+    struct propset_value *v;
+    WCHAR *end;
+
+    expr_skip_space( c );
+    if (iswdigit( *c->p ) || *c->p == '-' || *c->p == '.')
+    {
+        *out = wcstof( c->p, &end );
+        if (end == c->p) return FALSE;
+        c->p = end;
+        return TRUE;
+    }
+    if (!expr_name( c, ref, ARRAY_SIZE(ref), prop, ARRAY_SIZE(prop) )) return FALSE;
+    if (!(v = expr_property( c, ref, prop )) || v->type != PROP_SCALAR) return FALSE;
+    *out = v->u.scalar;
+    return TRUE;
+}
+static BOOL expr_matrix_product( struct expr_ctx *c, D2D_MATRIX_3X2_F *out );
+static BOOL expr_matrix_term( struct expr_ctx *c, D2D_MATRIX_3X2_F *out )
+{
+    static const D2D_MATRIX_3X2_F identity = { { { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f } } };
+    WCHAR ref[48], prop[48];
+    struct propset_value *v;
+    float x, y;
+
+    *out = identity;
+    if (expr_accept( c, L"Matrix4x4(" ) || expr_accept( c, L"(" ))
+        return expr_matrix_product( c, out ) && expr_accept( c, L")" );
+    if (expr_accept( c, L"Matrix3x2.CreateFromTranslation(" ) || expr_accept( c, L"Matrix4x4.CreateFromTranslation(" ))
+    {
+        if (!expr_vector( c, &x, &y ) || !expr_accept( c, L")" )) return FALSE;
+        out->_31 = x; out->_32 = y;
+        return TRUE;
+    }
+    if (expr_accept( c, L"Matrix3x2.CreateFromScale(" ) || expr_accept( c, L"Matrix4x4.CreateFromScale(" ))
+    {
+        if (!expr_vector( c, &x, &y ) || !expr_accept( c, L")" )) return FALSE;
+        out->_11 = x; out->_22 = y;
+        return TRUE;
+    }
+    if (!expr_name( c, ref, ARRAY_SIZE(ref), prop, ARRAY_SIZE(prop) )) return FALSE;
+    {   /* "manipTransform.Matrix": the manipulation transform object XAML wraps DManip's shared transform in */
+        unsigned int i;
+        for (i = 0; *ref && i < c->expr->ref_count; i++)
+            if (!wcsicmp( c->expr->ref_names[i], ref ))
+            {
+                struct matrix_transform *m = matrix_transform_from( c->expr->refs[i] );
+                if (!m && *(void ***)c->expr->refs[i] == (void **)manip_transform_vtbl)
+                    m = matrix_transform_from( CONTAINING_RECORD( c->expr->refs[i], struct manip_transform, vtbl )->source );
+                if (m && !wcsicmp( prop, L"Matrix" ))
+                {
+                    if (m->has_matrix) *out = m->matrix;
+                    return TRUE;
+                }
+                break;
+            }
+    }
+    {   /* a property animated by an expression evaluates through it (depth-limited) */
+        struct property_set *set = NULL;
+        unsigned int i;
+        if (!*ref) set = c->local;
+        else
+        {
+            for (i = 0; i < c->expr->ref_count; i++)
+                if (!wcsicmp( c->expr->ref_names[i], ref )) { set = propset_from_object( c->expr->refs[i] ); break; }
+            if (!set && !wcsicmp( ref, L"LOCAL" )) set = c->local;
+            }
+        if (set && c->depth < 4)
+            for (i = 0; i < set->binding_count; i++)
+                if (!wcsicmp( set->bindings[i].name, prop ) && set->bindings[i].expr != c->expr)
+                {
+                    struct expr_ctx inner = { set->bindings[i].expr, set, c->dmanip, set->bindings[i].expr->expression, c->depth + 1 };
+                    D2D_MATRIX_3X2_F m;
+                    if (expr_matrix_product( &inner, &m )) { expr_skip_space( &inner ); if (!*inner.p) { *out = m; return TRUE; } }
+                    break;
+                }
+    }
+    if (!(v = expr_property( c, ref, prop )))
+    {
+        /* LOCAL.DManip with nothing bound: the visual's manipulation transform */
+        if (!wcsicmp( ref, L"LOCAL" ) && !wcsicmp( prop, L"DManip" ))
+        {
+            if (c->dmanip) *out = *c->dmanip;
+            return TRUE;
+        }
+        return FALSE;
+    }
+    if (v->type == PROP_MATRIX3X2)
+    {
+        out->_11 = v->u.m32.M11; out->_12 = v->u.m32.M12; out->_21 = v->u.m32.M21; out->_22 = v->u.m32.M22;
+        out->_31 = v->u.m32.M31; out->_32 = v->u.m32.M32;
+        return TRUE;
+    }
+    if (v->type == PROP_MATRIX4X4)
+    {
+        out->_11 = v->u.m44.M11; out->_12 = v->u.m44.M12; out->_21 = v->u.m44.M21; out->_22 = v->u.m44.M22;
+        out->_31 = v->u.m44.M41; out->_32 = v->u.m44.M42;
+        return TRUE;
+    }
+    return FALSE;
+}
+static BOOL expr_matrix_product( struct expr_ctx *c, D2D_MATRIX_3X2_F *out )
+{
+    D2D_MATRIX_3X2_F term;
+
+    if (!expr_matrix_term( c, out )) return FALSE;
+    while (expr_accept( c, L"*" ))
+    {
+        D2D_MATRIX_3X2_F a = *out;
+        if (!expr_matrix_term( c, &term )) return FALSE;
+        out->_11 = a._11 * term._11 + a._12 * term._21;             out->_12 = a._11 * term._12 + a._12 * term._22;
+        out->_21 = a._21 * term._11 + a._22 * term._21;             out->_22 = a._21 * term._12 + a._22 * term._22;
+        out->_31 = a._31 * term._11 + a._32 * term._21 + term._31;  out->_32 = a._31 * term._12 + a._32 * term._22 + term._32;
+    }
+    return TRUE;
+}
+static BOOL expr_evaluate_matrix( struct expr_animation *expr, ICompositionPropertySet *local,
+                                  const D2D_MATRIX_3X2_F *dmanip, D2D_MATRIX_3X2_F *result )
+{
+    struct expr_ctx c;
+
+    if (!expr) return FALSE;
+    c.expr = expr;
+    c.local = local ? propset_from_object( (IUnknown *)local ) : NULL;
+    c.dmanip = dmanip;
+    c.p = expr->expression;
+    c.depth = 0;
+    if (!expr_matrix_product( &c, result )) return FALSE;
+    expr_skip_space( &c );
+    return !*c.p;
+}
+
+static struct property_set *propset_from_object( IUnknown *object )
+{
+    void **vtbl = object ? *(void ***)object : NULL;
+    void *interop = NULL;
+    struct property_set *set = NULL;
+
+    if (!object) return NULL;
+    if (vtbl == (void **)&propset_vtbl) return CONTAINING_RECORD( object, struct property_set, ICompositionPropertySet_iface );
+    /* transforms and animations are no visuals: their tables answer unknown interfaces with recording objects */
+    if (vtbl == (void **)manip_transform_vtbl || vtbl == (void **)matrix_transform_vtbl ||
+        vtbl == (void **)expr_animation_vtbl || vtbl == (void **)expr_anim_view_vtbl || vtbl == (void **)kf_animation_vtbl)
+        return NULL;
+    if (vtbl == (void **)object_view_vtbl) return propset_from_object( impl_from_object_view( object )->owner );
+    /* "_.Progress": an expression referencing a visual reads that visual's Properties */
+    if (SUCCEEDED( IUnknown_QueryInterface( object, &IID_IInteropVisual_private, &interop ) ))
+    {
+        struct dcomp_visual *dcv = dcv_from_any( interop );
+        struct visual *pub = dcv ? NULL : visual_from_interop( interop );
+        ICompositionPropertySet *props = dcv ? dcv->properties : (pub ? pub->properties : NULL);
+        if (props && *(void ***)props == (void **)&propset_vtbl)
+            set = CONTAINING_RECORD( props, struct property_set, ICompositionPropertySet_iface );
+        IUnknown_Release( (IUnknown *)interop );
+    }
+    return set;
+}
+/* WinUI's AnimatedIcon colours: "ColorRGB(_theme.Foreground.W,_theme.Foreground.X,_theme.Foreground.Y,
+ * _theme.Foreground.Z)" over a Vector4 the theme property set holds (A,R,G,B in 0..255). */
+static BOOL expr_resolve_colorrgb( void *animation, Color *color )
+{
+    void **vtbl = animation ? *(void ***)animation : NULL;
+    struct expr_animation *expr;
+    WCHAR ref[32], prop[48];
+    const WCHAR *e, *dot, *dot2;
+    unsigned int i, n;
+
+    if (vtbl == (void **)expr_animation_vtbl) expr = CONTAINING_RECORD( animation, struct expr_animation, vtbl );
+    else if (vtbl == (void **)expr_anim_view_vtbl) expr = CONTAINING_RECORD( animation, struct expr_animation, anim_vtbl );
+    else return FALSE;
+    if (wcsncmp( expr->expression, L"ColorRGB(", 9 )) return FALSE;
+    e = expr->expression + 9;
+    if (!(dot = wcschr( e, '.' )) || !(dot2 = wcschr( dot + 1, '.' ))) return FALSE;
+    if ((n = dot - e) >= ARRAY_SIZE(ref) || dot2 - dot - 1 >= ARRAY_SIZE(prop)) return FALSE;
+    lstrcpynW( ref, e, n + 1 );
+    lstrcpynW( prop, dot + 1, dot2 - dot );
+    for (i = 0; i < expr->ref_count; i++)
+    {
+        struct property_set *set = !wcsicmp( expr->ref_names[i], ref ) ? propset_from_object( expr->refs[i] ) : NULL;
+        unsigned int k;
+        if (!set) continue;
+        for (k = 0; k < set->value_count; k++)
+        {
+            if (set->values[k].type != PROP_VECTOR4 || wcsicmp( set->values[k].name, prop )) continue;
+            color->A = (BYTE)(set->values[k].u.vector4.W + 0.5f);
+            color->R = (BYTE)(set->values[k].u.vector4.X + 0.5f);
+            color->G = (BYTE)(set->values[k].u.vector4.Y + 0.5f);
+            color->B = (BYTE)(set->values[k].u.vector4.Z + 0.5f);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+/* "Ref.Property" expressions on a property set reference: resolve the value once, at StartAnimation. */
+static const char *debugstr_animation( void *animation )
+{
+    struct kf_animation *kf = kf_animation_from( animation );
+    struct expr_animation *expr = expr_animation_from_any( animation );
+
+    if (expr) return wine_dbg_sprintf( "expression %s", debugstr_w( expr->expression ) );
+    if (!kf) return wine_dbg_sprintf( "%p (not ours)", animation );
+    if (!kf->has_value) return wine_dbg_sprintf( "key frames %p (%u keys, no value)", kf, kf->key_count );
+    switch (kf->value_kind)
+    {
+    case KF_SCALAR:
+    {
+        char buf[200]; int n = 0; unsigned int i;
+        for (i = 0; i < kf->key_count && i < 6 && n < 180; i++)
+            n += snprintf( buf + n, sizeof(buf) - n, " %g@%g", kf->keys[i].u.scalar, kf->keys[i].key );
+        buf[n] = 0;
+        return wine_dbg_sprintf( "key frames %p (%u keys:%s) -> %g", kf, kf->key_count, buf, kf->scalar );
+    }
+    case KF_VECTOR2: return wine_dbg_sprintf( "key frames %p (%u keys) -> %g,%g", kf, kf->key_count, kf->vector2.X, kf->vector2.Y );
+    case KF_VECTOR3: return wine_dbg_sprintf( "key frames %p (%u keys) -> %g,%g,%g", kf, kf->key_count, kf->vector3.X, kf->vector3.Y, kf->vector3.Z );
+    case KF_BOOLEAN: return wine_dbg_sprintf( "key frames %p (%u keys) -> %d", kf, kf->key_count, kf->flag );
+    default: return wine_dbg_sprintf( "key frames %p (%u keys, colour)", kf, kf->key_count );
+    }
+}
+
+static struct propset_value *expr_resolve_value( void *animation, enum propset_type type )
+{
+    void **vtbl = animation ? *(void ***)animation : NULL;
+    struct expr_animation *expr;
+    const WCHAR *dot, *e;
+    WCHAR ref[32];
+    unsigned int i;
+
+    if (vtbl == (void **)expr_animation_vtbl) expr = CONTAINING_RECORD( animation, struct expr_animation, vtbl );
+    else if (vtbl == (void **)expr_anim_view_vtbl) expr = CONTAINING_RECORD( animation, struct expr_animation, anim_vtbl );
+    else return NULL;
+    if (!(dot = wcschr( expr->expression, '.' )) || dot - expr->expression >= ARRAY_SIZE(ref)) return NULL;
+    for (e = expr->expression; e < dot; e++) if (!iswalnum( *e ) && *e != '_') return NULL;
+    for (e = dot + 1; *e; e++) if (!iswalnum( *e ) && *e != '_') return NULL;
+    lstrcpynW( ref, expr->expression, dot - expr->expression + 1 );
+    for (i = 0; i < expr->ref_count; i++)
+    {
+        struct property_set *set = !wcsicmp( expr->ref_names[i], ref ) ? propset_from_object( expr->refs[i] ) : NULL;
+        struct propset_value *v;
+        unsigned int k;
+        if (!set) continue;
+        for (k = 0; k < set->value_count; k++)
+            if (set->values[k].type == type && !wcsicmp( set->values[k].name, dot + 1 )) return &set->values[k];
+    }
+    return NULL;
+}
+
+
+/* ---- composition shapes ---- */
+static const GUID IID_ICompositionShape_ = { 0xb47ce2f7, 0x9a88, 0x42c4, { 0x9e, 0x87, 0x2e, 0x50, 0x0c, 0xa8, 0x68, 0x8c } };
+static const GUID IID_ICompositionSpriteShape_ = { 0x401b61bb, 0x0007, 0x4363, { 0xb1, 0xf3, 0x6b, 0xcc, 0x00, 0x3f, 0xb8, 0x3e } };
+static const GUID IID_ICompositionContainerShape_ = { 0x4f5e859b, 0x2e5b, 0x44a8, { 0x98, 0x2c, 0xaa, 0x0f, 0x69, 0xc1, 0x60, 0x59 } };
+static const GUID IID_ICompositionPathGeometry_ = { 0x0b6a417e, 0x2c77, 0x4c23, { 0xaf, 0x5e, 0x63, 0x04, 0xc1, 0x47, 0xbb, 0x61 } };
+static const GUID IID_ICompositionGeometry_ = { 0xe985217c, 0x6a17, 0x4207, { 0xab, 0xd8, 0x5f, 0xd3, 0xdd, 0x61, 0x2a, 0x9d } };
+static const GUID IID_IGeometrySource2DInterop_ = { 0x0657af73, 0x53fd, 0x47cf, { 0x84, 0xff, 0xc8, 0x49, 0x2d, 0x2a, 0x80, 0xa3 } };
+/* private: hand back the struct pointer so the painter can walk shapes stored as any of their views */
+static const GUID IID_comp_shape_private = { 0x7a1c3d02, 0x5b1e, 0x4c7a, { 0x9d, 0x0e, 0x21, 0x8c, 0x3f, 0x5a, 0x77, 0x01 } };
+static const GUID IID_path_geometry_private = { 0x7a1c3d02, 0x5b1e, 0x4c7a, { 0x9d, 0x0e, 0x21, 0x8c, 0x3f, 0x5a, 0x77, 0x02 } };
+
+static void *sprite_shape_vtbl[COMP_OBJECT_SLOTS];
+static void *container_shape_vtbl[COMP_OBJECT_SLOTS];
+static void *path_geometry_vtbl[COMP_OBJECT_SLOTS];
+static LONG shape_vtbls_ready;
+static const void *shape_view_vtbl[], *shape_children_vtbl[], *geometry_view_vtbl[];
+
+static struct comp_shape *shape_from_view( void *iface ) { return CONTAINING_RECORD( iface, struct comp_shape, shape_vtbl ); }
+static struct comp_shape *shape_from_children( void *iface ) { return CONTAINING_RECORD( iface, struct comp_shape, shapes_vtbl ); }
+static struct path_geometry *geometry_from_view( void *iface ) { return CONTAINING_RECORD( iface, struct path_geometry, geometry_vtbl ); }
+
+static HRESULT WINAPI comp_shape_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct comp_shape *shape = CONTAINING_RECORD( iface, struct comp_shape, vtbl );
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+    TRACE( "%s %p, iid %s.\n", shape->kind, shape, debugstr_guid( iid ) );
+    /* The main table is the sprite/container interface, so ICompositionObject needs a real view. */
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&shape->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
+        return create_object4_view( (IUnknown *)&shape->vtbl, out );
+    InterlockedIncrement( &shape->ref );
+    if (IsEqualGUID( iid, &IID_ICompositionShape_ )) *out = &shape->shape_vtbl;
+    else if (IsEqualGUID( iid, &IID_comp_shape_private )) *out = shape;
+    else *out = &shape->vtbl;
+    return S_OK;
+}
+static ULONG WINAPI comp_shape_Release( void *iface )
+{
+    struct comp_shape *shape = CONTAINING_RECORD( iface, struct comp_shape, vtbl );
+    ULONG ref = InterlockedDecrement( &shape->ref );
+    if (!ref)
+    {
+        unsigned int i;
+        if (shape->fill) IUnknown_Release( shape->fill );
+        if (shape->stroke) IUnknown_Release( shape->stroke );
+        if (shape->geometry) IUnknown_Release( shape->geometry );
+        for (i = 0; i < shape->child_count; i++) IInspectable_Release( shape->children[i] );
+        free( shape );
+    }
+    return ref;
+}
+/* Every object in this file answers an unknown IID with its own vtbl and S_OK, so a successful QI
+ * for a private IID proves nothing about what came back. Check the vtbl before believing it.
+ *
+ * Without this, TryGetAnimationController on any non-shape object read that object's "bindings" at
+ * +0x290 and "binding_count" at +0x510 - past the end of a smaller allocation - and _wcsicmp faulted
+ * on the first entry. It reproduced about once in eight runs, whenever the following page happened
+ * not to be mapped. Both helpers hand back a borrowed pointer, so the QI reference is dropped
+ * through the object's own Release rather than through comp_shape's. */
+static struct comp_shape *comp_shape_from_any( IInspectable *object )
+{
+    struct comp_shape *shape = NULL;
+
+    if (!object || FAILED( IInspectable_QueryInterface( object, &IID_comp_shape_private, (void **)&shape ) )) return NULL;
+    IUnknown_Release( (IUnknown *)shape );
+    if (shape->vtbl != (const void **)sprite_shape_vtbl && shape->vtbl != (const void **)container_shape_vtbl)
+    {
+        TRACE( "%p is not a shape.\n", shape );
+        return NULL;
+    }
+    return shape;
+}
+static struct path_geometry *path_geometry_from_any( IUnknown *object )
+{
+    struct path_geometry *geometry = NULL;
+
+    if (!object || FAILED( IUnknown_QueryInterface( object, &IID_path_geometry_private, (void **)&geometry ) )) return NULL;
+    IUnknown_Release( (IUnknown *)geometry );
+    if (geometry->vtbl != (const void **)path_geometry_vtbl)
+    {
+        TRACE( "%p is not a path geometry.\n", geometry );
+        return NULL;
+    }
+    return geometry;
+}
+/* ICompositionShape view */
+static HRESULT WINAPI shape_view_QueryInterface( void *iface, REFIID iid, void **out ) { return comp_shape_QueryInterface( &shape_from_view( iface )->vtbl, iid, out ); }
+static ULONG WINAPI shape_view_AddRef( void *iface ) { return comp_object_AddRef( &shape_from_view( iface )->vtbl ); }
+static ULONG WINAPI shape_view_Release( void *iface ) { return comp_shape_Release( &shape_from_view( iface )->vtbl ); }
+static HRESULT WINAPI shape_view_GetIids( void *iface, ULONG *count, IID **iids ) { *count = 0; *iids = NULL; return S_OK; }
+static HRESULT WINAPI shape_view_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionShape";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI shape_view_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
+#define SHAPE_VEC2( name, field ) \
+    static HRESULT WINAPI shape_view_get_##name( void *iface, Vector2 *value ) \
+    { if (!value) return E_POINTER; *value = shape_from_view( iface )->xf.field; return S_OK; } \
+    static HRESULT WINAPI shape_view_put_##name( void *iface, Vector2 value ) \
+    { TRACE( "%p %g,%g\n", shape_from_view( iface ), value.X, value.Y ); shape_from_view( iface )->xf.field = value; return S_OK; }
+SHAPE_VEC2( CenterPoint, center )
+SHAPE_VEC2( Offset, offset )
+SHAPE_VEC2( Scale, scale )
+#undef SHAPE_VEC2
+static HRESULT WINAPI shape_view_get_RotationAngle( void *iface, FLOAT *value ) { if (!value) return E_POINTER; *value = shape_from_view( iface )->xf.rotation; return S_OK; }
+static HRESULT WINAPI shape_view_put_RotationAngle( void *iface, FLOAT value ) { shape_from_view( iface )->xf.rotation = value; return S_OK; }
+static HRESULT WINAPI shape_view_get_RotationAngleInDegrees( void *iface, FLOAT *value ) { if (!value) return E_POINTER; *value = shape_from_view( iface )->xf.rotation * 180.0f / 3.14159265f; return S_OK; }
+static HRESULT WINAPI shape_view_put_RotationAngleInDegrees( void *iface, FLOAT value ) { shape_from_view( iface )->xf.rotation = value * 3.14159265f / 180.0f; return S_OK; }
+static HRESULT WINAPI shape_view_get_TransformMatrix( void *iface, Matrix3x2 *value ) { if (!value) return E_POINTER; *value = shape_from_view( iface )->xf.matrix; return S_OK; }
+static HRESULT WINAPI shape_view_put_TransformMatrix( void *iface, Matrix3x2 value )
+{
+    scene_changed();
+    struct comp_shape *shape = shape_from_view( iface );
+    TRACE( "%p %g %g %g %g %g %g\n", shape, value.M11, value.M12, value.M21, value.M22, value.M31, value.M32 );
+    shape->xf.matrix = value;
+    shape->xf.has_matrix = TRUE;
+    return S_OK;
+}
+static const void *shape_view_vtbl[] =
+{
+    shape_view_QueryInterface, shape_view_AddRef, shape_view_Release,
+    shape_view_GetIids, shape_view_GetRuntimeClassName, shape_view_GetTrustLevel,
+    shape_view_get_CenterPoint, shape_view_put_CenterPoint, shape_view_get_Offset, shape_view_put_Offset,
+    shape_view_get_RotationAngle, shape_view_put_RotationAngle,
+    shape_view_get_RotationAngleInDegrees, shape_view_put_RotationAngleInDegrees,
+    shape_view_get_Scale, shape_view_put_Scale, shape_view_get_TransformMatrix, shape_view_put_TransformMatrix,
+};
+/* ICompositionSpriteShape main table: 6 get_FillBrush .. 28 put_StrokeThickness */
+static HRESULT WINAPI sprite_get_FillBrush( void *iface, void **value )
+{
+    struct comp_shape *shape = CONTAINING_RECORD( iface, struct comp_shape, vtbl );
+    if (!value) return E_POINTER;
+    if ((*value = shape->fill)) IUnknown_AddRef( shape->fill );
+    return S_OK;
+}
+static HRESULT WINAPI sprite_put_FillBrush( void *iface, IUnknown *value )
+{
+    scene_changed();
+    struct comp_shape *shape = CONTAINING_RECORD( iface, struct comp_shape, vtbl );
+    TRACE( "%p brush %p\n", shape, value );
+    if (value) IUnknown_AddRef( value );
+    if (shape->fill) IUnknown_Release( shape->fill );
+    shape->fill = value;
+    return S_OK;
+}
+static HRESULT WINAPI sprite_get_Geometry( void *iface, void **value )
+{
+    struct comp_shape *shape = CONTAINING_RECORD( iface, struct comp_shape, vtbl );
+    if (!value) return E_POINTER;
+    if ((*value = shape->geometry)) IUnknown_AddRef( shape->geometry );
+    return S_OK;
+}
+static HRESULT WINAPI sprite_put_Geometry( void *iface, IUnknown *value )
+{
+    scene_changed();
+    struct comp_shape *shape = CONTAINING_RECORD( iface, struct comp_shape, vtbl );
+    TRACE( "%p geometry %p\n", shape, value );
+    if (value) IUnknown_AddRef( value );
+    if (shape->geometry) IUnknown_Release( shape->geometry );
+    shape->geometry = value;
+    return S_OK;
+}
+static HRESULT WINAPI sprite_get_StrokeBrush( void *iface, void **value )
+{
+    struct comp_shape *shape = CONTAINING_RECORD( iface, struct comp_shape, vtbl );
+    if (!value) return E_POINTER;
+    if ((*value = shape->stroke)) IUnknown_AddRef( shape->stroke );
+    return S_OK;
+}
+static HRESULT WINAPI sprite_put_StrokeBrush( void *iface, IUnknown *value )
+{
+    scene_changed();
+    struct comp_shape *shape = CONTAINING_RECORD( iface, struct comp_shape, vtbl );
+    TRACE( "%p brush %p\n", shape, value );
+    if (value) IUnknown_AddRef( value );
+    if (shape->stroke) IUnknown_Release( shape->stroke );
+    shape->stroke = value;
+    return S_OK;
+}
+static HRESULT WINAPI sprite_get_StrokeThickness( void *iface, FLOAT *value )
+{
+    if (!value) return E_POINTER;
+    *value = CONTAINING_RECORD( iface, struct comp_shape, vtbl )->stroke_thickness;
+    return S_OK;
+}
+static HRESULT WINAPI sprite_put_StrokeThickness( void *iface, FLOAT value )
+{
+    scene_changed();
+    TRACE( "%p %g\n", iface, value );
+    CONTAINING_RECORD( iface, struct comp_shape, vtbl )->stroke_thickness = value;
+    return S_OK;
+}
+/* ICompositionContainerShape main table: 6 get_Shapes */
+static HRESULT WINAPI container_get_Shapes( void *iface, void **value )
+{
+    struct comp_shape *shape = CONTAINING_RECORD( iface, struct comp_shape, vtbl );
+    if (!value) return E_POINTER;
+    InterlockedIncrement( &shape->ref );
+    *value = &shape->shapes_vtbl;
+    return S_OK;
+}
+/* IVector<CompositionShape> for container shapes */
+static HRESULT WINAPI shape_children_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct comp_shape *shape = shape_from_children( iface );
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ))
+    {
+        InterlockedIncrement( &shape->ref );
+        *out = iface;
+        return S_OK;
+    }
+    TRACE( "shape children %p: no interface %s.\n", shape, debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI shape_children_AddRef( void *iface ) { return comp_object_AddRef( &shape_from_children( iface )->vtbl ); }
+static ULONG WINAPI shape_children_Release( void *iface ) { return comp_shape_Release( &shape_from_children( iface )->vtbl ); }
+static HRESULT WINAPI shape_children_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionShapeCollection";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI shape_children_GetAt( void *iface, UINT32 index, IInspectable **value )
+{
+    struct comp_shape *shape = shape_from_children( iface );
+    if (!value) return E_POINTER;
+    if (index >= shape->child_count) return E_BOUNDS;
+    IInspectable_AddRef( (*value = shape->children[index]) );
+    return S_OK;
+}
+static HRESULT WINAPI shape_children_get_Size( void *iface, UINT32 *value )
+{
+    if (!value) return E_POINTER;
+    *value = shape_from_children( iface )->child_count;
+    return S_OK;
+}
+static HRESULT WINAPI shape_children_GetView( void *iface, void **value ) { return E_NOTIMPL; }
+static HRESULT WINAPI shape_children_IndexOf( void *iface, IInspectable *item, UINT32 *index, boolean *found )
+{
+    struct comp_shape *shape = shape_from_children( iface );
+    unsigned int i;
+    *found = FALSE;
+    for (i = 0; i < shape->child_count; i++)
+        if (shape->children[i] == item) { *index = i; *found = TRUE; break; }
+    return S_OK;
+}
+static HRESULT WINAPI shape_children_InsertAt( void *iface, UINT32 index, IInspectable *item )
+{
+    scene_changed();
+    struct comp_shape *shape = shape_from_children( iface );
+    if (!item) return E_INVALIDARG;
+    if (index > shape->child_count || shape->child_count >= SHAPE_CHILDREN) return E_BOUNDS;
+    memmove( shape->children + index + 1, shape->children + index, (shape->child_count - index) * sizeof(*shape->children) );
+    IInspectable_AddRef( (shape->children[index] = item) );
+    shape->child_count++;
+    TRACE( "container %p: child %p at %u\n", shape, item, index );
+    return S_OK;
+}
+static HRESULT WINAPI shape_children_SetAt( void *iface, UINT32 index, IInspectable *item )
+{
+    scene_changed();
+    struct comp_shape *shape = shape_from_children( iface );
+    if (index >= shape->child_count || !item) return E_BOUNDS;
+    IInspectable_AddRef( item );
+    IInspectable_Release( shape->children[index] );
+    shape->children[index] = item;
+    return S_OK;
+}
+static HRESULT WINAPI shape_children_RemoveAt( void *iface, UINT32 index )
+{
+    scene_changed();
+    struct comp_shape *shape = shape_from_children( iface );
+    if (index >= shape->child_count) return E_BOUNDS;
+    IInspectable_Release( shape->children[index] );
+    memmove( shape->children + index, shape->children + index + 1, (shape->child_count - index - 1) * sizeof(*shape->children) );
+    shape->child_count--;
+    return S_OK;
+}
+static HRESULT WINAPI shape_children_Append( void *iface, IInspectable *item )
+{
+    return shape_children_InsertAt( iface, shape_from_children( iface )->child_count, item );
+}
+static HRESULT WINAPI shape_children_RemoveAtEnd( void *iface )
+{
+    scene_changed();
+    struct comp_shape *shape = shape_from_children( iface );
+    if (!shape->child_count) return E_BOUNDS;
+    return shape_children_RemoveAt( iface, shape->child_count - 1 );
+}
+static HRESULT WINAPI shape_children_Clear( void *iface )
+{
+    scene_changed();
+    struct comp_shape *shape = shape_from_children( iface );
+    while (shape->child_count) shape_children_RemoveAt( iface, shape->child_count - 1 );
+    return S_OK;
+}
+static HRESULT WINAPI shape_children_GetMany( void *iface, UINT32 start, UINT32 count, IInspectable **items, UINT32 *actual )
+{
+    struct comp_shape *shape = shape_from_children( iface );
+    unsigned int i;
+    *actual = 0;
+    for (i = start; i < shape->child_count && *actual < count; i++)
+        IInspectable_AddRef( (items[(*actual)++] = shape->children[i]) );
+    return S_OK;
+}
+static HRESULT WINAPI shape_children_ReplaceAll( void *iface, UINT32 count, IInspectable **items )
+{
+    unsigned int i;
+    HRESULT hr;
+    shape_children_Clear( iface );
+    for (i = 0; i < count; i++) if (FAILED( hr = shape_children_Append( iface, items[i] ) )) return hr;
+    return S_OK;
+}
+static const void *shape_children_vtbl[] =
+{
+    shape_children_QueryInterface, shape_children_AddRef, shape_children_Release,
+    shape_view_GetIids, shape_children_GetRuntimeClassName, shape_view_GetTrustLevel,
+    shape_children_GetAt, shape_children_get_Size, shape_children_GetView, shape_children_IndexOf,
+    shape_children_SetAt, shape_children_InsertAt, shape_children_RemoveAt, shape_children_Append,
+    shape_children_RemoveAtEnd, shape_children_Clear, shape_children_GetMany, shape_children_ReplaceAll,
+};
+/* path geometry: ICompositionPathGeometry main table (6 get_Path, 7 put_Path), ICompositionGeometry view (trims) */
+static HRESULT WINAPI path_geometry_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct path_geometry *geometry = CONTAINING_RECORD( iface, struct path_geometry, vtbl );
+    TRACE( "%p, iid %s.\n", geometry, debugstr_guid( iid ) );
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&geometry->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
+        return create_object4_view( (IUnknown *)&geometry->vtbl, out );
+    InterlockedIncrement( &geometry->ref );
+    if (IsEqualGUID( iid, &IID_ICompositionGeometry_ )) *out = &geometry->geometry_vtbl;
+    else if (IsEqualGUID( iid, &IID_path_geometry_private )) *out = geometry;
+    else *out = &geometry->vtbl;
+    return S_OK;
+}
+static ULONG WINAPI path_geometry_Release( void *iface )
+{
+    struct path_geometry *geometry = CONTAINING_RECORD( iface, struct path_geometry, vtbl );
+    ULONG ref = InterlockedDecrement( &geometry->ref );
+    if (!ref)
+    {
+        if (geometry->path) IUnknown_Release( geometry->path );
+        free( geometry );
+    }
+    return ref;
+}
+static HRESULT WINAPI path_geometry_get_Path( void *iface, void **value )
+{
+    struct path_geometry *geometry = CONTAINING_RECORD( iface, struct path_geometry, vtbl );
+    if (!value) return E_POINTER;
+    if ((*value = geometry->path)) IUnknown_AddRef( geometry->path );
+    return S_OK;
+}
+static HRESULT WINAPI path_geometry_put_Path( void *iface, IUnknown *value )
+{
+    scene_changed();
+    struct path_geometry *geometry = CONTAINING_RECORD( iface, struct path_geometry, vtbl );
+    TRACE( "%p path %p\n", geometry, value );
+    if (value) IUnknown_AddRef( value );
+    if (geometry->path) IUnknown_Release( geometry->path );
+    geometry->path = value;
+    return S_OK;
+}
+static HRESULT WINAPI geometry_view_QueryInterface( void *iface, REFIID iid, void **out ) { return path_geometry_QueryInterface( &geometry_from_view( iface )->vtbl, iid, out ); }
+static ULONG WINAPI geometry_view_AddRef( void *iface ) { return comp_object_AddRef( &geometry_from_view( iface )->vtbl ); }
+static ULONG WINAPI geometry_view_Release( void *iface ) { return path_geometry_Release( &geometry_from_view( iface )->vtbl ); }
+static HRESULT WINAPI geometry_view_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionPathGeometry";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+#define GEOMETRY_FLOAT( name, field ) \
+    static HRESULT WINAPI geometry_view_get_##name( void *iface, FLOAT *value ) \
+    { if (!value) return E_POINTER; *value = geometry_from_view( iface )->field; return S_OK; } \
+    static HRESULT WINAPI geometry_view_put_##name( void *iface, FLOAT value ) \
+    { TRACE( "%p %g\n", geometry_from_view( iface ), value ); geometry_from_view( iface )->field = value; return S_OK; }
+GEOMETRY_FLOAT( TrimEnd, trim_end )
+GEOMETRY_FLOAT( TrimOffset, trim_offset )
+GEOMETRY_FLOAT( TrimStart, trim_start )
+#undef GEOMETRY_FLOAT
+static const void *geometry_view_vtbl[] =
+{
+    geometry_view_QueryInterface, geometry_view_AddRef, geometry_view_Release,
+    shape_view_GetIids, geometry_view_GetRuntimeClassName, shape_view_GetTrustLevel,
+    geometry_view_get_TrimEnd, geometry_view_put_TrimEnd, geometry_view_get_TrimOffset, geometry_view_put_TrimOffset,
+    geometry_view_get_TrimStart, geometry_view_put_TrimStart,
+};
+
+static void init_shape_vtbls( void )
+{
+    unsigned int i;
+    if (shape_vtbls_ready) return;
+    for (i = 3; i < COMP_OBJECT_SLOTS; i++)
+        sprite_shape_vtbl[i] = container_shape_vtbl[i] = path_geometry_vtbl[i] = comp_object_slot_fn( i );
+    sprite_shape_vtbl[0] = container_shape_vtbl[0] = comp_shape_QueryInterface;
+    sprite_shape_vtbl[1] = container_shape_vtbl[1] = path_geometry_vtbl[1] = comp_object_AddRef;
+    sprite_shape_vtbl[2] = container_shape_vtbl[2] = comp_shape_Release;
+    /* IInspectable slots 3-5 are the default slot, which answers them harmlessly */
+    sprite_shape_vtbl[6] = sprite_get_FillBrush;        sprite_shape_vtbl[7] = sprite_put_FillBrush;
+    sprite_shape_vtbl[8] = sprite_get_Geometry;         sprite_shape_vtbl[9] = sprite_put_Geometry;
+    sprite_shape_vtbl[12] = sprite_get_StrokeBrush;     sprite_shape_vtbl[13] = sprite_put_StrokeBrush;
+    sprite_shape_vtbl[27] = sprite_get_StrokeThickness; sprite_shape_vtbl[28] = sprite_put_StrokeThickness;
+    container_shape_vtbl[6] = container_get_Shapes;
+    comp_object_set_inspectable( sprite_shape_vtbl );
+    comp_object_set_inspectable( container_shape_vtbl );
+    comp_object_set_inspectable( path_geometry_vtbl );
+    path_geometry_vtbl[0] = path_geometry_QueryInterface;
+    path_geometry_vtbl[2] = path_geometry_Release;
+    path_geometry_vtbl[6] = path_geometry_get_Path;     path_geometry_vtbl[7] = path_geometry_put_Path;
+    InterlockedExchange( &shape_vtbls_ready, 1 );
+}
+static HRESULT create_comp_shape( BOOL container, IUnknown *geometry, void **out )
+{
+    struct comp_shape *shape;
+    init_shape_vtbls();
+    if (!out) return E_POINTER;
+    if (!(shape = calloc( 1, sizeof(*shape) ))) return E_OUTOFMEMORY;
+    shape->vtbl = (const void **)(container ? container_shape_vtbl : sprite_shape_vtbl);
+    shape->kind = container ? "CompositionContainerShape" : "CompositionSpriteShape";
+    shape->ref = 1;
+    shape->shape_vtbl = shape_view_vtbl;
+    shape->shapes_vtbl = shape_children_vtbl;
+    shape->is_container = container;
+    shape->xf.scale.X = shape->xf.scale.Y = 1.0f;
+    shape->stroke_thickness = 1.0f;
+    if ((shape->geometry = geometry)) IUnknown_AddRef( geometry );
+    *out = &shape->vtbl;
+    return S_OK;
+}
+static HRESULT create_path_geometry( IUnknown *path, void **out )
+{
+    struct path_geometry *geometry;
+    init_shape_vtbls();
+    if (!out) return E_POINTER;
+    if (!(geometry = calloc( 1, sizeof(*geometry) ))) return E_OUTOFMEMORY;
+    geometry->vtbl = (const void **)path_geometry_vtbl;
+    geometry->kind = "CompositionPathGeometry";
+    geometry->ref = 1;
+    geometry->geometry_vtbl = geometry_view_vtbl;
+    geometry->trim_end = 1.0f;
+    if ((geometry->path = path)) IUnknown_AddRef( path );
+    *out = &geometry->vtbl;
+    return S_OK;
+}
+
+/* Painting: rasterise the shapes with Direct2D into a texture of the visual's size, then blend it in. */
+static ID2D1Geometry *shape_d2d_geometry( struct comp_shape *shape )
+{
+    struct path_geometry *geometry = path_geometry_from_any( shape->geometry );
+    struct composition_path *path;
+    IUnknown *interop = NULL;
+    ID2D1Geometry *result = NULL;
+
+    if (!geometry || !geometry->path) return NULL;
+    if (*(void ***)geometry->path != (void **)path_vtbl) return NULL;
+    path = CONTAINING_RECORD( geometry->path, struct composition_path, vtbl );
+    if (!path->source || FAILED( IUnknown_QueryInterface( path->source, &IID_IGeometrySource2DInterop_, (void **)&interop ) )) return NULL;
+    /* IGeometrySource2DInterop: 3 GetGeometry(ID2D1Geometry **) */
+    ((HRESULT (WINAPI *)( IUnknown *, ID2D1Geometry ** ))(*(void ***)interop)[3])( interop, &result );
+    IUnknown_Release( interop );
+    return result;
+}
+static D2D1_MATRIX_3X2_F shape_matrix( const struct shape_transform *xf )
+{
+    D2D1_MATRIX_3X2_F m;
+    float c = cosf( xf->rotation ), s = sinf( xf->rotation );
+    /* translate(-center) * scale * rotate * translate(center + offset), row-vector convention */
+    m._11 = xf->scale.X * c;  m._12 = xf->scale.X * s;
+    m._21 = -xf->scale.Y * s; m._22 = xf->scale.Y * c;
+    m._31 = -xf->center.X * m._11 - xf->center.Y * m._21 + xf->center.X + xf->offset.X;
+    m._32 = -xf->center.X * m._12 - xf->center.Y * m._22 + xf->center.Y + xf->offset.Y;
+    if (xf->has_matrix)
+    {
+        D2D1_MATRIX_3X2_F t = m, u;
+        u._11 = xf->matrix.M11; u._12 = xf->matrix.M12; u._21 = xf->matrix.M21; u._22 = xf->matrix.M22; u._31 = xf->matrix.M31; u._32 = xf->matrix.M32;
+        m._11 = u._11 * t._11 + u._12 * t._21;             m._12 = u._11 * t._12 + u._12 * t._22;
+        m._21 = u._21 * t._11 + u._22 * t._21;             m._22 = u._21 * t._12 + u._22 * t._22;
+        m._31 = u._31 * t._11 + u._32 * t._21 + t._31;     m._32 = u._31 * t._12 + u._32 * t._22 + t._32;
+    }
+    return m;
+}
+static D2D1_MATRIX_3X2_F matrix_multiply( const D2D1_MATRIX_3X2_F *a, const D2D1_MATRIX_3X2_F *b )
+{
+    D2D1_MATRIX_3X2_F m;
+    m._11 = a->_11 * b->_11 + a->_12 * b->_21;             m._12 = a->_11 * b->_12 + a->_12 * b->_22;
+    m._21 = a->_21 * b->_11 + a->_22 * b->_21;             m._22 = a->_21 * b->_12 + a->_22 * b->_22;
+    m._31 = a->_31 * b->_11 + a->_32 * b->_21 + b->_31;    m._32 = a->_31 * b->_12 + a->_32 * b->_22 + b->_32;
+    return m;
+}
+/* Everything paint_shape's output depends on, hashed: the icon a ShapeVisual holds (the NavigationView
+ * button's AnimatedIcon) only changes while it animates, and redrawing it through Direct2D plus reading it
+ * back cost about a millisecond every frame. */
+static void hash_bytes( ULONGLONG *hash, const void *data, size_t size )
+{
+    const BYTE *p = data;
+    while (size--) *hash = (*hash ^ *p++) * 1099511628211ull;
+}
+static void shape_signature( struct comp_shape *shape, const D2D1_MATRIX_3X2_F *parent, float opacity, ULONGLONG *hash )
+{
+    D2D1_MATRIX_3X2_F local, world;
+    struct path_geometry *geometry;
+    unsigned int i;
+    Color color;
+    BOOL have;
+
+    shape_apply_controlled( shape );
+    local = shape_matrix( &shape->xf );
+    world = matrix_multiply( &local, parent );
+    hash_bytes( hash, &shape->is_container, sizeof(shape->is_container) );
+    if (shape->is_container)
+    {
+        hash_bytes( hash, &shape->child_count, sizeof(shape->child_count) );
+        for (i = 0; i < shape->child_count; i++)
+        {
+            struct comp_shape *child = comp_shape_from_any( shape->children[i] );
+            hash_bytes( hash, &child, sizeof(child) );
+            if (child) shape_signature( child, &world, opacity, hash );
+        }
+        return;
+    }
+    hash_bytes( hash, &world, sizeof(world) );
+    hash_bytes( hash, &opacity, sizeof(opacity) );
+    geometry = path_geometry_from_any( shape->geometry );
+    hash_bytes( hash, &geometry, sizeof(geometry) );
+    if (geometry)
+    {
+        hash_bytes( hash, &geometry->path, sizeof(geometry->path) );
+        if (geometry->path && *(void ***)geometry->path == (void **)path_vtbl)
+            hash_bytes( hash, &CONTAINING_RECORD( geometry->path, struct composition_path, vtbl )->source, sizeof(IUnknown *) );
+    }
+    have = shape->fill && brush_solid_color( (ICompositionBrush *)shape->fill, &color );
+    hash_bytes( hash, &have, sizeof(have) );
+    if (have) hash_bytes( hash, &color, sizeof(color) );
+    have = shape->stroke && brush_solid_color( (ICompositionBrush *)shape->stroke, &color );
+    hash_bytes( hash, &have, sizeof(have) );
+    if (have) hash_bytes( hash, &color, sizeof(color) );
+    hash_bytes( hash, &shape->stroke_thickness, sizeof(shape->stroke_thickness) );
+}
+
+static void paint_shape( ID2D1RenderTarget *target, struct comp_shape *shape, const D2D1_MATRIX_3X2_F *parent, float opacity )
+{
+    D2D1_MATRIX_3X2_F local, world;
+    unsigned int i;
+
+    shape_apply_controlled( shape );
+    local = shape_matrix( &shape->xf );
+    world = matrix_multiply( &local, parent );
+
+    if (shape->is_container)
+    {
+        for (i = 0; i < shape->child_count; i++)
+        {
+            struct comp_shape *child = comp_shape_from_any( shape->children[i] );
+            if (child) paint_shape( target, child, &world, opacity );
+        }
+        return;
+    }
+    {
+        ID2D1Geometry *geometry = shape_d2d_geometry( shape );
+        ID2D1SolidColorBrush *brush;
+        Color color;
+        D2D1_COLOR_F c;
+
+        TRACE( "sprite %p geometry %p fill %p stroke %p thickness %g at %g,%g\n", shape, geometry, shape->fill, shape->stroke,
+               shape->stroke_thickness, world._31, world._32 );
+        if (!geometry) return;
+        ID2D1RenderTarget_SetTransform( target, &world );
+        if (shape->fill && brush_solid_color( (ICompositionBrush *)shape->fill, &color ) && color.A)
+        {
+            c.r = color.R / 255.0f; c.g = color.G / 255.0f; c.b = color.B / 255.0f; c.a = color.A / 255.0f * opacity;
+            if (SUCCEEDED( ID2D1RenderTarget_CreateSolidColorBrush( target, &c, NULL, &brush ) ))
+            {
+                ID2D1RenderTarget_FillGeometry( target, geometry, (ID2D1Brush *)brush, NULL );
+                ID2D1SolidColorBrush_Release( brush );
+            }
+        }
+        if (shape->stroke && shape->stroke_thickness > 0.0f && brush_solid_color( (ICompositionBrush *)shape->stroke, &color ) && color.A)
+        {
+            c.r = color.R / 255.0f; c.g = color.G / 255.0f; c.b = color.B / 255.0f; c.a = color.A / 255.0f * opacity;
+            if (SUCCEEDED( ID2D1RenderTarget_CreateSolidColorBrush( target, &c, NULL, &brush ) ))
+            {
+                ID2D1RenderTarget_DrawGeometry( target, geometry, (ID2D1Brush *)brush, shape->stroke_thickness, NULL );
+                ID2D1SolidColorBrush_Release( brush );
+            }
+        }
+        ID2D1Geometry_Release( geometry );
+    }
+}
+static void paint_shape_visual( HDC hdc, struct visual *impl, float x, float y, float dest_w, float dest_h )
+{
+    D2D1_MATRIX_3X2_F identity = { { { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f } } };
+    D2D1_COLOR_F transparent = { 0.0f, 0.0f, 0.0f, 0.0f };
+    UINT w = impl->size.X > 0.5f ? (UINT)(impl->size.X + 0.5f) : 48, h = impl->size.Y > 0.5f ? (UINT)(impl->size.Y + 0.5f) : 48;
+    struct drawing_surface *surface = impl->shape_surface;
+    unsigned int i;
+    HRESULT hr;
+
+    if (!impl->shape_count) return;
+    if (surface && (surface->width != w || surface->height != h))
+    {
+        surface_Release( &surface->vtbl );
+        surface = impl->shape_surface = NULL;
+        impl->shape_drawn = FALSE;
+    }
+    if (!surface)
+    {
+        void *out;
+        if (FAILED( hr = create_drawing_surface( w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED, &out ) ))
+        {
+            WARN( "no surface for the shapes of %p, hr %#lx.\n", impl, hr );
+            return;
+        }
+        surface = impl->shape_surface = CONTAINING_RECORD( out, struct drawing_surface, vtbl );
+        impl->shape_drawn = FALSE;
+    }
+    {
+        ULONGLONG signature = 1469598103934665603ull;
+        hash_bytes( &signature, &w, sizeof(w) );
+        hash_bytes( &signature, &h, sizeof(h) );
+        hash_bytes( &signature, &impl->shape_count, sizeof(impl->shape_count) );
+        for (i = 0; i < impl->shape_count; i++)
+        {
+            struct comp_shape *shape = comp_shape_from_any( impl->shapes[i] );
+            hash_bytes( &signature, &shape, sizeof(shape) );
+            if (shape) shape_signature( shape, &identity, 1.0f, &signature );
+        }
+        if (impl->shape_drawn && signature == impl->shape_signature)
+        {
+            blit_surface_rect( hdc, surface, (int)x, (int)y, dest_w > 0.5f ? (int)(dest_w + 0.5f) : w, dest_h > 0.5f ? (int)(dest_h + 0.5f) : h );
+            return;
+        }
+        impl->shape_signature = signature;
+        impl->shape_drawn = TRUE;
+    }
+    if (FAILED( hr = surface_ensure_target( surface ) ) || !surface->context)
+    {
+        WARN( "no D2D target for the shapes of %p, hr %#lx.\n", impl, hr );
+        impl->shape_drawn = FALSE;
+        return;
+    }
+    ID2D1DeviceContext_BeginDraw( surface->context );
+    ID2D1DeviceContext_Clear( surface->context, &transparent );
+    for (i = 0; i < impl->shape_count; i++)
+    {
+        struct comp_shape *shape = comp_shape_from_any( impl->shapes[i] );
+        if (shape) paint_shape( (ID2D1RenderTarget *)surface->context, shape, &identity, 1.0f );
+    }
+    hr = ID2D1DeviceContext_EndDraw( surface->context, NULL, NULL );
+    surface_invalidate_cache( surface );
+    TRACE( "shape visual %p: %u shapes into %ux%u at %g,%g, hr %#lx.\n", impl, impl->shape_count, w, h, x, y, hr );
+    blit_surface_rect( hdc, surface, (int)x, (int)y, dest_w > 0.5f ? (int)(dest_w + 0.5f) : w, dest_h > 0.5f ? (int)(dest_h + 0.5f) : h );
+}
+
+static HRESULT WINAPI compositor_CreateColorKeyFrameAnimation( ICompositor *iface, IColorKeyFrameAnimation **result )
+{
+    TRACE( "iface %p.\n", iface );
+    /* recorded, not run: animations and clips are not rendered yet */
+    if (!result) return E_POINTER;
+    return create_kf_animation( KF_COLOR, (void **)result );
+}
+
+static HRESULT WINAPI compositor_CreateColorBrush( ICompositor *iface, ICompositionColorBrush **result )
+{
+    /* Native dcomp zero-fills the brush and its constructors set no colour: the default is transparent black.
+     * Defaulting to opaque white painted XAML's unset button fills as solid white rectangles. */
+    Color color = { 0, 0, 0, 0 };
+    TRACE( "iface %p.\n", iface );
+    return create_color_brush( iface, color, result );
+}
+
+static HRESULT WINAPI compositor_CreateColorBrushWithColor( ICompositor *iface, Color color, ICompositionColorBrush **result )
+{
+    TRACE( "iface %p.\n", iface );
+    return create_color_brush( iface, color, result );
+}
+
+static HRESULT WINAPI compositor_CreateContainerVisual( ICompositor *iface, IContainerVisual **result )
+{
+    TRACE( "iface %p.\n", iface );
+    return create_visual( iface, VISUAL_CONTAINER, (void **)result );
+}
+
+/* Easing functions. Animations are not run yet, so these only have to exist and report what they were
+ * created with. A cubic bezier function answers ICubicBezierEasingFunction through its own view; any other
+ * interface gets the generic composition object. */
+static const GUID IID_ICubicBezierEasingFunction_ =
+    { 0x32350666, 0xc1e8, 0x44f9, { 0x96, 0xb8, 0xc9, 0x8a, 0xcf, 0x0a, 0xe6, 0x98 } };
+
+struct cubic_bezier_easing
+{
+    const void **vtbl;          /* generic composition object layout, must stay first */
+    const char *kind;
+    LONG ref;
+    const void **bezier_vtbl;   /* ICubicBezierEasingFunction */
+    Vector2 point1, point2;
+};
+
+static void *cubic_bezier_vtbl[COMP_OBJECT_SLOTS];
+static LONG cubic_bezier_vtbl_ready;
+
+static HRESULT WINAPI cubic_bezier_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct cubic_bezier_easing *impl = CONTAINING_RECORD( iface, struct cubic_bezier_easing, vtbl );
+
+    TRACE( "cubic bezier %p, iid %s.\n", impl, debugstr_guid( iid ) );
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&impl->vtbl, out );
+    InterlockedIncrement( &impl->ref );
+    *out = IsEqualGUID( iid, &IID_ICubicBezierEasingFunction_ ) ? (void *)&impl->bezier_vtbl : (void *)&impl->vtbl;
+    return S_OK;
+}
+
+static HRESULT WINAPI cubic_bezier_iface_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return cubic_bezier_QueryInterface( &CONTAINING_RECORD( iface, struct cubic_bezier_easing, bezier_vtbl )->vtbl, iid, out );
+}
+static ULONG WINAPI cubic_bezier_iface_AddRef( void *iface )
+{
+    return comp_object_AddRef( &CONTAINING_RECORD( iface, struct cubic_bezier_easing, bezier_vtbl )->vtbl );
+}
+static ULONG WINAPI cubic_bezier_iface_Release( void *iface )
+{
+    return comp_object_Release( &CONTAINING_RECORD( iface, struct cubic_bezier_easing, bezier_vtbl )->vtbl );
+}
+static HRESULT WINAPI cubic_bezier_iface_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI cubic_bezier_iface_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CubicBezierEasingFunction";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI cubic_bezier_iface_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+/* ICubicBezierEasingFunction::get_ControlPoint1 */
+static HRESULT WINAPI cubic_bezier_get_ControlPoint1( void *iface, Vector2 *value )
+{
+    if (!value) return E_POINTER;
+    *value = CONTAINING_RECORD( iface, struct cubic_bezier_easing, bezier_vtbl )->point1;
+    return S_OK;
+}
+/* ICubicBezierEasingFunction::get_ControlPoint2 */
+static HRESULT WINAPI cubic_bezier_get_ControlPoint2( void *iface, Vector2 *value )
+{
+    if (!value) return E_POINTER;
+    *value = CONTAINING_RECORD( iface, struct cubic_bezier_easing, bezier_vtbl )->point2;
+    return S_OK;
+}
+
+static const void *cubic_bezier_iface_vtbl[] =
+{
+    cubic_bezier_iface_QueryInterface, cubic_bezier_iface_AddRef, cubic_bezier_iface_Release,
+    cubic_bezier_iface_GetIids, cubic_bezier_iface_GetRuntimeClassName, cubic_bezier_iface_GetTrustLevel,
+    cubic_bezier_get_ControlPoint1, cubic_bezier_get_ControlPoint2,
+};
+
+static HRESULT WINAPI compositor_CreateCubicBezierEasingFunction( ICompositor *iface, Vector2 point1, Vector2 point2,
+        ICubicBezierEasingFunction **result )
+{
+    struct cubic_bezier_easing *impl;
+    unsigned int i;
+
+    TRACE( "iface %p, point1 %f,%f, point2 %f,%f.\n", iface, point1.X, point1.Y, point2.X, point2.Y );
+
+    if (!result) return E_POINTER;
+    *result = NULL;
+    if (!cubic_bezier_vtbl_ready)
+    {
+        cubic_bezier_vtbl[1] = comp_object_AddRef;
+        cubic_bezier_vtbl[2] = comp_object_Release;
+        for (i = 3; i < COMP_OBJECT_SLOTS; i++) cubic_bezier_vtbl[i] = comp_object_slot_fn( i );
+        cubic_bezier_vtbl[0] = cubic_bezier_QueryInterface;
+        comp_object_set_inspectable( cubic_bezier_vtbl );
+        InterlockedExchange( &cubic_bezier_vtbl_ready, 1 );
+    }
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->vtbl = (const void **)cubic_bezier_vtbl;
+    impl->kind = "CubicBezierEasingFunction";
+    impl->ref = 1;
+    impl->bezier_vtbl = cubic_bezier_iface_vtbl;
+    impl->point1 = point1;
+    impl->point2 = point2;
+    *result = (ICubicBezierEasingFunction *)&impl->bezier_vtbl;
+    return S_OK;
+}
+/* Effect brushes. The effect graph is not rendered yet: a CompositionEffectBrush remembers its source
+ * parameters and paints like its source brush where the renderer can (see brush_surface), which keeps
+ * images behind blur/tint effects visible. The factory reports a successful load. */
+static const GUID IID_ICompositionEffectFactory_ =
+    { 0xbe5624af, 0xba7e, 0x4510, { 0x98, 0x50, 0x41, 0xc0, 0xb4, 0xff, 0x74, 0xdf } };
+static const GUID IID_ICompositionEffectBrush_ =
+    { 0xbf7f795e, 0x83cc, 0x44bf, { 0xa4, 0x47, 0x3e, 0x3c, 0x07, 0x17, 0x89, 0xec } };
+
+#define EFFECT_BRUSH_SOURCES 8
+
+struct effect_brush
+{
+    const void **vtbl;          /* generic composition object layout, must stay first */
+    const char *kind;
+    LONG ref;
+    const void **effect_vtbl;   /* ICompositionEffectBrush */
+    unsigned int source_count;
+    HSTRING source_names[EFFECT_BRUSH_SOURCES];
+    IUnknown *sources[EFFECT_BRUSH_SOURCES];
+    IGraphicsEffect *effect;    /* the factory's effect graph */
+    ICompositionPropertySet *properties;   /* shared by every ICompositionObject view of the brush */
+};
+
+struct effect_factory
+{
+    const void **vtbl;          /* generic composition object layout, must stay first */
+    const char *kind;
+    LONG ref;
+    const void **factory_vtbl;  /* ICompositionEffectFactory */
+    IGraphicsEffect *effect;
+};
+
+/* IGraphicsEffectD2D1Interop {2fc57384-a068-44d7-a331-30982fcf7177}, from windows.graphics.effects.interop.h:
+ * how an effect description (XAML's own acrylic recipe, Win2D effects) exposes its D2D effect id, properties
+ * and sources. */
+static const GUID IID_IGraphicsEffectD2D1Interop_ =
+    { 0x2fc57384, 0xa068, 0x44d7, { 0xa3, 0x31, 0x30, 0x98, 0x2f, 0xcf, 0x71, 0x77 } };
+static const GUID CLSID_D2D1Flood_ = { 0x61c23c20, 0xae69, 0x4d8e, { 0x94, 0xcf, 0x50, 0x07, 0x8d, 0xf6, 0x38, 0xf2 } };
+typedef struct IGraphicsEffectD2D1Interop_ IGraphicsEffectD2D1Interop_;
+struct IGraphicsEffectD2D1Interop_vtbl_
+{
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)( IGraphicsEffectD2D1Interop_ *iface, REFIID iid, void **out );
+    ULONG (STDMETHODCALLTYPE *AddRef)( IGraphicsEffectD2D1Interop_ *iface );
+    ULONG (STDMETHODCALLTYPE *Release)( IGraphicsEffectD2D1Interop_ *iface );
+    HRESULT (STDMETHODCALLTYPE *GetEffectId)( IGraphicsEffectD2D1Interop_ *iface, GUID *id );
+    HRESULT (STDMETHODCALLTYPE *GetNamedPropertyMapping)( IGraphicsEffectD2D1Interop_ *iface, LPCWSTR name, UINT *index, UINT *mapping );
+    HRESULT (STDMETHODCALLTYPE *GetPropertyCount)( IGraphicsEffectD2D1Interop_ *iface, UINT *count );
+    HRESULT (STDMETHODCALLTYPE *GetProperty)( IGraphicsEffectD2D1Interop_ *iface, UINT index, IPropertyValue **value );
+    HRESULT (STDMETHODCALLTYPE *GetSource)( IGraphicsEffectD2D1Interop_ *iface, UINT index, IGraphicsEffectSource **source );
+    HRESULT (STDMETHODCALLTYPE *GetSourceCount)( IGraphicsEffectD2D1Interop_ *iface, UINT *count );
+};
+struct IGraphicsEffectD2D1Interop_ { const struct IGraphicsEffectD2D1Interop_vtbl_ *lpVtbl; };
+
+/* Walk an effect graph for its flood (colour source) effects and keep the most opaque one. XAML's acrylic
+ * is a blurred backdrop blended with a tint flood and a noise texture; with no effect rendering, the tint
+ * is the best stand-in for the whole thing. */
+static BOOL is_own_object( void *iface )
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    void *vtbl = iface ? *(void **)iface : NULL;
+
+    if (!vtbl || !VirtualQuery( vtbl, &mbi, sizeof(mbi) )) return TRUE;
+    return mbi.AllocationBase == (void *)GetModuleHandleW( L"dcomp.dll" );
+}
+
+static void effect_graph_tint( IUnknown *node, Color *best, float *best_alpha, unsigned int depth )
+{
+    IGraphicsEffectD2D1Interop_ *interop;
+    UINT i, count = 0;
+    GUID id;
+
+    /* Sources that are this module's own objects (CompositionEffectSourceParameter, brushes) are
+     * recording objects that answer every interface; only real effect descriptions are walked. */
+    if (!node || depth > 8 || is_own_object( node )) return;
+    if (FAILED( IUnknown_QueryInterface( node, &IID_IGraphicsEffectD2D1Interop_, (void **)&interop ) )) return;
+    if (SUCCEEDED( interop->lpVtbl->GetEffectId( interop, &id ) ) && IsEqualGUID( &id, &CLSID_D2D1Flood_ ) &&
+        SUCCEEDED( interop->lpVtbl->GetPropertyCount( interop, &count ) ) && count)
+    {
+        IPropertyValue *value = NULL;
+        if (SUCCEEDED( interop->lpVtbl->GetProperty( interop, 0, &value ) ) && value)
+        {
+            FLOAT *rgba = NULL;
+            UINT n = 0;
+            if (SUCCEEDED( IPropertyValue_GetSingleArray( value, &n, &rgba ) ) && rgba && n >= 4)
+            {
+                if (rgba[3] > *best_alpha)
+                {
+                    *best_alpha = rgba[3];
+                    best->A = (BYTE)(rgba[3] * 255.0f + 0.5f);
+                    best->R = (BYTE)(rgba[0] * 255.0f + 0.5f);
+                    best->G = (BYTE)(rgba[1] * 255.0f + 0.5f);
+                    best->B = (BYTE)(rgba[2] * 255.0f + 0.5f);
+                }
+                CoTaskMemFree( rgba );
+            }
+            IPropertyValue_Release( value );
+        }
+    }
+    count = 0;
+    if (SUCCEEDED( interop->lpVtbl->GetSourceCount( interop, &count ) ))
+    {
+        if (count > 16) count = 16;
+        for (i = 0; i < count; i++)
+        {
+            IGraphicsEffectSource *source = NULL;
+            if (SUCCEEDED( interop->lpVtbl->GetSource( interop, i, &source ) ) && source)
+            {
+                effect_graph_tint( (IUnknown *)source, best, best_alpha, depth + 1 );
+                IGraphicsEffectSource_Release( source );
+            }
+        }
+    }
+    interop->lpVtbl->Release( interop );
+}
+
+static struct effect_brush *effect_brush_from_any( void *brush_iface );
+static BOOL effect_brush_tint( void *brush_iface, Color *color )
+{
+    struct effect_brush *brush = effect_brush_from_any( brush_iface );
+    float alpha = 0.0f;
+    Color best = { 0 };
+
+    if (!brush || !brush->effect) return FALSE;
+    /* the live tint: XAML's acrylic sets "TintColor.Color" (and the "FallbackColor.Color" it shows
+     * when acrylic is off) in the brush's property set and updates them on a theme change; the
+     * flood colour in the effect description is only the initial value */
+    if (brush->properties)
+    {
+        static const WCHAR *const names[] = { L"TintColor.Color", L"FallbackColor.Color", L"Tint.Color" };
+        struct property_set *set = CONTAINING_RECORD( brush->properties, struct property_set, ICompositionPropertySet_iface );
+        unsigned int i, j;
+        for (j = 0; j < ARRAY_SIZE(names); j++)
+            for (i = 0; i < set->value_count; i++)
+                if (set->values[i].type == PROP_COLOR && !wcsicmp( set->values[i].name, names[j] ))
+                {
+                    *color = set->values[i].u.color;
+                    color->A = 255;
+                    return TRUE;
+                }
+    }
+    /* the effect descriptions are the app's (XAML's) objects; a fault in one loses the tint, not the frame */
+    __TRY
+    {
+        effect_graph_tint( (IUnknown *)brush->effect, &best, &alpha, 0 );
+    }
+    __EXCEPT_ALL
+    {
+        WARN( "effect graph of brush %p faulted.\n", brush );
+        alpha = 0.0f;
+    }
+    __ENDTRY
+    if (alpha <= 0.0f) return FALSE;
+    /* the blurred backdrop under the tint makes acrylic nearly opaque */
+    best.A = 255;
+    *color = best;
+    return TRUE;
+}
+
+static void *effect_brush_vtbl[COMP_OBJECT_SLOTS];
+static void *effect_factory_vtbl[COMP_OBJECT_SLOTS];
+static LONG effect_vtbls_ready;
+
+static HRESULT WINAPI effect_brush_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct effect_brush *brush = CONTAINING_RECORD( iface, struct effect_brush, vtbl );
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+
+    TRACE( "effect brush %p, iid %s.\n", brush, debugstr_guid( iid ) );
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+    {
+        /* XAML's acrylic writes "TintColor.Color" etc. into brush.Properties through a fresh view each
+         * time, so the views share one property set kept on the brush. */
+        HRESULT hr = create_composition_object_view( (IUnknown *)&brush->vtbl, out );
+        if (SUCCEEDED( hr ))
+        {
+            struct composition_object_view *view = impl_from_object_view( *out );
+            ICompositionPropertySet *set;
+            if (!brush->properties && SUCCEEDED( create_property_set( &set ) ) &&
+                InterlockedCompareExchangePointer( (void **)&brush->properties, set, NULL ))
+                ICompositionPropertySet_Release( set );
+            if (brush->properties) ICompositionPropertySet_AddRef( (view->properties = brush->properties) );
+        }
+        return hr;
+    }
+    InterlockedIncrement( &brush->ref );
+    *out = IsEqualGUID( iid, &IID_ICompositionEffectBrush_ ) ? (void *)&brush->effect_vtbl : (void *)&brush->vtbl;
+    return S_OK;
+}
+
+static ULONG WINAPI effect_brush_AddRef( void *iface )
+{
+    struct effect_brush *brush = CONTAINING_RECORD( iface, struct effect_brush, vtbl );
+    return InterlockedIncrement( &brush->ref );
+}
+
+static ULONG WINAPI effect_brush_Release( void *iface )
+{
+    struct effect_brush *brush = CONTAINING_RECORD( iface, struct effect_brush, vtbl );
+    ULONG ref = InterlockedDecrement( &brush->ref );
+    unsigned int i;
+
+    if (!ref)
+    {
+        for (i = 0; i < brush->source_count; i++)
+        {
+            WindowsDeleteString( brush->source_names[i] );
+            if (brush->sources[i]) IUnknown_Release( brush->sources[i] );
+        }
+        if (brush->effect) IGraphicsEffect_Release( brush->effect );
+        free( brush );
+    }
+    return ref;
+}
+
+static HRESULT WINAPI effect_brush_iface_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return effect_brush_QueryInterface( &CONTAINING_RECORD( iface, struct effect_brush, effect_vtbl )->vtbl, iid, out );
+}
+static ULONG WINAPI effect_brush_iface_AddRef( void *iface )
+{
+    return effect_brush_AddRef( &CONTAINING_RECORD( iface, struct effect_brush, effect_vtbl )->vtbl );
+}
+static ULONG WINAPI effect_brush_iface_Release( void *iface )
+{
+    return effect_brush_Release( &CONTAINING_RECORD( iface, struct effect_brush, effect_vtbl )->vtbl );
+}
+static HRESULT WINAPI effect_iface_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    FIXME( "%p, %p, %p stub.\n", iface, count, iids );
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI effect_iface_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+static HRESULT WINAPI effect_brush_iface_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionEffectBrush";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+
+static int effect_brush_find( struct effect_brush *brush, HSTRING name )
+{
+    unsigned int i;
+    INT32 cmp;
+
+    for (i = 0; i < brush->source_count; i++)
+        if (SUCCEEDED( WindowsCompareStringOrdinal( brush->source_names[i], name, &cmp ) ) && !cmp) return i;
+    return -1;
+}
+
+/* ICompositionEffectBrush::GetSourceParameter */
+static HRESULT WINAPI effect_brush_GetSourceParameter( void *iface, HSTRING name, IUnknown **result )
+{
+    struct effect_brush *brush = CONTAINING_RECORD( iface, struct effect_brush, effect_vtbl );
+    int i;
+
+    TRACE( "%p, %s, %p.\n", brush, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ), result );
+
+    if (!result) return E_POINTER;
+    *result = NULL;
+    if ((i = effect_brush_find( brush, name )) >= 0 && brush->sources[i])
+        IUnknown_AddRef( (*result = brush->sources[i]) );
+    return S_OK;
+}
+
+/* ICompositionEffectBrush::SetSourceParameter */
+static HRESULT WINAPI effect_brush_SetSourceParameter( void *iface, HSTRING name, IUnknown *source )
+{
+    scene_changed();
+    struct effect_brush *brush = CONTAINING_RECORD( iface, struct effect_brush, effect_vtbl );
+    int i;
+
+    TRACE( "%p, %s, %p.\n", brush, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ), source );
+
+    if ((i = effect_brush_find( brush, name )) < 0)
+    {
+        if (brush->source_count == EFFECT_BRUSH_SOURCES) return E_OUTOFMEMORY;
+        i = brush->source_count;
+        if (FAILED( WindowsDuplicateString( name, &brush->source_names[i] ) )) return E_OUTOFMEMORY;
+        brush->sources[i] = NULL;
+        brush->source_count++;
+    }
+    if (source) IUnknown_AddRef( source );
+    if (brush->sources[i]) IUnknown_Release( brush->sources[i] );
+    brush->sources[i] = source;
+    return S_OK;
+}
+
+static const void *effect_brush_iface_vtbl[] =
+{
+    effect_brush_iface_QueryInterface, effect_brush_iface_AddRef, effect_brush_iface_Release,
+    effect_iface_GetIids, effect_brush_iface_GetRuntimeClassName, effect_iface_GetTrustLevel,
+    effect_brush_GetSourceParameter, effect_brush_SetSourceParameter,
+};
+
+static HRESULT WINAPI effect_factory_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct effect_factory *factory = CONTAINING_RECORD( iface, struct effect_factory, vtbl );
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+
+    TRACE( "effect factory %p, iid %s.\n", factory, debugstr_guid( iid ) );
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&factory->vtbl, out );
+    InterlockedIncrement( &factory->ref );
+    *out = IsEqualGUID( iid, &IID_ICompositionEffectFactory_ ) ? (void *)&factory->factory_vtbl : (void *)&factory->vtbl;
+    return S_OK;
+}
+
+static HRESULT WINAPI effect_factory_iface_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return effect_factory_QueryInterface( &CONTAINING_RECORD( iface, struct effect_factory, factory_vtbl )->vtbl, iid, out );
+}
+static ULONG WINAPI effect_factory_iface_AddRef( void *iface )
+{
+    return comp_object_AddRef( &CONTAINING_RECORD( iface, struct effect_factory, factory_vtbl )->vtbl );
+}
+static ULONG WINAPI effect_factory_iface_Release( void *iface )
+{
+    return comp_object_Release( &CONTAINING_RECORD( iface, struct effect_factory, factory_vtbl )->vtbl );
+}
+static HRESULT WINAPI effect_factory_iface_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionEffectFactory";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+
+static void ensure_effect_vtbls( void );
+
+/* ICompositionEffectFactory::CreateBrush */
+static HRESULT WINAPI effect_factory_CreateBrush( void *iface, void **result )
+{
+    struct effect_brush *brush;
+
+    TRACE( "%p, %p.\n", iface, result );
+
+    if (!result) return E_POINTER;
+    *result = NULL;
+    ensure_effect_vtbls();
+    if (!(brush = calloc( 1, sizeof(*brush) ))) return E_OUTOFMEMORY;
+    brush->vtbl = (const void **)effect_brush_vtbl;
+    brush->kind = "EffectBrush";
+    brush->ref = 1;
+    brush->effect_vtbl = effect_brush_iface_vtbl;
+    brush->effect = CONTAINING_RECORD( iface, struct effect_factory, factory_vtbl )->effect;
+    if (brush->effect) IGraphicsEffect_AddRef( brush->effect );
+    /* the projection asks for CompositionEffectBrush's default interface */
+    *result = &brush->effect_vtbl;
+    return S_OK;
+}
+
+/* ICompositionEffectFactory::get_ExtendedError */
+static HRESULT WINAPI effect_factory_get_ExtendedError( void *iface, HRESULT *value )
+{
+    if (!value) return E_POINTER;
+    *value = S_OK;
+    return S_OK;
+}
+
+/* ICompositionEffectFactory::get_LoadStatus */
+static HRESULT WINAPI effect_factory_get_LoadStatus( void *iface, CompositionEffectFactoryLoadStatus *value )
+{
+    if (!value) return E_POINTER;
+    *value = CompositionEffectFactoryLoadStatus_Success;
+    return S_OK;
+}
+
+static const void *effect_factory_iface_vtbl[] =
+{
+    effect_factory_iface_QueryInterface, effect_factory_iface_AddRef, effect_factory_iface_Release,
+    effect_iface_GetIids, effect_factory_iface_GetRuntimeClassName, effect_iface_GetTrustLevel,
+    effect_factory_CreateBrush, effect_factory_get_ExtendedError, effect_factory_get_LoadStatus,
+};
+
+static void ensure_effect_vtbls( void )
+{
+    unsigned int i;
+
+    if (effect_vtbls_ready) return;
+    effect_brush_vtbl[1] = effect_brush_AddRef;
+    effect_brush_vtbl[2] = effect_brush_Release;
+    effect_factory_vtbl[1] = comp_object_AddRef;
+    effect_factory_vtbl[2] = comp_object_Release;
+    for (i = 3; i < COMP_OBJECT_SLOTS; i++)
+    {
+        effect_brush_vtbl[i] = comp_object_slot_fn( i );
+        effect_factory_vtbl[i] = comp_object_slot_fn( i );
+    }
+    comp_object_set_inspectable( effect_brush_vtbl );
+    comp_object_set_inspectable( effect_factory_vtbl );
+    /* publish QueryInterface last so a racing reader never sees a half-filled table */
+    effect_brush_vtbl[0] = effect_brush_QueryInterface;
+    effect_factory_vtbl[0] = effect_factory_QueryInterface;
+    InterlockedExchange( &effect_vtbls_ready, 1 );
+}
+
+static HRESULT create_effect_factory( IGraphicsEffect *effect, ICompositionEffectFactory **result )
+{
+    struct effect_factory *factory;
+
+    if (!result) return E_POINTER;
+    *result = NULL;
+    ensure_effect_vtbls();
+    if (!(factory = calloc( 1, sizeof(*factory) ))) return E_OUTOFMEMORY;
+    factory->vtbl = (const void **)effect_factory_vtbl;
+    factory->kind = "EffectFactory";
+    factory->ref = 1;
+    factory->factory_vtbl = effect_factory_iface_vtbl;
+    if ((factory->effect = effect)) IGraphicsEffect_AddRef( effect );
+    *result = (ICompositionEffectFactory *)&factory->factory_vtbl;
+    TRACE( "created effect factory %p for effect %p.\n", factory, effect );
+    return S_OK;
+}
+
+static HRESULT WINAPI compositor_CreateEffectFactory( ICompositor *iface, IGraphicsEffect *effect, ICompositionEffectFactory **result )
+{
+    TRACE( "iface %p, effect %p.\n", iface, effect );
+    return create_effect_factory( effect, result );
+}
+
+static HRESULT WINAPI compositor_CreateEffectFactoryWithProperties( ICompositor *iface, IGraphicsEffect *effect,
+        IIterable_HSTRING *animatable, ICompositionEffectFactory **result )
+{
+    TRACE( "iface %p, effect %p, animatable %p.\n", iface, effect, animatable );
+    return create_effect_factory( effect, result );
+}
+static HRESULT WINAPI compositor_CreateExpressionAnimation( ICompositor *iface, IExpressionAnimation **result )
+{
+    TRACE( "iface %p.\n", iface );
+    /* recorded, not run: animations and clips are not rendered yet */
+    if (!result) return E_POINTER;
+    return create_expr_animation( (void **)result );
+}
+static HRESULT WINAPI compositor_CreateExpressionAnimationWithExpression( ICompositor *iface,
+                                                                          HSTRING expression,
+                                                                          IExpressionAnimation **result )
+{
+    HRESULT hr;
+    TRACE( "iface %p, expression %s.\n", iface, debugstr_w(WindowsGetStringRawBuffer( expression, NULL )) );
+    if (!result) return E_POINTER;
+    if (SUCCEEDED( hr = create_expr_animation( (void **)result ) )) expr_put_Expression( *result, expression );
+    return hr;
+}
+static HRESULT WINAPI compositor_CreateInsetClip( ICompositor *iface, IInsetClip **result )
+{
+    TRACE( "iface %p.\n", iface );
+    return create_inset_clip( 0.0f, 0.0f, 0.0f, 0.0f, (void **)result );
+}
+static HRESULT WINAPI compositor_CreateInsetClipWithInsets( ICompositor *iface, FLOAT left, FLOAT top, FLOAT right,
+        FLOAT bottom, IInsetClip **result )
+{
+    TRACE( "iface %p, %g %g %g %g.\n", iface, left, top, right, bottom );
+    return create_inset_clip( left, top, right, bottom, (void **)result );
+}
+static HRESULT WINAPI compositor_CreateLinearEasingFunction( ICompositor *iface, ILinearEasingFunction **result )
+{
+    TRACE( "iface %p.\n", iface );
+    /* ILinearEasingFunction has no methods of its own */
+    if (!result) return E_POINTER;
+    return create_comp_object( "LinearEasingFunction", (void **)result );
+}
+
+static HRESULT WINAPI compositor_CreatePropertySet( ICompositor *iface, ICompositionPropertySet **result )
+{
+    TRACE( "iface %p.\n", iface );
+    return create_property_set( result );
+}
+
+static HRESULT WINAPI compositor_CreateQuaternionKeyFrameAnimation( ICompositor *iface, IQuaternionKeyFrameAnimation **result )
+{
+    TRACE( "iface %p.\n", iface );
+    /* recorded, not run: animations and clips are not rendered yet */
+    if (!result) return E_POINTER;
+    return create_comp_object( "QuaternionKeyFrameAnimation", (void **)result );
+}
+static HRESULT WINAPI compositor_CreateScalarKeyFrameAnimation( ICompositor *iface,
+                                                                IScalarKeyFrameAnimation **result )
+{
+    TRACE( "iface %p.\n", iface );
+    /* Calculator uses this for its first post-navigation layout animation.  A missing
+     * animation object turns into a stowed E_NOTIMPL in XAML; a recording object is enough
+     * until the compositor has a timeline implementation. */
+    if (!result) return E_POINTER;
+    return create_kf_animation( KF_SCALAR, (void **)result );
+}
+static HRESULT WINAPI compositor_CreateScopedBatch( ICompositor *iface, CompositionBatchTypes type,
+                                                     ICompositionScopedBatch **result )
+{
+    TRACE( "iface %p, type %#x.\n", iface, type );
+    if (!result) return E_POINTER;
+    return create_comp_batch( TRUE, (void **)result );
+}
+
+static HRESULT WINAPI compositor_CreateSpriteVisual( ICompositor *iface, ISpriteVisual **result )
+{
+    TRACE( "iface %p.\n", iface );
+    return create_visual( iface, VISUAL_SPRITE, (void **)result );
+}
+
+static HRESULT WINAPI compositor_CreateSurfaceBrush( ICompositor *iface, ICompositionSurfaceBrush **result )
+{
+    TRACE( "iface %p.\n", iface );
+    return create_surface_brush( NULL, (void **)result );
+}
+static HRESULT WINAPI compositor_CreateSurfaceBrushWithSurface( ICompositor *iface, ICompositionSurface *surface,
+                                                                ICompositionSurfaceBrush **result )
+{
+    TRACE( "iface %p, surface %p.\n", iface, surface );
+    return create_surface_brush( surface, (void **)result );
+}
+
+static HRESULT WINAPI compositor_CreateTargetForCurrentView( ICompositor *iface, ICompositionTarget **result )
+{
+    static const WCHAR corewindowW[] = L"Windows.UI.Core.CoreWindow";
+    ICoreWindowStatic *statics = NULL;
+    ICoreWindow *window = NULL;
+    IUnknown *islands = NULL;
+    void *island = NULL;
+    HSTRING name = NULL;
+    HRESULT hr;
+
+    TRACE( "iface %p.\n", iface );
+
+    hr = create_target( iface, result );
+    if (FAILED(hr)) return hr;
+
+    /* Native CreateTargetForCurrentView configures the current CoreWindow's composition
+     * island as a side effect. XAML's CoreWindowIslandAdapter then get_CompositionIsland
+     * and fail-fasts with ERROR_NOT_FOUND (0x80070490) if that was skipped. */
+    if (FAILED(WindowsCreateString( corewindowW, ARRAY_SIZE(corewindowW) - 1, &name ))) return S_OK;
+    hr = RoGetActivationFactory( name, &IID_ICoreWindowStatic, (void **)&statics );
+    WindowsDeleteString( name );
+    if (FAILED(hr) || !statics)
+    {
+        TRACE( "no ICoreWindowStatic, hr %#lx.\n", hr );
+        return S_OK;
+    }
+    hr = ICoreWindowStatic_GetForCurrentThread( statics, &window );
+    ICoreWindowStatic_Release( statics );
+    if (FAILED(hr) || !window)
+    {
+        TRACE( "GetForCurrentThread hr %#lx.\n", hr );
+        return S_OK;
+    }
+    hr = IUnknown_QueryInterface( (IUnknown *)window, &IID_ICoreWindow_CompositionIslands, (void **)&islands );
+    ICoreWindow_Release( window );
+    if (FAILED(hr) || !islands)
+    {
+        TRACE( "ICoreWindow_CompositionIslands hr %#lx.\n", hr );
+        return S_OK;
+    }
+    {
+        void **vtbl = *(void ***)islands;
+        HRESULT (WINAPI *configure)( void *, ICompositor *, void ** ) =
+                (HRESULT (WINAPI *)( void *, ICompositor *, void ** ))vtbl[8];
+        hr = configure( islands, iface, &island );
+        TRACE( "ConfigureCompositionIsland hr %#lx island %p.\n", hr, island );
+        if (island) IUnknown_Release( (IUnknown *)island );
+    }
+    IUnknown_Release( islands );
+    return S_OK;
+}
+
+static HRESULT WINAPI compositor_CreateVector2KeyFrameAnimation( ICompositor *iface, IVector2KeyFrameAnimation **result )
+{
+    TRACE( "iface %p.\n", iface );
+    /* recorded, not run: animations and clips are not rendered yet */
+    if (!result) return E_POINTER;
+    return create_kf_animation( KF_VECTOR2, (void **)result );
+}
+static HRESULT WINAPI compositor_CreateVector3KeyFrameAnimation( ICompositor *iface, IVector3KeyFrameAnimation **result )
+{
+    TRACE( "iface %p.\n", iface );
+    /* recorded, not run: animations and clips are not rendered yet */
+    if (!result) return E_POINTER;
+    return create_kf_animation( KF_VECTOR3, (void **)result );
+}
+static HRESULT WINAPI compositor_CreateVector4KeyFrameAnimation( ICompositor *iface, IVector4KeyFrameAnimation **result )
+{
+    TRACE( "iface %p.\n", iface );
+    /* recorded, not run: animations and clips are not rendered yet */
+    if (!result) return E_POINTER;
+    return create_comp_object( "Vector4KeyFrameAnimation", (void **)result );
+}
+static HRESULT WINAPI compositor_GetCommitBatch( ICompositor *iface, CompositionBatchTypes type, ICompositionCommitBatch **result )
+{
+    TRACE( "iface %p, type %#x.\n", iface, type );
+    if (!result) return E_POINTER;
+    return create_comp_batch( FALSE, (void **)result );
+}
+
+static const struct ICompositorVtbl compositor_vtbl =
+{
+    compositor_QueryInterface,
+    compositor_AddRef,
+    compositor_Release,
+    /* IInspectable methods */
+    compositor_GetIids,
+    compositor_GetRuntimeClassName,
+    compositor_GetTrustLevel,
+    /* ICompositor methods */
+    compositor_CreateColorKeyFrameAnimation,
+    compositor_CreateColorBrush,
+    compositor_CreateColorBrushWithColor,
+    compositor_CreateContainerVisual,
+    compositor_CreateCubicBezierEasingFunction,
+    compositor_CreateEffectFactory,
+    compositor_CreateEffectFactoryWithProperties,
+    compositor_CreateExpressionAnimation,
+    compositor_CreateExpressionAnimationWithExpression,
+    compositor_CreateInsetClip,
+    compositor_CreateInsetClipWithInsets,
+    compositor_CreateLinearEasingFunction,
+    compositor_CreatePropertySet,
+    compositor_CreateQuaternionKeyFrameAnimation,
+    compositor_CreateScalarKeyFrameAnimation,
+    compositor_CreateScopedBatch,
+    compositor_CreateSpriteVisual,
+    compositor_CreateSurfaceBrush,
+    compositor_CreateSurfaceBrushWithSurface,
+    compositor_CreateTargetForCurrentView,
+    compositor_CreateVector2KeyFrameAnimation,
+    compositor_CreateVector3KeyFrameAnimation,
+    compositor_CreateVector4KeyFrameAnimation,
+    compositor_GetCommitBatch,
+};
+
+/* ICompositorInterop is IUnknown, not IInspectable. Answering it with the numbered probe table
+ * maps CreateGraphicsDevice onto GetTrustLevel, which is what DCompTreeHost::EnsureResources
+ * calls after EnsureDCompDevice. */
+
+struct graphics_device
+{
+    ICompositionGraphicsDevice ICompositionGraphicsDevice_iface;
+    ICompositor *compositor;
+    LONG ref;
+};
+
+static HRESULT WINAPI gfx_QueryInterface( ICompositionGraphicsDevice *iface, REFIID iid, void **out )
+{
+    struct graphics_device *impl = CONTAINING_RECORD( iface, struct graphics_device, ICompositionGraphicsDevice_iface );
+
+    ERR( "[DEBUG-gfx-qi] iface %p, iid %s.\n", iface, debugstr_guid( iid ) );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ICompositionGraphicsDevice ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = &impl->ICompositionGraphicsDevice_iface;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI gfx_AddRef( ICompositionGraphicsDevice *iface )
+{
+    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct graphics_device, ICompositionGraphicsDevice_iface )->ref );
+}
+static ULONG WINAPI gfx_Release( ICompositionGraphicsDevice *iface )
+{
+    struct graphics_device *impl = CONTAINING_RECORD( iface, struct graphics_device, ICompositionGraphicsDevice_iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref)
+    {
+        ICompositor_Release( impl->compositor );
+        free( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI gfx_GetIids( ICompositionGraphicsDevice *iface, ULONG *count, IID **iids )
+{
+    *count = 0; *iids = NULL; return S_OK;
+}
+static HRESULT WINAPI gfx_GetRuntimeClassName( ICompositionGraphicsDevice *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_CompositionGraphicsDevice,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_CompositionGraphicsDevice) - 1, name );
+}
+static HRESULT WINAPI gfx_GetTrustLevel( ICompositionGraphicsDevice *iface, TrustLevel *level )
+{
+    *level = BaseTrust; return S_OK;
+}
+static HRESULT WINAPI gfx_CreateDrawingSurface( ICompositionGraphicsDevice *iface, Size pixels,
+                                                DirectXPixelFormat format, DirectXAlphaMode mode,
+                                                ICompositionDrawingSurface **result )
+{
+    ERR( "[DEBUG-surface] CreateDrawingSurface %gx%g format %d mode %d.\n",
+         pixels.Width, pixels.Height, format, mode );
+    if (!result) return E_POINTER;
+    return create_comp_object( "DrawingSurface", (void **)result );
+}
+static HRESULT WINAPI gfx_add_RenderingDeviceReplaced( ICompositionGraphicsDevice *iface,
+        __FITypedEventHandler_2_Windows__CUI__CComposition__CCompositionGraphicsDevice_Windows__CUI__CComposition__CRenderingDeviceReplacedEventArgs *handler,
+        EventRegistrationToken *token )
+{
+    if (token) token->value = 1;
+    return S_OK;
+}
+static HRESULT WINAPI gfx_remove_RenderingDeviceReplaced( ICompositionGraphicsDevice *iface, EventRegistrationToken token )
+{
+    return S_OK;
+}
+
+static const struct ICompositionGraphicsDeviceVtbl graphics_device_vtbl =
+{
+    gfx_QueryInterface, gfx_AddRef, gfx_Release,
+    gfx_GetIids, gfx_GetRuntimeClassName, gfx_GetTrustLevel,
+    gfx_CreateDrawingSurface, gfx_add_RenderingDeviceReplaced, gfx_remove_RenderingDeviceReplaced,
+};
+
+static HRESULT create_graphics_device( ICompositor *compositor, ICompositionGraphicsDevice **out )
+{
+    struct graphics_device *impl;
+    if (!out) return E_POINTER;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->ICompositionGraphicsDevice_iface.lpVtbl = &graphics_device_vtbl;
+    impl->ref = 1;
+    ICompositor_AddRef( (impl->compositor = compositor) );
+    TRACE( "created graphics device %p.\n", impl );
+    *out = &impl->ICompositionGraphicsDevice_iface;
+    return S_OK;
+}
+
+static inline struct compositor *impl_from_ICompositorInterop( ICompositorInterop *iface )
+{
+    return CONTAINING_RECORD( iface, struct compositor, ICompositorInterop_iface );
+}
+
+static HRESULT WINAPI compositor_interop_QueryInterface( ICompositorInterop *iface, REFIID iid, void **out )
+{
+    struct compositor *impl = impl_from_ICompositorInterop( iface );
+    return compositor_QueryInterface( &impl->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI compositor_interop_AddRef( ICompositorInterop *iface )
+{
+    struct compositor *impl = impl_from_ICompositorInterop( iface );
+    return compositor_AddRef( &impl->ICompositor_iface );
+}
+static ULONG WINAPI compositor_interop_Release( ICompositorInterop *iface )
+{
+    struct compositor *impl = impl_from_ICompositorInterop( iface );
+    return compositor_Release( &impl->ICompositor_iface );
+}
+static HRESULT WINAPI compositor_interop_CreateCompositionSurfaceForHandle( ICompositorInterop *iface,
+                                                                            HANDLE handle, ICompositionSurface **result )
+{
+    TRACE( "handle %p.\n", handle );
+    return create_comp_object( "SurfaceForHandle", (void **)result );
+}
+static HRESULT WINAPI compositor_interop_CreateCompositionSurfaceForSwapChain( ICompositorInterop *iface,
+                                                                               IUnknown *swapchain, ICompositionSurface **result )
+{
+    TRACE( "swapchain %p.\n", swapchain );
+    if (!result) return E_POINTER;
+    return create_swapchain_surface( swapchain, (void **)result );
+}
+
+static void CALLBACK swapchain_timer_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD time )
+{
+    if (swapchain_surfaces_dirty() && last_desktop_hwnd)
+    {
+        scene_changed();
+        present_desktop_hwnd( last_desktop_hwnd );
+    }
+}
+
+/* A drawing surface that shows a DXGI composition swap chain's buffer 0; shared by
+ * ICompositorInterop::CreateCompositionSurfaceForSwapChain and IDCompositionVisual::SetContent. */
+static HRESULT create_swapchain_surface( IUnknown *swapchain, void **result )
+{
+    IDXGISwapChain *chain = NULL;
+    DXGI_SWAP_CHAIN_DESC desc;
+    struct drawing_surface *surface;
+    HRESULT hr;
+
+    *result = NULL;
+    if (!swapchain || FAILED( hr = IUnknown_QueryInterface( swapchain, &IID_IDXGISwapChain, (void **)&chain ) ))
+    {
+        WARN( "%p is not a DXGI swap chain.\n", swapchain );
+        return swapchain ? hr : E_INVALIDARG;
+    }
+    if (FAILED( hr = IDXGISwapChain_GetDesc( chain, &desc ) ))
+    {
+        IDXGISwapChain_Release( chain );
+        return hr;
+    }
+    if (FAILED( hr = create_drawing_surface( desc.BufferDesc.Width, desc.BufferDesc.Height, desc.BufferDesc.Format, 0,
+                                             (void **)result ) ))
+    {
+        IDXGISwapChain_Release( chain );
+        return hr;
+    }
+    surface = CONTAINING_RECORD( *result, struct drawing_surface, vtbl );
+    surface->kind = "swapchain surface";
+    surface->swapchain = chain;
+    surface->presented = ~0u;
+    EnterCriticalSection( &swapchain_cs );
+    if ((swapchain_surfaces = realloc( swapchain_surfaces, (swapchain_surface_count + 1) * sizeof(*swapchain_surfaces) )))
+        swapchain_surfaces[swapchain_surface_count++] = surface;
+    LeaveCriticalSection( &swapchain_cs );
+    /* the app presents on its own schedule; XAML commits nothing for that. Wine's composition swap chains
+     * report presents; anything else is polled. */
+    if (!(surface->notified = register_present_notify( surface )))
+        SetTimer( NULL, 0, 33, swapchain_timer_proc );
+    TRACE( "swap chain %p -> surface %p %ux%u.\n", chain, surface, desc.BufferDesc.Width, desc.BufferDesc.Height );
+    return S_OK;
+}
+static HRESULT WINAPI compositor_interop_CreateGraphicsDevice( ICompositorInterop *iface,
+                                                               IUnknown *device, ICompositionGraphicsDevice **result )
+{
+    struct compositor *impl = impl_from_ICompositorInterop( iface );
+    TRACE( "rendering device %p.\n", device );
+    return create_graphics_device( &impl->ICompositor_iface, result );
+}
+
+static const struct ICompositorInteropVtbl compositor_interop_vtbl =
+{
+    compositor_interop_QueryInterface, compositor_interop_AddRef, compositor_interop_Release,
+    compositor_interop_CreateCompositionSurfaceForHandle,
+    compositor_interop_CreateCompositionSurfaceForSwapChain,
+    compositor_interop_CreateGraphicsDevice,
+};
+
+static HRESULT WINAPI islands_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, islands_vtbl );
+    return compositor_QueryInterface( &impl->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI islands_AddRef( void *iface )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, islands_vtbl );
+    return compositor_AddRef( &impl->ICompositor_iface );
+}
+static ULONG WINAPI islands_Release( void *iface )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, islands_vtbl );
+    return compositor_Release( &impl->ICompositor_iface );
+}
+static HRESULT WINAPI islands_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0; *iids = NULL; return S_OK;
+}
+static HRESULT WINAPI islands_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_Compositor,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_Compositor) - 1, name );
+}
+static HRESULT WINAPI islands_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust; return S_OK;
+}
+static HRESULT WINAPI islands_CreateVisualIslandSite( void *iface, void **out )
+{
+    TRACE( "iid %s.\n", debugstr_guid(&IID_IVisualIslandSite_) );
+    /* Must not return a container visual: XAML treats the result as IVisualIslandSite and
+     * calling island-site methods through a container vtbl AVs (see island22). */
+    return create_comp_object( "VisualIslandSite", out );
+}
+static HRESULT WINAPI islands_CreateVisualTreeIsland( void *iface, void **out )
+{
+    TRACE( ".\n" );
+    return create_comp_object( "VisualTreeIsland", out );
+}
+
+static const void *compositor_islands_vtbl[] =
+{
+    islands_QueryInterface, islands_AddRef, islands_Release,
+    islands_GetIids, islands_GetRuntimeClassName, islands_GetTrustLevel,
+    islands_CreateVisualIslandSite, islands_CreateVisualTreeIsland,
+};
+
+static HRESULT WINAPI desktop_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, desktop_vtbl );
+    return compositor_QueryInterface( &impl->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI desktop_AddRef( void *iface )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, desktop_vtbl );
+    return compositor_AddRef( &impl->ICompositor_iface );
+}
+static ULONG WINAPI desktop_Release( void *iface )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, desktop_vtbl );
+    return compositor_Release( &impl->ICompositor_iface );
+}
+static HRESULT WINAPI desktop_CreateDesktopWindowTarget( void *iface, HWND hwnd, BOOL topmost, void **out )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, desktop_vtbl );
+    struct composition_target *target;
+    HRESULT hr;
+
+    TRACE( "hwnd %p topmost %d.\n", hwnd, topmost );
+    if (FAILED(hr = create_target( &impl->ICompositor_iface, (ICompositionTarget **)out ))) return hr;
+    target = impl_from_target( (ICompositionTarget *)*out );
+    target->hwnd = hwnd;
+    last_desktop_hwnd = hwnd;
+    last_desktop_root = NULL;
+    present_desktop_hwnd( hwnd );
+    return S_OK;
+}
+static HRESULT WINAPI desktop_EnsureOnThread( void *iface, DWORD thread_id )
+{
+    TRACE( "thread %lu.\n", thread_id );
+    return S_OK;
+}
+
+static const void *compositor_desktop_vtbl[] =
+{
+    desktop_QueryInterface, desktop_AddRef, desktop_Release,
+    desktop_CreateDesktopWindowTarget, desktop_EnsureOnThread,
+};
+
+/* IInteropCompositorPartner {0e779a72}. Slot layout recovered from dcomp.pdb: RealClose is slot 6
+ * (vtbl+0x30). Named methods beyond QI/AddRef/Release/RealClose are still stubs returning S_OK. */
+static HRESULT WINAPI partner_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, partner_vtbl );
+    return compositor_QueryInterface( &impl->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI partner_AddRef( void *iface )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, partner_vtbl );
+    return compositor_AddRef( &impl->ICompositor_iface );
+}
+static ULONG WINAPI partner_Release( void *iface )
+{
+    struct compositor *impl = CONTAINING_RECORD( iface, struct compositor, partner_vtbl );
+    return compositor_Release( &impl->ICompositor_iface );
+}
+static HRESULT WINAPI partner_ok( void *iface )
+{
+    TRACE( "IInteropCompositorPartner: ignored.\n" );
+    return S_OK;
+}
+static HRESULT WINAPI partner_RealClose( void *iface )
+{
+    TRACE( "RealClose.\n" );
+    return S_OK;
+}
+
+static const void *compositor_partner_vtbl[] =
+{
+    partner_QueryInterface, partner_AddRef, partner_Release,
+    partner_ok, partner_ok, partner_ok,
+    partner_RealClose,
+    partner_ok, partner_ok, partner_ok, partner_ok,
+    partner_ok, partner_ok, partner_ok, partner_ok,
+};
+
+/* the activation factory */
+
+static inline struct compositor *impl_from_IActivationFactory( IActivationFactory *iface )
+{
+    return CONTAINING_RECORD( iface, struct compositor, IActivationFactory_iface );
+}
+
+static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
+{
+    struct compositor *impl = impl_from_IActivationFactory( iface );
+
+    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) ||
+        IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) ||
+        IsEqualGUID( iid, &IID_IActivationFactory ))
+    {
+        IInspectable_AddRef( (*out = &impl->IActivationFactory_iface) );
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_ICompositorInteropFactory_private ))
+    {
+        *out = &compositor_factory_private;
+        return S_OK;
+    }
+
+    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
+static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
+
+static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+
+static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_Compositor,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_Compositor) - 1, name );
+}
+
+static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+
+static HRESULT create_compositor( REFIID iid, void **out )
+{
+    struct compositor *impl;
+    HRESULT hr;
+
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->ICompositor_iface.lpVtbl = &compositor_vtbl;
+    impl->ICompositorInterop_iface.lpVtbl = &compositor_interop_vtbl;
+    impl->ref = 1;
+    last_created_compositor = &impl->ICompositor_iface;
+
+    hr = compositor_QueryInterface( &impl->ICompositor_iface, iid, out );
+    compositor_Release( &impl->ICompositor_iface );
+    return hr;
+}
+
+static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+{
+    TRACE( "iface %p, instance %p.\n", iface, instance );
+    return create_compositor( &IID_IInspectable, (void **)instance );
+}
+
+static const struct IActivationFactoryVtbl factory_vtbl =
+{
+    factory_QueryInterface,
+    factory_AddRef,
+    factory_Release,
+    /* IInspectable methods */
+    factory_GetIids,
+    factory_GetRuntimeClassName,
+    factory_GetTrustLevel,
+    /* IActivationFactory methods */
+    factory_ActivateInstance,
+};
+
+static struct compositor compositor_factory = { { &factory_vtbl } };
+
+static HRESULT WINAPI compositor_factory_private_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return factory_QueryInterface( &compositor_factory.IActivationFactory_iface, iid, out );
+}
+IActivationFactory *compositor_activation_factory = &compositor_factory.IActivationFactory_iface;
+
+/***********************************************************************
+ *      DCompositionCreateTargetForHandle (dcomp.@)
+ *
+ * Ordinal 1038. DCompTreeHost::EnsureDCompDevice GetProcAddress's this from dcomp.dll and
+ * CreateTargetForHandle calls it as (HANDLE, IDCompositionTarget**). A recording target is
+ * enough for XAML to attach a root visual; nothing is presented yet.
+ */
+HRESULT WINAPI DCompositionCreateTargetForHandle( HANDLE handle, void **target )
+{
+    FIXME( "handle %p, target %p: semi-stub.\n", handle, target );
+    return create_comp_object( "TargetForHandle", target );
+}
+
+/***********************************************************************
+ *      DCompositionCreateSurfaceHandle (dcomp.@)
+ *
+ * Named export, ordinal 1023. XAML uses it for swapchain/surface presentation. A closable
+ * handle of our own is enough for callers that only store and CloseHandle it.
+ */
+HRESULT WINAPI DCompositionCreateSurfaceHandle( DWORD access, SECURITY_ATTRIBUTES *sa, HANDLE *handle )
+{
+    FIXME( "access %#lx, sa %p, handle %p: semi-stub.\n", access, sa, handle );
+    if (!handle) return E_INVALIDARG;
+    if (!(*handle = CreateEventW( sa, TRUE, FALSE, NULL ))) return HRESULT_FROM_WIN32( GetLastError() );
+    return S_OK;
+}
+
+
+
+/***********************************************************************
+ *      Windows.UI.Composition.CompositionCapabilities
+ *
+ * WinUI asks the capabilities before it builds an acrylic or backdrop brush; when the class is
+ * missing it throws instead of falling back, which fails the XAML parse. Both interfaces and the
+ * vtable order come from dcomp.dll's CompositionCapabilities::Api. Effects are reported as
+ * unsupported, which is the answer a machine without composition acceleration gives and the one
+ * that makes XAML take its plain-brush path.
+ */
+static const GUID IID_ICompositionCapabilities =
+    { 0x8253353e, 0xb517, 0x48bc, { 0xb1, 0xe8, 0x4b, 0x35, 0x61, 0xa2, 0xe1, 0x81 } };
+static const GUID IID_ICompositionCapabilitiesStatics =
+    { 0xf7b7a86e, 0x6416, 0x49e5, { 0x8d, 0xdf, 0xaf, 0xe9, 0x49, 0xe2, 0x05, 0x62 } };
+
+struct capabilities
+{
+    const void **vtbl;
+    LONG ref;
+};
+
+static struct capabilities capabilities_instance;
+
+static HRESULT WINAPI capabilities_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct capabilities *impl = CONTAINING_RECORD( iface, struct capabilities, vtbl );
+
+    TRACE( "iid %s.\n", debugstr_guid(iid) );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ICompositionCapabilities ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = &impl->vtbl;
+        return S_OK;
+    }
+
+    WARN( "capabilities: no interface %s.\n", debugstr_guid(iid) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI capabilities_AddRef( void *iface )
+{
+    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct capabilities, vtbl )->ref );
+}
+
+static ULONG WINAPI capabilities_Release( void *iface )
+{
+    return InterlockedDecrement( &CONTAINING_RECORD( iface, struct capabilities, vtbl )->ref );
+}
+
+static HRESULT WINAPI capabilities_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+
+static HRESULT WINAPI capabilities_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( L"Windows.UI.Composition.CompositionCapabilities",
+                                ARRAY_SIZE(L"Windows.UI.Composition.CompositionCapabilities") - 1, name );
+}
+
+static HRESULT WINAPI capabilities_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+
+static HRESULT WINAPI capabilities_AreEffectsSupported( void *iface, boolean *value )
+{
+    TRACE( "value %p.\n", value );
+
+    if (!value) return E_POINTER;
+    *value = FALSE;
+    return S_OK;
+}
+
+static HRESULT WINAPI capabilities_AreEffectsFast( void *iface, boolean *value )
+{
+    TRACE( "value %p.\n", value );
+
+    if (!value) return E_POINTER;
+    *value = FALSE;
+    return S_OK;
+}
+
+static HRESULT WINAPI capabilities_add_Changed( void *iface, void *handler, EventRegistrationToken *token )
+{
+    TRACE( "handler %p, token %p: capabilities never change.\n", handler, token );
+
+    if (!token) return E_POINTER;
+    token->value = 0;
+    return S_OK;
+}
+
+static HRESULT WINAPI capabilities_remove_Changed( void *iface, EventRegistrationToken token )
+{
+    TRACE( "token %I64x.\n", token.value );
+    return S_OK;
+}
+
+static const void *capabilities_vtbl[] =
+{
+    capabilities_QueryInterface, capabilities_AddRef, capabilities_Release,
+    capabilities_GetIids, capabilities_GetRuntimeClassName, capabilities_GetTrustLevel,
+    capabilities_AreEffectsSupported, capabilities_AreEffectsFast,
+    capabilities_add_Changed, capabilities_remove_Changed,
+};
+
+static struct capabilities capabilities_instance = { capabilities_vtbl, 1 };
+
+static IActivationFactory capabilities_factory;
+static const void *const *capabilities_statics;
+
+static HRESULT WINAPI capabilities_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
+{
+    TRACE( "iid %s.\n", debugstr_guid(iid) );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
+    {
+        *out = &capabilities_factory;
+        return S_OK;
+    }
+    /* GetForCurrentView is slot 6 of ICompositionCapabilitiesStatics, where IActivationFactory has
+     * ActivateInstance, so the statics need their own vtable */
+    if (IsEqualGUID( iid, &IID_ICompositionCapabilitiesStatics ))
+    {
+        *out = &capabilities_statics;
+        return S_OK;
+    }
+
+    WARN( "capabilities factory: no interface %s.\n", debugstr_guid(iid) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI capabilities_factory_AddRef( IActivationFactory *iface )
+{
+    return 2;
+}
+
+static ULONG WINAPI capabilities_factory_Release( IActivationFactory *iface )
+{
+    return 1;
+}
+
+static HRESULT WINAPI capabilities_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+
+static HRESULT WINAPI capabilities_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
+{
+    return capabilities_GetRuntimeClassName( NULL, name );
+}
+
+static HRESULT WINAPI capabilities_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+
+static HRESULT WINAPI capabilities_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+{
+    /* CompositionCapabilities is statics-only, so this is what Windows returns too; log it
+     * anyway, because a silent E_NOTIMPL is indistinguishable from a missing implementation
+     * when an HRESULT turns up stashed somewhere later. */
+    FIXME( "CompositionCapabilities has no instance activation.\n" );
+    if (instance) *instance = NULL;
+    return E_NOTIMPL;
+}
+
+/* ICompositionCapabilitiesStatics::GetForCurrentView */
+static HRESULT WINAPI capabilities_factory_GetForCurrentView( IActivationFactory *iface, void **value )
+{
+    TRACE( "value %p.\n", value );
+
+    if (!value) return E_POINTER;
+    capabilities_AddRef( &capabilities_instance.vtbl );
+    *value = &capabilities_instance.vtbl;
+    return S_OK;
+}
+
+static const IActivationFactoryVtbl capabilities_factory_vtbl =
+{
+    capabilities_factory_QueryInterface,
+    capabilities_factory_AddRef,
+    capabilities_factory_Release,
+    capabilities_factory_GetIids,
+    capabilities_factory_GetRuntimeClassName,
+    capabilities_factory_GetTrustLevel,
+    capabilities_factory_ActivateInstance,
+};
+
+static IActivationFactory capabilities_factory = { &capabilities_factory_vtbl };
+
+static HRESULT WINAPI capabilities_statics_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return capabilities_factory_QueryInterface( &capabilities_factory, iid, out );
+}
+static ULONG WINAPI capabilities_statics_AddRef( void *iface ) { return 2; }
+static ULONG WINAPI capabilities_statics_Release( void *iface ) { return 1; }
+static HRESULT WINAPI capabilities_statics_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return capabilities_factory_GetIids( &capabilities_factory, count, iids );
+}
+static HRESULT WINAPI capabilities_statics_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return capabilities_factory_GetRuntimeClassName( &capabilities_factory, name );
+}
+static HRESULT WINAPI capabilities_statics_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return capabilities_factory_GetTrustLevel( &capabilities_factory, level );
+}
+static HRESULT WINAPI capabilities_statics_GetForCurrentView( void *iface, void **value )
+{
+    return capabilities_factory_GetForCurrentView( &capabilities_factory, value );
+}
+
+/* ICompositionCapabilitiesStatics */
+static const void *capabilities_statics_vtbl[] =
+{
+    capabilities_statics_QueryInterface, capabilities_statics_AddRef, capabilities_statics_Release,
+    capabilities_statics_GetIids, capabilities_statics_GetRuntimeClassName, capabilities_statics_GetTrustLevel,
+    capabilities_statics_GetForCurrentView,
+};
+
+static const void *const *capabilities_statics = capabilities_statics_vtbl;
+
+IActivationFactory *capabilities_activation_factory = &capabilities_factory;
+
+/* Windows.UI.Composition.CompositionEffectSourceParameter: a named placeholder input for an effect graph. XAML
+ * creates them while building effect brushes. The object only has to carry its name. */
+static const GUID IID_ICompositionEffectSourceParameter_ =
+    { 0x858ab13a, 0x3292, 0x4e4e, { 0xb3, 0xbb, 0x2b, 0x6c, 0x65, 0x44, 0xa6, 0xee } };
+static const GUID IID_ICompositionEffectSourceParameterFactory_ =
+    { 0xb3d9f276, 0xaba3, 0x4724, { 0xac, 0xf3, 0xd0, 0x39, 0x74, 0x64, 0xdb, 0x1c } };
+static const GUID IID_IGraphicsEffectSource_ =
+    { 0x2d8f9ddc, 0x4339, 0x4eb9, { 0x92, 0x16, 0xf9, 0xde, 0xb7, 0x56, 0x58, 0xa2 } };
+
+struct effect_source_parameter
+{
+    const void **parameter_vtbl;    /* ICompositionEffectSourceParameter */
+    const void **source_vtbl;       /* IGraphicsEffectSource */
+    LONG ref;
+    HSTRING name;
+};
+
+static struct effect_source_parameter *effect_source_parameter_from_source( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct effect_source_parameter, source_vtbl );
+}
+
+static struct effect_source_parameter *effect_source_parameter_from_parameter( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct effect_source_parameter, parameter_vtbl );
+}
+
+static HRESULT effect_source_parameter_query( struct effect_source_parameter *impl, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ICompositionEffectSourceParameter_ ))
+        *out = &impl->parameter_vtbl;
+    else if (IsEqualGUID( iid, &IID_IGraphicsEffectSource_ ))
+        *out = &impl->source_vtbl;
+    else
+    {
+        WARN( "CompositionEffectSourceParameter: no interface %s.\n", debugstr_guid( iid ) );
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    InterlockedIncrement( &impl->ref );
+    return S_OK;
+}
+
+static ULONG effect_source_parameter_release( struct effect_source_parameter *impl )
+{
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref)
+    {
+        WindowsDeleteString( impl->name );
+        free( impl );
+    }
+    return ref;
+}
+
+static HRESULT WINAPI esp_parameter_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return effect_source_parameter_query( effect_source_parameter_from_parameter( iface ), iid, out );
+}
+static ULONG WINAPI esp_parameter_AddRef( void *iface )
+{
+    return InterlockedIncrement( &effect_source_parameter_from_parameter( iface )->ref );
+}
+static ULONG WINAPI esp_parameter_Release( void *iface )
+{
+    return effect_source_parameter_release( effect_source_parameter_from_parameter( iface ) );
+}
+static HRESULT WINAPI esp_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    FIXME( "%p, %p, %p stub.\n", iface, count, iids );
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI esp_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionEffectSourceParameter";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI esp_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+static HRESULT WINAPI esp_parameter_get_Name( void *iface, HSTRING *value )
+{
+    struct effect_source_parameter *impl = effect_source_parameter_from_parameter( iface );
+
+    TRACE( "%p, %p.\n", iface, value );
+
+    if (!value) return E_POINTER;
+    return WindowsDuplicateString( impl->name, value );
+}
+
+static const void *esp_parameter_vtbl[] =
+{
+    esp_parameter_QueryInterface, esp_parameter_AddRef, esp_parameter_Release,
+    esp_GetIids, esp_GetRuntimeClassName, esp_GetTrustLevel,
+    esp_parameter_get_Name,
+};
+
+static HRESULT WINAPI esp_source_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return effect_source_parameter_query( effect_source_parameter_from_source( iface ), iid, out );
+}
+static ULONG WINAPI esp_source_AddRef( void *iface )
+{
+    return InterlockedIncrement( &effect_source_parameter_from_source( iface )->ref );
+}
+static ULONG WINAPI esp_source_Release( void *iface )
+{
+    return effect_source_parameter_release( effect_source_parameter_from_source( iface ) );
+}
+
+static const void *esp_source_vtbl[] =
+{
+    esp_source_QueryInterface, esp_source_AddRef, esp_source_Release,
+    esp_GetIids, esp_GetRuntimeClassName, esp_GetTrustLevel,
+};
+
+static IActivationFactory esp_factory;
+static const void *const *esp_factory_iface;
+
+static HRESULT WINAPI esp_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
+{
+    TRACE( "iid %s.\n", debugstr_guid( iid ) );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
+    {
+        *out = &esp_factory;
+        return S_OK;
+    }
+    /* a separate vtable: Create is slot 6 of ICompositionEffectSourceParameterFactory, where
+     * IActivationFactory has ActivateInstance */
+    if (IsEqualGUID( iid, &IID_ICompositionEffectSourceParameterFactory_ ))
+    {
+        *out = &esp_factory_iface;
+        return S_OK;
+    }
+
+    WARN( "CompositionEffectSourceParameter factory: no interface %s.\n", debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI esp_factory_AddRef( IActivationFactory *iface ) { return 2; }
+static ULONG WINAPI esp_factory_Release( IActivationFactory *iface ) { return 1; }
+static HRESULT WINAPI esp_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI esp_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
+{
+    return esp_GetRuntimeClassName( NULL, name );
+}
+static HRESULT WINAPI esp_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+static HRESULT WINAPI esp_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+{
+    /* only constructible with a name, through ICompositionEffectSourceParameterFactory::Create */
+    if (instance) *instance = NULL;
+    return E_NOTIMPL;
+}
+/* ICompositionEffectSourceParameterFactory::Create */
+static HRESULT WINAPI esp_factory_Create( IActivationFactory *iface, HSTRING name, void **value )
+{
+    struct effect_source_parameter *impl;
+    HRESULT hr;
+
+    TRACE( "%s, %p.\n", debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ), value );
+
+    if (!value) return E_POINTER;
+    *value = NULL;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->parameter_vtbl = esp_parameter_vtbl;
+    impl->source_vtbl = esp_source_vtbl;
+    impl->ref = 1;
+    if (FAILED(hr = WindowsDuplicateString( name, &impl->name )))
+    {
+        free( impl );
+        return hr;
+    }
+    *value = &impl->parameter_vtbl;
+    return S_OK;
+}
+
+static const IActivationFactoryVtbl esp_factory_vtbl =
+{
+    esp_factory_QueryInterface,
+    esp_factory_AddRef,
+    esp_factory_Release,
+    esp_factory_GetIids,
+    esp_factory_GetRuntimeClassName,
+    esp_factory_GetTrustLevel,
+    esp_factory_ActivateInstance,
+};
+
+static IActivationFactory esp_factory = { &esp_factory_vtbl };
+
+static HRESULT WINAPI esp_factory_iface_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return esp_factory_QueryInterface( &esp_factory, iid, out );
+}
+static ULONG WINAPI esp_factory_iface_AddRef( void *iface ) { return 2; }
+static ULONG WINAPI esp_factory_iface_Release( void *iface ) { return 1; }
+static HRESULT WINAPI esp_factory_iface_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return esp_factory_GetIids( &esp_factory, count, iids );
+}
+static HRESULT WINAPI esp_factory_iface_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return esp_factory_GetRuntimeClassName( &esp_factory, name );
+}
+static HRESULT WINAPI esp_factory_iface_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return esp_factory_GetTrustLevel( &esp_factory, level );
+}
+static HRESULT WINAPI esp_factory_iface_Create( void *iface, HSTRING name, void **value )
+{
+    return esp_factory_Create( &esp_factory, name, value );
+}
+
+/* ICompositionEffectSourceParameterFactory */
+static const void *esp_factory_iface_vtbl[] =
+{
+    esp_factory_iface_QueryInterface, esp_factory_iface_AddRef, esp_factory_iface_Release,
+    esp_factory_iface_GetIids, esp_factory_iface_GetRuntimeClassName, esp_factory_iface_GetTrustLevel,
+    esp_factory_iface_Create,
+};
+
+static const void *const *esp_factory_iface = esp_factory_iface_vtbl;
+
+IActivationFactory *effect_source_parameter_activation_factory = &esp_factory;
+
+/* Windows.UI.Composition.Effects.SceneLightingEffect: XAML's XamlLight (Calculator's Programmer page
+ * lights its keypad) builds its effect graph with one and gives up with a C++ exception in a
+ * noexcept function (the process aborts) when the class cannot be activated. Effects are not
+ * rendered here, so a recording object that accepts its properties is enough. */
+static HRESULT WINAPI light_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
+    {
+        *out = iface;
+        return S_OK;
+    }
+    WARN( "SceneLightingEffect factory: no interface %s.\n", debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI light_factory_AddRef( IActivationFactory *iface ) { return 2; }
+static ULONG WINAPI light_factory_Release( IActivationFactory *iface ) { return 1; }
+static HRESULT WINAPI light_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI light_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
+{
+    static const WCHAR nameW[] = L"Windows.UI.Composition.Effects.SceneLightingEffect";
+    return WindowsCreateString( nameW, ARRAY_SIZE(nameW) - 1, name );
+}
+static HRESULT WINAPI light_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+static HRESULT WINAPI light_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+{
+    TRACE( "%p.\n", instance );
+    if (!instance) return E_POINTER;
+    return create_comp_object( "SceneLightingEffect", (void **)instance );
+}
+static const IActivationFactoryVtbl light_factory_vtbl =
+{
+    light_factory_QueryInterface,
+    light_factory_AddRef,
+    light_factory_Release,
+    light_factory_GetIids,
+    light_factory_GetRuntimeClassName,
+    light_factory_GetTrustLevel,
+    light_factory_ActivateInstance,
+};
+static IActivationFactory light_factory = { &light_factory_vtbl };
+IActivationFactory *scene_lighting_effect_activation_factory = &light_factory;
+
+/* Windows.UI.Composition.CompositionIsland — XAML RoGetActivationFactory asks for
+ * ICompositionIslandStatics {77fcc60e} (ConnectIsland / DisconnectIsland), not bare
+ * IActivationFactory. */
+static const GUID IID_ICompositionIslandStatics =
+    { 0x77fcc60e, 0x69bd, 0x4d67, { 0x8f, 0xab, 0xe9, 0x78, 0x72, 0x19, 0xb1, 0x84 } };
+
+static HRESULT WINAPI island_factory_QueryInterface( void *iface, REFIID iid, void **out );
+static ULONG WINAPI island_factory_AddRef( void *iface ) { return 2; }
+static ULONG WINAPI island_factory_Release( void *iface ) { return 1; }
+static HRESULT WINAPI island_factory_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0; *iids = NULL; return S_OK;
+}
+static HRESULT WINAPI island_factory_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( L"Windows.UI.Composition.CompositionIsland",
+                                ARRAY_SIZE(L"Windows.UI.Composition.CompositionIsland") - 1, name );
+}
+static HRESULT WINAPI island_factory_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust; return S_OK;
+}
+static HRESULT WINAPI island_factory_ActivateInstance( void *iface, IInspectable **instance )
+{
+    TRACE( ".\n" );
+    return create_comp_object( "CompositionIsland", (void **)instance );
+}
+static HRESULT WINAPI island_statics_ConnectIsland( void *iface, void *site, void *island )
+{
+    TRACE( "site %p island %p.\n", site, island );
+    return S_OK;
+}
+static HRESULT WINAPI island_statics_DisconnectIsland( void *iface, void *site, void *island )
+{
+    TRACE( "site %p island %p.\n", site, island );
+    return S_OK;
+}
+static HRESULT WINAPI island_statics_ConnectIslandAsync( void *iface, void *site, void *island, void **op )
+{
+    TRACE( "site %p island %p.\n", site, island );
+    if (op) return create_comp_object( "ConnectIslandAsync", op );
+    return S_OK;
+}
+static HRESULT WINAPI island_statics_DisconnectIslandAsync( void *iface, void *site, void *island, void **op )
+{
+    TRACE( "site %p island %p.\n", site, island );
+    if (op) return create_comp_object( "DisconnectIslandAsync", op );
+    return S_OK;
+}
+
+/* IActivationFactory and ICompositionIslandStatics are distinct: statics has ConnectIsland at
+ * slot 6 (after IInspectable). Serving ActivateInstance there made ConnectIsland(site, island)
+ * overwrite site->vtbl with a new CompositionIsland (island33 NX). */
+static const void *island_activation_vtbl[] =
+{
+    island_factory_QueryInterface, island_factory_AddRef, island_factory_Release,
+    island_factory_GetIids, island_factory_GetRuntimeClassName, island_factory_GetTrustLevel,
+    island_factory_ActivateInstance,
+};
+
+static const void *island_statics_vtbl[] =
+{
+    island_factory_QueryInterface, island_factory_AddRef, island_factory_Release,
+    island_factory_GetIids, island_factory_GetRuntimeClassName, island_factory_GetTrustLevel,
+    island_statics_ConnectIsland, island_statics_DisconnectIsland,
+    island_statics_ConnectIslandAsync, island_statics_DisconnectIslandAsync,
+};
+
+struct island_factory
+{
+    const void **vtbl;
+};
+
+static struct island_factory island_activation_obj = { island_activation_vtbl };
+static struct island_factory island_statics_obj = { island_statics_vtbl };
+
+static HRESULT WINAPI island_factory_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    TRACE( "iid %s.\n", debugstr_guid(iid) );
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ))
+    {
+        *out = iface;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IActivationFactory ))
+    {
+        *out = &island_activation_obj.vtbl;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_ICompositionIslandStatics ))
+    {
+        *out = &island_statics_obj.vtbl;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+IActivationFactory *composition_island_activation_factory =
+    (IActivationFactory *)&island_activation_obj.vtbl;
+
+static struct effect_brush *effect_brush_from_any( void *brush_iface )
+{
+    if (!brush_iface) return NULL;
+    if (*(void ***)brush_iface == (void **)effect_brush_vtbl)
+        return CONTAINING_RECORD( brush_iface, struct effect_brush, vtbl );
+    if (*(void ***)brush_iface == (void **)effect_brush_iface_vtbl)
+        return CONTAINING_RECORD( brush_iface, struct effect_brush, effect_vtbl );
+    return NULL;
+}
+
+static struct drawing_surface *effect_brush_surface( void *brush_iface )
+{
+    struct effect_brush *brush = effect_brush_from_any( brush_iface );
+    struct drawing_surface *surface;
+    unsigned int i;
+
+    if (!brush) return NULL;
+    for (i = 0; i < brush->source_count; i++)
+        if (brush->sources[i] && (surface = brush_surface( brush->sources[i] ))) return surface;
+    return NULL;
+}
+
+
+/* CompositionNineGridBrush. ICompositionNineGridBrush {f25154e4}, native Api vtable in dcomp.pdb: 6/7 BottomInset,
+ * 8/9 BottomInsetScale, 10/11 IsCenterHollow, 12/13 LeftInset, 14/15 LeftInsetScale, 16/17 RightInset,
+ * 18/19 RightInsetScale, 20/21 Source, 22/23 TopInset, 24/25 TopInsetScale, 26 SetInsets, 27 SetInsetsWithValues,
+ * 28 SetInsetScales, 29 SetInsetScalesWithValues. XAML builds rounded button backgrounds as a MaskBrush whose
+ * mask (and often source) is a nine-grid brush over a small corner texture. */
+static const GUID IID_ICompositionNineGridBrush_local =
+    { 0xf25154e4, 0xbc8c, 0x4be7, { 0xb8, 0x0f, 0x86, 0x85, 0xb8, 0x3c, 0x01, 0x86 } };
+
+struct nine_grid_brush
+{
+    const void **vtbl;          /* generic composition object layout, must stay first */
+    const char *kind;
+    LONG ref;
+    const void **grid_vtbl;     /* ICompositionNineGridBrush */
+    IUnknown *source;
+    FLOAT left, top, right, bottom;
+    FLOAT left_scale, top_scale, right_scale, bottom_scale;
+    boolean hollow;
+};
+
+static void *nine_grid_brush_vtbl[COMP_OBJECT_SLOTS];
+static const void *nine_grid_iface_vtbl[];
+static LONG nine_grid_vtbls_ready;
+
+static struct nine_grid_brush *nine_grid_from( void *iface )
+{
+    if (!iface) return NULL;
+    if (*(void ***)iface == (void **)nine_grid_brush_vtbl) return CONTAINING_RECORD( iface, struct nine_grid_brush, vtbl );
+    if (*(void ***)iface == (void **)nine_grid_iface_vtbl)
+        return CONTAINING_RECORD( iface, struct nine_grid_brush, grid_vtbl );
+    return NULL;
+}
+static HRESULT WINAPI nine_grid_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct nine_grid_brush *brush = nine_grid_from( iface );
+
+    static const GUID IID_ICompositionSurfaceBrush_local =
+        { 0xad016d79, 0x1e4c, 0x4c0d, { 0x9c, 0x29, 0x83, 0x33, 0x8c, 0x87, 0xc1, 0x62 } };
+    static const GUID IID_ICompositionSurfaceBrush2_local =
+        { 0xd27174d5, 0x64f5, 0x4692, { 0x9d, 0xc7, 0x71, 0xb6, 0x1d, 0x7e, 0x58, 0x80 } };
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&brush->vtbl, out );
+    /* WUCBrushManager::GetSurfaceBrush asks every brush for these; a nine-grid brush is not a surface brush. */
+    if (IsEqualGUID( iid, &IID_ICompositionSurfaceBrush_local ) || IsEqualGUID( iid, &IID_ICompositionSurfaceBrush2_local ))
+    {
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    InterlockedIncrement( &brush->ref );
+    *out = IsEqualGUID( iid, &IID_ICompositionNineGridBrush_local ) ? (void *)&brush->grid_vtbl : (void *)&brush->vtbl;
+    return S_OK;
+}
+static ULONG WINAPI nine_grid_AddRef( void *iface )
+{
+    return InterlockedIncrement( &nine_grid_from( iface )->ref );
+}
+static ULONG WINAPI nine_grid_Release( void *iface )
+{
+    struct nine_grid_brush *brush = nine_grid_from( iface );
+    ULONG ref = InterlockedDecrement( &brush->ref );
+
+    if (!ref)
+    {
+        if (brush->source) IUnknown_Release( brush->source );
+        free( brush );
+    }
+    return ref;
+}
+static HRESULT WINAPI nine_grid_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI nine_grid_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionNineGridBrush";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI nine_grid_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+#define NINE_GRID_FLOAT( name, field ) \
+    static HRESULT WINAPI nine_grid_get_##name( void *iface, FLOAT *value ) \
+    { \
+        if (!value) return E_POINTER; \
+        *value = nine_grid_from( iface )->field; \
+        return S_OK; \
+    } \
+    static HRESULT WINAPI nine_grid_put_##name( void *iface, FLOAT value ) \
+    { \
+        nine_grid_from( iface )->field = value; \
+        return S_OK; \
+    }
+NINE_GRID_FLOAT( BottomInset, bottom )
+NINE_GRID_FLOAT( BottomInsetScale, bottom_scale )
+NINE_GRID_FLOAT( LeftInset, left )
+NINE_GRID_FLOAT( LeftInsetScale, left_scale )
+NINE_GRID_FLOAT( RightInset, right )
+NINE_GRID_FLOAT( RightInsetScale, right_scale )
+NINE_GRID_FLOAT( TopInset, top )
+NINE_GRID_FLOAT( TopInsetScale, top_scale )
+static HRESULT WINAPI nine_grid_get_IsCenterHollow( void *iface, boolean *value )
+{
+    if (!value) return E_POINTER;
+    *value = nine_grid_from( iface )->hollow;
+    return S_OK;
+}
+static HRESULT WINAPI nine_grid_put_IsCenterHollow( void *iface, boolean value )
+{
+    scene_changed();
+    nine_grid_from( iface )->hollow = value;
+    return S_OK;
+}
+static HRESULT WINAPI nine_grid_get_Source( void *iface, IUnknown **value )
+{
+    struct nine_grid_brush *brush = nine_grid_from( iface );
+
+    if (!value) return E_POINTER;
+    if ((*value = brush->source)) IUnknown_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI nine_grid_put_Source( void *iface, IUnknown *value )
+{
+    scene_changed();
+    struct nine_grid_brush *brush = nine_grid_from( iface );
+
+    TRACE( "nine-grid brush %p source %p.\n", brush, value );
+    if (value) IUnknown_AddRef( value );
+    if (brush->source) IUnknown_Release( brush->source );
+    brush->source = value;
+    return S_OK;
+}
+static HRESULT WINAPI nine_grid_SetInsets( void *iface, FLOAT inset )
+{
+    scene_changed();
+    struct nine_grid_brush *brush = nine_grid_from( iface );
+    brush->left = brush->top = brush->right = brush->bottom = inset;
+    return S_OK;
+}
+static HRESULT WINAPI nine_grid_SetInsetsWithValues( void *iface, FLOAT left, FLOAT top, FLOAT right, FLOAT bottom )
+{
+    scene_changed();
+    struct nine_grid_brush *brush = nine_grid_from( iface );
+
+    TRACE( "nine-grid brush %p insets %g,%g,%g,%g.\n", brush, left, top, right, bottom );
+    brush->left = left;
+    brush->top = top;
+    brush->right = right;
+    brush->bottom = bottom;
+    return S_OK;
+}
+static HRESULT WINAPI nine_grid_SetInsetScales( void *iface, FLOAT scale )
+{
+    scene_changed();
+    struct nine_grid_brush *brush = nine_grid_from( iface );
+    brush->left_scale = brush->top_scale = brush->right_scale = brush->bottom_scale = scale;
+    return S_OK;
+}
+static HRESULT WINAPI nine_grid_SetInsetScalesWithValues( void *iface, FLOAT left, FLOAT top, FLOAT right, FLOAT bottom )
+{
+    scene_changed();
+    struct nine_grid_brush *brush = nine_grid_from( iface );
+    brush->left_scale = left;
+    brush->top_scale = top;
+    brush->right_scale = right;
+    brush->bottom_scale = bottom;
+    return S_OK;
+}
+
+static const void *nine_grid_iface_vtbl[] =
+{
+    nine_grid_QueryInterface, nine_grid_AddRef, nine_grid_Release,
+    nine_grid_GetIids, nine_grid_GetRuntimeClassName, nine_grid_GetTrustLevel,
+    nine_grid_get_BottomInset, nine_grid_put_BottomInset, nine_grid_get_BottomInsetScale, nine_grid_put_BottomInsetScale,
+    nine_grid_get_IsCenterHollow, nine_grid_put_IsCenterHollow,
+    nine_grid_get_LeftInset, nine_grid_put_LeftInset, nine_grid_get_LeftInsetScale, nine_grid_put_LeftInsetScale,
+    nine_grid_get_RightInset, nine_grid_put_RightInset, nine_grid_get_RightInsetScale, nine_grid_put_RightInsetScale,
+    nine_grid_get_Source, nine_grid_put_Source,
+    nine_grid_get_TopInset, nine_grid_put_TopInset, nine_grid_get_TopInsetScale, nine_grid_put_TopInsetScale,
+    nine_grid_SetInsets, nine_grid_SetInsetsWithValues, nine_grid_SetInsetScales, nine_grid_SetInsetScalesWithValues,
+};
+
+static HRESULT create_nine_grid_brush( void **out )
+{
+    struct nine_grid_brush *brush;
+    unsigned int i;
+
+    if (!out) return E_POINTER;
+    if (!nine_grid_vtbls_ready)
+    {
+        nine_grid_brush_vtbl[1] = nine_grid_AddRef;
+        nine_grid_brush_vtbl[2] = nine_grid_Release;
+        for (i = 3; i < COMP_OBJECT_SLOTS; i++) nine_grid_brush_vtbl[i] = comp_object_slot_fn( i );
+        comp_object_set_inspectable( nine_grid_brush_vtbl );
+        nine_grid_brush_vtbl[0] = nine_grid_QueryInterface;
+        InterlockedExchange( &nine_grid_vtbls_ready, 1 );
+    }
+    if (!(brush = calloc( 1, sizeof(*brush) ))) return E_OUTOFMEMORY;
+    brush->vtbl = (const void **)nine_grid_brush_vtbl;
+    brush->kind = "NineGridBrush";
+    brush->ref = 1;
+    brush->grid_vtbl = nine_grid_iface_vtbl;
+    brush->left_scale = brush->top_scale = brush->right_scale = brush->bottom_scale = 1.0f;
+    TRACE( "created NineGridBrush %p.\n", brush );
+    /* ICompositor2::CreateNineGridBrush returns ICompositionNineGridBrush. */
+    *out = &brush->grid_vtbl;
+    return S_OK;
+}
+
+/* Map a destination coordinate to the source for one nine-grid axis. */
+static unsigned int nine_grid_map( unsigned int d, unsigned int dst, unsigned int src, float lo, float hi )
+{
+    float dlo = lo, dhi = hi, s;
+
+    if (dlo + dhi > dst) { dlo = dst * lo / (lo + hi); dhi = dst - dlo; }
+    if (d < dlo) s = d;
+    else if (d >= dst - dhi) s = src - (dst - d);
+    else s = lo + (d - dlo) * (src - lo - hi) / (dst - dlo - dhi > 0 ? dst - dlo - dhi : 1);
+    if (s < 0) s = 0;
+    if (s > src - 1) s = src - 1;
+    return (unsigned int)s;
+}
+
+/* CompositionMaskBrush: ICompositionMaskBrush {522cf09e} is 6 get_Mask, 7 put_Mask, 8 get_Source,
+ * 9 put_Source. XAML draws text and glyph icons as an A8 mask surface combined with a colour source.
+ * Answers ICompositionMaskBrush with its own vtable and ICompositionObject with a view, so neither
+ * collides with the generic recording slots. */
+static const GUID IID_ICompositionMaskBrush_local =
+    { 0x522cf09e, 0xbe6b, 0x4f41, { 0xbe, 0x49, 0xf9, 0x22, 0x6d, 0x47, 0x1b, 0x4a } };
+
+struct mask_brush
+{
+    const void **vtbl;          /* generic composition object layout, must stay first */
+    const char *kind;
+    LONG ref;
+    const void **mask_vtbl;     /* ICompositionMaskBrush */
+    IUnknown *mask;
+    IUnknown *source;
+    /* the composed (mask x colour/source) bitmap, kept until any input changes: XAML paints every
+     * glyph run and button fill through one of these, and recomposing them all each frame was most
+     * of the frame time */
+    HBITMAP cache_bmp;
+    BYTE *cache_bits;
+    unsigned int cache_w, cache_h;
+    const void *cache_mask_surface, *cache_source_surface;
+    ULONG cache_mask_gen, cache_source_gen;
+    BOOL cache_have_color;
+    Color cache_color;
+    FLOAT cache_grid[8];
+    ULONG cache_serial;         /* content generation of cache_bits */
+};
+
+static void *mask_brush_vtbl[COMP_OBJECT_SLOTS];
+static const void *mask_brush_iface_vtbl[];
+static LONG mask_vtbls_ready;
+
+static struct mask_brush *mask_brush_from( void *iface )
+{
+    if (!iface) return NULL;
+    if (*(void ***)iface == (void **)mask_brush_vtbl) return CONTAINING_RECORD( iface, struct mask_brush, vtbl );
+    if (*(void ***)iface == (void **)mask_brush_iface_vtbl)
+        return CONTAINING_RECORD( iface, struct mask_brush, mask_vtbl );
+    return NULL;
+}
+
+static HRESULT WINAPI mask_brush_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct mask_brush *brush = mask_brush_from( iface );
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+
+    TRACE( "mask brush %p, iid %s.\n", brush, debugstr_guid( iid ) );
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&brush->vtbl, out );
+    InterlockedIncrement( &brush->ref );
+    *out = IsEqualGUID( iid, &IID_ICompositionMaskBrush_local ) ? (void *)&brush->mask_vtbl : (void *)&brush->vtbl;
+    return S_OK;
+}
+static ULONG WINAPI mask_brush_AddRef( void *iface )
+{
+    return InterlockedIncrement( &mask_brush_from( iface )->ref );
+}
+static ULONG WINAPI mask_brush_Release( void *iface )
+{
+    struct mask_brush *brush = mask_brush_from( iface );
+    ULONG ref = InterlockedDecrement( &brush->ref );
+
+    if (!ref)
+    {
+        if (brush->mask) IUnknown_Release( brush->mask );
+        if (brush->source) IUnknown_Release( brush->source );
+        if (brush->cache_bmp) DeleteObject( brush->cache_bmp );
+        free( brush );
+    }
+    return ref;
+}
+static HRESULT WINAPI mask_brush_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI mask_brush_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionMaskBrush";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI mask_brush_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT mask_brush_get( IUnknown *value, void **out )
+{
+    if (!out) return E_POINTER;
+    if ((*out = value)) IUnknown_AddRef( value );
+    return S_OK;
+}
+static void mask_brush_set( IUnknown **field, IUnknown *value )
+{
+    if (value) IUnknown_AddRef( value );
+    if (*field) IUnknown_Release( *field );
+    *field = value;
+}
+static HRESULT WINAPI mask_brush_get_Mask( void *iface, void **value )
+{
+    return mask_brush_get( mask_brush_from( iface )->mask, value );
+}
+static HRESULT WINAPI mask_brush_put_Mask( void *iface, IUnknown *value )
+{
+    scene_changed();
+    TRACE( "mask brush %p mask %p.\n", mask_brush_from( iface ), value );
+    mask_brush_set( &mask_brush_from( iface )->mask, value );
+    return S_OK;
+}
+static HRESULT WINAPI mask_brush_get_Source( void *iface, void **value )
+{
+    return mask_brush_get( mask_brush_from( iface )->source, value );
+}
+static HRESULT WINAPI mask_brush_put_Source( void *iface, IUnknown *value )
+{
+    scene_changed();
+    TRACE( "mask brush %p source %p.\n", mask_brush_from( iface ), value );
+    mask_brush_set( &mask_brush_from( iface )->source, value );
+    return S_OK;
+}
+
+static const void *mask_brush_iface_vtbl[] =
+{
+    mask_brush_QueryInterface, mask_brush_AddRef, mask_brush_Release,
+    mask_brush_GetIids, mask_brush_GetRuntimeClassName, mask_brush_GetTrustLevel,
+    mask_brush_get_Mask, mask_brush_put_Mask, mask_brush_get_Source, mask_brush_put_Source,
+};
+
+static HRESULT create_mask_brush( void **out )
+{
+    struct mask_brush *brush;
+    unsigned int i;
+
+    if (!out) return E_POINTER;
+    if (!mask_vtbls_ready)
+    {
+        mask_brush_vtbl[1] = mask_brush_AddRef;
+        mask_brush_vtbl[2] = mask_brush_Release;
+        for (i = 3; i < COMP_OBJECT_SLOTS; i++) mask_brush_vtbl[i] = comp_object_slot_fn( i );
+        comp_object_set_inspectable( mask_brush_vtbl );
+        mask_brush_vtbl[0] = mask_brush_QueryInterface;
+        InterlockedExchange( &mask_vtbls_ready, 1 );
+    }
+    if (!(brush = calloc( 1, sizeof(*brush) ))) return E_OUTOFMEMORY;
+    brush->vtbl = (const void **)mask_brush_vtbl;
+    brush->kind = "MaskBrush";
+    brush->ref = 1;
+    brush->mask_vtbl = mask_brush_iface_vtbl;
+    TRACE( "created MaskBrush %p.\n", brush );
+    /* ICompositor2::CreateMaskBrush returns ICompositionMaskBrush; XAML calls put_Mask/put_Source on it directly. */
+    *out = &brush->mask_vtbl;
+    return S_OK;
+}
+
+/* Read a surface texture into memory: BGRA or A8, top-down, tightly packed. */
+static BYTE *read_surface_pixels( struct drawing_surface *surface, D3D11_TEXTURE2D_DESC *desc )
+{
+    const BYTE *cached = surface_cached_pixels( surface, desc );
+    size_t size;
+    BYTE *pixels;
+
+    if (!cached) return NULL;
+    size = (size_t)desc->Width * desc->Height * (desc->Format == DXGI_FORMAT_A8_UNORM ? 1 : 4);
+    if (!(pixels = malloc( size ))) return NULL;
+    memcpy( pixels, cached, size );
+    return pixels;
+}
+
+/* Composite a mask brush onto the DC: the mask's alpha (A8, or the alpha channel of a BGRA surface)
+ * scales the source, which is a colour brush or a surface. */
+static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int width, int height, float opacity )
+{
+    struct mask_brush *brush = mask_brush_from( brush_iface );
+    struct drawing_surface *mask_surface, *source_surface = NULL;
+    struct nine_grid_brush *grid;
+    D3D11_TEXTURE2D_DESC mask_desc, source_desc = { 0 };
+    const BYTE *mask, *source = NULL;
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    unsigned int w, h;
+    BOOL have_color, done = FALSE, same;
+    FLOAT grid_key[8] = { 0 };
+    HBITMAP old;
+    Color color = { 0 };
+    HDC mem;
+
+    if (!brush) return FALSE;
+    if (!brush->mask)
+    {
+        TRACE( "mask brush %p: no mask.\n", brush );
+        return FALSE;
+    }
+    grid = nine_grid_from( brush->mask );
+    if (!(mask_surface = brush_surface( grid ? grid->source : brush->mask )))
+    {
+        TRACE( "mask brush %p: mask %p is not a surface brush with a texture (vtbl %p).\n", brush, brush->mask,
+               *(void **)brush->mask );
+        return FALSE;
+    }
+    {
+        struct nine_grid_brush *source_grid = nine_grid_from( brush->source );
+        IUnknown *src = source_grid ? source_grid->source : brush->source;
+
+        have_color = src && brush_solid_color( (ICompositionBrush *)src, &color );
+        if (!have_color && src) source_surface = brush_surface( src );
+    }
+    if (!have_color && !source_surface)
+    {
+        TRACE( "mask brush %p: source %p is neither a colour nor a surface brush (vtbl %p).\n", brush,
+               brush->source, brush->source ? *(void **)brush->source : NULL );
+        return FALSE;
+    }
+
+    if (!(mask = surface_cached_pixels( mask_surface, &mask_desc )))
+    {
+        TRACE( "mask brush %p: mask surface %p unreadable (format?).\n", brush, mask_surface );
+        return FALSE;
+    }
+    if (source_surface && !(source = surface_cached_pixels( source_surface, &source_desc ))) return FALSE;
+
+    w = grid && width > 0 ? (unsigned int)width : mask_desc.Width;
+    h = grid && height > 0 ? (unsigned int)height : mask_desc.Height;
+    if (grid)
+    {
+        grid_key[0] = grid->left; grid_key[1] = grid->right; grid_key[2] = grid->top; grid_key[3] = grid->bottom;
+        grid_key[4] = grid->left_scale; grid_key[5] = grid->right_scale; grid_key[6] = grid->top_scale; grid_key[7] = grid->bottom_scale;
+    }
+    same = brush->cache_bmp && brush->cache_w == w && brush->cache_h == h &&
+           brush->cache_mask_surface == mask_surface && brush->cache_mask_gen == mask_surface->generation &&
+           brush->cache_source_surface == source_surface &&
+           (!source_surface || brush->cache_source_gen == source_surface->generation) &&
+           brush->cache_have_color == have_color && (!have_color || !memcmp( &brush->cache_color, &color, sizeof(color) )) &&
+           !memcmp( brush->cache_grid, grid_key, sizeof(grid_key) );
+    if (!same)
+    {
+        BITMAPINFO info = { { 0 } };
+        unsigned int px, py;
+        BYTE *bgra;
+        void *bits;
+
+        if (brush->cache_bmp) DeleteObject( brush->cache_bmp );
+        brush->cache_bmp = NULL;
+        info.bmiHeader.biSize = sizeof(info.bmiHeader);
+        info.bmiHeader.biWidth = w;
+        info.bmiHeader.biHeight = -(LONG)h;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        if (!(brush->cache_bmp = CreateDIBSection( NULL, &info, DIB_RGB_COLORS, &bits, NULL, 0 ))) return FALSE;
+        brush->cache_bits = bgra = bits;
+        for (py = 0; py < h; py++)
+        {
+            for (px = 0; px < w; px++)
+            {
+                unsigned int mx = grid ? nine_grid_map( px, w, mask_desc.Width, grid->left * grid->left_scale,
+                                                        grid->right * grid->right_scale ) : px;
+                unsigned int my = grid ? nine_grid_map( py, h, mask_desc.Height, grid->top * grid->top_scale,
+                                                        grid->bottom * grid->bottom_scale ) : py;
+                unsigned int a = mask_desc.Format == DXGI_FORMAT_A8_UNORM ? mask[my * mask_desc.Width + mx]
+                                                                          : mask[(my * mask_desc.Width + mx) * 4 + 3];
+                BYTE *out = bgra + (py * w + px) * 4;
+
+                if (have_color)
+                {
+                    a = a * color.A / 255;
+                    out[0] = color.B * a / 255;
+                    out[1] = color.G * a / 255;
+                    out[2] = color.R * a / 255;
+                    out[3] = a;
+                }
+                else if (px < source_desc.Width && py < source_desc.Height)
+                {
+                    /* source surfaces hold premultiplied BGRA */
+                    const BYTE *in = source + ((size_t)py * source_desc.Width + px) * 4;
+                    out[0] = in[0] * a / 255;
+                    out[1] = in[1] * a / 255;
+                    out[2] = in[2] * a / 255;
+                    out[3] = in[3] * a / 255;
+                }
+                else memset( out, 0, 4 );
+            }
+        }
+        if (TRACE_ON(dcomp))
+        {
+            unsigned int n = 0, i;
+            for (i = 0; i < w * h; i++) if (((const BYTE *)brush->cache_bits)[i * 4 + 3]) n++;
+            TRACE( "mask brush %p: %ux%u composed, %u of %u pixels visible (mask gen %u).\n", brush, w, h, n, w * h,
+                   mask_surface->generation );
+        }
+        brush->cache_w = w; brush->cache_h = h;
+        brush->cache_mask_surface = mask_surface; brush->cache_mask_gen = mask_surface->generation;
+        brush->cache_source_surface = source_surface; brush->cache_source_gen = source_surface ? source_surface->generation : 0;
+        brush->cache_have_color = have_color; brush->cache_color = color;
+        memcpy( brush->cache_grid, grid_key, sizeof(grid_key) );
+        brush->cache_serial = InterlockedIncrement( &content_generation );
+    }
+    /* The visual's opacity scales the whole brush: XAML draws its keypad button fills as opaque white masks
+     * on sprites with an opacity of about 0.09. */
+    if (opacity < 0.0f) opacity = 0.0f;
+    if (opacity > 1.0f) opacity = 1.0f;
+    blend.SourceConstantAlpha = (BYTE)(opacity * 255.0f + 0.5f);
+    {
+        int dest_w = grid ? (int)w : (width > 0 ? width : (int)w), dest_h = grid ? (int)h : (height > 0 ? height : (int)h);
+        if (dest_w == (int)w && dest_h == (int)h &&
+            soft_blend( hdc, x, y, w, h, brush->cache_bits, w * 4, blend.SourceConstantAlpha, brush, brush->cache_serial ))
+        {
+            TRACE( "mask brush %p: %ux%u mask blended directly%s.\n", brush, w, h, same ? " (cached)" : "" );
+            return TRUE;
+        }
+        soft_stretch( x, y, dest_w, dest_h, brush->cache_bmp, w, h, blend.SourceConstantAlpha, brush, brush->cache_serial );
+        done = TRUE;
+        (void)mem; (void)old;
+    }
+    TRACE( "mask brush %p: %ux%u mask, %s source -> %d%s.\n", brush, w, h, have_color ? "colour" : "surface", done,
+           same ? " (cached)" : "" );
+    return done;
+}
+
+/* ICompositor2 ({735081dc-...}). Slots from CompositorCommon's ICompositor2 vtable in dcomp.pdb:
+ * 6 CreateAmbientLight, 7 CreateAnimationGroup, 8 CreateBackdropBrush, 9 CreateDistantLight, 10 CreateDropShadow,
+ * 11 CreateImplicitAnimationCollection, 12 CreateLayerVisual, 13 CreateMaskBrush, 14 CreateNineGridBrush,
+ * 15 CreatePointLight, 16 CreateSpotLight, 17 CreateStepEasingFunction, 18 CreateStepEasingFunctionWithStepCount.
+ * WinUI calls CreateImplicitAnimationCollection while setting up its animations. Nothing here is rendered yet:
+ * the creators return recording objects, except CreateLayerVisual, which gives a real container visual because
+ * it can end up in the visual tree. */
+static struct compositor *impl_from_compositor2( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct compositor, compositor2_vtbl );
+}
+static HRESULT WINAPI compositor2_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return compositor_QueryInterface( &impl_from_compositor2( iface )->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI compositor2_AddRef( void *iface )
+{
+    return compositor_AddRef( &impl_from_compositor2( iface )->ICompositor_iface );
+}
+static ULONG WINAPI compositor2_Release( void *iface )
+{
+    return compositor_Release( &impl_from_compositor2( iface )->ICompositor_iface );
+}
+static HRESULT WINAPI compositor2_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI compositor2_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_UI_Composition_Compositor,
+                                ARRAY_SIZE(RuntimeClass_Windows_UI_Composition_Compositor) - 1, name );
+}
+static HRESULT WINAPI compositor2_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+
+#define COMPOSITOR2_RECORDING( name, kind )                                                        \
+    static HRESULT WINAPI compositor2_##name( void *iface, void **result )                         \
+    {                                                                                              \
+        TRACE( "iface %p.\n", iface );                                                            \
+        if (!result) return E_POINTER;                                                             \
+        return create_comp_object( kind, result );                                                 \
+    }
+
+COMPOSITOR2_RECORDING( CreateAmbientLight, "AmbientLight" )
+COMPOSITOR2_RECORDING( CreateAnimationGroup, "CompositionAnimationGroup" )
+COMPOSITOR2_RECORDING( CreateBackdropBrush, "BackdropBrush" )
+COMPOSITOR2_RECORDING( CreateDistantLight, "DistantLight" )
+static HRESULT WINAPI compositor2_CreateDropShadow( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    return create_drop_shadow( result );
+}
+COMPOSITOR2_RECORDING( CreateImplicitAnimationCollection, "ImplicitAnimationCollection" )
+static HRESULT WINAPI compositor2_CreateMaskBrush( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    return create_mask_brush( result );
+}
+static HRESULT WINAPI compositor2_CreateNineGridBrush( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    return create_nine_grid_brush( result );
+}
+COMPOSITOR2_RECORDING( CreatePointLight, "PointLight" )
+COMPOSITOR2_RECORDING( CreateSpotLight, "SpotLight" )
+COMPOSITOR2_RECORDING( CreateStepEasingFunction, "StepEasingFunction" )
+
+static HRESULT WINAPI compositor2_CreateLayerVisual( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_visual( &impl_from_compositor2( iface )->ICompositor_iface, VISUAL_CONTAINER, result );
+}
+
+static HRESULT WINAPI compositor2_CreateStepEasingFunctionWithStepCount( void *iface, INT32 count, void **result )
+{
+    TRACE( "iface %p, count %d.\n", iface, count );
+    if (!result) return E_POINTER;
+    return create_comp_object( "StepEasingFunction", result );
+}
+
+static struct compositor *impl_from_compositor3( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct compositor, compositor3_vtbl );
+}
+static HRESULT WINAPI compositor3_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return compositor_QueryInterface( &impl_from_compositor3( iface )->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI compositor3_AddRef( void *iface )
+{
+    return compositor_AddRef( &impl_from_compositor3( iface )->ICompositor_iface );
+}
+static ULONG WINAPI compositor3_Release( void *iface )
+{
+    return compositor_Release( &impl_from_compositor3( iface )->ICompositor_iface );
+}
+static HRESULT WINAPI compositor3_CreateHostBackdropBrush( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_comp_object( "BackdropBrush", result );
+}
+static const void *compositor3_vtbl[] =
+{
+    compositor3_QueryInterface, compositor3_AddRef, compositor3_Release,
+    compositor2_GetIids, compositor2_GetRuntimeClassName, compositor2_GetTrustLevel,
+    compositor3_CreateHostBackdropBrush,
+};
+
+static const void *compositor2_vtbl[] =
+{
+    compositor2_QueryInterface, compositor2_AddRef, compositor2_Release,
+    compositor2_GetIids, compositor2_GetRuntimeClassName, compositor2_GetTrustLevel,
+    compositor2_CreateAmbientLight,
+    compositor2_CreateAnimationGroup,
+    compositor2_CreateBackdropBrush,
+    compositor2_CreateDistantLight,
+    compositor2_CreateDropShadow,
+    compositor2_CreateImplicitAnimationCollection,
+    compositor2_CreateLayerVisual,
+    compositor2_CreateMaskBrush,
+    compositor2_CreateNineGridBrush,
+    compositor2_CreatePointLight,
+    compositor2_CreateSpotLight,
+    compositor2_CreateStepEasingFunction,
+    compositor2_CreateStepEasingFunctionWithStepCount,
+};
+
+
+static struct composition_object_view *impl_from_object_view( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct composition_object_view, vtbl );
+}
+static HRESULT WINAPI object_view_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct composition_object_view *view = impl_from_object_view( iface );
+
+    if (IsEqualGUID( iid, &IID_ICompositionObject ) || IsEqualGUID( iid, &IID_IAgileObject ))
+    {
+        InterlockedIncrement( &view->ref );
+        *out = &view->vtbl;
+        return S_OK;
+    }
+    return IUnknown_QueryInterface( view->owner, iid, out );
+}
+static ULONG WINAPI object_view_AddRef( void *iface )
+{
+    return InterlockedIncrement( &impl_from_object_view( iface )->ref );
+}
+static ULONG WINAPI object_view_Release( void *iface )
+{
+    struct composition_object_view *view = impl_from_object_view( iface );
+    ULONG ref = InterlockedDecrement( &view->ref );
+
+    if (!ref)
+    {
+        if (view->properties) ICompositionPropertySet_Release( view->properties );
+        IUnknown_Release( view->owner );
+        free( view );
+    }
+    return ref;
+}
+static HRESULT WINAPI object_view_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI object_view_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionObject";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI object_view_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+/* ICompositionObject::get_Compositor */
+static HRESULT WINAPI object_view_get_Compositor( void *iface, ICompositor **value )
+{
+    TRACE( "%p -> compositor %p.\n", iface, last_created_compositor );
+    if (!value) return E_POINTER;
+    if ((*value = last_created_compositor)) ICompositor_AddRef( *value );
+    return S_OK;
+}
+/* ICompositionObject::get_Dispatcher */
+static HRESULT WINAPI object_view_get_Dispatcher( void *iface, void **value )
+{
+    if (!value) return E_POINTER;
+    *value = NULL;
+    return S_OK;
+}
+/* ICompositionObject::get_Properties */
+static HRESULT WINAPI object_view_get_Properties( void *iface, ICompositionPropertySet **value )
+{
+    struct composition_object_view *view = impl_from_object_view( iface );
+    ICompositionPropertySet *set;
+    HRESULT hr;
+
+    if (!value) return E_POINTER;
+    /* XAML's expression conversion walks an expression's Properties into a private partner interface
+     * ({83112a11}) and fail-fasts when a real property set refuses it; a recording object answers. */
+    /* An expression's Properties are a real property set shared by every view: XAML's RenderTransform
+     * expressions read PS.X, PS.CenterX ... from it (a Pivot places its items panel 160000 px into its
+     * scroll extent that way). The partner interface XAML walks it into answers with a recording object. */
+    if (view->owner && *(void ***)view->owner == (void **)expr_animation_vtbl)
+    {
+        struct expr_animation *expr = CONTAINING_RECORD( view->owner, struct expr_animation, vtbl );
+        if (!expr->properties)
+        {
+            if (FAILED(hr = create_property_set( &set ))) return hr;
+            if (InterlockedCompareExchangePointer( (void **)&expr->properties, set, NULL ))
+                ICompositionPropertySet_Release( set );
+        }
+        ICompositionPropertySet_AddRef( (*value = expr->properties) );
+        return S_OK;
+    }
+    if (!view->properties)
+    {
+        if (FAILED(hr = create_property_set( &set ))) return hr;
+        if (InterlockedCompareExchangePointer( (void **)&view->properties, set, NULL ))
+            ICompositionPropertySet_Release( set );
+    }
+    ICompositionPropertySet_AddRef( (*value = view->properties) );
+    return S_OK;
+}
+/* ICompositionObject::StartAnimation / StopAnimation: accepted, not run */
+static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, void *animation )
+{
+    scene_changed();
+    struct composition_object_view *view = impl_from_object_view( iface );
+    TRACE( "%p, %s, %p.\n", iface, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ), animation );
+    TRACE_(dcompanim)( "object %p (owner %p) %s <- %s\n", view, view->owner, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ),
+                       debugstr_animation( animation ) );
+    /* A property set animated from a manipulation transform passes the link on to whatever
+     * expression references the property set later. */
+    {   /* a shape's animation is remembered; a controller's "Progress" expression drives it */
+        struct comp_shape *shape = view->owner ? comp_shape_from_any( (IInspectable *)view->owner ) : NULL;
+        struct anim_controller *ctrl = anim_controller_from_any( view->owner );
+        struct kf_animation *kf = kf_animation_from( animation );
+        struct expr_animation *expr = expr_animation_from_any( animation );
+        const WCHAR *prop = WindowsGetStringRawBuffer( name, NULL );
+        if (shape && kf && prop)
+        {
+            anim_bind( shape->bindings, &shape->binding_count, prop, kf );
+            TRACE( "shape %p: %s bound to %p.\n", shape, debugstr_w( prop ), kf );
+        }
+        else if (!shape && !ctrl && kf && prop)
+            TRACE( "owner %p (%s): %s key-frame animation not bound.\n", view->owner,
+                   view->owner && *(void ***)view->owner == (void **)kf_animation_vtbl ? "kf" : "?", debugstr_w( prop ) );
+        if (ctrl && prop && !wcsicmp( prop, L"Progress" ) && expr)
+        {
+            IUnknown_AddRef( (IUnknown *)&expr->vtbl );
+            if (ctrl->progress_expr) IUnknown_Release( (IUnknown *)&ctrl->progress_expr->vtbl );
+            ctrl->progress_expr = expr;
+            TRACE( "controller %p progress follows %s.\n", ctrl, debugstr_w( expr->expression ) );
+        }
+        if (ctrl && prop && !wcsicmp( prop, L"Progress" ) && kf && kf->has_value && kf->value_kind == KF_SCALAR)
+        {
+            ctrl->progress = kf->scalar;
+            ctrl->has_progress = TRUE;
+        }
+    }
+    if (view->owner && *(void ***)view->owner == (void **)&propset_vtbl)
+    {
+        struct property_set *set = CONTAINING_RECORD( view->owner, struct property_set, ICompositionPropertySet_iface );
+        struct kf_animation *pkf = kf_animation_from( animation );
+        const WCHAR *pprop = WindowsGetStringRawBuffer( name, NULL );
+        /* a scalar key-frame animation on a property (an AnimatedIcon's "Progress" to a new state) settles
+         * at its end value */
+        if (pkf && pkf->has_value && pkf->value_kind == KF_SCALAR && pprop)
+        {
+            HSTRING h;
+            struct propset_value *pv;
+            TRACE( "set %p %s settles at %g (%u keys).\n", set, debugstr_w( pprop ), pkf->scalar, pkf->key_count );
+            if (SUCCEEDED( WindowsCreateString( pprop, lstrlenW( pprop ), &h ) ))
+            {
+                if ((pv = propset_find( set, h, TRUE ))) { pv->type = PROP_SCALAR; pv->u.scalar = pkf->scalar; }
+                WindowsDeleteString( h );
+            }
+        }
+        struct matrix_transform *m = manip_matrix_from_animation( animation );
+        struct expr_animation *expr = expr_animation_from_any( animation );
+        const WCHAR *prop = WindowsGetStringRawBuffer( name, NULL );
+        if (m) set->manip = m;
+        if (expr && prop)
+        {
+            unsigned int i;
+            for (i = 0; i < set->binding_count; i++) if (!wcsicmp( set->bindings[i].name, prop )) break;
+            if (i == set->binding_count && i < PROPSET_BINDINGS) set->binding_count++;
+            if (i < PROPSET_BINDINGS)
+            {
+                IUnknown_AddRef( (IUnknown *)&expr->vtbl );
+                if (set->bindings[i].expr) IUnknown_Release( (IUnknown *)&set->bindings[i].expr->vtbl );
+                set->bindings[i].expr = expr;
+                lstrcpynW( set->bindings[i].name, prop, ARRAY_SIZE(set->bindings[i].name) );
+            }
+        }
+    }
+    return S_OK;
+}
+static HRESULT WINAPI object_view_StopAnimation( void *iface, HSTRING name )
+{
+    scene_changed();
+    return S_OK;
+}
+
+static const void *object_view_vtbl[] =
+{
+    object_view_QueryInterface, object_view_AddRef, object_view_Release,
+    object_view_GetIids, object_view_GetRuntimeClassName, object_view_GetTrustLevel,
+    object_view_get_Compositor, object_view_get_Dispatcher, object_view_get_Properties,
+    object_view_StartAnimation, object_view_StopAnimation,
+};
+
+static HRESULT create_composition_object_view( IUnknown *owner, void **out )
+{
+    struct composition_object_view *view;
+
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!(view = calloc( 1, sizeof(*view) ))) return E_OUTOFMEMORY;
+    view->vtbl = object_view_vtbl;
+    view->ref = 1;
+    IUnknown_AddRef( (view->owner = owner) );
+    *out = &view->vtbl;
+    return S_OK;
+}
+
+/* ICompositor5 ({48ea31ad-...}). Slots from CompositorCommon's ICompositor5 vtable in dcomp.pdb:
+ * 6 get_Comment, 7 put_Comment, 8 get_GlobalPlaybackRate, 9 put_GlobalPlaybackRate, 10 CreateBounceScalarAnimation,
+ * 11 CreateBounceVector2Animation, 12 CreateBounceVector3Animation, 13 CreateContainerShape, 14 CreateEllipseGeometry,
+ * 15 CreateLineGeometry, 16 CreatePathGeometry, 17 CreatePathGeometryWithPath, 18 CreatePathKeyFrameAnimation,
+ * 19 CreateRectangleGeometry, 20 CreateRoundedRectangleGeometry, 21 CreateShapeVisual, 22 CreateSpriteShape,
+ * 23 CreateSpriteShapeWithGeometry, 24 CreateViewBox, 25 RequestCommitAsync.
+ * WinUI's AnimatedIcon calls CreateShapeVisual. Shapes and geometries are recorded, not rendered; a shape visual is a
+ * real container visual because it goes into the visual tree. */
+/* ICompositor7 ({d3483fad-...}). Slots from CompositorCommon's ICompositor7 vtable in dcomp.pdb:
+ * 6 get_DispatcherQueue, 7 CreateAnimationPropertyInfo, 8 CreateRectangleClip,
+ * 9 CreateRectangleClipWithSides, 10 CreateRectangleClipWithSidesAndRadius. XAML's
+ * HWCompTreeNodeWinRT::UpdateRoundedCornerClipVisual creates its rounded corner clips here. */
+static struct compositor *impl_from_compositor7( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct compositor, compositor7_vtbl );
+}
+static HRESULT WINAPI compositor7_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return compositor_QueryInterface( &impl_from_compositor7( iface )->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI compositor7_AddRef( void *iface )
+{
+    return compositor_AddRef( &impl_from_compositor7( iface )->ICompositor_iface );
+}
+static ULONG WINAPI compositor7_Release( void *iface )
+{
+    return compositor_Release( &impl_from_compositor7( iface )->ICompositor_iface );
+}
+static HRESULT WINAPI compositor7_get_DispatcherQueue( void *iface, void **value )
+{
+    FIXME( "iface %p: no dispatcher queue.\n", iface );
+    if (!value) return E_POINTER;
+    *value = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI compositor7_CreateAnimationPropertyInfo( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_comp_object( "AnimationPropertyInfo", result );
+}
+static HRESULT WINAPI compositor7_CreateRectangleClip( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_comp_object( "RectangleClip", result );
+}
+static HRESULT WINAPI compositor7_CreateRectangleClipWithSides( void *iface, FLOAT left, FLOAT top, FLOAT right,
+                                                                FLOAT bottom, void **result )
+{
+    TRACE( "iface %p, %f,%f-%f,%f.\n", iface, left, top, right, bottom );
+    if (!result) return E_POINTER;
+    return create_comp_object( "RectangleClip", result );
+}
+/* The four Vector2 radii are passed by pointer on x64; only the out pointer position matters here. */
+static HRESULT WINAPI compositor7_CreateRectangleClipWithSidesAndRadius( void *iface, FLOAT left, FLOAT top,
+                                                                         FLOAT right, FLOAT bottom, void *top_left,
+                                                                         void *top_right, void *bottom_right,
+                                                                         void *bottom_left, void **result )
+{
+    TRACE( "iface %p, %f,%f-%f,%f.\n", iface, left, top, right, bottom );
+    if (!result) return E_POINTER;
+    return create_comp_object( "RectangleClip", result );
+}
+
+static const void *compositor7_vtbl[] =
+{
+    compositor7_QueryInterface, compositor7_AddRef, compositor7_Release,
+    compositor2_GetIids, compositor2_GetRuntimeClassName, compositor2_GetTrustLevel,
+    compositor7_get_DispatcherQueue, compositor7_CreateAnimationPropertyInfo, compositor7_CreateRectangleClip,
+    compositor7_CreateRectangleClipWithSides, compositor7_CreateRectangleClipWithSidesAndRadius,
+};
+
+/* ICompositorWithProjectedShadow ({a2e6330e-...}): 6 CreateProjectedShadowCaster, 7 CreateProjectedShadowReceiver,
+ * 8 CreateProjectedShadow. XAML's ThemeShadowScene::EnsureInitialized (ThemeShadow on flyouts, the converter
+ * pages' combo boxes) asks for it and dereferences the result unchecked; shadows are not rendered, the
+ * objects only record. */
+static struct compositor *impl_from_compositor_shadow( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct compositor, shadow_vtbl );
+}
+static HRESULT WINAPI compositor_shadow_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return compositor_QueryInterface( &impl_from_compositor_shadow( iface )->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI compositor_shadow_AddRef( void *iface )
+{
+    return compositor_AddRef( &impl_from_compositor_shadow( iface )->ICompositor_iface );
+}
+static ULONG WINAPI compositor_shadow_Release( void *iface )
+{
+    return compositor_Release( &impl_from_compositor_shadow( iface )->ICompositor_iface );
+}
+static HRESULT WINAPI compositor_shadow_CreateProjectedShadowCaster( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_comp_object( "ProjectedShadowCaster", result );
+}
+static HRESULT WINAPI compositor_shadow_CreateProjectedShadowReceiver( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_comp_object( "ProjectedShadowReceiver", result );
+}
+static HRESULT WINAPI compositor_shadow_CreateProjectedShadow( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_comp_object( "ProjectedShadow", result );
+}
+static const void *compositor_shadow_vtbl[] =
+{
+    compositor_shadow_QueryInterface, compositor_shadow_AddRef, compositor_shadow_Release,
+    compositor2_GetIids, compositor2_GetRuntimeClassName, compositor2_GetTrustLevel,
+    compositor_shadow_CreateProjectedShadowCaster, compositor_shadow_CreateProjectedShadowReceiver,
+    compositor_shadow_CreateProjectedShadow,
+};
+
+/* ICompositor4 ({ae47e78a-...}). Slots from CompositorCommon's ICompositor4 vtable in dcomp.pdb:
+ * 6 CreateColorGradientStop, 7 CreateColorGradientStopWithOffsetAndColor, 8 CreateLinearGradientBrush,
+ * 9 CreateSpringScalarAnimation, 10 CreateSpringVector2Animation, 11 CreateSpringVector3Animation. */
+static struct compositor *impl_from_compositor4( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct compositor, compositor4_vtbl );
+}
+static HRESULT WINAPI compositor4_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return compositor_QueryInterface( &impl_from_compositor4( iface )->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI compositor4_AddRef( void *iface )
+{
+    return compositor_AddRef( &impl_from_compositor4( iface )->ICompositor_iface );
+}
+static ULONG WINAPI compositor4_Release( void *iface )
+{
+    return compositor_Release( &impl_from_compositor4( iface )->ICompositor_iface );
+}
+static HRESULT WINAPI compositor4_CreateColorGradientStop( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_comp_object( "CompositionColorGradientStop", result );
+}
+/* (FLOAT offset, Color color, out): the float goes in xmm1 and the Color is passed by value in r8. */
+static HRESULT WINAPI compositor4_CreateColorGradientStopWithOffsetAndColor( void *iface, FLOAT offset, UINT32 color,
+                                                                            void **result )
+{
+    TRACE( "iface %p, offset %f, color %#x.\n", iface, offset, color );
+    if (!result) return E_POINTER;
+    return create_comp_object( "CompositionColorGradientStop", result );
+}
+static HRESULT WINAPI compositor4_CreateLinearGradientBrush( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_comp_object( "CompositionLinearGradientBrush", result );
+}
+static HRESULT WINAPI compositor4_CreateSpringScalarAnimation( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_comp_object( "SpringScalarNaturalMotionAnimation", result );
+}
+static HRESULT WINAPI compositor4_CreateSpringVector2Animation( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_comp_object( "SpringVector2NaturalMotionAnimation", result );
+}
+static HRESULT WINAPI compositor4_CreateSpringVector3Animation( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_comp_object( "SpringVector3NaturalMotionAnimation", result );
+}
+
+static const void *compositor4_vtbl[] =
+{
+    compositor4_QueryInterface, compositor4_AddRef, compositor4_Release,
+    compositor2_GetIids, compositor2_GetRuntimeClassName, compositor2_GetTrustLevel,
+    compositor4_CreateColorGradientStop, compositor4_CreateColorGradientStopWithOffsetAndColor,
+    compositor4_CreateLinearGradientBrush, compositor4_CreateSpringScalarAnimation,
+    compositor4_CreateSpringVector2Animation, compositor4_CreateSpringVector3Animation,
+};
+
+/* ICompositor6 ({7a38b2bd-...}). Slots from CompositorCommon's ICompositor6 vtable in dcomp.pdb:
+ * 6 CreateGeometricClip, 7 CreateGeometricClipWithGeometry, 8 CreateRedirectVisual,
+ * 9 CreateRedirectVisualWithSourceVisual, 10 CreateBooleanKeyFrameAnimation. */
+static struct compositor *impl_from_compositor6( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct compositor, compositor6_vtbl );
+}
+static HRESULT WINAPI compositor6_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return compositor_QueryInterface( &impl_from_compositor6( iface )->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI compositor6_AddRef( void *iface )
+{
+    return compositor_AddRef( &impl_from_compositor6( iface )->ICompositor_iface );
+}
+static ULONG WINAPI compositor6_Release( void *iface )
+{
+    return compositor_Release( &impl_from_compositor6( iface )->ICompositor_iface );
+}
+static HRESULT WINAPI compositor6_CreateGeometricClip( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_comp_object( "CompositionGeometricClip", result );
+}
+static HRESULT WINAPI compositor6_CreateGeometricClipWithGeometry( void *iface, void *geometry, void **result )
+{
+    TRACE( "iface %p, geometry %p.\n", iface, geometry );
+    if (!result) return E_POINTER;
+    return create_comp_object( "CompositionGeometricClip", result );
+}
+/* RedirectVisual is a ContainerVisual; its Source is not rendered. */
+static HRESULT WINAPI compositor6_CreateRedirectVisual( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_visual( &impl_from_compositor6( iface )->ICompositor_iface, VISUAL_CONTAINER, result );
+}
+static HRESULT WINAPI compositor6_CreateRedirectVisualWithSourceVisual( void *iface, void *source, void **result )
+{
+    TRACE( "iface %p, source %p.\n", iface, source );
+    if (!result) return E_POINTER;
+    return create_visual( &impl_from_compositor6( iface )->ICompositor_iface, VISUAL_CONTAINER, result );
+}
+static HRESULT WINAPI compositor6_CreateBooleanKeyFrameAnimation( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_kf_animation( KF_BOOLEAN, result );
+}
+
+static const void *compositor6_vtbl[] =
+{
+    compositor6_QueryInterface, compositor6_AddRef, compositor6_Release,
+    compositor2_GetIids, compositor2_GetRuntimeClassName, compositor2_GetTrustLevel,
+    compositor6_CreateGeometricClip, compositor6_CreateGeometricClipWithGeometry, compositor6_CreateRedirectVisual,
+    compositor6_CreateRedirectVisualWithSourceVisual, compositor6_CreateBooleanKeyFrameAnimation,
+};
+
+static struct compositor *impl_from_compositor5( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct compositor, compositor5_vtbl );
+}
+static HRESULT WINAPI compositor5_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return compositor_QueryInterface( &impl_from_compositor5( iface )->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI compositor5_AddRef( void *iface )
+{
+    return compositor_AddRef( &impl_from_compositor5( iface )->ICompositor_iface );
+}
+static ULONG WINAPI compositor5_Release( void *iface )
+{
+    return compositor_Release( &impl_from_compositor5( iface )->ICompositor_iface );
+}
+static HRESULT WINAPI compositor5_get_Comment( void *iface, HSTRING *value )
+{
+    if (!value) return E_POINTER;
+    *value = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI compositor5_put_Comment( void *iface, HSTRING value )
+{
+    scene_changed();
+    return S_OK;
+}
+static HRESULT WINAPI compositor5_get_GlobalPlaybackRate( void *iface, FLOAT *value )
+{
+    if (!value) return E_POINTER;
+    *value = 1.0f;
+    return S_OK;
+}
+static HRESULT WINAPI compositor5_put_GlobalPlaybackRate( void *iface, FLOAT value )
+{
+    scene_changed();
+    TRACE( "%p, %f.\n", iface, value );
+    return S_OK;
+}
+
+#define COMPOSITOR5_RECORDING( name, kind )                                                        \
+    static HRESULT WINAPI compositor5_##name( void *iface, void **result )                         \
+    {                                                                                              \
+        TRACE( "iface %p.\n", iface );                                                             \
+        if (!result) return E_POINTER;                                                             \
+        return create_comp_object( kind, result );                                                 \
+    }
+#define COMPOSITOR5_RECORDING_ARG( name, kind )                                                    \
+    static HRESULT WINAPI compositor5_##name( void *iface, void *arg, void **result )              \
+    {                                                                                              \
+        TRACE( "iface %p, arg %p.\n", iface, arg );                                                \
+        if (!result) return E_POINTER;                                                             \
+        return create_comp_object( kind, result );                                                 \
+    }
+
+COMPOSITOR5_RECORDING( CreateBounceScalarAnimation, "BounceScalarNaturalMotionAnimation" )
+COMPOSITOR5_RECORDING( CreateBounceVector2Animation, "BounceVector2NaturalMotionAnimation" )
+COMPOSITOR5_RECORDING( CreateBounceVector3Animation, "BounceVector3NaturalMotionAnimation" )
+static HRESULT WINAPI compositor5_CreateContainerShape( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    return create_comp_shape( TRUE, NULL, result );
+}
+COMPOSITOR5_RECORDING( CreateEllipseGeometry, "CompositionEllipseGeometry" )
+COMPOSITOR5_RECORDING( CreateLineGeometry, "CompositionLineGeometry" )
+static HRESULT WINAPI compositor5_CreatePathGeometry( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    return create_path_geometry( NULL, result );
+}
+static HRESULT WINAPI compositor5_CreatePathGeometryWithPath( void *iface, void *path, void **result )
+{
+    TRACE( "iface %p, path %p.\n", iface, path );
+    return create_path_geometry( path, result );
+}
+COMPOSITOR5_RECORDING( CreatePathKeyFrameAnimation, "PathKeyFrameAnimation" )
+COMPOSITOR5_RECORDING( CreateRectangleGeometry, "CompositionRectangleGeometry" )
+COMPOSITOR5_RECORDING( CreateRoundedRectangleGeometry, "CompositionRoundedRectangleGeometry" )
+static HRESULT WINAPI compositor5_CreateSpriteShape( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    return create_comp_shape( FALSE, NULL, result );
+}
+static HRESULT WINAPI compositor5_CreateSpriteShapeWithGeometry( void *iface, void *geometry, void **result )
+{
+    TRACE( "iface %p, geometry %p.\n", iface, geometry );
+    return create_comp_shape( FALSE, geometry, result );
+}
+COMPOSITOR5_RECORDING( CreateViewBox, "CompositionViewBox" )
+COMPOSITOR5_RECORDING( RequestCommitAsync, "RequestCommitAsync" )
+
+static HRESULT WINAPI compositor5_CreateShapeVisual( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_shape_visual( &impl_from_compositor5( iface )->ICompositor_iface, result );
+}
+
+static const void *compositor5_vtbl[] =
+{
+    compositor5_QueryInterface, compositor5_AddRef, compositor5_Release,
+    compositor2_GetIids, compositor2_GetRuntimeClassName, compositor2_GetTrustLevel,
+    compositor5_get_Comment,
+    compositor5_put_Comment,
+    compositor5_get_GlobalPlaybackRate,
+    compositor5_put_GlobalPlaybackRate,
+    compositor5_CreateBounceScalarAnimation,
+    compositor5_CreateBounceVector2Animation,
+    compositor5_CreateBounceVector3Animation,
+    compositor5_CreateContainerShape,
+    compositor5_CreateEllipseGeometry,
+    compositor5_CreateLineGeometry,
+    compositor5_CreatePathGeometry,
+    compositor5_CreatePathGeometryWithPath,
+    compositor5_CreatePathKeyFrameAnimation,
+    compositor5_CreateRectangleGeometry,
+    compositor5_CreateRoundedRectangleGeometry,
+    compositor5_CreateShapeVisual,
+    compositor5_CreateSpriteShape,
+    compositor5_CreateSpriteShapeWithGeometry,
+    compositor5_CreateViewBox,
+    compositor5_RequestCommitAsync,
+};
+
+/* Windows.UI.Composition.CompositionPath: wraps an IGeometrySource2D for path geometries. WinUI's AnimatedIcon creates
+ * them through ICompositionPathFactory::Create. Paths are recorded, not rendered. */
+static const GUID IID_ICompositionPath_ =
+    { 0x66da1d5f, 0x2e10, 0x4f22, { 0x8a, 0x06, 0x0a, 0x81, 0x51, 0x91, 0x9e, 0x60 } };
+static const GUID IID_ICompositionPathFactory_ =
+    { 0x9c1e8c6a, 0x0f33, 0x4751, { 0x94, 0x37, 0xeb, 0x3f, 0xb9, 0xd3, 0xab, 0x07 } };
+static const GUID IID_IGeometrySource2D_ =
+    { 0xcaff7902, 0x670c, 0x4181, { 0xa6, 0x24, 0xda, 0x97, 0x72, 0x03, 0xb8, 0x45 } };
+
+
+static HRESULT WINAPI path_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct composition_path *path = CONTAINING_RECORD( iface, struct composition_path, vtbl );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ICompositionPath_ ) ||
+        IsEqualGUID( iid, &IID_IGeometrySource2D_ ))
+    {
+        InterlockedIncrement( &path->ref );
+        *out = &path->vtbl;
+        return S_OK;
+    }
+    WARN( "CompositionPath: no interface %s.\n", debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI path_AddRef( void *iface )
+{
+    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct composition_path, vtbl )->ref );
+}
+static ULONG WINAPI path_Release( void *iface )
+{
+    struct composition_path *path = CONTAINING_RECORD( iface, struct composition_path, vtbl );
+    ULONG ref = InterlockedDecrement( &path->ref );
+
+    if (!ref)
+    {
+        if (path->source) IUnknown_Release( path->source );
+        free( path );
+    }
+    return ref;
+}
+static HRESULT WINAPI path_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI path_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionPath";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI path_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+
+static const void *path_vtbl[] =
+{
+    path_QueryInterface, path_AddRef, path_Release,
+    path_GetIids, path_GetRuntimeClassName, path_GetTrustLevel,
+};
+
+static IActivationFactory path_factory;
+static const void *const *path_factory_iface;
+
+static HRESULT WINAPI path_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
+{
+    TRACE( "iid %s.\n", debugstr_guid( iid ) );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
+    {
+        *out = &path_factory;
+        return S_OK;
+    }
+    /* Create is slot 6 of ICompositionPathFactory, where IActivationFactory has ActivateInstance */
+    if (IsEqualGUID( iid, &IID_ICompositionPathFactory_ ))
+    {
+        *out = &path_factory_iface;
+        return S_OK;
+    }
+    WARN( "CompositionPath factory: no interface %s.\n", debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI path_factory_AddRef( IActivationFactory *iface ) { return 2; }
+static ULONG WINAPI path_factory_Release( IActivationFactory *iface ) { return 1; }
+static HRESULT WINAPI path_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
+{
+    return path_GetIids( NULL, count, iids );
+}
+static HRESULT WINAPI path_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
+{
+    return path_GetRuntimeClassName( NULL, name );
+}
+static HRESULT WINAPI path_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
+{
+    return path_GetTrustLevel( NULL, level );
+}
+static HRESULT WINAPI path_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+{
+    /* only constructible from a geometry source, through ICompositionPathFactory::Create */
+    if (instance) *instance = NULL;
+    return E_NOTIMPL;
+}
+
+static const IActivationFactoryVtbl path_factory_vtbl =
+{
+    path_factory_QueryInterface,
+    path_factory_AddRef,
+    path_factory_Release,
+    path_factory_GetIids,
+    path_factory_GetRuntimeClassName,
+    path_factory_GetTrustLevel,
+    path_factory_ActivateInstance,
+};
+
+static IActivationFactory path_factory = { &path_factory_vtbl };
+
+static HRESULT WINAPI path_factory_iface_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return path_factory_QueryInterface( &path_factory, iid, out );
+}
+static ULONG WINAPI path_factory_iface_AddRef( void *iface ) { return 2; }
+static ULONG WINAPI path_factory_iface_Release( void *iface ) { return 1; }
+static HRESULT WINAPI path_factory_iface_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return path_GetIids( NULL, count, iids );
+}
+static HRESULT WINAPI path_factory_iface_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return path_GetRuntimeClassName( NULL, name );
+}
+static HRESULT WINAPI path_factory_iface_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return path_GetTrustLevel( NULL, level );
+}
+/* ICompositionPathFactory::Create */
+static HRESULT WINAPI path_factory_iface_Create( void *iface, IUnknown *source, void **value )
+{
+    struct composition_path *path;
+
+    TRACE( "source %p, value %p.\n", source, value );
+
+    if (!value) return E_POINTER;
+    *value = NULL;
+    if (!(path = calloc( 1, sizeof(*path) ))) return E_OUTOFMEMORY;
+    path->vtbl = path_vtbl;
+    path->ref = 1;
+    if ((path->source = source)) IUnknown_AddRef( source );
+    *value = &path->vtbl;
+    return S_OK;
+}
+
+/* ICompositionPathFactory */
+static const void *path_factory_iface_vtbl[] =
+{
+    path_factory_iface_QueryInterface, path_factory_iface_AddRef, path_factory_iface_Release,
+    path_factory_iface_GetIids, path_factory_iface_GetRuntimeClassName, path_factory_iface_GetTrustLevel,
+    path_factory_iface_Create,
+};
+
+static const void *const *path_factory_iface = path_factory_iface_vtbl;
+
+IActivationFactory *composition_path_activation_factory = &path_factory;
+/* A recording activation factory for classes XAML only needs to exist: its statics interfaces are
+ * answered with a recording object, whose out-pointer slots hand back further recording objects.
+ * Windows.UI.Composition.Interactions.* (InteractionTracker, VisualInteractionSource) are created when
+ * a ScrollViewer takes keyboard focus; without them the key press is an unhandled exception. */
+static HRESULT create_failing_object( const char *kind, void **out );
+struct generic_factory
+{
+    IActivationFactory IActivationFactory_iface;
+    const char *kind;
+};
+
+/* ---------------------------------------------------------------------------------------------
+ * Windows.UI.Composition.Interactions: InteractionTracker and VisualInteractionSource
+ *
+ * XAML's Pivot (the calculator's history/memory dock) creates a tracker with an owner, adds a
+ * VisualInteractionSource over its header panel and drives header offsets from tracker.Position;
+ * WinUI's SwipeControl (history items) does the same. Without these the Pivot content never
+ * appears, and a resize crashed WinUI on a null tracker. Layouts from the 10.0.26100 SDK header.
+ * No input ever reaches the tracker here: TryUpdatePosition/Scale apply at once and the owner is
+ * told ValuesChanged then IdleStateEntered, which is what a request that lands immediately
+ * looks like. Position and Scale mirror into the property set for expressions. */
+static const GUID IID_IInteractionTracker_ = { 0x2a8e8cb1, 0x1000, 0x4416, { 0x83, 0x63, 0xcc, 0x27, 0xfb, 0x87, 0x73, 0x08 } };
+static const GUID IID_IInteractionTrackerStatics_ = { 0xbba5d7b7, 0x6590, 0x4498, { 0x8d, 0x6c, 0xeb, 0x62, 0xb5, 0x14, 0xc9, 0x2a } };
+static const GUID IID_IVisualInteractionSource_ = { 0xca0e8a86, 0xd8d6, 0x4111, { 0xb0, 0x88, 0x70, 0x34, 0x7b, 0xd2, 0xb0, 0xed } };
+static const GUID IID_ICompositionInteractionSource_ = { 0x043b2431, 0x06e3, 0x495a, { 0xba, 0x54, 0x40, 0x9f, 0x00, 0x17, 0xfa, 0xc0 } };
+static const GUID IID_IVisualInteractionSource2_ = { 0xaa914893, 0xa73c, 0x414d, { 0x80, 0xd0, 0x24, 0x9b, 0xad, 0x2f, 0xbd, 0x93 } };
+static const GUID IID_IInteractionTrackerInertiaModifier_ = { 0xa0e2c920, 0x26b4, 0x4da2, { 0x8b, 0x61, 0x5e, 0x68, 0x39, 0x79, 0xbb, 0xe2 } };
+static const GUID IID_IInteractionTrackerInertiaRestingValue_ = { 0x86f7ec09, 0x5096, 0x4170, { 0x9c, 0xc8, 0xdf, 0x2f, 0xe1, 0x01, 0xbb, 0x93 } };
+static const GUID IID_IInteractionTrackerInertiaRestingValueStatics_ = { 0x18ed4699, 0x0745, 0x4096, { 0xbc, 0xab, 0x3a, 0x4e, 0x99, 0x56, 0x9b, 0xcf } };
+static const GUID IID_IVisualInteractionSourceStatics_ = { 0x369965e1, 0x8645, 0x4f75, { 0xba, 0x00, 0x64, 0x79, 0xcd, 0x10, 0xc8, 0xe6 } };
+static const GUID IID_ICompositionInteractionSourceCollection_ = { 0x1b468e4b, 0xa5bf, 0x47d8, { 0xa5, 0x47, 0x38, 0x94, 0x15, 0x5a, 0x15, 0x8c } };
+static const GUID IID_IInteractionTrackerValuesChangedArgs_ = { 0xcf1578ef, 0xd3df, 0x4501, { 0xb9, 0xe6, 0xf0, 0x2f, 0xb2, 0x2f, 0x73, 0xd0 } };
+static const GUID IID_IInteractionTrackerIdleStateEnteredArgs_ = { 0x50012faa, 0x1510, 0x4142, { 0xa1, 0xa5, 0x01, 0x9b, 0x09, 0xf8, 0x85, 0x7b } };
+
+struct interactions_object
+{
+    const void **vtbl;          /* generic composition object layout, must stay first */
+    const char *kind;
+    LONG ref;
+    const void **vtbl2;         /* secondary interface (IVisualInteractionSource2) */
+    ICompositionPropertySet *properties;
+    IUnknown *owner;            /* tracker: IInteractionTrackerOwner */
+    IUnknown *source;           /* VisualInteractionSource: the visual; args: the tracker */
+    struct interactions_object *sources; /* tracker: its InteractionSources collection */
+    IUnknown *items[16];
+    unsigned int count;
+    Vector3 min_position, max_position, position, natural_position, position_decay;
+    float min_scale, max_scale, scale, natural_scale, scale_decay;
+    LONG request_id;
+    int modes[12];
+    BOOL rails_x, rails_y, in_callback;
+    const WCHAR *class_name;
+    const GUID *main_iid;
+};
+
+static struct interactions_object *interactions_from( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct interactions_object, vtbl );
+}
+static struct interactions_object *interactions_from2( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct interactions_object, vtbl2 );
+}
+
+static HRESULT WINAPI interactions_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct interactions_object *object = interactions_from( iface );
+
+    TRACE( "%s %p, iid %s.\n", object->kind, object, debugstr_guid( iid ) );
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, object->main_iid ))
+    {
+        InterlockedIncrement( &object->ref );
+        *out = &object->vtbl;
+        return S_OK;
+    }
+    if (!strcmp( object->kind, "InertiaRestingValue" ) && IsEqualGUID( iid, &IID_IInteractionTrackerInertiaModifier_ ))
+    {
+        IUnknown_AddRef( (IUnknown *)iface );
+        *out = iface;
+        return S_OK;
+    }
+    if (object->vtbl2 && IsEqualGUID( iid, &IID_ICompositionInteractionSource_ ))
+    {
+        /* the collection element type; no methods of its own, the main table serves */
+        InterlockedIncrement( &object->ref );
+        *out = &object->vtbl;
+        return S_OK;
+    }
+    if (object->vtbl2 && IsEqualGUID( iid, &IID_IVisualInteractionSource2_ ))
+    {
+        InterlockedIncrement( &object->ref );
+        *out = &object->vtbl2;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_ICompositionObject ) && object->properties)
+    {
+        HRESULT hr = create_composition_object_view( (IUnknown *)&object->vtbl, out );
+        if (SUCCEEDED( hr ))
+        {
+            struct composition_object_view *view = impl_from_object_view( *out );
+            ICompositionPropertySet_AddRef( (view->properties = object->properties) );
+        }
+        return hr;
+    }
+    TRACE( "%s: no interface %s.\n", object->kind, debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI interactions_AddRef( void *iface )
+{
+    return InterlockedIncrement( &interactions_from( iface )->ref );
+}
+static ULONG WINAPI interactions_Release( void *iface )
+{
+    struct interactions_object *object = interactions_from( iface );
+    ULONG ref = InterlockedDecrement( &object->ref );
+    if (!ref)
+    {
+        unsigned int i;
+        for (i = 0; i < object->count; i++) if (object->items[i]) IUnknown_Release( object->items[i] );
+        if (object->properties) ICompositionPropertySet_Release( object->properties );
+        if (object->owner) IUnknown_Release( object->owner );
+        if (object->source) IUnknown_Release( object->source );
+        if (object->sources) interactions_Release( &object->sources->vtbl );
+        free( object );
+    }
+    return ref;
+}
+static HRESULT WINAPI interactions2_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return interactions_QueryInterface( &interactions_from2( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI interactions2_AddRef( void *iface ) { return interactions_AddRef( &interactions_from2( iface )->vtbl ); }
+static ULONG WINAPI interactions2_Release( void *iface ) { return interactions_Release( &interactions_from2( iface )->vtbl ); }
+static HRESULT WINAPI interactions_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0; *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI interactions_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    struct interactions_object *object = interactions_from( iface );
+    return WindowsCreateString( object->class_name, wcslen( object->class_name ), name );
+}
+static HRESULT WINAPI interactions2_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return interactions_GetRuntimeClassName( &interactions_from2( iface )->vtbl, name );
+}
+static HRESULT WINAPI interactions_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+
+static struct interactions_object *interactions_create( const char *kind, const WCHAR *class_name, const GUID *iid,
+                                                        const void **vtbl, BOOL properties )
+{
+    struct interactions_object *object;
+    if (!(object = calloc( 1, sizeof(*object) ))) return NULL;
+    object->vtbl = vtbl;
+    object->kind = kind;
+    object->class_name = class_name;
+    object->main_iid = iid;
+    object->ref = 1;
+    if (properties) create_property_set( &object->properties );
+    TRACE( "created %s %p.\n", kind, object );
+    return object;
+}
+
+/* --- args objects --- */
+static HRESULT WINAPI values_args_get_Position( void *iface, Vector3 *value )
+{
+    *value = interactions_from( iface )->position;
+    return S_OK;
+}
+static HRESULT WINAPI args_get_RequestId( void *iface, INT32 *value )
+{
+    *value = interactions_from( iface )->request_id;
+    return S_OK;
+}
+static HRESULT WINAPI values_args_get_Scale( void *iface, float *value )
+{
+    *value = interactions_from( iface )->scale;
+    return S_OK;
+}
+static const void *values_changed_args_vtbl[] =
+{
+    interactions_QueryInterface, interactions_AddRef, interactions_Release,
+    interactions_GetIids, interactions_GetRuntimeClassName, interactions_GetTrustLevel,
+    values_args_get_Position, args_get_RequestId, values_args_get_Scale,
+};
+static const void *idle_args_vtbl[] =
+{
+    interactions_QueryInterface, interactions_AddRef, interactions_Release,
+    interactions_GetIids, interactions_GetRuntimeClassName, interactions_GetTrustLevel,
+    args_get_RequestId,
+};
+
+/* --- InteractionSources collection --- */
+static HRESULT WINAPI sources_get_Count( void *iface, INT32 *value )
+{
+    *value = interactions_from( iface )->count;
+    return S_OK;
+}
+static HRESULT WINAPI sources_Add( void *iface, IUnknown *value )
+{
+    struct interactions_object *object = interactions_from( iface );
+    TRACE( "%p add %p.\n", object, value );
+    if (!value) return E_INVALIDARG;
+    if (object->count == ARRAY_SIZE(object->items)) return E_FAIL;
+    IUnknown_AddRef( value );
+    object->items[object->count++] = value;
+    return S_OK;
+}
+static HRESULT WINAPI sources_Remove( void *iface, IUnknown *value )
+{
+    struct interactions_object *object = interactions_from( iface );
+    unsigned int i;
+    TRACE( "%p remove %p.\n", object, value );
+    for (i = 0; i < object->count; i++)
+        if (object->items[i] == value)
+        {
+            IUnknown_Release( value );
+            memmove( object->items + i, object->items + i + 1, (object->count - i - 1) * sizeof(*object->items) );
+            object->count--;
+            return S_OK;
+        }
+    return S_OK;
+}
+static HRESULT WINAPI sources_RemoveAll( void *iface )
+{
+    struct interactions_object *object = interactions_from( iface );
+    unsigned int i;
+    for (i = 0; i < object->count; i++) IUnknown_Release( object->items[i] );
+    object->count = 0;
+    return S_OK;
+}
+static const void *sources_vtbl[] =
+{
+    interactions_QueryInterface, interactions_AddRef, interactions_Release,
+    interactions_GetIids, interactions_GetRuntimeClassName, interactions_GetTrustLevel,
+    sources_get_Count, sources_Add, sources_Remove, sources_RemoveAll,
+};
+
+/* --- InteractionTracker --- */
+static void tracker_sync_properties( struct interactions_object *tracker )
+{
+    static const WCHAR positionW[] = L"Position", scaleW[] = L"Scale", minW[] = L"MinPosition", maxW[] = L"MaxPosition";
+    HSTRING str;
+    if (!tracker->properties) return;
+    if (SUCCEEDED( WindowsCreateString( positionW, ARRAY_SIZE(positionW) - 1, &str ) ))
+    {
+        ICompositionPropertySet_InsertVector3( tracker->properties, str, tracker->position );
+        WindowsDeleteString( str );
+    }
+    if (SUCCEEDED( WindowsCreateString( minW, ARRAY_SIZE(minW) - 1, &str ) ))
+    {
+        ICompositionPropertySet_InsertVector3( tracker->properties, str, tracker->min_position );
+        WindowsDeleteString( str );
+    }
+    if (SUCCEEDED( WindowsCreateString( maxW, ARRAY_SIZE(maxW) - 1, &str ) ))
+    {
+        ICompositionPropertySet_InsertVector3( tracker->properties, str, tracker->max_position );
+        WindowsDeleteString( str );
+    }
+    if (SUCCEEDED( WindowsCreateString( scaleW, ARRAY_SIZE(scaleW) - 1, &str ) ))
+    {
+        ICompositionPropertySet_InsertScalar( tracker->properties, str, tracker->scale );
+        WindowsDeleteString( str );
+    }
+}
+
+/* Tell the owner a request landed: ValuesChanged, then IdleStateEntered. IInteractionTrackerOwner
+ * slots: 6 CustomAnimationStateEntered, 7 IdleStateEntered, 8 InertiaStateEntered,
+ * 9 InteractingStateEntered, 10 RequestIgnored, 11 ValuesChanged. */
+static void tracker_notify( struct interactions_object *tracker, INT32 request )
+{
+    typedef HRESULT (WINAPI *callback_t)( void *iface, void *tracker, void *args );
+    struct interactions_object *args;
+    const void **owner_vtbl;
+
+    tracker_sync_properties( tracker );
+    scene_changed();
+    if (!tracker->owner || tracker->in_callback) return;
+    owner_vtbl = *(const void ***)tracker->owner;
+    tracker->in_callback = TRUE;
+    if ((args = interactions_create( "InteractionTrackerValuesChangedArgs",
+                                     L"Windows.UI.Composition.Interactions.InteractionTrackerValuesChangedArgs",
+                                     &IID_IInteractionTrackerValuesChangedArgs_, values_changed_args_vtbl, FALSE )))
+    {
+        args->position = tracker->position;
+        args->scale = tracker->scale;
+        args->request_id = request;
+        ((callback_t)owner_vtbl[11])( tracker->owner, &tracker->vtbl, &args->vtbl );
+        interactions_Release( &args->vtbl );
+    }
+    if ((args = interactions_create( "InteractionTrackerIdleStateEnteredArgs",
+                                     L"Windows.UI.Composition.Interactions.InteractionTrackerIdleStateEnteredArgs",
+                                     &IID_IInteractionTrackerIdleStateEnteredArgs_, idle_args_vtbl, FALSE )))
+    {
+        args->request_id = request;
+        ((callback_t)owner_vtbl[7])( tracker->owner, &tracker->vtbl, &args->vtbl );
+        interactions_Release( &args->vtbl );
+    }
+    tracker->in_callback = FALSE;
+}
+
+static float clampf( float v, float lo, float hi )
+{
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return v;
+}
+static void tracker_set_position( struct interactions_object *tracker, Vector3 value )
+{
+    tracker->position.X = clampf( value.X, tracker->min_position.X, tracker->max_position.X );
+    tracker->position.Y = clampf( value.Y, tracker->min_position.Y, tracker->max_position.Y );
+    tracker->position.Z = clampf( value.Z, tracker->min_position.Z, tracker->max_position.Z );
+}
+
+static HRESULT WINAPI tracker_get_InteractionSources( void *iface, void **value )
+{
+    struct interactions_object *tracker = interactions_from( iface );
+    if (!value) return E_POINTER;
+    interactions_AddRef( &tracker->sources->vtbl );
+    *value = &tracker->sources->vtbl;
+    return S_OK;
+}
+static HRESULT WINAPI tracker_get_IsPositionRoundingSuggested( void *iface, boolean *value ) { *value = FALSE; return S_OK; }
+#define TRACKER_VEC3( name, field ) \
+    static HRESULT WINAPI tracker_get_##name( void *iface, Vector3 *value ) { *value = interactions_from( iface )->field; return S_OK; } \
+    static HRESULT WINAPI tracker_put_##name( void *iface, Vector3 value ) \
+    { TRACE( "%p " #name " %g,%g,%g.\n", iface, value.X, value.Y, value.Z ); interactions_from( iface )->field = value; \
+      tracker_sync_properties( interactions_from( iface ) ); return S_OK; }
+#define TRACKER_FLOAT( name, field ) \
+    static HRESULT WINAPI tracker_get_##name( void *iface, float *value ) { *value = interactions_from( iface )->field; return S_OK; } \
+    static HRESULT WINAPI tracker_put_##name( void *iface, float value ) \
+    { TRACE( "%p " #name " %g.\n", iface, value ); interactions_from( iface )->field = value; return S_OK; }
+TRACKER_VEC3( MaxPosition, max_position )
+TRACKER_FLOAT( MaxScale, max_scale )
+TRACKER_VEC3( MinPosition, min_position )
+TRACKER_FLOAT( MinScale, min_scale )
+TRACKER_VEC3( NaturalRestingPosition, natural_position )
+TRACKER_FLOAT( NaturalRestingScale, natural_scale )
+static HRESULT WINAPI tracker_get_Owner( void *iface, void **value )
+{
+    struct interactions_object *tracker = interactions_from( iface );
+    if ((*value = tracker->owner)) IUnknown_AddRef( tracker->owner );
+    return S_OK;
+}
+TRACKER_VEC3( Position, position )
+TRACKER_VEC3( PositionInertiaDecayRate, position_decay )
+static HRESULT WINAPI tracker_get_PositionVelocityInPixelsPerSecond( void *iface, Vector3 *value )
+{
+    memset( value, 0, sizeof(*value) );
+    return S_OK;
+}
+TRACKER_FLOAT( Scale, scale )
+TRACKER_FLOAT( ScaleInertiaDecayRate, scale_decay )
+static HRESULT WINAPI tracker_get_ScaleVelocityInPercentPerSecond( void *iface, float *value ) { *value = 0.0f; return S_OK; }
+static HRESULT WINAPI tracker_AdjustPositionXIfGreaterThanThreshold( void *iface, float adjustment, float threshold )
+{
+    TRACE( "%p %g %g.\n", iface, adjustment, threshold );
+    return S_OK;
+}
+static HRESULT WINAPI tracker_AdjustPositionYIfGreaterThanThreshold( void *iface, float adjustment, float threshold )
+{
+    TRACE( "%p %g %g.\n", iface, adjustment, threshold );
+    return S_OK;
+}
+static HRESULT WINAPI tracker_ConfigureModifiers( void *iface, void *modifiers )
+{
+    TRACE( "%p %p: ignored.\n", iface, modifiers );
+    return S_OK;
+}
+static HRESULT WINAPI tracker_TryUpdatePosition( void *iface, Vector3 value, INT32 *request )
+{
+    struct interactions_object *tracker = interactions_from( iface );
+    INT32 id = InterlockedIncrement( &tracker->request_id );
+    TRACE( "%p position %g,%g,%g -> request %ld.\n", tracker, value.X, value.Y, value.Z, id );
+    if (request) *request = id;
+    tracker_set_position( tracker, value );
+    tracker_notify( tracker, id );
+    return S_OK;
+}
+static HRESULT WINAPI tracker_TryUpdatePositionBy( void *iface, Vector3 amount, INT32 *request )
+{
+    struct interactions_object *tracker = interactions_from( iface );
+    Vector3 value = { tracker->position.X + amount.X, tracker->position.Y + amount.Y, tracker->position.Z + amount.Z };
+    return tracker_TryUpdatePosition( iface, value, request );
+}
+static HRESULT WINAPI tracker_TryUpdatePositionWithAnimation( void *iface, void *animation, INT32 *request )
+{
+    struct interactions_object *tracker = interactions_from( iface );
+    INT32 id = InterlockedIncrement( &tracker->request_id );
+    FIXME( "%p animation %p: applied as idle.\n", tracker, animation );
+    if (request) *request = id;
+    tracker_notify( tracker, id );
+    return S_OK;
+}
+static HRESULT WINAPI tracker_TryUpdatePositionWithAdditionalVelocity( void *iface, Vector3 velocity, INT32 *request )
+{
+    struct interactions_object *tracker = interactions_from( iface );
+    INT32 id = InterlockedIncrement( &tracker->request_id );
+    TRACE( "%p velocity %g,%g: ignored.\n", tracker, velocity.X, velocity.Y );
+    if (request) *request = id;
+    tracker_notify( tracker, id );
+    return S_OK;
+}
+static HRESULT WINAPI tracker_TryUpdateScale( void *iface, float value, Vector3 center, INT32 *request )
+{
+    struct interactions_object *tracker = interactions_from( iface );
+    INT32 id = InterlockedIncrement( &tracker->request_id );
+    TRACE( "%p scale %g -> request %ld.\n", tracker, value, id );
+    if (request) *request = id;
+    tracker->scale = clampf( value, tracker->min_scale, tracker->max_scale );
+    tracker_notify( tracker, id );
+    return S_OK;
+}
+static HRESULT WINAPI tracker_TryUpdateScaleWithAnimation( void *iface, void *animation, Vector3 center, INT32 *request )
+{
+    return tracker_TryUpdatePositionWithAnimation( iface, animation, request );
+}
+static HRESULT WINAPI tracker_TryUpdateScaleWithAdditionalVelocity( void *iface, float velocity, Vector3 center, INT32 *request )
+{
+    struct interactions_object *tracker = interactions_from( iface );
+    INT32 id = InterlockedIncrement( &tracker->request_id );
+    if (request) *request = id;
+    tracker_notify( tracker, id );
+    return S_OK;
+}
+static const void *tracker_vtbl[] =
+{
+    interactions_QueryInterface, interactions_AddRef, interactions_Release,
+    interactions_GetIids, interactions_GetRuntimeClassName, interactions_GetTrustLevel,
+    tracker_get_InteractionSources, tracker_get_IsPositionRoundingSuggested,
+    tracker_get_MaxPosition, tracker_put_MaxPosition, tracker_get_MaxScale, tracker_put_MaxScale,
+    tracker_get_MinPosition, tracker_put_MinPosition, tracker_get_MinScale, tracker_put_MinScale,
+    tracker_get_NaturalRestingPosition, tracker_get_NaturalRestingScale, tracker_get_Owner, tracker_get_Position,
+    tracker_get_PositionInertiaDecayRate, tracker_put_PositionInertiaDecayRate, tracker_get_PositionVelocityInPixelsPerSecond,
+    tracker_get_Scale, tracker_get_ScaleInertiaDecayRate, tracker_put_ScaleInertiaDecayRate,
+    tracker_get_ScaleVelocityInPercentPerSecond,
+    tracker_AdjustPositionXIfGreaterThanThreshold, tracker_AdjustPositionYIfGreaterThanThreshold,
+    tracker_ConfigureModifiers, tracker_ConfigureModifiers, tracker_ConfigureModifiers,
+    tracker_TryUpdatePosition, tracker_TryUpdatePositionBy, tracker_TryUpdatePositionWithAnimation,
+    tracker_TryUpdatePositionWithAdditionalVelocity, tracker_TryUpdateScale, tracker_TryUpdateScaleWithAnimation,
+    tracker_TryUpdateScaleWithAdditionalVelocity,
+};
+
+static HRESULT create_interaction_tracker( IUnknown *owner, void **out )
+{
+    struct interactions_object *tracker;
+    if (!out) return E_POINTER;
+    if (!(tracker = interactions_create( "InteractionTracker", L"Windows.UI.Composition.Interactions.InteractionTracker",
+                                         &IID_IInteractionTracker_, tracker_vtbl, TRUE )))
+        return E_OUTOFMEMORY;
+    if (!(tracker->sources = interactions_create( "InteractionTrackerInteractionSourceCollection",
+            L"Windows.UI.Composition.Interactions.InteractionTrackerInteractionSourceCollection",
+            &IID_ICompositionInteractionSourceCollection_, sources_vtbl, FALSE )))
+    {
+        interactions_Release( &tracker->vtbl );
+        return E_OUTOFMEMORY;
+    }
+    if ((tracker->owner = owner)) IUnknown_AddRef( owner );
+    tracker->min_scale = tracker->max_scale = tracker->scale = tracker->natural_scale = 1.0f;
+    tracker_sync_properties( tracker );
+    *out = &tracker->vtbl;
+    return S_OK;
+}
+
+/* --- VisualInteractionSource --- */
+#define VIS_BOOL( name, field ) \
+    static HRESULT WINAPI vis_get_##name( void *iface, boolean *value ) { *value = interactions_from( iface )->field; return S_OK; } \
+    static HRESULT WINAPI vis_put_##name( void *iface, boolean value ) { interactions_from( iface )->field = value; return S_OK; }
+#define VIS_MODE( name, index ) \
+    static HRESULT WINAPI vis_get_##name( void *iface, int *value ) { *value = interactions_from( iface )->modes[index]; return S_OK; } \
+    static HRESULT WINAPI vis_put_##name( void *iface, int value ) \
+    { TRACE( "%p " #name " %d.\n", iface, value ); interactions_from( iface )->modes[index] = value; return S_OK; }
+VIS_BOOL( IsPositionXRailsEnabled, rails_x )
+VIS_BOOL( IsPositionYRailsEnabled, rails_y )
+VIS_MODE( ManipulationRedirectionMode, 0 )
+VIS_MODE( PositionXChainingMode, 1 )
+VIS_MODE( PositionXSourceMode, 2 )
+VIS_MODE( PositionYChainingMode, 3 )
+VIS_MODE( PositionYSourceMode, 4 )
+VIS_MODE( ScaleChainingMode, 5 )
+VIS_MODE( ScaleSourceMode, 6 )
+static HRESULT WINAPI vis_get_Source( void *iface, void **value )
+{
+    struct interactions_object *object = interactions_from( iface );
+    if ((*value = object->source)) IUnknown_AddRef( object->source );
+    return S_OK;
+}
+static HRESULT WINAPI vis_TryRedirectForManipulation( void *iface, void *pointer_point )
+{
+    TRACE( "%p pointer %p: nothing to redirect to.\n", iface, pointer_point );
+    return S_OK;
+}
+static const void *vis_vtbl[] =
+{
+    interactions_QueryInterface, interactions_AddRef, interactions_Release,
+    interactions_GetIids, interactions_GetRuntimeClassName, interactions_GetTrustLevel,
+    vis_get_IsPositionXRailsEnabled, vis_put_IsPositionXRailsEnabled, vis_get_IsPositionYRailsEnabled, vis_put_IsPositionYRailsEnabled,
+    vis_get_ManipulationRedirectionMode, vis_put_ManipulationRedirectionMode,
+    vis_get_PositionXChainingMode, vis_put_PositionXChainingMode, vis_get_PositionXSourceMode, vis_put_PositionXSourceMode,
+    vis_get_PositionYChainingMode, vis_put_PositionYChainingMode, vis_get_PositionYSourceMode, vis_put_PositionYSourceMode,
+    vis_get_ScaleChainingMode, vis_put_ScaleChainingMode, vis_get_ScaleSourceMode, vis_put_ScaleSourceMode,
+    vis_get_Source, vis_TryRedirectForManipulation,
+};
+/* IVisualInteractionSource2: 6 get_DeltaPosition, 7 get_DeltaScale, 8 get_Position, 9 get_PositionVelocity,
+ * 10 get_Scale, 11 get_ScaleVelocity, 12-16 Configure*Modifiers. All zero / ignored. */
+static HRESULT WINAPI vis2_get_vec3( void *iface, Vector3 *value ) { memset( value, 0, sizeof(*value) ); return S_OK; }
+static HRESULT WINAPI vis2_get_float( void *iface, float *value ) { *value = 0.0f; return S_OK; }
+static HRESULT WINAPI vis2_configure( void *iface, void *modifiers ) { TRACE( "%p %p: ignored.\n", iface, modifiers ); return S_OK; }
+static HRESULT WINAPI vis2_GetIids( void *iface, ULONG *count, IID **iids ) { *count = 0; *iids = NULL; return S_OK; }
+static HRESULT WINAPI vis2_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
+static const void *vis2_vtbl[] =
+{
+    interactions2_QueryInterface, interactions2_AddRef, interactions2_Release,
+    vis2_GetIids, interactions2_GetRuntimeClassName, vis2_GetTrustLevel,
+    vis2_get_vec3, vis2_get_float, vis2_get_vec3, vis2_get_vec3, vis2_get_float, vis2_get_float,
+    vis2_configure, vis2_configure, vis2_configure, vis2_configure, vis2_configure,
+};
+
+static HRESULT create_visual_interaction_source( IUnknown *visual, void **out )
+{
+    struct interactions_object *object;
+    if (!out) return E_POINTER;
+    if (!(object = interactions_create( "VisualInteractionSource", L"Windows.UI.Composition.Interactions.VisualInteractionSource",
+                                        &IID_IVisualInteractionSource_, vis_vtbl, TRUE )))
+        return E_OUTOFMEMORY;
+    object->vtbl2 = vis2_vtbl;
+    if ((object->source = visual)) IUnknown_AddRef( visual );
+    *out = &object->vtbl;
+    return S_OK;
+}
+
+/* --- InteractionTrackerInertiaRestingValue: items[0] condition, items[1] resting value (expression animations) --- */
+static HRESULT WINAPI resting_get_item( void *iface, unsigned int index, IUnknown **out )
+{
+    struct interactions_object *object = interactions_from( iface );
+    if (!out) return E_POINTER;
+    if ((*out = object->items[index])) IUnknown_AddRef( *out );
+    return S_OK;
+}
+static HRESULT WINAPI resting_put_item( void *iface, unsigned int index, IUnknown *value )
+{
+    struct interactions_object *object = interactions_from( iface );
+    TRACE( "%p index %u value %p.\n", iface, index, value );
+    if (value) IUnknown_AddRef( value );
+    if (object->items[index]) IUnknown_Release( object->items[index] );
+    object->items[index] = value;
+    return S_OK;
+}
+static HRESULT WINAPI resting_get_Condition( void *iface, IUnknown **out ) { return resting_get_item( iface, 0, out ); }
+static HRESULT WINAPI resting_put_Condition( void *iface, IUnknown *value ) { return resting_put_item( iface, 0, value ); }
+static HRESULT WINAPI resting_get_RestingValue( void *iface, IUnknown **out ) { return resting_get_item( iface, 1, out ); }
+static HRESULT WINAPI resting_put_RestingValue( void *iface, IUnknown *value ) { return resting_put_item( iface, 1, value ); }
+static const void *resting_vtbl[] =
+{
+    interactions_QueryInterface, interactions_AddRef, interactions_Release,
+    interactions_GetIids, interactions_GetRuntimeClassName, interactions_GetTrustLevel,
+    resting_get_Condition, resting_put_Condition, resting_get_RestingValue, resting_put_RestingValue,
+};
+static HRESULT create_inertia_resting_value( void **out )
+{
+    struct interactions_object *object;
+    if (!out) return E_POINTER;
+    if (!(object = interactions_create( "InertiaRestingValue", L"Windows.UI.Composition.Interactions.InteractionTrackerInertiaRestingValue",
+                                        &IID_IInteractionTrackerInertiaRestingValue_, resting_vtbl, TRUE )))
+        return E_OUTOFMEMORY;
+    object->count = 2;
+    *out = &object->vtbl;
+    return S_OK;
+}
+
+/* --- statics --- */
+static HRESULT WINAPI interactions_statics_QueryInterface( void *iface, REFIID iid, void **out );
+static ULONG WINAPI interactions_statics_AddRef( void *iface ) { return 2; }
+static ULONG WINAPI interactions_statics_Release( void *iface ) { return 1; }
+static HRESULT WINAPI interactions_statics_GetIids( void *iface, ULONG *count, IID **iids ) { *count = 0; *iids = NULL; return S_OK; }
+static HRESULT WINAPI interactions_statics_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.Interactions.InteractionTracker";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI interactions_statics_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
+static HRESULT WINAPI tracker_statics_Create( void *iface, void *compositor, void **out )
+{
+    TRACE( "compositor %p.\n", compositor );
+    return create_interaction_tracker( NULL, out );
+}
+static HRESULT WINAPI tracker_statics_CreateWithOwner( void *iface, void *compositor, IUnknown *owner, void **out )
+{
+    TRACE( "compositor %p, owner %p.\n", compositor, owner );
+    return create_interaction_tracker( owner, out );
+}
+static HRESULT WINAPI vis_statics_Create( void *iface, IUnknown *visual, void **out )
+{
+    TRACE( "visual %p.\n", visual );
+    return create_visual_interaction_source( visual, out );
+}
+static const void *tracker_statics_vtbl[] =
+{
+    interactions_statics_QueryInterface, interactions_statics_AddRef, interactions_statics_Release,
+    interactions_statics_GetIids, interactions_statics_GetRuntimeClassName, interactions_statics_GetTrustLevel,
+    tracker_statics_Create, tracker_statics_CreateWithOwner,
+};
+static const void *vis_statics_vtbl[] =
+{
+    interactions_statics_QueryInterface, interactions_statics_AddRef, interactions_statics_Release,
+    interactions_statics_GetIids, interactions_statics_GetRuntimeClassName, interactions_statics_GetTrustLevel,
+    vis_statics_Create,
+};
+static HRESULT WINAPI resting_statics_Create( void *iface, IUnknown *compositor, void **out )
+{
+    TRACE( "compositor %p.\n", compositor );
+    return create_inertia_resting_value( out );
+}
+static const void *resting_statics_vtbl[] =
+{
+    interactions_statics_QueryInterface, interactions_statics_AddRef, interactions_statics_Release,
+    interactions_statics_GetIids, interactions_statics_GetRuntimeClassName, interactions_statics_GetTrustLevel,
+    resting_statics_Create,
+};
+static const void *const *resting_statics = resting_statics_vtbl;
+static const void *const *tracker_statics = tracker_statics_vtbl;
+static const void *const *vis_statics = vis_statics_vtbl;
+static HRESULT WINAPI interactions_statics_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IInteractionTrackerStatics_ )) { *out = &tracker_statics; return S_OK; }
+    if (IsEqualGUID( iid, &IID_IVisualInteractionSourceStatics_ )) { *out = &vis_statics; return S_OK; }
+    if (IsEqualGUID( iid, &IID_IInteractionTrackerInertiaRestingValueStatics_ )) { *out = &resting_statics; return S_OK; }
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ))
+    {
+        *out = iface;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static HRESULT WINAPI generic_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
+{
+    struct generic_factory *factory = CONTAINING_RECORD( iface, struct generic_factory, IActivationFactory_iface );
+    TRACE( "%s factory, iid %s.\n", factory->kind, debugstr_guid( iid ) );
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
+    {
+        *out = iface;
+        return S_OK;
+    }
+    /* InteractionTracker, VisualInteractionSource and InteractionTrackerInertiaRestingValue are typed
+     * (WinUI's SwipeControl in Calculator's history items builds on them). Other Interactions statics
+     * fail on purpose (see create_failing_object): recording objects fared worse, XAML kept a released
+     * view of the tracker and crashed on it. WINE_DCOMP_INTERACTIONS_RECORD tries the recording path. */
+    if (!strcmp( factory->kind, "Interactions" ))
+    {
+        if (IsEqualGUID( iid, &IID_IInteractionTrackerStatics_ )) { *out = &tracker_statics; return S_OK; }
+        if (IsEqualGUID( iid, &IID_IVisualInteractionSourceStatics_ )) { *out = &vis_statics; return S_OK; }
+    if (IsEqualGUID( iid, &IID_IInteractionTrackerInertiaRestingValueStatics_ )) { *out = &resting_statics; return S_OK; }
+        if (!getenv( "WINE_DCOMP_INTERACTIONS_RECORD" )) return create_failing_object( "InteractionsStatics", out );
+    }
+    return create_comp_object( factory->kind, out );
+}
+static ULONG WINAPI generic_factory_AddRef( IActivationFactory *iface ) { return 2; }
+static ULONG WINAPI generic_factory_Release( IActivationFactory *iface ) { return 1; }
+static HRESULT WINAPI generic_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI generic_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.Interactions.InteractionTracker";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI generic_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+static HRESULT WINAPI generic_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+{
+    struct generic_factory *factory = CONTAINING_RECORD( iface, struct generic_factory, IActivationFactory_iface );
+    return create_comp_object( factory->kind, (void **)instance );
+}
+static const struct IActivationFactoryVtbl generic_factory_vtbl =
+{
+    generic_factory_QueryInterface, generic_factory_AddRef, generic_factory_Release,
+    generic_factory_GetIids, generic_factory_GetRuntimeClassName, generic_factory_GetTrustLevel,
+    generic_factory_ActivateInstance,
+};
+/* Statics whose creators fail: WinUI's ScrollPresenter drives an InteractionTracker through
+ * expressions and private interfaces a recording object cannot satisfy (it overwrote the object), and
+ * it copes with the tracker not being creatable. */
+static void *failing_object_vtbl[COMP_OBJECT_SLOTS];
+static LONG failing_object_ready;
+static HRESULT WINAPI failing_slot( void *iface, void *a, void *b, void *c, void *d )
+{
+    struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
+    TRACE( "%s %p: E_NOTIMPL.\n", object->kind, object );
+    return E_NOTIMPL;
+}
+static HRESULT create_failing_object( const char *kind, void **out )
+{
+    struct comp_object *object;
+    unsigned int i;
+    ensure_comp_object_vtbl();
+    if (!failing_object_ready)
+    {
+        for (i = 6; i < COMP_OBJECT_SLOTS; i++) failing_object_vtbl[i] = failing_slot;
+        failing_object_vtbl[0] = comp_object_QueryInterface;
+        failing_object_vtbl[1] = comp_object_AddRef;
+        failing_object_vtbl[2] = comp_object_Release;
+        comp_object_set_inspectable( failing_object_vtbl );
+        InterlockedExchange( &failing_object_ready, 1 );
+    }
+    if (!out) return E_POINTER;
+    if (!(object = calloc( 1, sizeof(*object) ))) return E_OUTOFMEMORY;
+    object->vtbl = (const void **)failing_object_vtbl;
+    object->kind = kind;
+    object->ref = 1;
+    *out = &object->vtbl;
+    return S_OK;
+}
+static struct generic_factory interactions_factory = { { &generic_factory_vtbl }, "Interactions" };
+IActivationFactory *interactions_activation_factory = &interactions_factory.IActivationFactory_iface;
+

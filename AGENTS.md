@@ -20,7 +20,7 @@ environment:
 | `run.sh`, `install-overrides.sh`, `stage-app.sh` | launching and prefix setup |
 | `shims/`, `probes/`, `CMakeLists.txt` | the WinRT stand-ins and the diagnostic probes |
 | `*.py` | the investigation toolkit (`xref.py`, `winmd.py`, `piid.py`, `fasthive.py`, ...) |
-| `wine-patches/` | our Wine diffs, exported by `export-wine-patches.sh` |
+| `wine/` | **our Wine source**, vendored in full by `sync-wine.sh` - 120 files, ~22,700 lines |
 | `docs/` | Plan, Findings, screenshots |
 | `uwp-bin/` | **gitignored**, 3.9G: staged apps, the Windows image we borrow DLLs from, PDBs, built shims |
 | `prefix/` | **gitignored**, 946M: the live Wine prefix |
@@ -30,7 +30,7 @@ it and the Python tools get the same values from `uwppaths.py`. All four are ove
 
 **The Wine source is deliberately *not* in here.** `~/src/wine` and `~/src/wine-build` are shared
 with another session; they are not ours to move or commit. That is why our Wine changes live as
-patches in `wine-patches/`, and why a fix that belongs in one of their files has to be made
+real files in `wine/`, and why a fix that belongs in one of their files has to be made
 somewhere else instead.
 
 This repo was split out of the Microsoft Calculator fork it started in, keeping the 131 commits
@@ -66,12 +66,18 @@ that were ours; the Calculator tree is no longer involved.
   `dlls/user32`, `dlls/combase`, `dlls/d3d11`, `dlls/windows.graphics`, `dlls/wintypes`, `server/*`,
   `include/*`. Commit only files in *this* repo.
 - **Never push.** Commit freely; pushing is the user's call.
-- **Export our Wine changes into this repo after touching them**:
-  `./export-wine-patches.sh` writes `wine-patches/`. "Commit only files
-  in this repo" is not the same as "let our Wine work exist nowhere" - it was ~2,700 lines living
-  in one working tree, one `git checkout` from gone. Nothing gets committed in the shared tree; the
-  diffs get committed here. The exporter takes an **explicit file list**, not a glob, so it cannot
-  start sweeping the other session's work into our history.
+- **Sync our Wine source into this repo after touching it**: `./sync-wine.sh --from-tree`, then
+  commit. `--check` tells you whether the two are in step; `--to-tree` reconstructs the tree from
+  the repo. "Commit only files in this repo" is not the same as "let our Wine work exist nowhere":
+  it is ~22,700 lines across 120 files, and `dlls/dcomp/composition.c` (14k lines) and
+  `dlls/wineuwp/main.c` (3.8k) **do not exist upstream at all** - they are our source, not patches.
+  Nothing gets committed in the shared tree; the files get committed here, in full.
+  `wine/FILES` is an **explicit list, never a glob**, so this cannot start sweeping the other
+  session's work into our history.
+- **This used to be a patch export, and that silently lost 88% of the work.** `git diff` sees only
+  the *uncommitted* delta, but most of our Wine work had already been committed in the shared tree -
+  so `wine-patches/` captured 2,700 of 22,700 lines and looked complete. If you ever find yourself
+  exporting diffs of our own code again, check what is already committed over there first.
 - **Byte patches go in `$UWP_BIN/win11/...`**; `run.sh` re-copies into the prefix. Always keep a
   backup and verify the restore with `cmp` before moving on. Leaving one behind silently poisons
   every later run - it has happened.
@@ -218,10 +224,9 @@ For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
 
 ## Mistakes already made - do not repeat them
 
-**A byte patch to a Windows DLL is not a deliverable, and cannot be exported as a diff.** The
-`wine-patches/` mechanism exists because the Wine tree is *shared*, not because patch files are
-good - and it does not transfer here: applying a diff needs the exact base binary, and Microsoft
-serves only current revisions. When a patch to a Microsoft DLL turns out to be load-bearing, the
+**A byte patch to a Windows DLL is not a deliverable, and cannot be exported as a diff.** Unlike
+our Wine source, which is vendored in full under `wine/`, a diff against a Microsoft DLL needs the
+exact base binary to apply, and Microsoft serves only current revisions. When a patch to a Microsoft DLL turns out to be load-bearing, the
 job is to **re-home it** into Wine (or into `wineuwp` when the right file is the other session's),
 not to archive it. Most of the CoreMessaging patches are Wine IOCP/message-pump fixes wearing a
 disguise. See Findings-M4.

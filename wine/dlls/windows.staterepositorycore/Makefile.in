@@ -1,0 +1,5 @@
+MODULE    = windows.staterepositorycore.dll
+IMPORTS   = kernelbase
+
+SOURCES = \
+	main.c

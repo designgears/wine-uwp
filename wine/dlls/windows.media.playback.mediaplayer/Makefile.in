@@ -1,0 +1,7 @@
+MODULE  = windows.media.playback.mediaplayer.dll
+IMPORTS = combase user32 mfplat mfreadwrite mfuuid winmm ole32
+
+SOURCES = \
+	classes.idl \
+	main.c \
+	playback_engine.c

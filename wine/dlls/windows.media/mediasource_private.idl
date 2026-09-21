@@ -1,0 +1,214 @@
+/*
+ * Wine.Internal.IWineMediaPath - how a MediaSource tells a player which file it wraps.
+ *
+ * Copyright 2026 the Wine project authors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#pragma makedep header
+
+#ifdef __WIDL__
+#pragma winrt ns_prefix
+#endif
+
+import "inspectable.idl";
+import "windows.foundation.idl";
+
+/* A MediaSource on Windows is an opaque handle onto a demuxed pipeline. Wine's player only needs
+ * to know which file to open, and there is no public interface that says so, so MediaSource and
+ * MediaPlaybackItem both answer this one instead. windows.media.playback.mediaplayer queries for
+ * it by IID; nothing outside Wine ever sees it. */
+namespace Wine.Internal {
+    [uuid(148b8ebf-7e85-458e-b516-1038ad8bf525)]
+    interface IWineMediaPath : IInspectable
+    {
+        [propget] HRESULT Path([out, retval] HSTRING *value);
+    }
+
+    /* windows.media.core.idl declares IMediaSource2 with no methods, and there is no
+     * IMediaSourceStatics, IMediaPlaybackItem or IMediaPlaybackItemFactory at all. The real
+     * shapes are declared here with the uuids from the Windows metadata; that is all a caller
+     * sees. Parameters this does not model are IInspectable *, which is pointer-compatible. */
+    [uuid(2eb61048-655f-4c37-b813-b4e45dfa0abe)]
+    interface IMediaSource2Internal : IInspectable
+    {
+        HRESULT add_OpenOperationCompleted([in] IInspectable *handler,
+                                           [out, retval] Windows.Foundation.EventRegistrationToken *token);
+        HRESULT remove_OpenOperationCompleted([in] Windows.Foundation.EventRegistrationToken token);
+        [propget] HRESULT CustomProperties([out, retval] IInspectable **value);
+        [propget] HRESULT Duration([out, retval] IInspectable **value);
+        [propget] HRESULT IsOpen([out, retval] boolean *value);
+        [propget] HRESULT ExternalTimedTextSources([out, retval] IInspectable **value);
+        [propget] HRESULT ExternalTimedMetadataTracks([out, retval] IInspectable **value);
+    }
+
+    [uuid(f77d6fa4-4652-410e-b1d8-e9a5e245a45c)]
+    interface IMediaSourceStaticsInternal : IInspectable
+    {
+        HRESULT CreateFromAdaptiveMediaSource([in] IInspectable *source,
+                                              [out, retval] Wine.Internal.IMediaSource2Internal **value);
+        HRESULT CreateFromMediaStreamSource([in] IInspectable *source,
+                                            [out, retval] Wine.Internal.IMediaSource2Internal **value);
+        HRESULT CreateFromMseStreamSource([in] IInspectable *source,
+                                          [out, retval] Wine.Internal.IMediaSource2Internal **value);
+        HRESULT CreateFromIMediaSource([in] IInspectable *source,
+                                       [out, retval] Wine.Internal.IMediaSource2Internal **value);
+        HRESULT CreateFromStorageFile([in] IInspectable *file,
+                                      [out, retval] Wine.Internal.IMediaSource2Internal **value);
+        HRESULT CreateFromStream([in] IInspectable *stream, [in] HSTRING content_type,
+                                 [out, retval] Wine.Internal.IMediaSource2Internal **value);
+        HRESULT CreateFromStreamReference([in] IInspectable *stream, [in] HSTRING content_type,
+                                          [out, retval] Wine.Internal.IMediaSource2Internal **value);
+        HRESULT CreateFromUri([in] IInspectable *uri,
+                              [out, retval] Wine.Internal.IMediaSource2Internal **value);
+    }
+
+    [uuid(047097d2-e4af-48ab-b283-6929e674ece2)]
+    interface IMediaPlaybackItemInternal : IInspectable
+    {
+        HRESULT add_AudioTracksChanged([in] IInspectable *handler,
+                                       [out, retval] Windows.Foundation.EventRegistrationToken *token);
+        HRESULT remove_AudioTracksChanged([in] Windows.Foundation.EventRegistrationToken token);
+        HRESULT add_VideoTracksChanged([in] IInspectable *handler,
+                                       [out, retval] Windows.Foundation.EventRegistrationToken *token);
+        HRESULT remove_VideoTracksChanged([in] Windows.Foundation.EventRegistrationToken token);
+        HRESULT add_TimedMetadataTracksChanged([in] IInspectable *handler,
+                                               [out, retval] Windows.Foundation.EventRegistrationToken *token);
+        HRESULT remove_TimedMetadataTracksChanged([in] Windows.Foundation.EventRegistrationToken token);
+        [propget] HRESULT Source([out, retval] Wine.Internal.IMediaSource2Internal **value);
+        [propget] HRESULT AudioTracks([out, retval] IInspectable **value);
+        [propget] HRESULT VideoTracks([out, retval] IInspectable **value);
+        [propget] HRESULT TimedMetadataTracks([out, retval] IInspectable **value);
+    }
+
+    [uuid(7133fce1-1769-4ff9-a7c1-38d2c4d42360)]
+    interface IMediaPlaybackItemFactoryInternal : IInspectable
+    {
+        HRESULT Create([in] Wine.Internal.IMediaSource2Internal *source,
+                       [out, retval] Wine.Internal.IMediaPlaybackItemInternal **value);
+    }
+
+    /* MediaBinder defers resolving what a MediaSource plays until the player asks. Media Player
+     * creates one straight after a file is picked, and windows.media.core.idl has neither the
+     * class nor IMediaBinder, so the activation threw out of the pick with 0x80040111. */
+    [uuid(2b7e40aa-de07-424f-83f1-f1de46c4fa2e)]
+    interface IMediaBinderInternal : IInspectable
+    {
+        HRESULT add_Binding([in] IInspectable *handler,
+                            [out, retval] Windows.Foundation.EventRegistrationToken *token);
+        HRESULT remove_Binding([in] Windows.Foundation.EventRegistrationToken token);
+        [propget] HRESULT Token([out, retval] HSTRING *value);
+        [propput] HRESULT Token([in] HSTRING value);
+        [propget] HRESULT Source([out, retval] Wine.Internal.IMediaSource2Internal **value);
+    }
+
+    /* A MediaPlaybackItem's AudioTracks is a MediaPlaybackAudioTrackList, and the app casts the
+     * result to exactly that class. An empty IVectorView is not a MediaPlaybackAudioTrackList, so
+     * the cast threw and the item was dropped on the floor before it ever reached the playlist.
+     *
+     * windows.media.core.idl in the Wine tree gives AudioTrack IAudioTrack as its default
+     * interface; the shipping metadata gives it IMediaTrack, and the app's QI agrees with the
+     * metadata - it asks for IVectorView<AudioTrack> as {e71ffa4a-...}, which only comes out of
+     * the derivation when the default is IMediaTrack. The generated IID_IVectorView_AudioTrack is
+     * therefore the wrong one and is not used here. */
+    [uuid(03e1fafc-c931-491a-b46b-c10ee8c256b7)]
+    interface IMediaTrackInternal : IInspectable
+    {
+        [propget] HRESULT Id([out, retval] HSTRING *value);
+        [propget] HRESULT Language([out, retval] HSTRING *value);
+        [propget] HRESULT TrackKind([out, retval] INT32 *value);
+        [propput] HRESULT Label([in] HSTRING value);
+        [propget] HRESULT Label([out, retval] HSTRING *value);
+    }
+
+    [uuid(f23b6e77-3ef7-40de-b943-068b1321701d)]
+    interface IAudioTrackInternal : IInspectable
+    {
+        HRESULT add_OpenFailed([in] IInspectable *handler,
+                               [out, retval] Windows.Foundation.EventRegistrationToken *token);
+        HRESULT remove_OpenFailed([in] Windows.Foundation.EventRegistrationToken token);
+        HRESULT GetEncodingProperties([out, retval] IInspectable **value);
+        [propget] HRESULT PlaybackItem([out, retval] IInspectable **value);
+        [propget] HRESULT Name([out, retval] HSTRING *value);
+        [propget] HRESULT SupportInfo([out, retval] IInspectable **value);
+    }
+
+    [uuid(77206f1f-c34f-494f-8077-2bad9ff4ecf1)]
+    interface ISingleSelectMediaTrackListInternal : IInspectable
+    {
+        HRESULT add_SelectedIndexChanged([in] IInspectable *handler,
+                                         [out, retval] Windows.Foundation.EventRegistrationToken *token);
+        HRESULT remove_SelectedIndexChanged([in] Windows.Foundation.EventRegistrationToken token);
+        [propput] HRESULT SelectedIndex([in] INT32 value);
+        [propget] HRESULT SelectedIndex([out, retval] INT32 *value);
+    }
+
+    /* windows.media.playback.idl stops at IMediaPlaybackList. The app QIs for the revision as
+     * part of setting up the playlist and throws InvalidCastException when it is refused. */
+    [uuid(0e09b478-600a-4274-a14b-0b6723d0f48b)]
+    interface IMediaPlaybackList2Internal : IInspectable
+    {
+        [propget] HRESULT MaxPrefetchTime([out, retval] IInspectable **value);
+        [propput] HRESULT MaxPrefetchTime([in] IInspectable *value);
+        [propget] HRESULT StartingItem([out, retval] IInspectable **value);
+        [propput] HRESULT StartingItem([in] IInspectable *value);
+        [propget] HRESULT ShuffledItems([out, retval] IInspectable **value);
+        HRESULT SetShuffledItems([in] IInspectable *value);
+    }
+
+    [uuid(72b41319-bbfb-46a3-9372-9c9c744b9438)]
+    interface IMediaPlaybackTimedMetadataTrackListInternal : IInspectable
+    {
+        HRESULT add_PresentationModeChanged([in] IInspectable *handler,
+                                            [out, retval] Windows.Foundation.EventRegistrationToken *token);
+        HRESULT remove_PresentationModeChanged([in] Windows.Foundation.EventRegistrationToken token);
+        HRESULT GetPresentationMode([in] UINT32 index, [out, retval] INT32 *value);
+        HRESULT SetPresentationMode([in] UINT32 index, [in] INT32 value);
+    }
+
+    /* The args the Binding handler receives. The app answers the event by calling one of the
+     * setters on this; that is the only place the app ever tells us which file it picked, so a
+     * binder that never fires Binding can never learn its content. The uuids are the real ones
+     * from the Windows metadata - .NET Native QIs for them by IID. IMediaBindingEventArgs3 is
+     * deliberately absent: SetDownloadOperation takes a download we cannot honour, and
+     * E_NOINTERFACE is an answer the caller handles. */
+    [uuid(b61cb25a-1b6d-4630-a86d-2f0837f712e5)]
+    interface IMediaBindingEventArgsInternal : IInspectable
+    {
+        HRESULT add_Canceled([in] IInspectable *handler,
+                             [out, retval] Windows.Foundation.EventRegistrationToken *token);
+        HRESULT remove_Canceled([in] Windows.Foundation.EventRegistrationToken token);
+        [propget] HRESULT MediaBinder([out, retval] Wine.Internal.IMediaBinderInternal **value);
+        HRESULT GetDeferral([out, retval] Windows.Foundation.IDeferral **value);
+        HRESULT SetUri([in] IInspectable *uri);
+        HRESULT SetStream([in] IInspectable *stream, [in] HSTRING content_type);
+        HRESULT SetStreamReference([in] IInspectable *stream, [in] HSTRING content_type);
+    }
+
+    [uuid(0464cceb-bb5a-482f-b8ba-f0284c696567)]
+    interface IMediaBindingEventArgs2Internal : IInspectable
+    {
+        HRESULT SetAdaptiveMediaSource([in] IInspectable *source);
+        HRESULT SetStorageFile([in] IInspectable *file);
+    }
+
+    [uuid(eee161a4-7f13-4896-b8cb-df0de5bcb9f1)]
+    interface IMediaSourceStatics2Internal : IInspectable
+    {
+        HRESULT CreateFromMediaBinder([in] Wine.Internal.IMediaBinderInternal *binder,
+                                      [out, retval] Wine.Internal.IMediaSource2Internal **value);
+    }
+}

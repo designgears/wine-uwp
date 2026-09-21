@@ -1,6 +1,0 @@
-Wine commit these patches apply to:
-  8101e4e8118246f3918800d3fe188ed7f4f3410e
-  wineuwp: sample four stack frames per profile sample.
-
-Regenerate with: tools/wine-uwp/export-wine-patches.sh
-Apply with:      cd ~/src/wine && git apply wine-patches/*.patch
