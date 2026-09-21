@@ -8,7 +8,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]:-$0}")/./env.sh"
 export WINEPREFIX=${WINEPREFIX}
 SYS32=$WINEPREFIX/drive_c/windows/system32
-WINE_BIN=${WINE_BIN_DIR:-$HOME/src/wine-build/}
+WINE_BIN=$WINE_BIN_DIR   # from env.sh, sourced above; always ends in a slash
 SRC=${UWP_BIN}/win11/Windows/System32
 # Nothing to do when neither the source tree, the Wine build, this script nor the prefix's system32
 # listing changed since the last run: the file-by-file comparison below costs about three seconds
