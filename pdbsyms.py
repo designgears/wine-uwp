@@ -6,8 +6,11 @@
   pdbsyms.py DLL --rva 0x6260 ...     name arbitrary RVAs (nearest public symbol below)
 Requires: pefile, curl, llvm-pdbutil.
 """
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import uwppaths
 import sys, os, re, subprocess, bisect, pefile
-CACHE = os.path.expanduser("~/uwp-bin/pdb")
+CACHE = uwppaths.PDB
 def pdb_for(dll):
     p = pefile.PE(dll, fast_load=True)
     p.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_DEBUG']])

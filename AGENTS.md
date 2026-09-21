@@ -1,14 +1,40 @@
 # Working on wine-uwp
 
-This repo is Microsoft's Calculator, but the work here is `tools/wine-uwp` and `docs/LinuxPort`:
-running **packaged UWP apps we have no source for** under a patched Wine. The target is Shapr3D.
-Calculator, Feedback Hub, Media Player and Camera are test subjects, in that order of usefulness -
-Calculator because it is small and byte-comparable, the others because they are the same .NET
-Native + WinUI 2 shape Shapr3D is.
+Running **packaged UWP apps we have no source for** under a patched Wine. The target is Shapr3D.
+Calculator, Feedback Hub, Media Player, Camera and Solitaire are test subjects, in that order of
+usefulness - Calculator because it is small and byte-comparable, the others because they are the
+same .NET Native + WinUI 2 shape Shapr3D is, and Solitaire because it is the closest proxy for
+Shapr3D's *rendering* path.
 
-`docs/LinuxPort/Plan.md` has the architecture. `docs/LinuxPort/Findings-M*.md` are the running
-log - **append findings there**, including the ones that did not work. This file is the part that
-generalises: how to investigate, and the mistakes that have already cost time.
+`docs/Plan.md` has the architecture. `docs/Findings-M*.md` are the running log - **append findings
+there**, including the ones that did not work. This file is the part that generalises: how to
+investigate, and the mistakes that have already cost time.
+
+## Layout
+
+This repo carries its own data, so a clone plus the two ignored directories is the whole
+environment:
+
+| Path | What |
+| --- | --- |
+| `run.sh`, `install-overrides.sh`, `stage-app.sh` | launching and prefix setup |
+| `shims/`, `probes/`, `CMakeLists.txt` | the WinRT stand-ins and the diagnostic probes |
+| `*.py` | the investigation toolkit (`xref.py`, `winmd.py`, `piid.py`, `fasthive.py`, ...) |
+| `wine-patches/` | our Wine diffs, exported by `export-wine-patches.sh` |
+| `docs/` | Plan, Findings, screenshots |
+| `uwp-bin/` | **gitignored**, 3.9G: staged apps, the Windows image we borrow DLLs from, PDBs, built shims |
+| `prefix/` | **gitignored**, 946M: the live Wine prefix |
+
+`env.sh` defines `UWP_BIN`, `WINEPREFIX`, `WINE_SRC` and `WINE_BIN_DIR`; every shell script sources
+it and the Python tools get the same values from `uwppaths.py`. All four are overridable.
+
+**The Wine source is deliberately *not* in here.** `~/src/wine` and `~/src/wine-build` are shared
+with another session; they are not ours to move or commit. That is why our Wine changes live as
+patches in `wine-patches/`, and why a fix that belongs in one of their files has to be made
+somewhere else instead.
+
+This repo was split out of the Microsoft Calculator fork it started in, keeping the 131 commits
+that were ours; the Calculator tree is no longer involved.
 
 ## Ground rules
 
@@ -33,7 +59,7 @@ generalises: how to investigate, and the mistakes that have already cost time.
     ```
 
   Then `Read` the PNG, describe what is actually on it, and embed it in the reply.
-- **Run on Xvfb `:98`, never the user's `:0`.** `DISPLAY=:98 tools/wine-uwp/run.sh`.
+- **Run on Xvfb `:98`, never the user's `:0`.** `DISPLAY=:98 ./run.sh`.
 - **The Wine tree (`~/src/wine`) is shared with another session and is deliberately uncommitted.**
   Check `git -C ~/src/wine status` before touching anything. Files that are not yours include
   `dlls/kernelbase/*`, `dlls/ntdll/{loader,rtl,sync,signal_x86_64,threadpool}.c`, `dlls/win32u`,
@@ -41,12 +67,12 @@ generalises: how to investigate, and the mistakes that have already cost time.
   `include/*`. Commit only files in *this* repo.
 - **Never push.** Commit freely; pushing is the user's call.
 - **Export our Wine changes into this repo after touching them**:
-  `tools/wine-uwp/export-wine-patches.sh` writes `docs/LinuxPort/wine-patches/`. "Commit only files
+  `./export-wine-patches.sh` writes `docs/wine-patches/`. "Commit only files
   in this repo" is not the same as "let our Wine work exist nowhere" - it was ~2,700 lines living
   in one working tree, one `git checkout` from gone. Nothing gets committed in the shared tree; the
   diffs get committed here. The exporter takes an **explicit file list**, not a glob, so it cannot
   start sweeping the other session's work into our history.
-- **Byte patches go in `~/uwp-bin/win11/...`**; `run.sh` re-copies into the prefix. Always keep a
+- **Byte patches go in `$UWP_BIN/win11/...`**; `run.sh` re-copies into the prefix. Always keep a
   backup and verify the restore with `cmp` before moving on. Leaving one behind silently poisons
   every later run - it has happened.
 - Commit messages end with the attribution line the harness gives you.
@@ -58,7 +84,7 @@ a result:
 
 ```
 # Calculator must stay byte-identical to the saved baseline
-DISPLAY=:98 UWP_TIMEOUT=80 UWP_LOG=/tmp/c.log tools/wine-uwp/run.sh &  sleep 48
+DISPLAY=:98 UWP_TIMEOUT=80 UWP_LOG=/tmp/c.log ./run.sh &  sleep 48
 DISPLAY=:98 import -window root /tmp/c.png; cmp /tmp/c.png /tmp/calc-regress.png
 
 # Feedback Hub: no fail-fasts, no app error, ~822 unique colours
@@ -77,10 +103,10 @@ These all exist and work. Prefer them over reading code and guessing.
 
 | Question | Tool |
 | --- | --- |
-| What is this IID, and what are its methods? | `tools/wine-uwp/winmd.py <winmd> --guid <iid>` (public interfaces; prints slots from 6) |
+| What is this IID, and what are its methods? | `./winmd.py <winmd> --guid <iid>` (public interfaces; prints slots from 6) |
 | Demangle an MSVC symbol | `llvm-undname` |
-| Symbols for a Microsoft binary | read the RSDS record from the PE debug directory, `curl` it from `msdl.microsoft.com/download/symbols/<name>/<sig><age>/<name>` ([docs](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/microsoft-public-symbols)), then `llvm-pdbutil dump --publics` into a `rva name` `.syms` file next to it in `~/uwp-bin/pdb`. `tools/wine-uwp/pdbsyms.py` does this but needs `pefile`, which is **not installed** - parse the debug directory by hand (~20 lines) or install it |
-| Which module is this address in? | `tools/wine-uwp/addr2mod.py <log-with-+loaddll> <addr>` - **native modules only**, see below; for a Wine builtin use `/proc/<pid>/maps` |
+| Symbols for a Microsoft binary | read the RSDS record from the PE debug directory, `curl` it from `msdl.microsoft.com/download/symbols/<name>/<sig><age>/<name>` ([docs](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/microsoft-public-symbols)), then `llvm-pdbutil dump --publics` into a `rva name` `.syms` file next to it in `$UWP_BIN/pdb`. `./pdbsyms.py` does this but needs `pefile`, which is **not installed** - parse the debug directory by hand (~20 lines) or install it |
+| Which module is this address in? | `./addr2mod.py <log-with-+loaddll> <addr>` - **native modules only**, see below; for a Wine builtin use `/proc/<pid>/maps` |
 | Which of N call sites returned this HRESULT? | unique-HRESULT tagging, below |
 | Did this code path run at all? | patch `0f 0b` (`ud2`) over its first two bytes, below |
 | What did managed code throw, and where? | `WINE_UWP_TRACE_ORIGINATE=1` + the chunked `trace_language_exception` in `dlls/combase/roerror.c` |
@@ -89,8 +115,8 @@ These all exist and work. Prefer them over reading code and guessing.
 | Why is an app stuck, when the stack dumper cannot say? | `WINE_UWP_PROFILE=<prefix> WINE_UWP_PROFILE_MS=10` - a sampling profiler already in `wineuwp`. Writes `<prefix>.<pid>` every 2 s: an `M` line per module then `S <tid> <rip> <count> <4 callers>`. It **found the waiting thread's loop when `WINE_UWP_DUMP_STACKS` returned nothing useful**, and it distinguishes *blocked* from *spinning*, which no single stack snapshot can |
 | What is every thread actually doing? | `WINE_UWP_DUMP_STACKS=<seconds>` - suspends and unwinds every thread, prints `STACK tid N frame M rip=`. Works on an *idle* app, not just a hung one. Resolve against `/proc/<pid>/maps` from the same run |
 | Method count of a private interface | parse the MIDL proxy/stub DLL, below |
-| Where is the code behind one of the app's own log strings? | `tools/wine-uwp/xref.py <exe> --string '<log string>'` - finds rip-relative LEAs to it and resolves each to its **enclosing function** via `.pdata`, which is where a `ud2` has to go. `--callers <rva>` finds direct call sites |
-| Does a size change reach the app? | `~/uwp-bin/build-probes/probe-resize.exe <w> <h> [title]` - `SetWindowPos` through Wine. **`xdotool windowsize` does not reach Wine at all** |
+| Where is the code behind one of the app's own log strings? | `./xref.py <exe> --string '<log string>'` - finds rip-relative LEAs to it and resolves each to its **enclosing function** via `.pdata`, which is where a `ud2` has to go. `--callers <rva>` finds direct call sites |
+| Does a size change reach the app? | `$UWP_BIN/build-probes/probe-resize.exe <w> <h> [title]` - `SetWindowPos` through Wine. **`xdotool windowsize` does not reach Wine at all** |
 | Which methods of an interface does the app actually call? | give every slot a traced thunk returning `E_NOTIMPL` and read the log - see `shims/storecontext`, which proved the app wanted only `GetDefault` out of 26 methods |
 
 ### Unique-HRESULT tagging
@@ -122,8 +148,8 @@ different claims: a firing control proves `ud2` works in that process, not that 
 function the app actually calls. Calculator and Media Player both fire
 `WindowGenerated::put_Content`, which is what makes Solitaire's silence there mean something.
 
-**Patch and restore *every* copy.** `run.sh` copies `~/uwp-bin/win11/...` into the prefix, so a
-patch applied to the source is live in `~/.wine-uwp/drive_c/windows/system32/` too - restoring only
+**Patch and restore *every* copy.** `run.sh` copies `$UWP_BIN/win11/...` into the prefix, so a
+patch applied to the source is live in `$WINEPREFIX/drive_c/windows/system32/` too - restoring only
 the source leaves the probe in place for every later run. `cmp` both against the backup afterwards.
 
 **Restore in the *same command* that reads the result.** The rule above is old and I broke it
@@ -147,7 +173,7 @@ Three negatives in a row usually means the patched file is not the file being lo
 
 For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
 
-1. `HKCR\Interface\{iid}` in the Windows SOFTWARE hive (`tools/wine-uwp/fasthive.py`) often has the
+1. `HKCR\Interface\{iid}` in the Windows SOFTWARE hive (`./fasthive.py`) often has the
    name even when the metadata does not.
 2. Find which DLLs contain the IID bytes. A **proxy/stub** DLL gives the exact method count: find a
    pointer to the IID (that is `CInterfaceStubHeader::piid`), read `DispatchTableCount` at +0x10.
@@ -434,7 +460,7 @@ wrote both of the following into this file, and both were wrong:
   `ls -lt --time-style=+%H:%M`, which prints **no date**, saw `03:43`, and assumed today. With
   `--time-style='+%m-%d %H:%M'` those DLLs are from **09-19**. The only file rebuilt that day was my
   own `windows.media.playback.mediaplayer.dll`. Always print the date; also check
-  `~/.wine-uwp/.update-timestamp` for a wineboot and `cmp` the byte-patched prefix DLLs.
+  `$WINEPREFIX/.update-timestamp` for a wineboot and `cmp` the byte-patched prefix DLLs.
 - *"Every app including Calculator is dying."* That came from counting log lines
   (`deadlock=4 xaml=2`). Those same counts appear in **healthy** Calculator runs - the
   `loader_section` retry messages are normal noise. A clean run with `import`/`identify` showed
@@ -458,7 +484,7 @@ the whole chain, and the first link is our own tooling:
 3. msftedit's `DllMain` calls `RegisterClassW`. So the log says
    `blocked by <tid> (in DllMain of L"msftedit.dll")` and `first-view startup not taken`, and the
    innocent DLL gets the blame. On a healthy display `LoadLibrary("msftedit.dll")` takes **153 ms**
-   (`tools/wine-uwp/probes/probe-load.cpp` reports per-DLL load times).
+   (`./probes/probe-load.cpp` reports per-DLL load times).
 
 **Do not use `import`.** `xwd` is installed now (`xorg-xwd`) and does not grab:
 `xwd -id <win> -silent > f.xwd && magick xwd:f.xwd f.png`, or `-root` for the whole screen. If you
@@ -563,7 +589,7 @@ the fully-qualified name. `--grep` first, always.
   public PDBs, but `mrt100_app.pdb` does - and `RhpPInvokeExceptionGuard` in a stack means a native
   exception was taken under a P/Invoke, which is always a fail-fast. If you see that, look for a
   *native* fault, not a managed bug.
-- A Wine DLL can have a **copy in the prefix** (`~/.wine-uwp/drive_c/windows/system32/`) shadowing
+- A Wine DLL can have a **copy in the prefix** (`$WINEPREFIX/drive_c/windows/system32/`) shadowing
   the build tree. Restoring a backup there can silently reinstate a pre-fix build - check with
   `cmp` against `~/src/wine-build/dlls/<dll>/x86_64-windows/<dll>.dll` after any backup/restore
   dance.

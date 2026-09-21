@@ -1,7 +1,8 @@
 # Shared settings for the performance scripts. Source it; override any of these in the environment.
+. "$(dirname "${BASH_SOURCE[0]:-$0}")/../env.sh"
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 WINE_BUILD=${WINE_BUILD:-$HOME/src/wine-build}
-UWP_PREFIX=${UWP_PREFIX:-$HOME/.wine-uwp}
+UWP_PREFIX=${UWP_PREFIX:-${WINEPREFIX}}
 PERF_OUT=${PERF_OUT:-/tmp/wine-uwp-perf}
 export DISPLAY=${PERF_DISPLAY:-:98}
 unset WAYLAND_DISPLAY

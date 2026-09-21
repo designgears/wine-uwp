@@ -1,0 +1,12 @@
+# The two big data directories now live inside the repo so that a clone plus these is the whole
+# environment. They are emphatically not source: 3.9G of staged apps, borrowed Windows DLLs and
+# PDBs, and a 946M live Wine prefix.
+/uwp-bin/
+/prefix/
+
+# Build output for the shims and probes
+/build-probes/
+
+__pycache__/
+*.pyc
+*.xwd

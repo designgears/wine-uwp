@@ -6,9 +6,12 @@
 Reading a private method's actual code is usually the only way to learn its parameter shape or
 which failure path it takes; pdbsyms.py names addresses, xrefs.py finds callers, this shows why.
 """
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import uwppaths
 import sys, os, re, bisect, subprocess, pefile
 
-CACHE = os.path.expanduser("~/uwp-bin/pdb")
+CACHE = uwppaths.PDB
 
 def publics(dll):
     name = os.path.basename(dll)

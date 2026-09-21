@@ -8,8 +8,9 @@
 #   e.g. tools/wine-uwp/stage-app.sh Microsoft.ZuneMusic media-player
 # WINDOWSAPPS overrides where installed packages are read from (default: the /mnt/win mount).
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]:-$0}")/./env.sh"
 WA=${WINDOWSAPPS:-/mnt/win/Program Files/WindowsApps}
-FWSRC=$HOME/uwp-bin/win11/Program\ Files/WindowsApps
+FWSRC=${UWP_BIN}/win11/Program\ Files/WindowsApps
 [ -d "$WA" ] || { echo "no WindowsApps at $WA (mount the Windows partition first)" >&2; exit 1; }
 
 pat=$1
@@ -18,7 +19,7 @@ src=$(ls -d "$WA"/${pat}_*_x64__* 2>/dev/null | head -1) || true
 full=$(basename "$src")
 name=${full%%_*}; pub=${full##*__}
 stage=${2:-$(echo "${name##*.}" | tr 'A-Z' 'a-z')}
-S=$HOME/uwp-bin/stage/$stage
+S=${UWP_BIN}/stage/$stage
 
 # The manifest is UTF-16 or UTF-8 depending on the packaging tool; strip NULs and read it flat.
 man=$(tr -d '\0' < "$src/AppxManifest.xml" | tr '>' '>\n')

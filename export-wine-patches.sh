@@ -12,9 +12,8 @@
 # else in `git status` over there is theirs and must not be copied into our history.
 set -euo pipefail
 
-WINE=${WINE_SRC:-$HOME/src/wine}
-OUT=$(cd "$(dirname "$0")/../../docs/LinuxPort/wine-patches" 2>/dev/null && pwd) \
-  || OUT=$(dirname "$0")/../../docs/LinuxPort/wine-patches
+WINE=${WINE_SRC:-$HOME/src/wine}   # shared with another session; stays outside the repo
+OUT=$(dirname "$0")/wine-patches
 mkdir -p "$OUT"
 
 # Ours. Keep this list explicit: a glob would silently start exporting the other session's work
@@ -50,6 +49,6 @@ Wine commit these patches apply to:
   $subject
 
 Regenerate with: tools/wine-uwp/export-wine-patches.sh
-Apply with:      cd ~/src/wine && git apply docs/LinuxPort/wine-patches/*.patch
+Apply with:      cd ~/src/wine && git apply wine-patches/*.patch
 EOF
-echo "exported $total patch(es) to docs/LinuxPort/wine-patches, base $base"
+echo "exported $total patch(es) to wine-patches, base $base"

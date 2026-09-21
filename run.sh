@@ -2,7 +2,8 @@
 # Run a staged UWP app (or a probe) in the wine-uwp prefix with useful tracing.
 # Usage: tools/wine-uwp/run.sh [exe] [args...]     default exe: CalculatorApp.exe in the stage dir
 set -uo pipefail
-export WINEPREFIX=$HOME/.wine-uwp
+. "$(dirname "${BASH_SOURCE[0]:-$0}")/./env.sh"
+export WINEPREFIX=${WINEPREFIX}
 # Tests run on a headless Xvfb (DISPLAY=:98), but a desktop session also exports WAYLAND_DISPLAY
 # and Wine prefers winewayland.drv when it is set - which would put the app on the real desktop
 # compositor instead of the test display. Unsetting it is NOT enough: libwayland then falls back to
@@ -43,9 +44,9 @@ if ! wine sc query CoreMessagingRegistrar 2>/dev/null | grep -q RUNNING; then
     sleep 1
   done
 fi
-# UWP_STAGE names a directory under ~/uwp-bin/stage (see stage-app.sh); the identity defaults below
+# UWP_STAGE names a directory under ${UWP_BIN}/stage (see stage-app.sh); the identity defaults below
 # only make sense for the calculator, so a different stage carries its own identity file.
-S=$HOME/uwp-bin/stage/${UWP_STAGE:-calculator}
+S=${UWP_BIN}/stage/${UWP_STAGE:-calculator}
 cd "$S"
 # stage-app.sh writes identity.env for packages staged straight out of a Windows install.
 if [ -f "$S/identity.env" ]; then . "$S/identity.env"; fi
@@ -59,7 +60,7 @@ export WINE_UWP_AUMID=${WINE_UWP_AUMID:-Microsoft.WindowsCalculator.Dev_8wekyb3d
 export WINE_UWP_WINDOW_TITLE=${WINE_UWP_WINDOW_TITLE:-Calculator}
 export WINE_UWP_WINDOW_SIZE=${WINE_UWP_WINDOW_SIZE:-1280x800}
 # Framework dependencies: "fullname|family|path;..." (GetCurrentPackageInfo returns them after the main package)
-if [ -z "${WINE_UWP_PACKAGE_DEPENDENCIES:-}" ] && [ -d "$HOME/uwp-bin/stage/frameworks" ]; then
+if [ -z "${WINE_UWP_PACKAGE_DEPENDENCIES:-}" ] && [ -d "${UWP_BIN}/stage/frameworks" ]; then
   deps=""
   for d in "$HOME"/uwp-bin/stage/frameworks/*/; do
     full=$(basename "$d"); name=${full%%_*}; pub=${full##*__}
@@ -69,7 +70,7 @@ if [ -z "${WINE_UWP_PACKAGE_DEPENDENCIES:-}" ] && [ -d "$HOME/uwp-bin/stage/fram
 fi
 # Package graph DLL search path: Windows adds every framework package root to the process search
 # path, which is how an app resolves framework DLLs it does not carry itself.
-if [ -d "$HOME/uwp-bin/stage/frameworks" ]; then
+if [ -d "${UWP_BIN}/stage/frameworks" ]; then
   fwpath=""
   for d in "$HOME"/uwp-bin/stage/frameworks/*/; do fwpath="$fwpath${fwpath:+:}${d%/}"; done
   export WINEPATH="${WINEPATH:+$WINEPATH:}$fwpath"

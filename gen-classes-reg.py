@@ -5,6 +5,9 @@ Every in-process class whose DLL we extracted gets registered with an absolute Z
 System32 copy. Server-activated (out-of-proc) classes are skipped: there is no RuntimeBroker in Wine.
 Usage: gen-classes-reg.py <SOFTWARE hive> <extracted System32 dir> <out.reg> [--json out.json]
 """
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import uwppaths
 import sys, os, json
 from regipy.registry import RegistryHive
 hive, sysdir, outreg = sys.argv[1:4]
@@ -12,7 +15,7 @@ jsonout = sys.argv[5] if len(sys.argv) > 5 and sys.argv[4] == "--json" else None
 h = RegistryHive(hive)
 k = h.get_key(r"\Microsoft\WindowsRuntime\ActivatableClassId")
 present = {f.lower(): f for f in os.listdir(sysdir)}
-prefix_sys32 = os.environ.get("WINE_UWP_SYSTEM32", os.path.expanduser("~/.wine-uwp/drive_c/windows/system32"))
+prefix_sys32 = uwppaths.SYSTEM32
 in_prefix = {f.lower() for f in os.listdir(prefix_sys32)} if os.path.isdir(prefix_sys32) else set()
 winpath = "Z:" + os.path.abspath(sysdir).replace("/", "\\")
 lines = ["Windows Registry Editor Version 5.00", ""]

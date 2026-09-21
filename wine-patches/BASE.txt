@@ -3,4 +3,4 @@ Wine commit these patches apply to:
   wineuwp: sample four stack frames per profile sample.
 
 Regenerate with: tools/wine-uwp/export-wine-patches.sh
-Apply with:      cd ~/src/wine && git apply docs/LinuxPort/wine-patches/*.patch
+Apply with:      cd ~/src/wine && git apply wine-patches/*.patch

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Stage the calculator package with its framework DLLs and our shims into ~/uwp-bin/stage/calculator.
-# Usage: tools/wine-uwp/stage.sh [path-to-unpacked-msix]   (default: ~/uwp-bin/calculator/pkg)
+# Stage the calculator package with its framework DLLs and our shims into ${UWP_BIN}/stage/calculator.
+# Usage: tools/wine-uwp/stage.sh [path-to-unpacked-msix]   (default: ${UWP_BIN}/calculator/pkg)
 set -euo pipefail
-SRC=${1:-$HOME/uwp-bin/calculator/pkg}
-S=$HOME/uwp-bin/stage/calculator
-F=$HOME/uwp-bin/frameworks
-B=$HOME/uwp-bin/build-probes
+. "$(dirname "${BASH_SOURCE[0]:-$0}")/./env.sh"
+SRC=${1:-${UWP_BIN}/calculator/pkg}
+S=${UWP_BIN}/stage/calculator
+F=${UWP_BIN}/frameworks
+B=${UWP_BIN}/build-probes
 rm -rf "$S"; mkdir -p "$S"
 cp -r "$SRC"/. "$S"/
-WA="$HOME/uwp-bin/win11/Program Files/WindowsApps"
+WA="${UWP_BIN}/win11/Program Files/WindowsApps"
 if [ -d "$WA" ]; then
   # Exact framework package versions from the Windows install (matches the manifest's PackageDependency)
   cp "$WA"/Microsoft.NET.Native.Runtime.2.2_*_x64__*/*.dll "$S"/
@@ -18,7 +19,7 @@ if [ -d "$WA" ]; then
   cp "$WA"/Microsoft.VCLibs.140.00_*_x64__*/*.dll "$S"/
   cp "$HOME"/uwp-bin/win11/Windows/System32/mrt100.dll "$S"/
   # Framework packages as separate package directories (package graph for MRM and manifest scanning)
-  FW=$HOME/uwp-bin/stage/frameworks; rm -rf "$FW"; mkdir -p "$FW"
+  FW=${UWP_BIN}/stage/frameworks; rm -rf "$FW"; mkdir -p "$FW"
   for d in "$WA"/Microsoft.UI.Xaml.2.8_8.2511*_x64__* "$WA"/Microsoft.NET.Native.Framework.2.2_*_x64__* "$WA"/Microsoft.NET.Native.Runtime.2.2_*_x64__* "$WA"/Microsoft.VCLibs.140.00_*_x64__*; do
     cp -r "$d" "$FW"/
   done
@@ -38,8 +39,8 @@ fi
 
 # The repo's GraphingImpl is a mock (draws nothing, parses nothing). The Store package ships the
 # real engine as GraphingImpl.dll + omsautimmss.dll; when a copy of the package is at
-# ~/uwp-bin/store-calc (see docs/LinuxPort/Overrides.md) use it so Graphing actually plots.
-SC=$HOME/uwp-bin/store-calc
+# ${UWP_BIN}/store-calc (see docs/LinuxPort/Overrides.md) use it so Graphing actually plots.
+SC=${UWP_BIN}/store-calc
 if [ -f "$SC/GraphingImpl.dll" ] && [ -f "$SC/omsautimmss.dll" ]; then
   cp "$SC"/GraphingImpl.dll "$SC"/omsautimmss.dll "$S"/
   echo "staged the Store graphing engine"

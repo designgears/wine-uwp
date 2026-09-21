@@ -20,10 +20,13 @@ The registry side, for reference - bare filenames resolve against the Fonts dire
   "SegoeUIVariableTextRegular (TrueType)"="SegoeUIVariableTextRegular.ttf"
 """
 import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import uwppaths
+import os, sys
 from fontTools.ttLib import TTFont
 
 SRC = sys.argv[1] if len(sys.argv) > 1 else "/mnt/win/Windows/Fonts/SegUIVar.ttf"
-OUT = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser("~/uwp-bin/win11/Windows/Fonts")
+OUT = sys.argv[2] if len(sys.argv) > 2 else os.path.join(uwppaths.UWP_BIN, "win11/Windows/Fonts")
 
 # Windows groups the named instances by optical size; the weight names inside a group become the
 # style. "Regular" with no suffix is the Text group's regular - the default UI font.

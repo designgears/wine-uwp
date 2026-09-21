@@ -5,10 +5,11 @@
 # leaving case-duplicates next to the genuine copies; the loader then picks the exact-case builtin.
 # We therefore remove every case variant and install the genuine file under the lowercase name.
 set -euo pipefail
-export WINEPREFIX=$HOME/.wine-uwp
+. "$(dirname "${BASH_SOURCE[0]:-$0}")/./env.sh"
+export WINEPREFIX=${WINEPREFIX}
 SYS32=$WINEPREFIX/drive_c/windows/system32
 WINE_BIN=${WINE_BIN_DIR:-$HOME/src/wine-build/}
-SRC=$HOME/uwp-bin/win11/Windows/System32
+SRC=${UWP_BIN}/win11/Windows/System32
 # Nothing to do when neither the source tree, the Wine build, this script nor the prefix's system32
 # listing changed since the last run: the file-by-file comparison below costs about three seconds
 # of every launch. WINE_UWP_FORCE_OVERRIDES=1 skips the check.
@@ -102,18 +103,18 @@ done
 # copies that have separate data and separate lifetimes. Pin the activatable classes of those DLLs
 # to the prefix copy. Only byte-identical copies are pinned, so Wine builtins keep serving their
 # own classes.
-PY=${PY:-$HOME/uwp-bin/venv/bin/python}
+PY=${PY:-${UWP_BIN}/venv/bin/python}
 # Classic in-process COM classes the UWP stack CoCreates by CLSID (WindowServerFactory and friends).
 # Needed once combase really marshals: a custom marshaler names its unmarshal class by CLSID.
-CLSID_REG=$HOME/uwp-bin/win11/wine-uwp-clsid.reg
+CLSID_REG=${UWP_BIN}/win11/wine-uwp-clsid.reg
 if [ -x "$PY" ]; then
   "$PY" "$(dirname "$0")/gen-clsid-reg.py" "$SRC/config/SOFTWARE" "$SRC" "$CLSID_REG" | tail -1
   if ! cmp -s "$CLSID_REG" "$CLSID_REG.imported"; then
     "${WINE_BIN}wine" reg import "$CLSID_REG" >/dev/null 2>&1 && cp -f "$CLSID_REG" "$CLSID_REG.imported"
   fi
 fi
-CLASSES_REG=${CLASSES_REG:-$HOME/uwp-bin/win11/wine-uwp-classes.reg}
-SINGLE_REG=$HOME/uwp-bin/win11/wine-uwp-single-module.reg
+CLASSES_REG=${CLASSES_REG:-${UWP_BIN}/win11/wine-uwp-classes.reg}
+SINGLE_REG=${UWP_BIN}/win11/wine-uwp-single-module.reg
 if [ -f "$CLASSES_REG" ] && [ -x "$PY" ]; then
   "$PY" "$(dirname "$0")/gen-single-module-reg.py" "$CLASSES_REG" "$SRC" "$SYS32" "$SINGLE_REG" | tail -1
   if ! cmp -s "$SINGLE_REG" "$SINGLE_REG.imported"; then
@@ -124,7 +125,7 @@ fi
 # Windows.Internal.StateRepository.* stand-in. Those classes are service-activated in the Windows
 # hive (ActivationType=1, Server=StateRepository) with no DllPath, so gen-classes-reg.py skips them
 # and RoGetActivationFactory returns REGDB_E_CLASSNOTREG. See shims/staterepository.
-SR_SHIM=$HOME/uwp-bin/build-probes/wineuwp_staterepository.dll
+SR_SHIM=${UWP_BIN}/build-probes/wineuwp_staterepository.dll
 if [ -f "$SR_SHIM" ]; then
   SR_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_staterepository.dll
   if ! cmp -s "$SR_SHIM" "$SR_DST"; then cp -f "$SR_SHIM" "$SR_DST"; fi
@@ -142,7 +143,7 @@ fi
 # DllPath is the native CapabilityAccessManagerClient.dll, which RPCs to a service the prefix does
 # not have, so every CheckAccess is denied and Media Player paints "can't access your music
 # library" instead of the library. See shims/appcapability.
-AC_SHIM=$HOME/uwp-bin/build-probes/wineuwp_appcapability.dll
+AC_SHIM=${UWP_BIN}/build-probes/wineuwp_appcapability.dll
 if [ -f "$AC_SHIM" ]; then
   AC_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_appcapability.dll
   if ! cmp -s "$AC_SHIM" "$AC_DST"; then cp -f "$AC_SHIM" "$AC_DST"; fi
@@ -158,7 +159,7 @@ fi
 # (RoGetActivationFactory says "not found in windows.storage.dll"), and it cannot easily: Wine's
 # include/windows.storage.idl declares neither StorageLibrary nor KnownLibraryId. Media Player's
 # library pages need it once AppCapability reports musicLibrary as Allowed. See shims/storagelibrary.
-SL_SHIM=$HOME/uwp-bin/build-probes/wineuwp_storagelibrary.dll
+SL_SHIM=${UWP_BIN}/build-probes/wineuwp_storagelibrary.dll
 if [ -f "$SL_SHIM" ]; then
   SL_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_storagelibrary.dll
   if ! cmp -s "$SL_SHIM" "$SL_DST"; then cp -f "$SL_SHIM" "$SL_DST"; fi
@@ -174,7 +175,7 @@ fi
 # twinui.appcore.dll, whose picker is a shell UI in a broker process the prefix does not have, so
 # PickSingleFileAsync never completes and an app's "open file" button does nothing. The stand-in
 # returns the file named by WINE_UWP_PICKER_FILE. See shims/filepicker.
-FP_SHIM=$HOME/uwp-bin/build-probes/wineuwp_filepicker.dll
+FP_SHIM=${UWP_BIN}/build-probes/wineuwp_filepicker.dll
 if [ -f "$FP_SHIM" ]; then
   FP_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_filepicker.dll
   if ! cmp -s "$FP_SHIM" "$FP_DST"; then cp -f "$FP_SHIM" "$FP_DST"; fi
@@ -190,7 +191,7 @@ fi
 # Server=UserManager - an out-of-process class with no DllPath - so RoGetActivationFactory fails
 # outright and Xbox Live auth (XAL) reports E_FAIL. Solitaire logs that as its first two lines.
 # See shims/userpicker.
-UP_SHIM=$HOME/uwp-bin/build-probes/wineuwp_userpicker.dll
+UP_SHIM=${UWP_BIN}/build-probes/wineuwp_userpicker.dll
 if [ -f "$UP_SHIM" ]; then
   UP_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_userpicker.dll
   if ! cmp -s "$UP_SHIM" "$UP_DST"; then cp -f "$UP_SHIM" "$UP_DST"; fi
@@ -204,7 +205,7 @@ fi
 
 # MemoryManager's native rmclient event registration requires an absent Windows service.
 # Solitaire throws out of its page constructor when registration returns 0x800706d9.
-MM_SHIM=$HOME/uwp-bin/build-probes/wineuwp_memorymanager.dll
+MM_SHIM=${UWP_BIN}/build-probes/wineuwp_memorymanager.dll
 if [ -f "$MM_SHIM" ]; then
   MM_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_memorymanager.dll
   if ! cmp -s "$MM_SHIM" "$MM_DST"; then cp -f "$MM_SHIM" "$MM_DST"; fi
@@ -220,7 +221,7 @@ fi
 # except the DeviceClass one, which returns E_NOTIMPL. Solitaire is C++/CX, so that becomes a
 # thrown Platform::Exception that abandons AppHost::EngineInitialize - including the render-window
 # event subscription it needs to resize its swap chain. See shims/deviceinformation.
-DI_SHIM=$HOME/uwp-bin/build-probes/wineuwp_deviceinformation.dll
+DI_SHIM=${UWP_BIN}/build-probes/wineuwp_deviceinformation.dll
 if [ -f "$DI_SHIM" ]; then
   DI_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_deviceinformation.dll
   if ! cmp -s "$DI_SHIM" "$DI_DST"; then cp -f "$DI_SHIM" "$DI_DST"; fi
@@ -269,7 +270,7 @@ fi
 
 # api-ms-win-appmodel-runtime-l1-1-1.dll: forwards the apiset to kernelbase plus the one function
 # Wine lacks. Resolved by name at load time, so it only has to exist in system32.
-AMR=$HOME/uwp-bin/build-probes/api-ms-win-appmodel-runtime-l1-1-1.dll
+AMR=${UWP_BIN}/build-probes/api-ms-win-appmodel-runtime-l1-1-1.dll
 if [ -f "$AMR" ]; then
   AMR_DST=$SYS32/api-ms-win-appmodel-runtime-l1-1-1.dll
   if ! cmp -s "$AMR" "$AMR_DST"; then cp -f "$AMR" "$AMR_DST"; fi
@@ -277,7 +278,7 @@ if [ -f "$AMR" ]; then
 fi
 
 # NetworkInformation stand-in (see shims/networkstatus): fires NetworkStatusChanged once.
-NS=$HOME/uwp-bin/build-probes/wineuwp_networkstatus.dll
+NS=${UWP_BIN}/build-probes/wineuwp_networkstatus.dll
 if [ -f "$NS" ]; then
   if ! cmp -s "$NS" "$SYS32/wineuwp_networkstatus.dll"; then cp -f "$NS" "$SYS32/wineuwp_networkstatus.dll"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Networking.Connectivity.NetworkInformation"
@@ -289,7 +290,7 @@ if [ -f "$NS" ]; then
 fi
 
 # SpatialAudioDeviceConfiguration stand-in (see shims/spatialaudio).
-SA=$HOME/uwp-bin/build-probes/wineuwp_spatialaudio.dll
+SA=${UWP_BIN}/build-probes/wineuwp_spatialaudio.dll
 if [ -f "$SA" ]; then
   if ! cmp -s "$SA" "$SYS32/wineuwp_spatialaudio.dll"; then cp -f "$SA" "$SYS32/wineuwp_spatialaudio.dll"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Media.Audio.SpatialAudioDeviceConfiguration"
@@ -306,7 +307,7 @@ if [ -f "$SA" ]; then
 fi
 
 # WebAuthenticationCoreManager stand-in (see shims/webauthcore).
-WAC=$HOME/uwp-bin/build-probes/wineuwp_webauthcore.dll
+WAC=${UWP_BIN}/build-probes/wineuwp_webauthcore.dll
 if [ -f "$WAC" ]; then
   if ! cmp -s "$WAC" "$SYS32/wineuwp_webauthcore.dll"; then cp -f "$WAC" "$SYS32/wineuwp_webauthcore.dll"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager"
@@ -319,7 +320,7 @@ fi
 
 # UserActivityChannel.GetDefault needs cdp.dll in the native implementation. Its failure
 # unwinds out of Solitaire's startup subscriber and terminates the engine thread.
-UA_SHIM=$HOME/uwp-bin/build-probes/wineuwp_useractivitychannel.dll
+UA_SHIM=${UWP_BIN}/build-probes/wineuwp_useractivitychannel.dll
 if [ -f "$UA_SHIM" ]; then
   UA_DST=$SYS32/wineuwp_useractivitychannel.dll
   if ! cmp -s "$UA_SHIM" "$UA_DST"; then cp -f "$UA_SHIM" "$UA_DST"; fi
@@ -332,7 +333,7 @@ if [ -f "$UA_SHIM" ]; then
 fi
 
 # The notification service is absent; expose its disabled availability to apps.
-TN_SHIM=$HOME/uwp-bin/build-probes/wineuwp_toastnotifier.dll
+TN_SHIM=${UWP_BIN}/build-probes/wineuwp_toastnotifier.dll
 if [ -f "$TN_SHIM" ]; then
   TN_DST=$SYS32/wineuwp_toastnotifier.dll
   if ! cmp -s "$TN_SHIM" "$TN_DST"; then cp -f "$TN_SHIM" "$TN_DST"; fi
@@ -346,7 +347,7 @@ fi
 
 # Windows.Services.Store.StoreContext: traced stand-in (see shims/storecontext). The real one
 # needs ContainerHostActivation {22f5b1df-...}, which is not registered under Wine.
-SC_SHIM=$HOME/uwp-bin/build-probes/wineuwp_storecontext.dll
+SC_SHIM=${UWP_BIN}/build-probes/wineuwp_storecontext.dll
 if [ -f "$SC_SHIM" ]; then
   SC_DST=$SYS32/wineuwp_storecontext.dll
   if ! cmp -s "$SC_SHIM" "$SC_DST"; then cp -f "$SC_SHIM" "$SC_DST"; fi
@@ -361,7 +362,7 @@ fi
 # api-ms-win-appmodel-advertisingid-l1-1-0.dll. No registry entry: this is a plain DLL resolved by
 # name at load time, so it only has to exist in system32 for twinapi.appcore's imports to bind to
 # it instead of Wine's raising stub.
-ADID=$HOME/uwp-bin/build-probes/api-ms-win-appmodel-advertisingid-l1-1-0.dll
+ADID=${UWP_BIN}/build-probes/api-ms-win-appmodel-advertisingid-l1-1-0.dll
 if [ -f "$ADID" ]; then
   ADID_DST=$SYS32/api-ms-win-appmodel-advertisingid-l1-1-0.dll
   if ! cmp -s "$ADID" "$ADID_DST"; then cp -f "$ADID" "$ADID_DST"; fi
@@ -372,7 +373,7 @@ fi
 # ({c2f03a33-...}, not registered under Wine) and, when that fails, never completes the
 # IAsyncOperation the caller is waiting on. Solitaire blocks there forever and its render loop
 # never starts. See shims/taskbarmanager.
-TB_SHIM=$HOME/uwp-bin/build-probes/wineuwp_taskbarmanager.dll
+TB_SHIM=${UWP_BIN}/build-probes/wineuwp_taskbarmanager.dll
 if [ -f "$TB_SHIM" ]; then
   TB_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_taskbarmanager.dll
   if ! cmp -s "$TB_SHIM" "$TB_DST"; then cp -f "$TB_SHIM" "$TB_DST"; fi
@@ -387,7 +388,7 @@ fi
 # Windows.Storage.AccessCache.StorageApplicationPermissions stand-in. An app adds a picked file to
 # its future-access list so it can reopen it later; the class does not exist in Wine, so the
 # activation throws straight out of the pick with 0x80040111. See shims/accesscache.
-AC2_SHIM=$HOME/uwp-bin/build-probes/wineuwp_accesscache.dll
+AC2_SHIM=${UWP_BIN}/build-probes/wineuwp_accesscache.dll
 if [ -f "$AC2_SHIM" ]; then
   AC2_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_accesscache.dll
   if ! cmp -s "$AC2_SHIM" "$AC2_DST"; then cp -f "$AC2_SHIM" "$AC2_DST"; fi
@@ -402,7 +403,7 @@ fi
 # ICU data: the genuine icu.dll (used by the native windows.globalization.dll) loads
 # Windows\Globalization\ICU\icudtl.dat and the time-zone .res files next to it, and fails with
 # E_FAIL without them.
-GLOB_SRC=$HOME/uwp-bin/win11/Windows/Globalization
+GLOB_SRC=${UWP_BIN}/win11/Windows/Globalization
 if [ -d "$GLOB_SRC/ICU" ]; then
   for sub in ICU "Time Zone"; do
     lsub=$(echo "$sub" | tr "A-Z" "a-z"); mkdir -p "$WINEPREFIX/drive_c/windows/globalization/$lsub"

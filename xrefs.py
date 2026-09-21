@@ -7,9 +7,12 @@ Complements pdbsyms.py (which names an address); this finds the callers of one. 
 rel32 call/jmp are found: virtual calls through a vtable will not show up here, so an empty
 result means "nobody calls it directly", not "nobody calls it".
 """
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import uwppaths
 import sys, os, re, bisect, subprocess, pefile
 
-CACHE = os.path.expanduser("~/uwp-bin/pdb")
+CACHE = uwppaths.PDB
 
 def publics(dll):
     name = os.path.basename(dll)

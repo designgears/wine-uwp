@@ -8,6 +8,9 @@ by its prefix path so the process never maps two copies (Findings-M4.md). DLLs W
 itself keep their builtin registration.
 Usage: gen-clsid-reg.py <SOFTWARE hive> <extracted System32 dir> <out.reg>
 """
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import uwppaths
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fasthive import Hive
@@ -15,7 +18,7 @@ from fasthive import Hive
 hive, sysdir, outreg = sys.argv[1:4]
 h = Hive(hive)
 present = {f.lower(): f for f in os.listdir(sysdir)}
-prefix_sys32 = os.environ.get("WINE_UWP_SYSTEM32", os.path.expanduser("~/.wine-uwp/drive_c/windows/system32"))
+prefix_sys32 = uwppaths.SYSTEM32
 in_prefix = {f.lower() for f in os.listdir(prefix_sys32)} if os.path.isdir(prefix_sys32) else set()
 winpath = "Z:" + os.path.abspath(sysdir).replace("/", "\\")
 keep_builtin = {"ole32.dll", "combase.dll", "oleaut32.dll", "rpcrt4.dll", "actxprxy.dll", "shell32.dll",

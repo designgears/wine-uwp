@@ -4,11 +4,14 @@
 Samples in waits (NtWaitFor*, message waits, vkWaitForFences ...) are counted apart; for each busy thread the
 top leaf functions are listed with their most common callers (a stack-scan guess). Windows DLLs are named
 with the .pdb.syms files in $UWP_PDB_DIR, Wine builtins with nm on the build tree."""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import uwppaths
 import sys, os, re, bisect, subprocess, collections, glob
 
 path = sys.argv[1]; topn = int(sys.argv[2]) if len(sys.argv) > 2 else 25
-PDB = os.environ.get('UWP_PDB_DIR', os.path.expanduser('~/uwp-bin/pdb')); BUILD = os.environ.get('WINE_BUILD', os.path.expanduser('~/src/wine-build'))
-PREFIX = os.environ.get('UWP_PREFIX', os.path.expanduser('~/.wine-uwp'))
+PDB = uwppaths.PDB; BUILD = os.environ.get('WINE_BUILD', os.path.expanduser('~/src/wine-build'))
+PREFIX = uwppaths.PREFIX
 modules = []; samples = []
 for line in open(path, errors='replace'):
     p = line.rstrip('\n').split(' ', 3)
