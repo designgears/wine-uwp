@@ -6661,3 +6661,84 @@ metadata-defined interfaces and normal COM ownership. Only channel acquisition i
 implemented; Timeline CRUD methods return initialized failure outputs and
 E_NOTIMPL, with optional `WINE_UWP_USERACTIVITY_TRACE=1` logging, so later use is
 visible rather than silently pretending activities were saved.
+
+## Solitaire renders
+
+![the splash screen](/tmp/solitaire-rendering.png)
+
+1280x800, **151118 unique colours, 0 critical errors, 4/4 runs** - cards, mahjong tiles, jewels,
+sudoku, jigsaw, bubbles, the lot. The last blocker was the audio layer, not the renderer.
+
+### The fix: `E_NOINTERFACE` was the fatal answer
+
+Once the bootstrap completed, the app reached `Gui -- EnterScreen [splashpage_pc]` and then died
+~200 ms later. Three adjacent log lines:
+
+```
+fixme:combase:RoGetActivationFactory (L"Windows.Media.Audio.SpatialAudioDeviceConfiguration", ...)
+fixme:mmdevapi:windows_media_devices_QueryInterface {3ec37f7b-...} not implemented, returning E_NOINTERFACE.
+wine: Unhandled exception 0xe06d7363 in thread 1fc
+[   1.649] *** CRITICAL ERROR ***
+```
+
+Wine routes that class to `windows.media.devices.dll`, whose single factory serves
+`IMediaDeviceStatics` and refuses everything else. Wwise asks with C++/WinRT's `.as<>()`, which
+**throws** on `E_NOINTERFACE` - on its own audio thread, with nothing to catch it. Answering the
+interface (`shims/spatialaudio`) got past it; the app then asked for
+`Windows.Media.Audio.SpatialAudioFormatSubtype` and threw identically, so that class is served from
+the same shim. With both answered: renders, 0 critical errors, reproducibly.
+
+This is the counter-case to "do not claim an interface you cannot implement". That rule is about
+interfaces with a behavioural contract - `IReferenceTrackerInternal` calls tracking methods the
+object must then honour. `ISpatialAudioDeviceConfiguration` is a property bag, and the honest
+answer to all of it is "this machine has no spatial audio". Refusing was not the conservative
+choice; it was the lethal one.
+
+### How the audio thread was identified, after the stack dumper failed
+
+`WINE_UWP_DUMP_STACKS` never found it. What did: **the app prints its own callstack.**
+`JSON_CALLSTACK:{...}` carries raw addresses, and because the exe is at a fixed base
+(`0x140000000`), `xref.py`'s `.pdata` lookup names every app frame with no module map and no
+symbols. Scanning each named function for the strings it references then names the subsystem:
+
+```
+0x140c095b0   CAkAudioMgr::PerformPrologue / CAkAudioMgr::BeginPerform
+0x140bf9cf0   AK JobMgr Signal WorkUntilDone
+0x140cb8a80   AK_MSCoreAudioThread  (.../AkAudiolib/Win32/AkSinkCoreAudio...)
+0x140ad2d00   winrt::throw_hresult
+```
+
+And the exact HRESULT came from the innermost frame rather than a guess: `throw_hresult` is a switch
+with one `call` + `int3` per value, and the return address `0x140ad2d7c` is the `int3` after the
+branch for **`0x80004002`** - `E_NOINTERFACE`, confirmed.
+
+### Two things this settles
+
+**The 1x1 swap chain was never the bug.** Runs that render perfectly still log
+`created swap chain with resolution 1 x 1`; `Dx11RenderWindow::UpdateWindowRect` resizes it silently
+and logs only on failure. Two sessions went into that line. The rule it violates is already in
+AGENTS.md - absence of a log line is only evidence if the line would have been printed - and the
+corollary is new: **presence of an alarming log line is not evidence either, if the code that would
+correct it is silent on success.**
+
+**The "subscriber that never returns" was the same audio throw all along.** A `+seh` run - which
+only adds logging - got all the way to the splash screen, which was the first sign the block was
+not deterministic. It was not a race: the shim registrations had simply become stable in
+`system.reg` by then, which is the registration clobber from earlier in this file showing up as
+apparent flakiness a third time.
+
+### Constants that do not ship
+
+`SpatialAudioFormatSubtype`'s seven strings appear nowhere in this Windows image - a UTF-16 search
+of every System32 DLL for `Sonic`, `DolbyAtmos`, `HeadphoneX` and `DTSX` finds nothing. So the shim
+uses its own, and says so. That is safe **only** because the app compares those strings against each
+other and against `ActiveSpatialAudioFormat`, which the same shim returns: distinct and stable
+within the process is sufficient. If anything ever hands one of them to a real audio API, the true
+constants have to be recovered from a machine that ships them.
+
+### State
+
+Solitaire starts clean, completes its bootstrap, runs its GUI and paints. It holds on the splash
+page because the CDN content it wants cannot download here; whether that matters depends on whether
+Shapr3D needs the same path. Calculator stays byte-identical to the baseline (249 colours, `AE` = 0)
+and Feedback Hub is 822 colours with 0 fail-fasts, with every shim above installed.

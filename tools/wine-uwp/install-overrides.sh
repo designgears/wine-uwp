@@ -252,6 +252,23 @@ if [ -f "$AMR" ]; then
   echo "installed: appmodel-runtime apiset stand-in"
 fi
 
+# SpatialAudioDeviceConfiguration stand-in (see shims/spatialaudio).
+SA=$HOME/uwp-bin/build-probes/wineuwp_spatialaudio.dll
+if [ -f "$SA" ]; then
+  if ! cmp -s "$SA" "$SYS32/wineuwp_spatialaudio.dll"; then cp -f "$SA" "$SYS32/wineuwp_spatialaudio.dll"; fi
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Media.Audio.SpatialAudioDeviceConfiguration"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_spatialaudio.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  K2="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Media.Audio.SpatialAudioFormatSubtype"
+  "${WINE_BIN}wine" reg add "$K2" /v DllPath /d 'C:\windows\system32\wineuwp_spatialaudio.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K2" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K2" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K2" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: SpatialAudioDeviceConfiguration + FormatSubtype stand-ins"
+fi
+
 # WebAuthenticationCoreManager stand-in (see shims/webauthcore).
 WAC=$HOME/uwp-bin/build-probes/wineuwp_webauthcore.dll
 if [ -f "$WAC" ]; then
@@ -409,6 +426,8 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_taskbarmanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Shell.TaskbarManager:wineuwp_taskbarmanager.dll"
 [ -f "$SYS32/wineuwp_storecontext.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Services.Store.StoreContext:wineuwp_storecontext.dll"
 [ -f "$SYS32/wineuwp_webauthcore.dll" ]       && SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager:wineuwp_webauthcore.dll"
+[ -f "$SYS32/wineuwp_spatialaudio.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioDeviceConfiguration:wineuwp_spatialaudio.dll"
+[ -f "$SYS32/wineuwp_spatialaudio.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioFormatSubtype:wineuwp_spatialaudio.dll"
 [ -f "$SYS32/wineuwp_useractivitychannel.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.UserActivities.UserActivityChannel:wineuwp_useractivitychannel.dll"
 [ -f "$SYS32/wineuwp_toastnotifier.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Notifications.ToastNotificationManager:wineuwp_toastnotifier.dll"
 

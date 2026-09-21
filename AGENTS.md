@@ -258,6 +258,37 @@ event has to succeed even when the event never fires.
 51 fail-fasts. A plain WinRT object is *supposed* to return `E_NOINTERFACE` there. Both
 `E_NOINTERFACE` and `E_NOTIMPL` are answers callers handle; an invented value is not.
 
+**`E_NOINTERFACE` can be the fatal answer, and this is the exception to the rule above.**
+"Do not claim an interface you cannot implement" is about interfaces with a behavioural contract -
+XAML's `IReferenceTrackerInternal` calls tracking methods the object then has to honour. It does
+**not** apply to a property bag. Wwise asks for `ISpatialAudioDeviceConfigurationStatics` with
+C++/WinRT's `.as<>()`, which *throws* on `E_NOINTERFACE`; on its own audio thread, with nothing to
+catch it, that killed Solitaire the moment it reached its splash screen. Refusing was not the safe
+answer, it was the lethal one - the caller is written knowing the platform always has that class.
+Before refusing an interface, ask whether it has a contract you would be breaking, or whether it is
+just properties you can answer honestly ("this machine has no spatial audio").
+
+**`.as<>()` vs `try_as<>()` is the whole difference, and you can tell which one threw.** C++/WinRT's
+`throw_hresult` is a switch on the HRESULT with one `call` + `int3` per value, so the **return
+address in the app's own crash callstack lands in the branch for the specific HRESULT**. For
+Solitaire it landed in the `0x80004002` arm - `E_NOINTERFACE` confirmed, not inferred. Disassemble
+the innermost app frame and read which `cmpl $0x8000...` it fell through to.
+
+**An app's own crash dump may carry a better stack than anything you can capture.** Solitaire prints
+`JSON_CALLSTACK:{...}` with raw addresses. The app's own frames are at a fixed base
+(`0x140000000`), so `xref.py`'s `.pdata` lookup names every one of them with **no module map and no
+symbols** - and the strings inside each function name the subsystem
+(`CAkAudioMgr::BeginPerform`, `AK_MSCoreAudioThread`). That is how the audio thread was identified
+after `WINE_UWP_DUMP_STACKS` had failed to find it. `grep -oE 'JSON_CALLSTACK:.*'` first, always.
+
+**Constants that do not ship can be your own, if they are only ever compared with each other.**
+`SpatialAudioFormatSubtype`'s strings appear nowhere in this Windows image (a UTF-16 search of every
+System32 DLL finds nothing), so there was nothing to copy. Inventing a value and presenting it as
+Microsoft's is the mistake this file warns about - but here the app only compares those strings
+against each other and against `ActiveSpatialAudioFormat`, which the same shim returns. Distinct and
+stable within the process is sufficient; say so in the shim, and say what would break the reasoning
+(anything passing one of them to a real audio API).
+
 **Never guess which argument is the out-parameter.** In the StateRepository interfaces it is always
 the *last*; in `get_DescriptionReference(HSTRING **)` it is the *first*. Get arity from metadata
 (`gen-staterepository.py` generates a table from the vtables plus `llvm-undname`), or you will write
@@ -514,7 +545,7 @@ the fully-qualified name. `--grep` first, always.
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | **Starts completely, renders nothing.** Runs to `Solitaire::Startup END`, loads sound banks and fonts, XSAPI/XAL initialise, real 1280x800 window, 60 Hz dispatcher loop, closes cleanly, **0 critical errors, 0 unresolved-import stubs**. Blocked in one subscriber of the event raise inside `AppHost::EngineAppStartup` - see below. Closest proxy we have to Shapr3D's rendering path |
+| Solitaire | **Renders.** The splash screen paints fully at 1280x800 - cards, mahjong tiles, jewels, sudoku, bubbles - 151118 unique colours, **0 critical errors, 4/4 runs**. Starts clean, completes its bootstrap, runs its GUI. Does not yet advance past the splash page: the CDN content it wants cannot download here. Closest proxy we have to Shapr3D's rendering path |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
@@ -529,28 +560,34 @@ all three unset behaves identically. Note the partial combinations (`MANUAL_CONF
 The `ConfigureCoreWindow` hang that used to lose one run in three is **fixed** - it was our own
 APC landing on Wine's RPC server thread, not anything in XAML. See Findings-M4.md.
 
-### Solitaire: exactly where it stops, and what is already ruled out
+### Solitaire: how it was made to render, and what the dead ends were
 
-The 1x1 swap chain is **not** the bug. `Dx11RenderWindow::SwapBuffers` never executes - the engine
-never presents a frame - so the flat `srgb(32,96,192)` window is the XAML page's background. The
-chain, each link probed rather than argued:
+**The 1x1 swap chain was never the bug**, and it is still logged as 1x1 in runs that render
+perfectly - `Dx11RenderWindow::UpdateWindowRect` resizes it silently, logging only on failure. Two
+sessions were spent on that line. What actually stopped it was a chain of eight blockers, each
+found by probe and each moving the app one step further:
 
-```
-WinUwp::BootStrap -- Startup Began        logged
-  -> call 4 of 4 = AppHost::EngineAppStartup (0x7eb8fc)   logs START, never END, never "Startup failed"
-       -> SystemInitializer            returns
-       -> virtual App::Startup         returns  (logs Solitaire::Startup START/END)
-       -> 0x7eba45 -> 0x96080c         an event-raise loop; ONE SUBSCRIBER NEVER RETURNS
-WinUwp::BootStrap -- Startup Finished     never logged  -> render loop never starts
-```
+1. `install-overrides.sh` racing itself, so the shims below were registered and never loaded.
+2. `DeviceInformation::CreateWatcher(DeviceClass)` -> `E_NOTIMPL`, and then the watcher's own
+   `add_Removed` -> `E_NOTIMPL`. C++/CX turns both into throws.
+3. `TaskbarManager` -> ImmersiveShell: an `IAsyncOperation` never completed.
+4. The advertising-id apiset: an unresolved delay import raising `EXCEPTION_WINE_STUB`.
+5. `StoreContext` -> ContainerHostActivation: same never-completing async. Only `GetDefault` is
+   ever called.
+6. `GetPackageFamilyNameFromToken`, repaired by patching the delay-import thunk from `wineuwp`.
+7. `WebAuthenticationCoreManager` -> the token broker: same shape again.
+8. `SpatialAudioDeviceConfiguration` and `SpatialAudioFormatSubtype` answered `E_NOINTERFACE` by
+   Wine's `windows.media.devices` factory. Wwise asks with `.as<>()`, which throws, on its own
+   audio thread - **this was the one that killed it after the splash screen appeared.**
 
-Already fixed and *not* the remaining cause: `DeviceInformation` watcher refusals, `TaskbarManager`,
-`StoreContext`, `WebAuthenticationCoreManager`, the advertising-id apiset, and
-`GetPackageFamilyNameFromToken`. Also ruled out by probe: XAML **does** raise `SizeChanged` on the
-SwapChainPanel and the dispatched handler **does** run; `CoreDispatcher.RunAsync` works;
-`XamlBootStrap::OnInitRender`'s early return is benign; the three MP switches are irrelevant.
+Ruled out by probe, so do not re-walk them: XAML **does** raise `SizeChanged` on the SwapChainPanel
+and the dispatched handler **does** run; `CoreDispatcher.RunAsync` works;
+`XamlBootStrap::OnInitRender`'s early return is benign; the three Media Player switches are
+irrelevant (all three unset is identical). Two wrong turns worth remembering: I nearly reported
+"cross-thread `RunAsync` is dropped in combase" (a probe disproved it before I touched another
+session's file), and an `xdotool windowsize` test gave a clean negative that meant nothing because
+the resize never reached XAML at all.
 
-**The next step is to identify the blocked subscriber directly** - `WINE_UWP_DUMP_STACKS` cannot
-(see its entry above), so either make it produce a usable stack for that thread, or instrument the
-loop at `0x96080c`, whose body calls `vtbl[1]` on each subscriber and counts iterations at
-`this+0x30`. Do not pick the next shim off the tail of the log; that reasoning has now failed twice.
+Next: the app holds on the splash page because its CDN content will not download. Whether that is
+worth pursuing depends on whether Shapr3D needs the same path - the rendering path itself is now
+proven end to end.
