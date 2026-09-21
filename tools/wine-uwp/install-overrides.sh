@@ -232,6 +232,52 @@ if [ -f "$DI_SHIM" ]; then
   echo "installed: DeviceInformation CreateWatcher(DeviceClass) shim"
 fi
 
+# wineuwp.dll is ours and is rebuilt often. A prefix update copies Wine's PE builtins into
+# system32, and that copy shadows the build tree - so a stale one silently reinstates the previous
+# build and a fresh fix looks like it had no effect. That is exactly what happened to the
+# GetPackageFamilyNameFromToken import repair: the prefix held a copy three hours older than the
+# build. Keep it in step.
+UWPDLL=$WINE_BIN/dlls/wineuwp/x86_64-windows/wineuwp.dll
+if [ -f "$UWPDLL" ] && [ -f "$SYS32/wineuwp.dll" ] && ! cmp -s "$UWPDLL" "$SYS32/wineuwp.dll"; then
+  cp -f "$UWPDLL" "$SYS32/wineuwp.dll"
+  echo "refreshed: stale wineuwp.dll in the prefix"
+fi
+
+# api-ms-win-appmodel-runtime-l1-1-1.dll: forwards the apiset to kernelbase plus the one function
+# Wine lacks. Resolved by name at load time, so it only has to exist in system32.
+AMR=$HOME/uwp-bin/build-probes/api-ms-win-appmodel-runtime-l1-1-1.dll
+if [ -f "$AMR" ]; then
+  AMR_DST=$SYS32/api-ms-win-appmodel-runtime-l1-1-1.dll
+  if ! cmp -s "$AMR" "$AMR_DST"; then cp -f "$AMR" "$AMR_DST"; fi
+  echo "installed: appmodel-runtime apiset stand-in"
+fi
+
+# WebAuthenticationCoreManager stand-in (see shims/webauthcore).
+WAC=$HOME/uwp-bin/build-probes/wineuwp_webauthcore.dll
+if [ -f "$WAC" ]; then
+  if ! cmp -s "$WAC" "$SYS32/wineuwp_webauthcore.dll"; then cp -f "$WAC" "$SYS32/wineuwp_webauthcore.dll"; fi
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_webauthcore.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: WebAuthenticationCoreManager stand-in"
+fi
+
+# Windows.Services.Store.StoreContext: traced stand-in (see shims/storecontext). The real one
+# needs ContainerHostActivation {22f5b1df-...}, which is not registered under Wine.
+SC_SHIM=$HOME/uwp-bin/build-probes/wineuwp_storecontext.dll
+if [ -f "$SC_SHIM" ]; then
+  SC_DST=$SYS32/wineuwp_storecontext.dll
+  if ! cmp -s "$SC_SHIM" "$SC_DST"; then cp -f "$SC_SHIM" "$SC_DST"; fi
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Services.Store.StoreContext"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_storecontext.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: StoreContext traced stand-in"
+fi
+
 # api-ms-win-appmodel-advertisingid-l1-1-0.dll. No registry entry: this is a plain DLL resolved by
 # name at load time, so it only has to exist in system32 for twinapi.appcore's imports to bind to
 # it instead of Wine's raising stub.
@@ -334,6 +380,8 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_memorymanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.System.MemoryManager:wineuwp_memorymanager.dll"
 [ -f "$SYS32/wineuwp_deviceinformation.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Devices.Enumeration.DeviceInformation:wineuwp_deviceinformation.dll"
 [ -f "$SYS32/wineuwp_taskbarmanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Shell.TaskbarManager:wineuwp_taskbarmanager.dll"
+[ -f "$SYS32/wineuwp_storecontext.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Services.Store.StoreContext:wineuwp_storecontext.dll"
+[ -f "$SYS32/wineuwp_webauthcore.dll" ]       && SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager:wineuwp_webauthcore.dll"
 
 if [ -n "$SHIM_CLASSES" ]; then
   # Let any update already in flight finish. Forcing one with `wineboot -u` is deliberately not

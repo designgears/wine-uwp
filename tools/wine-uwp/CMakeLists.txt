@@ -61,6 +61,25 @@ add_library(deviceinformation SHARED shims/deviceinformation/deviceinformation.c
 set_target_properties(deviceinformation PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_deviceinformation")
 target_link_libraries(deviceinformation PRIVATE runtimeobject.lib)
 
+# api-ms-win-appmodel-runtime-l1-1-1: forwards the apiset to kernelbase and adds the one function
+# Wine is missing (GetPackageFamilyNameFromToken). Must provide the whole apiset, not just the gap.
+add_library(appmodelruntime SHARED shims/appmodelruntime/appmodelruntime.cpp)
+set_target_properties(appmodelruntime PROPERTIES PREFIX "" SUFFIX ""
+                      OUTPUT_NAME "api-ms-win-appmodel-runtime-l1-1-1.dll")
+
+# Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager. The Web Account Manager
+# needs the out-of-process token broker; without it its IAsyncOperation is never completed and
+# Solitaire's Xbox sign-in check hangs the whole startup.
+add_library(webauthcore SHARED shims/webauthcore/webauthcore.cpp)
+set_target_properties(webauthcore PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_webauthcore")
+target_link_libraries(webauthcore PRIVATE runtimeobject.lib)
+
+# Windows.Services.Store.StoreContext - a traced stand-in used to find out which Store methods
+# the app actually calls, before implementing any of them.
+add_library(storecontext SHARED shims/storecontext/storecontext.cpp)
+set_target_properties(storecontext PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_storecontext")
+target_link_libraries(storecontext PRIVATE runtimeobject.lib)
+
 # api-ms-win-appmodel-advertisingid-l1-1-0: twinapi.appcore imports three functions from this
 # apiset and Wine implements none, so the loader's unresolved-import stub raises
 # EXCEPTION_WINE_STUB (0x80000100) mid-startup. Built with the apiset's exact file name.

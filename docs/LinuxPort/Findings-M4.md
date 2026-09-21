@@ -6524,3 +6524,92 @@ window is a real 1280x800, the app pumps a 60 Hz dispatcher loop and closes clea
 Calculator stays byte-identical to the baseline (249 colours, `magick compare -metric AE` = 0)
 across every change here, including the `advertisingid` stand-in, which affects `twinapi.appcore`
 for every app.
+
+## The chain, continued: four more links, and what the apiset table does to a file-drop shim
+
+Each fix below moved the app further and was confirmed by its own trace, and all four together take
+Solitaire to **zero critical errors and zero unresolved-import stubs**. It still does not render:
+the subscriber inside `AppHost::EngineAppStartup`'s event raise still never returns (re-probed after
+every fix - the `ud2` on that function's success path at `0x7ebad7` has never once fired).
+
+3. **`Windows.Services.Store.StoreContext`** -> `StoreContextServer` -> `ContainerHostActivation`
+   `{22f5b1df-7d7a-4d21-97f8-c21aefba859c}`, not registered. `shims/storecontext` is deliberately a
+   *traced* stand-in rather than an implementation: 40 thunks, one per slot, each logging and
+   returning `E_NOTIMPL`, with `add_/remove_OfflineLicensesChanged` answered `S_OK` because an event
+   registration must succeed. The trace then answered the question for us - the app calls
+   **`GetDefault` and nothing else**. Merely being able to *create* a StoreContext, instead of the
+   real one hanging on a broker, was the whole fix. That is the argument for traced thunks over
+   guessing: implementing 26 Store methods would have been wasted work.
+
+4. **`api-ms-win-appmodel-runtime-l1-1-1.GetPackageFamilyNameFromToken`**. Wine's kernelbase has the
+   other seven functions this apiset is used for, not this one, so the loader's `allocate_stub()`
+   raised `EXCEPTION_WINE_STUB` on the thread running
+   `XblAccountStatusHelperWinRT::PopulateXblAccountStatusAsync`.
+
+   **A file named after the apiset in system32 does not fix this, and understanding why matters.**
+   `find_apiset_dll()` consults `Peb->ApiSetMap` before any file is looked at, and apiset name
+   matching ignores the trailing version fields - so `l1-1-1` matches
+   `apisetschema.spec`'s `api-ms-win-appmodel-runtime-l1-1-2 = kernelbase.dll` and the import binds
+   to kernelbase. The file drop *does* work for `api-ms-win-appmodel-advertisingid-l1-1-0`, because
+   that apiset is in no schema entry at all: the delay-load helper falls back to a runtime
+   `LoadLibrary`, which finds the file. Two apisets, two different outcomes, one rule - check the
+   schema first.
+
+   The proper homes for this are `kernelbase.spec` and `apisetschema.spec`, both of which are
+   another session's modified files. So `dlls/wineuwp/main.c` repairs the binding instead: it walks
+   each module's import tables and replaces the stub thunk with a real implementation, driven by a
+   one-entry table. Two details cost a round each:
+
+   - The imports that matter are **delay** imports, so they are not in the normal import directory
+     at all - `llvm-readobj --coff-imports` labels them `DelayImport {` and it is easy to miss.
+     Both directories are now walked.
+   - A **stale `wineuwp.dll` in the prefix** shadowed the build tree, so the first correct version
+     of the fix looked like it did nothing. `install-overrides.sh` now refreshes it and says so.
+     This is the trap AGENTS.md already warns about and I walked into it anyway; the tell was
+     `cmp` against the build output, not the timestamp.
+
+   `GetPackageFamilyNameFromToken` is documented, so it is implemented properly rather than refused:
+   the family name is the first and last fields of the full name
+   (`Name_Version_Architecture_ResourceId_PublisherId` -> `Name_PublisherId`), derived from
+   kernelbase's `GetPackageFullNameFromToken` so a token for another package still gets the right
+   answer. It is resolved with `GetProcAddress` rather than imported, because importing it would
+   bind to the very apiset being repaired.
+
+5. **`Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager`**. The Web Account
+   Manager needs the out-of-process token broker, so its async never completed and the app's Xbox
+   sign-in check hung. `shims/webauthcore` answers `FindAccountProviderAsync` with a *completed*
+   async whose result is **null** - the documented "no such provider", which is the truth here.
+   Its trace shows the app calls slot 12 only and never reaches `GetTokenSilentlyAsync`, so no
+   `WebTokenRequestResult` had to be invented; those slots log and return `E_NOTIMPL` so a future
+   run will say if that changes.
+
+`Windows.ApplicationModel.UserActivities.UserActivityChannel` also fails (`cdprt.dll` needs
+`cdp.dll`, which is **not in the Windows image at all**), but this one was *not* shimmed, on
+purpose: the activation already fails with a clean HRESULT, and a shim whose `GetDefault` also
+fails would change nothing. It is the last line in the log, which is not the same as being the
+thing that blocks - a distinction that has now been wrong twice in this hunt.
+
+### Where it actually stands
+
+The app's own log localises the block better than anything else available:
+
+```
+[1.389] PremiumGameAppComponent::Initialize -- StoreAppComponent::Connect - InitializingStoreSilent
+[1.390] XblAccountStatusHelperWinRT::PopulateXblAccountStatusAsync - Start.
+[1.390] UserIdentityUtils::GetRpsTokenAsync - Calling with service: user.auth.xboxlive.com.
+```
+
+`PopulateXblAccountStatusAsync` logs `Start.` and never a finish. With the account provider lookup
+now completing as "no provider", the remaining wait is inside that Xbox token path. The next step is
+to read the strings around `GetRpsTokenAsync` in `.rdata` to recover its own sequence - the
+technique that has worked every time in this app - rather than shimming whatever appears last in
+the log.
+
+**Do not trust `WINE_UWP_DUMP_STACKS` to rule a function out here.** It yields only ~10 frames per
+thread and reports no thread inside `EngineAppStartup` even though a `ud2` proves one is. When
+`RtlLookupFunctionEntry` fails it guesses `rip = *rsp` and derails, so a *positive* hit is evidence
+and a *negative* is not. Two conclusions in this session were nearly drawn from its negatives.
+
+Regression after all of the above, including the `wineuwp` and `twinapi.appcore` changes that affect
+every app: Calculator 249 colours and `magick compare -metric AE` = **0** against the baseline;
+Feedback Hub **822** colours, 0 fail-fasts, 0 app errors.
