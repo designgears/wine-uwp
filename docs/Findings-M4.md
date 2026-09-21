@@ -7036,3 +7036,86 @@ rather than rewritten, because the reasoning recorded there really did proceed f
 sentence in this log that treats a Wine file as off-limits is wrong on that point. Cost: the patch
 export excluded ~5,000 lines of our own work, and a Media Player regression got a fabricated
 explanation ("the other session rebuilt ntdll").
+
+## Solitaire: the blocker is BootflowItemFont (2026-09-21)
+
+The app gets much further than this log previously recorded. A clean run reaches
+`Solitaire::Startup START`, `AppHost::EngineAppStartup -- END`, `SolitaireApp::StartupComplete`,
+**`WinUwp::BootStrap -- Startup Finished`**, transitions to `Sgi::BootflowState`, paints
+`splashpage_pc` and logs `PlayFab login successful`. Then nothing. Note that "Startup Finished"
+contradicts the earlier claim that the bootstrap thread spins forever inside
+`WinUwp::BootStrap::Startup`; whatever that profile showed, the current build gets past it.
+
+**The bootflow driver, from disassembly.** `BootflowState`'s tick is at `0x307020`, its
+error/shutdown path at `0x6b97c4` (the one that logs `Bootflow -- Error on bootflow item: %s`).
+The bootflow object sits at `state+0x50`:
+
+| Offset | Meaning |
+| --- | --- |
+| `+0x1c` | current item index |
+| `+0x20` | status: 1 = running, 2 = finished |
+| `+0x28` | the promise fulfilled when every item is done |
+| vtbl `+0x08` | `BeginInit` |
+| vtbl `+0x18` | `UpdateInit` -> **0 = done, 1 = error, anything else = still working** |
+| vtbl `+0x28` | `Shutdown` |
+
+Each tick calls the current item's `UpdateInit`; on 0 it advances and calls the next item's
+`BeginInit`; on 1 it runs the error path. **Nothing is logged on success**, which is exactly why the
+log simply stops with no error - the stuck item returns "still working" forever, so neither the
+success path nor the error path ever runs.
+
+**Item order** - all nine constructors are in `BootflowState::Enter` (`0x306670..0x306ce2`), which is
+straight-line code (first conditional jump is at `0x306b01`, after the last constructor), each
+followed by the same `call 0x6b9754` push_back. So the order is fixed and nothing is skipped:
+
+`ArkadiumMigration -> Font -> LoadCdn -> SignIn -> InitializeThemes -> ContentLoad -> Ads -> Notifications`
+
+`ArkadiumMigration`, `ContentLoad` and `Notifications` use the base `BeginInit` at `0x6dcb0`, which
+is `this->m_state = 0` - instant. The base `UpdateInit` at `0x67f50` is `return this->m_state`.
+
+**Ruled out by disassembly:** `SignIn` (`0xc7680`) sets `m_state = 2` and then falls through to
+`m_state = 0` on *both* paths, so it always completes. It looked like the obvious suspect because
+`LiveManagerXsapi2 - Failed to initialize XAL/XSAPI` is the loudest error in the log, at 0.002. It
+is not the blocker.
+
+**Measured with `ud2` probes** (control first, per the rule - a probe on `BootflowState::Enter`
+fired, and Solitaire's own handler reports a hit as `*** CRITICAL ERROR ***`, not as Wine's
+"illegal instruction" line):
+
+| Probe | Reached bootflow | Fired |
+| --- | --- | --- |
+| control, `BootflowState::Enter` | - | **yes** |
+| `LoadCdn::BeginInit` (3rd) | yes, + PlayFab | no |
+| `InitializeThemes::BeginInit` (5th) | yes, + PlayFab | no |
+| `Ads::BeginInit` (7th) | yes, + PlayFab | no |
+
+Item 1 completes instantly, items 3/5/7 never begin, so **item 2, `BootflowItemFont`, is where it
+stops**. `Font::BeginInit` (`0xc7650`) is just `m_state = 2`; `Font::UpdateInit` (`0xc7660`) is a
+single boolean gate - it returns 0 only when the byte at `[app_context+0x190]` is set, else 2.
+
+**That byte has exactly three writers in the whole binary**: cleared at `0x8b2b89` (font-load
+kickoff), set at `0x8b2d5b` and `0xa82754`. `0x8b2d5b` is the **first instruction** of function
+`0x8b2d24`, so if that function runs at all the flag is set - and it has a single caller, `0x8ba8c4`
+inside `0x8ba880`. That caller is a **future continuation**: it reads the shared state of the future
+at `this+0xe0` and calls the setter only when `(state & 3) == 1` (fulfilled with a value); any other
+state takes the exception path. So "fonts never become ready" means that future is never fulfilled.
+
+The kickoff at `0x8b2b6c` clears the flag, then asks the resource manager (`this+0x168`) to load
+**`gui/fonts/fonts.fontlib`** via `0x7821c0` and registers the continuation. The font-load starter
+`0x8b1854` references `gui/fonts/fonts.manifest`. Both paths exist in the packed archive
+(`archives/data-c792...archive` contains `gui/fonts`), so the content is present.
+
+Worth noting alongside: the same run logs `DlcAppComponent::MountContentFromCache -- Failed
+mounting` for Cardbacks, CardBundles, Storefront and WeeklyRewardsScreens, and
+`Inventory - Failed to Find/Load asset: [notifications/notifications]`. The splash that *does* load
+is `dlc/gui/...`; the fonts are plain `gui/...`.
+
+**Run-to-run variance**: about one run in three stalls before
+`App -- AppState Transition ... NewState 'Sgi::BootflowState'` even with no probe applied. A probe
+result from such a run is not evidence - one nearly cost a false negative here. Always check the
+run reached the bootflow before reading a probe's absence.
+
+**Housekeeping**: `uwp-bin/stage/microsoftsolitairecollection/Solitaire.exe.probe-backup` is left
+over from an earlier session. It is byte-identical to the live exe, which is itself byte-identical
+to the pristine package copy under `/mnt/win`, so nothing is poisoned - but check that before
+trusting any Solitaire run (`cmp` against the WindowsApps original).
