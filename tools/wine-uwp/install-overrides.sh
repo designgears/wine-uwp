@@ -232,6 +232,30 @@ if [ -f "$DI_SHIM" ]; then
   echo "installed: DeviceInformation CreateWatcher(DeviceClass) shim"
 fi
 
+# msxml6's COM classes. Installing msxml6.dll into system32 is not enough: nothing registers its
+# CLSIDs, so CoCreateInstance returns REGDB_E_CLASSNOTREG (0x80040154). That matters because
+# libHttpClient - which is what XSAPI and PlayFab make every HTTP call through on UWP - uses
+# **IXMLHTTPRequest2**, i.e. CLSID_FreeThreadedXMLHTTP60. Without it Solitaire's PlayFab login is
+# issued and never completes, the process never opens a single TCP socket, and the app waits on its
+# splash screen forever while Wine's own NetworkListManager reports full internet connectivity.
+# `wine regsvr32 msxml6.dll` silently does nothing here, so the three XMLHTTP classes are
+# registered directly. The paths and ThreadingModel values are copied from the Windows hive
+# (fasthive.py on Classes\CLSID\{...}\InprocServer32), not guessed - {88d96a09} is "Free Threaded
+# XML HTTP Request class 6.0" and is the only one of the three with ThreadingModel Both.
+if [ -f "$SYS32/msxml6.dll" ]; then
+  msxml_reg() {
+    local clsid=$1 model=$2
+    "${WINE_BIN}wine" reg add "HKCR\\CLSID\\$clsid\\InprocServer32" /ve \
+        /d 'C:\windows\system32\msxml6.dll' /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "HKCR\\CLSID\\$clsid\\InprocServer32" /v ThreadingModel \
+        /d "$model" /f >/dev/null 2>&1
+  }
+  msxml_reg '{88d96a09-f192-11d4-a65f-0040963251e5}' Both        # Free Threaded XML HTTP 6.0
+  msxml_reg '{88d96a0a-f192-11d4-a65f-0040963251e5}' Apartment   # XML HTTP 6.0
+  msxml_reg '{88d96a0b-f192-11d4-a65f-0040963251e5}' Apartment   # Server XML HTTP 6.0
+  echo "registered: msxml6 XMLHTTP classes"
+fi
+
 # wineuwp.dll is ours and is rebuilt often. A prefix update copies Wine's PE builtins into
 # system32, and that copy shadows the build tree - so a stale one silently reinstates the previous
 # build and a fresh fix looks like it had no effect. That is exactly what happened to the
@@ -250,6 +274,18 @@ if [ -f "$AMR" ]; then
   AMR_DST=$SYS32/api-ms-win-appmodel-runtime-l1-1-1.dll
   if ! cmp -s "$AMR" "$AMR_DST"; then cp -f "$AMR" "$AMR_DST"; fi
   echo "installed: appmodel-runtime apiset stand-in"
+fi
+
+# NetworkInformation stand-in (see shims/networkstatus): fires NetworkStatusChanged once.
+NS=$HOME/uwp-bin/build-probes/wineuwp_networkstatus.dll
+if [ -f "$NS" ]; then
+  if ! cmp -s "$NS" "$SYS32/wineuwp_networkstatus.dll"; then cp -f "$NS" "$SYS32/wineuwp_networkstatus.dll"; fi
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Networking.Connectivity.NetworkInformation"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_networkstatus.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: NetworkInformation stand-in"
 fi
 
 # SpatialAudioDeviceConfiguration stand-in (see shims/spatialaudio).
@@ -428,6 +464,7 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_webauthcore.dll" ]       && SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager:wineuwp_webauthcore.dll"
 [ -f "$SYS32/wineuwp_spatialaudio.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioDeviceConfiguration:wineuwp_spatialaudio.dll"
 [ -f "$SYS32/wineuwp_spatialaudio.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioFormatSubtype:wineuwp_spatialaudio.dll"
+[ -f "$SYS32/wineuwp_networkstatus.dll" ]     && SHIM_CLASSES="$SHIM_CLASSES Windows.Networking.Connectivity.NetworkInformation:wineuwp_networkstatus.dll"
 [ -f "$SYS32/wineuwp_useractivitychannel.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.UserActivities.UserActivityChannel:wineuwp_useractivitychannel.dll"
 [ -f "$SYS32/wineuwp_toastnotifier.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Notifications.ToastNotificationManager:wineuwp_toastnotifier.dll"
 

@@ -6742,3 +6742,79 @@ Solitaire starts clean, completes its bootstrap, runs its GUI and paints. It hol
 page because the CDN content it wants cannot download here; whether that matters depends on whether
 Shapr3D needs the same path. Calculator stays byte-identical to the baseline (249 colours, `AE` = 0)
 and Feedback Hub is 822 colours with 0 fail-fasts, with every shim above installed.
+
+## Solitaire gets online, and still does not leave the splash screen
+
+**It does not reach the game.** The screen it paints is `splashpage_pc` - decorative artwork of
+cards, tiles and jewels - and it stays there indefinitely (checked to 150 s, with clicks and keys).
+`Gui -- EnterScreen` fires exactly once and there is never a second screen transition. A high
+colour count is not a working app.
+
+### What was fixed: the app had no HTTP at all
+
+The app never opened a single TCP socket - `ss -tnp` on its pid at 8/20/35/55 s shows zero - while
+Wine's own NetworkListManager reported `0x660`
+(`IPV4_INTERNET | IPV6_INTERNET | IPV4_LOCALNETWORK | IPV6_LOCALNETWORK`), i.e. fully online. So the
+request never left the process, and the question was which layer swallowed it.
+
+The app's `.rdata` gave it up: `.../libHttpClient/Source/HTTP/httpcall.cpp`, and RTTI for
+`IXMLHTTPRequest2Callback` implemented via WRL. libHttpClient's UWP backend is **IXMLHTTPRequest2**,
+i.e. msxml6's `CLSID_FreeThreadedXMLHTTP60`. We install native `msxml6.dll` into system32 - but
+**nothing ever registered its COM classes**, so `CoCreateInstance` returned
+`REGDB_E_CLASSNOTREG (0x80040154)` and every HTTP call died before reaching a socket.
+
+`wine regsvr32 msxml6.dll` silently does nothing here, so `install-overrides.sh` now writes the
+three XMLHTTP registrations directly, with paths and `ThreadingModel` values read out of the
+Windows hive (`fasthive.py` on `Classes\CLSID\{...}\InprocServer32`) rather than guessed:
+`{88d96a09}` "Free Threaded XML HTTP Request class 6.0" is `Both`, `{88d96a0a}` and `{88d96a0b}` are
+`Apartment`.
+
+Result - the app is now genuinely online:
+
+```
+[   1.682] PlayFabLoginTask -- PlayFab login successful PlayFabID: A37300F898444DA6
+[   1.682] [PlayFabAppComponent] PlayFab Logged in 92AB
+```
+
+`tools/wine-uwp/probes/probe-http.cpp` isolates that layer for any future app: it creates
+`CLSID_FreeThreadedXMLHTTP60`, fires a GET and reports each step, separating "not registered" from
+"registered but the callback never fires". It now reports `HTTP 200 OK`.
+
+**Two GUIDs I wrote from memory were both wrong in their last eight bytes** (`IID_IXMLHTTPRequest2`
+and `IID_IXMLHTTPRequest2Callback`). The symptom was a class that created fine and then answered
+`E_NOINTERFACE` - which reads exactly like a broken implementation rather than a typo on my side.
+Copy GUIDs out of the header; `DEFINE_GUID` lines in `msxml6.h` had both.
+
+### What is still stuck
+
+After `PlayFab Logged in` the app logs **nothing further, ever**. The bootflow never reports any of
+its own outcomes - `BootflowState - Bootflow initialization finished` / `failed` / `canceled` are
+all absent, as is `Bootflow -- Error on bootflow item: %s`. Its items, from RTTI, are
+`BootflowItemSignIn`, `LoadCdn`, `ContentLoad`, `Themes`, `InitializeThemes`, `Font`, `Ads`,
+`Notifications`, `ArkadiumMigration` - and **not one of their log lines appears**, so the first item
+never completes rather than the chain failing somewhere in the middle.
+
+One lead was investigated and did not pay off, recorded so it is not repeated:
+`Sgi::Network::ReachableWinRT::Startup` registers a `NetworkStatusChangedEventHandler`, and every
+gating component takes a `(bool, Sgi::Network::Reachable::Status)` callback from it
+(`UserDataFlowAppComponent::Initialize`, `BootflowItemThemes::BeginInit`,
+`DlcDownloaderAppComponent::Initialize`, `SolitaireApp::Startup`). Wine's
+`network_information_statics_add_NetworkStatusChanged` is a stub that returns `S_OK` with a dummy
+cookie and never raises the event - so the registration *succeeds* and the app waits for a callback
+that cannot arrive. `shims/networkstatus` forwards everything to Wine and fires the handler once
+after registration; the trace confirms the handler runs and returns `S_OK`, and **the app still does
+not proceed**. The shim is kept because the gap it closes is real, but it is not the blocker.
+
+That gap is worth stating generally, because it inverts a rule already in AGENTS.md: "registering an
+event must succeed even when the event never fires" is right for events an app needs only for
+*updates*, and wrong when the app takes its **initial** state from the first callback. Then
+"registered and permanently silent" is as fatal as `E_NOTIMPL`, and much quieter.
+
+### Also worth knowing
+
+`PublisherStorageAppComponent::MigrateData -- Error getting GetPublisherCacheFolder(mcg\analytics).
+Reason: ''` is our own `IApplicationData3::GetPublisherCacheFolder` returning an error for a folder
+that does not exist. The app logs it and continues, so it is not the blocker, but it is ours.
+
+Regression with everything above installed: Calculator 249 colours and `magick compare -metric AE`
+= **0** against the baseline; Feedback Hub **822** colours, 0 fail-fasts, 0 app errors.

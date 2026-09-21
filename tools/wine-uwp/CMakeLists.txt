@@ -6,6 +6,11 @@ target_link_libraries(probe-activate PRIVATE runtimeobject.lib)
 add_library(mrt100 SHARED shims/mrt100/mrt100.cpp)
 set_target_properties(mrt100 PROPERTIES PREFIX "" OUTPUT_NAME "mrt100")
 # Drives a real SetWindowPos on a running app's windows: an X-side resize never reaches Wine.
+# Isolates the IXMLHTTPRequest2 layer libHttpClient uses on UWP, which is where Solitaire's
+# PlayFab login disappears without opening a socket.
+add_executable(probe-http probes/probe-http.cpp)
+target_link_libraries(probe-http PRIVATE ole32.lib)
+
 add_executable(probe-resize probes/probe-resize.cpp)
 
 add_executable(probe-token probes/probe-token.cpp)
@@ -66,6 +71,13 @@ target_link_libraries(deviceinformation PRIVATE runtimeobject.lib)
 add_library(appmodelruntime SHARED shims/appmodelruntime/appmodelruntime.cpp)
 set_target_properties(appmodelruntime PROPERTIES PREFIX "" SUFFIX ""
                       OUTPUT_NAME "api-ms-win-appmodel-runtime-l1-1-1.dll")
+
+# Windows.Networking.Connectivity.NetworkInformation. Wine registers NetworkStatusChanged and then
+# never raises it, so an app that takes its initial reachability from the first callback waits for
+# ever. Forwards everything and fires the event once after registration.
+add_library(networkstatus SHARED shims/networkstatus/networkstatus.cpp)
+set_target_properties(networkstatus PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_networkstatus")
+target_link_libraries(networkstatus PRIVATE runtimeobject.lib)
 
 # Windows.Media.Audio.SpatialAudioDeviceConfiguration. Wine routes the class to
 # windows.media.devices, whose factory refuses ISpatialAudioDeviceConfigurationStatics; Wwise asks
