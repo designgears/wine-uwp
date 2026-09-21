@@ -59,6 +59,7 @@ These all exist and work. Prefer them over reading code and guessing.
 | What did managed code throw, and where? | `WINE_UWP_TRACE_ORIGINATE=1` + the chunked `trace_language_exception` in `dlls/combase/roerror.c` |
 | How many real `CoreApplicationView`s exist, on which threads? | `WINE_UWP_REPORT_VIEWS=1` (read-only census) |
 | What is the visual tree doing? | `WINEDEBUG=+dcomp`; `present_desktop_hwnd frame: N ops` - 0 ops means nothing to draw |
+| What is every thread actually doing? | `WINE_UWP_DUMP_STACKS=<seconds>` - suspends and unwinds every thread, prints `STACK tid N frame M rip=`. Works on an *idle* app, not just a hung one. Resolve against `/proc/<pid>/maps` from the same run |
 | Method count of a private interface | parse the MIDL proxy/stub DLL, below |
 
 ### Unique-HRESULT tagging
@@ -154,6 +155,15 @@ that *that same thread* has to service. It never returned to its loop, never set
 `server_ready_event`, and every later `RoGetAgileReference` blocked - one Media Player run in three
 started and never painted. `open_app_thread()` in `dlls/wineuwp/main.c` filters them out by
 `GetThreadDescription`; use it for any new broadcast.
+
+**A stack that looks alarming may be the normal state - check it against a working app.**
+Solitaire's main thread sits in
+`FrameworkApplicationFactory::Start -> RunInActivationMode -> CoreApplicationFactory::Run ->
+CoreApplication::RunInternal -> TearDown -> WaitForExit`, which reads exactly like an app that has
+skipped its main loop and is shutting down. I reported that as the root cause. **Media Player's
+main thread has the identical chain** - it is simply where `CoreApplication::Run` parks while the
+real work happens on other threads. The difference between the two apps was in the *other* threads:
+Media Player has engine/app workers and a UI thread inside `dcomp`; Solitaire has neither.
 
 **When a thread will not answer, go and look at it.** There is no usable debugger here, but a
 watchdog thread inside the process can `SuspendThread` any target, `GetThreadContext` it, and walk

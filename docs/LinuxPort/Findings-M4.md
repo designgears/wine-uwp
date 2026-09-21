@@ -6194,3 +6194,38 @@ with real prospects are:
    implementation (`universal windows`, `windows app sdk`, `android`, `generic`). Whatever the
    `universal windows` backend waits for between command-line parse and `Startup START` is the
    whole question, and the other backends are the cheapest way to infer its shape.
+
+### Reading Solitaire's threads against Media Player's
+
+`WINE_UWP_DUMP_STACKS=<seconds>` (new, in `dlls/wineuwp/main.c`) suspends and unwinds every thread.
+Pointed at Solitaire while it idles, the main thread shows:
+
+```
+Solitaire.exe (app main)
+  windows.ui.xaml!FrameworkApplicationFactory::Start
+    windows.ui.xaml!RunInActivationMode
+      twinapi!CoreApplicationFactory::Run
+        twinapi!CoreApplication::RunInternal
+          twinapi!CoreApplication::TearDown
+            twinapi!CoreApplication::WaitForExit
+              Event::WaitWithFreeUnusedLibraries
+```
+
+I read that as "the app skipped its main loop and is shutting down" and said so. **It is wrong.**
+Media Player's main thread has the identical chain, and Media Player renders fine - that is simply
+where `CoreApplication::Run` parks. Always dump the working app too.
+
+The difference is in the other threads:
+
+| | Solitaire | Media Player |
+| --- | --- | --- |
+| threads | 10 | 12 |
+| UI thread | idle in a message wait | inside `dcomp`, painting |
+| XAML render thread | `RenderThreadFrame` -> `CWindowsServices::WaitForObjects` | `RenderThreadFrame` -> `RefreshRateInfo::WaitForRefreshInterval` -> dxgi |
+| `mrmcorer` blocked in `CoWaitForMultipleHandles` | yes | **yes** - normal |
+| engine/app worker threads | none | several |
+
+**No engine worker threads at all** is the substantive signal: a started engine would have sim,
+render, audio and IO workers. It matches the app never reaching its own `Startup START`, and rules
+out the engine being stuck partway through initialising - there is nothing of its own running to be
+stuck in.
