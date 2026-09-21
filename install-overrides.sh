@@ -17,7 +17,7 @@ STAMP=$WINEPREFIX/.install-overrides.stamp
 # The shim DLLs have to be in the stamp: without them, rebuilding a shim leaves the stamp
 # unchanged, the installer skips itself, and the prefix keeps running the previous build - which
 # looks exactly like the code change having no effect.
-stamp=$( { find "$SRC" "$(dirname "$SRC")/Globalization" -printf '%p %s %T@\n' 2>/dev/null; stat -c '%Y' "$SYS32" "$WINE_BIN/dlls/ntdll/x86_64-windows/ntdll.dll" "$0" "$(dirname "$0")/globalization.reg" 2>/dev/null; stat -c '%n %s %Y' "$HOME"/uwp-bin/build-probes/wineuwp_*.dll 2>/dev/null; echo "${1:-}"; } | md5sum | cut -d' ' -f1 )
+stamp=$( { find "$SRC" "$(dirname "$SRC")/Globalization" -printf '%p %s %T@\n' 2>/dev/null; stat -c '%Y' "$SYS32" "$WINE_BIN/dlls/ntdll/x86_64-windows/ntdll.dll" "$0" "$(dirname "$0")/globalization.reg" 2>/dev/null; stat -c '%n %s %Y' ${UWP_BIN}/build-probes/wineuwp_*.dll 2>/dev/null; echo "${1:-}"; } | md5sum | cut -d' ' -f1 )
 if [ -z "${WINE_UWP_FORCE_OVERRIDES:-}" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$stamp" ]; then
   echo "overrides unchanged"
   exit 0
@@ -92,7 +92,14 @@ done
 
 # Per-user language profile: bcp47mrm throws a C++ exception when it is missing (Findings-M4.md).
 "${WINE_BIN}wine" reg import "$(dirname "$0")/globalization.reg" >/dev/null 2>&1
-"${WINE_BIN}wine" reg import "$(dirname "$0")/wineuwp.reg" >/dev/null 2>&1
+# wineuwp.reg carries one absolute host path (threadpoolwinrt.dll in the Windows image). A .reg
+# file cannot expand a variable, so the placeholder is substituted at import time - otherwise the
+# path is baked to whoever generated it, which is exactly what broke every app when this tree moved
+# out of the home directory.
+UWP_BIN_WINPATH="Z:$(echo "$UWP_BIN" | sed 's|/|\\\\|g')"
+sed "s|@UWP_BIN_WINPATH@|${UWP_BIN_WINPATH}|g" "$(dirname "$0")/wineuwp.reg" > "$WINEPREFIX/.wineuwp.reg.tmp"
+"${WINE_BIN}wine" reg import "$WINEPREFIX/.wineuwp.reg.tmp" >/dev/null 2>&1
+rm -f "$WINEPREFIX/.wineuwp.reg.tmp"
 
 # MRT shares process resource state between its COM and WinRT entry points. Loading a second
 # physical copy through an absolute extraction path breaks that state (see Findings-M4.md).

@@ -17,7 +17,7 @@ if [ -d "$WA" ]; then
   # Microsoft.UI.Xaml is a framework package, not app content: it has to load from the framework
   # package directory or WinUI decides it is app-local and looks for its themes under the app root.
   cp "$WA"/Microsoft.VCLibs.140.00_*_x64__*/*.dll "$S"/
-  cp "$HOME"/uwp-bin/win11/Windows/System32/mrt100.dll "$S"/
+  cp ${UWP_BIN}/win11/Windows/System32/mrt100.dll "$S"/
   # Framework packages as separate package directories (package graph for MRM and manifest scanning)
   FW=${UWP_BIN}/stage/frameworks; rm -rf "$FW"; mkdir -p "$FW"
   for d in "$WA"/Microsoft.UI.Xaml.2.8_8.2511*_x64__* "$WA"/Microsoft.NET.Native.Framework.2.2_*_x64__* "$WA"/Microsoft.NET.Native.Runtime.2.2_*_x64__* "$WA"/Microsoft.VCLibs.140.00_*_x64__*; do

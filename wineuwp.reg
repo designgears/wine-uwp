@@ -27,7 +27,7 @@ Windows Registry Editor Version 5.00
 
 ; Windows.System.Threading helper class (threadpoolwinrt.dll, Wine's builtin implements the WinRT side)
 [HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{96c7a5ef-0e2c-46d7-9bc1-6445c2444d7a}\InprocServer32]
-@="Z:\\home\\bobby\\uwp-bin\\win11\\Windows\\System32\\threadpoolwinrt.dll"
+@="@UWP_BIN_WINPATH@\\win11\\Windows\\System32\\threadpoolwinrt.dll"
 "ThreadingModel"="Both"
 
 ; MrtResourceManager (MRT resource loader used by Windows.UI.Xaml for pri lookups), native MrmCoreR.dll

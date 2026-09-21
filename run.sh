@@ -53,7 +53,12 @@ if [ -f "$S/identity.env" ]; then . "$S/identity.env"; fi
 # Package identity consumed by the patched Wine (ntdll/kernelbase read these).
 export WINE_UWP_PACKAGE_FULL_NAME=${WINE_UWP_PACKAGE_FULL_NAME:-Microsoft.WindowsCalculator.Dev_0.365.1.0_x64__8wekyb3d8bbwe}
 export WINE_UWP_PACKAGE_FAMILY_NAME=${WINE_UWP_PACKAGE_FAMILY_NAME:-Microsoft.WindowsCalculator.Dev_8wekyb3d8bbwe}
-export WINE_UWP_PACKAGE_PATH=${WINE_UWP_PACKAGE_PATH:-"Z:$(echo "$S" | sed 's|/|\\|g')"}
+# Always computed from $S, never taken from identity.env: the package path is just the stage
+# directory in Windows form, and a stale copy of it is unfixable from inside the app. Staged
+# identity.env files used to bake this in, which is what broke every app when this tree moved out
+# of the home directory - the app looked for its package at a path that no longer existed and died
+# just after CoreWindow with nothing but an RtlReportException to show for it.
+export WINE_UWP_PACKAGE_PATH="Z:$(echo "$S" | sed 's|/|\\|g')"
 export WINE_UWP_AUMID=${WINE_UWP_AUMID:-Microsoft.WindowsCalculator.Dev_8wekyb3d8bbwe!App}
 # Frame title for the hosted CoreWindow (its own text is the entry id, "App"), and the launch size;
 # a window covering the whole screen cannot be resized through the frame.
@@ -62,7 +67,7 @@ export WINE_UWP_WINDOW_SIZE=${WINE_UWP_WINDOW_SIZE:-1280x800}
 # Framework dependencies: "fullname|family|path;..." (GetCurrentPackageInfo returns them after the main package)
 if [ -z "${WINE_UWP_PACKAGE_DEPENDENCIES:-}" ] && [ -d "${UWP_BIN}/stage/frameworks" ]; then
   deps=""
-  for d in "$HOME"/uwp-bin/stage/frameworks/*/; do
+  for d in ${UWP_BIN}/stage/frameworks/*/; do
     full=$(basename "$d"); name=${full%%_*}; pub=${full##*__}
     deps="$deps$full|${name}_$pub|Z:$(echo "${d%/}" | sed 's|/|\\|g');"
   done
@@ -72,7 +77,7 @@ fi
 # path, which is how an app resolves framework DLLs it does not carry itself.
 if [ -d "${UWP_BIN}/stage/frameworks" ]; then
   fwpath=""
-  for d in "$HOME"/uwp-bin/stage/frameworks/*/; do fwpath="$fwpath${fwpath:+:}${d%/}"; done
+  for d in ${UWP_BIN}/stage/frameworks/*/; do fwpath="$fwpath${fwpath:+:}${d%/}"; done
   export WINEPATH="${WINEPATH:+$WINEPATH:}$fwpath"
 fi
 # Windows creates a per-package key under the user's AppContainer storage when the package is

@@ -77,6 +77,32 @@ that were ours; the Calculator tree is no longer involved.
   every later run - it has happened.
 - Commit messages end with the attribution line the harness gives you.
 
+## Moving this tree
+
+The data directories live inside the repo now, but a handful of things bake absolute paths and will
+silently break if it moves again. All of these bit me during the move out of the home directory:
+
+- **`"$HOME"/x` does not match a `$HOME/x` search.** A sed over `\$HOME/uwp-bin` and `~/uwp-bin`
+  left `"$HOME"/uwp-bin/stage/frameworks/*/` in `run.sh` untouched, because of the quotes. The glob
+  then matched nothing, so the loop ran **once with a literal `*`**, and the app was handed a
+  framework dependency path containing a wildcard. Grep for `HOME.*uwp-bin` - loose, not exact -
+  and check `${HOME}` and `"$HOME"` variants before believing a rewrite is complete.
+- **The prefix registry holds ~2,500 absolute paths.** Rewrite them with wineserver **down**, or
+  the server flushes its in-memory copy back over your edit.
+- **`.reg` files cannot expand variables**, so any path in one is baked to whoever generated it.
+  `wineuwp.reg` now carries an `@UWP_BIN_WINPATH@` placeholder that `install-overrides.sh`
+  substitutes at import time.
+- **`identity.env` in a stage directory must not contain `WINE_UWP_PACKAGE_PATH`.** `run.sh` sources
+  that file, so a stale value there wins over the computed one. `run.sh` now always computes it from
+  the stage directory and `stage-app.sh` no longer writes it.
+
+**`info[0]=0x8007007B` in an exception record is `ERROR_INVALID_NAME`** - "the filename, directory
+name, or volume label syntax is incorrect". It means a path is *malformed*, not missing, which is a
+much narrower thing to look for: an unexpanded glob, a doubled separator, an empty segment. Trace
+with `WINEDEBUG=+file` and read the last named `CreateFileW`. That one number turned a day-shaped
+hunt into a ten-minute one, after I had already wasted four runs checking that paths *existed* -
+they all did.
+
 ## The regression protocol - do not skip it
 
 Every change to Wine or the host gets checked against apps that already work, *before* you believe

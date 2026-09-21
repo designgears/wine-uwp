@@ -39,12 +39,13 @@ chmod -R u+w "$S"
 cp "$FWSRC"/Microsoft.NET.Native.Runtime.2.2_*_x64__*/*.dll "$S"/ 2>/dev/null || true
 cp "$FWSRC"/Microsoft.NET.Native.Framework.2.2_*_x64__*/SharedLibrary.dll "$S"/ 2>/dev/null || true
 cp "$FWSRC"/Microsoft.VCLibs.140.00_*_x64__*/*.dll "$S"/ 2>/dev/null || true
-cp "$HOME"/uwp-bin/win11/Windows/System32/mrt100.dll "$S"/ 2>/dev/null || true
+cp ${UWP_BIN}/win11/Windows/System32/mrt100.dll "$S"/ 2>/dev/null || true
 
 cat > "$S/identity.env" <<EOF
 export WINE_UWP_PACKAGE_FULL_NAME=$full
 export WINE_UWP_PACKAGE_FAMILY_NAME=${name}_$pub
-export WINE_UWP_PACKAGE_PATH='Z:'$(echo "$S" | sed 's|/|\\\\|g')
+# deliberately not written: run.sh computes the package path from the stage directory, so a moved
+# or renamed tree keeps working. Baking it here is what broke every app once.
 export WINE_UWP_AUMID=${name}_$pub!$appid
 export WINE_UWP_WINDOW_TITLE='$title'
 export UWP_EXE='$exe'
