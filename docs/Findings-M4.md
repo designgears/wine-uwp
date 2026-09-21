@@ -7119,3 +7119,38 @@ run reached the bootflow before reading a probe's absence.
 over from an earlier session. It is byte-identical to the live exe, which is itself byte-identical
 to the pristine package copy under `/mnt/win`, so nothing is poisoned - but check that before
 trusting any Solitaire run (`cmp` against the WindowsApps original).
+
+### Correction: BootflowItemFont is NOT the blocker (same day)
+
+The section above concluded `BootflowItemFont` stalls because its font future is never fulfilled.
+**Both halves of that are wrong**, and the way it failed is worth keeping.
+
+Two further probes killed it:
+
+| Probe | Reached bootflow | Fired |
+| --- | --- | --- |
+| success setter `0x8b2d24` (sets the ready flag) | - | **yes** |
+| error branch `0x8ba8ee` | yes | no |
+
+So the font future *succeeds* and the ready flag *is* set - and the flag's object is definitely the
+one `Font::UpdateInit` reads: the global at `0x141364b80` is stored exactly once, at `0x8b13f1`,
+with the return value of the font-manager constructor `0x8b1854`, which is the same object the
+kickoff clears `+0x190` on.
+
+Then the decisive experiment: patching `Font::UpdateInit` (`0xc7660`) to `xor eax,eax; ret` - always
+"done" - **changed nothing**. The log still ends at `PlayFab login successful`. If forcing the gate
+open does not advance the flow, the flow is not waiting on that gate.
+
+Meanwhile the load-bearing negative held up: `LoadCdn::BeginInit` did not fire in **three** separate
+runs that all reached `AppState Transition ... 'Sgi::BootflowState'`.
+
+**Where the reasoning went wrong.** Items 3/5/7 never beginning is a sound measurement. "Therefore
+item 2 is stuck" is the inference, and it silently assumes the tick is running at all. `Enter`
+(`0x306b84`) sets the status word at `+0x20` and then calls `items[0]->BeginInit()`, so the flow is
+armed - but the tick at `0x307020` begins `cmpl $0x1,0x20(%rbx); jne ret`, so if it is never called,
+or called with a status that is not 1, **no item ever advances and every "never begins" probe comes
+back negative regardless of which item is stuck**. Every negative I collected is equally consistent
+with "the bootflow is never ticked", and I did not test that before naming a culprit.
+
+This is the same mistake AGENTS.md already records for the `ud2` work on `Window.put_Content`: a
+correct measurement, with a wrong model wrapped around it.
