@@ -86,6 +86,7 @@ These all exist and work. Prefer them over reading code and guessing.
 | What did managed code throw, and where? | `WINE_UWP_TRACE_ORIGINATE=1` + the chunked `trace_language_exception` in `dlls/combase/roerror.c` |
 | How many real `CoreApplicationView`s exist, on which threads? | `WINE_UWP_REPORT_VIEWS=1` (read-only census) |
 | What is the visual tree doing? | `WINEDEBUG=+dcomp`; `present_desktop_hwnd frame: N ops` - 0 ops means nothing to draw |
+| Why is an app stuck, when the stack dumper cannot say? | `WINE_UWP_PROFILE=<prefix> WINE_UWP_PROFILE_MS=10` - a sampling profiler already in `wineuwp`. Writes `<prefix>.<pid>` every 2 s: an `M` line per module then `S <tid> <rip> <count> <4 callers>`. It **found the waiting thread's loop when `WINE_UWP_DUMP_STACKS` returned nothing useful**, and it distinguishes *blocked* from *spinning*, which no single stack snapshot can |
 | What is every thread actually doing? | `WINE_UWP_DUMP_STACKS=<seconds>` - suspends and unwinds every thread, prints `STACK tid N frame M rip=`. Works on an *idle* app, not just a hung one. Resolve against `/proc/<pid>/maps` from the same run |
 | Method count of a private interface | parse the MIDL proxy/stub DLL, below |
 | Where is the code behind one of the app's own log strings? | `tools/wine-uwp/xref.py <exe> --string '<log string>'` - finds rip-relative LEAs to it and resolves each to its **enclosing function** via `.pdata`, which is where a `ud2` has to go. `--callers <rva>` finds direct call sites |
@@ -349,6 +350,15 @@ three times running on Solitaire and then failed twice: the Xbox auth path I "id
 had in fact completed, and `UserActivityChannel` fails with a clean HRESULT the app handles. Confirm
 with a probe (does the caller's return point execute?) before writing a shim for whatever appears
 last.
+
+**"Stuck" is not the same as "blocked", and a sampling profile tells them apart.** Solitaire's
+bootstrap thread looked blocked for a whole session - no log output for five minutes, a continuation
+that never fired, a future never fulfilled. `WINE_UWP_PROFILE` showed it is **busy**: it spins in
+`WinUwp::BootStrap::Startup`, calling `this->vtbl[5]()` (a tick), which pumps a task queue and
+returns as soon as any of three flags at `+0x208/+0x20a/+0x210` is set - "finished", "failed",
+"cancelled". None ever is. That reframes the question from "what is it waiting on" to "what should
+have set a flag", and it is not something a single stack snapshot can tell you. Reach for the
+profiler before concluding a thread is parked.
 
 **`WINE_UWP_DUMP_STACKS` negatives are not evidence.** It unwinds ~10 frames per thread, and when
 `RtlLookupFunctionEntry` fails it guesses `rip = *rsp` and derails. It reported *no thread inside
