@@ -7198,3 +7198,40 @@ took one run and two bytes; triangulating around it took six rounds and about tw
 **Next**: find what calls vtable slot `+0x20` on the current app state. That is a `call *0x20(%rax)`
 through the state pointer, in whatever drives `AppState`. The app does keep presenting frames, so
 something is still running - the question is why the state machine's update is not part of it.
+
+### Who calls the bootflow tick: the app's frame pump lives inside `BootStrap::Startup`
+
+A `ud2` at the tick entry makes Solitaire's own handler dump `JSON_CALLSTACK`, and because the app is
+based at a fixed `0x140000000`, `.pdata` names every frame with no symbols and no module map. The
+single call to `BootflowState::Update` comes from:
+
+```
+0x140307020  BootflowState::Update            <- the tick (our ud2)
+0x14095ee56  DoTransition (0x95eb50..0x95ee79)
+0x1407ec6c6  the frame loop (0x7ec5a8..0x7ecc2c)   "FPS: %7.2f (U:%6.2fms R:%6.2fms S:%6.2fms)"
+0x1407dfb7d  WinUwp::BootStrap::Startup (0x7df800..0x7dfecc)  "Startup Began/Finished/Resume Received"
+0x1407de6eb  0x7de6a0..0x7de730
+0x140684d0d  0x684c80..0x684d23
+```
+
+Two things fall out of this, both checkable and both important:
+
+1. **The tick's one call is from `DoTransition`** - the state machine calls the new state's `Update`
+   once as part of entering it. That is the *only* call. So the per-frame path is separate and is
+   not running.
+2. **The frame loop `0x7ec5a8` has exactly one caller in the whole binary**: `0x7dfb78`, inside
+   `WinUwp::BootStrap::Startup`. It is in no vtable. So the app's entire Update/Render/Swap pump is
+   reachable only from `BootStrap::Startup`.
+
+That makes the earlier profiler observation fit: `BootStrap::Startup` *is* the loop, calling a tick
+and checking its three flags. The identifiers to use from here are the frame loop body at
+`0x7ec623`, which walks a list of updatable objects between `[rdi+0x40]` and `[rdi+0x48]` calling a
+virtual on each - the app-state manager's per-frame update should be in that list.
+
+Field map for the app-state manager (from `DoTransition`): **`+0x290` = current state**, `+0x288` =
+previous state during a transition. Its `Enter` is `BootflowState` vtable slot `+0x10`, `Update` is
+slot `+0x20` (vtable at `0xec2708`).
+
+Caution for whoever continues: `0x88d2f8` also reads `+0x290` *and* calls slot `+0x20`, and is **not**
+the state manager - it is a ring buffer where `+0x290`/`+0x298` are a size and a mask. Offsets alone
+are not identification.
