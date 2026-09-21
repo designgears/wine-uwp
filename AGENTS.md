@@ -336,6 +336,15 @@ I killed my own shell with this **a fifth time** (exit 144), with `pkill -x soak
 works: **never let the pattern appear literally anywhere in the command line.** Build it from
 pieces and exclude your own pid:
 
+And a **sixth time**, in a new variation worth spelling out. I used the split-string trick
+(`awk '/impor""t/'`) believing that was enough - but splitting the literal only stops *awk's own
+pattern* from matching; the string still appears in the enclosing shell's command line, so
+`ps | awk` matched my own shell and `xargs kill` killed it. Worse, the count it printed first
+("3 stray processes") was itself just my shell plus its awk, so I acted on a reading that was
+entirely my own noise. **Splitting the string is not sufficient on its own - you must also exclude
+your own pid.** Both halves of the rule below matter; either alone will bite you. And before
+believing a process count, check whether the matches are your own pipeline.
+
 ```
 P=soak2; ME=$$
 ps -eo pid,args --no-headers | awk -v pat="$P"".sh" -v me="$ME" '$1 != me && index($0, pat) {print $1}' | xargs -r kill
