@@ -73,7 +73,8 @@ that were ours; the Calculator tree is no longer involved.
   it is **+49,264/-1,024 lines across 196 files**, and 29 of them - `dlls/dcomp/composition.c`
   (14k lines), `dlls/wineuwp/main.c` (4.8k), `dlls/dxgi/compswapchain.c` - **do not exist upstream
   at all**. They are our source, not patches.
-  Nothing gets committed in the shared tree; the files get committed here, in full.
+  Commit in the Wine tree too - it is ours, and it is where `git log` for that work lives. The
+  repo copy is what makes it visible and recoverable; the two are not alternatives.
   `wine/FILES` is an **explicit list, never a glob**, so this cannot start sweeping the other
   session's work into our history.
 - **This used to be a patch export, and it silently lost ~95% of the work.** Two compounding
