@@ -6143,3 +6143,54 @@ The app also opens `LocalState\Logs\Solitaire.log`, but that file stays **0 byte
 clean exit**, so the file writer is never installed and stderr is the only copy. Worth knowing
 before spending a run trying to recover it: closing the window politely instead of
 `wineserver -k` did produce a clean 2 s shutdown, and still no log.
+
+### Solitaire: what has been eliminated, with evidence
+
+The app stops between parsing its command line (~0.35 s) and its own `Startup START`, and nothing
+below has been able to move it. Recorded so the next session does not re-run any of these:
+
+| hypothesis | how it died |
+| --- | --- |
+| Never finishes `OnLaunched` | Withdrawn - it is a native engine that has no reason to set `Window.Content` |
+| Waiting for window activation | Forced focus, raise, click inside the window and a resize: no change, still 2 colours |
+| Waiting on `SplashScreen.Dismissed` | It never registers a handler (fixed the stub anyway) |
+| Waiting on `CoreApplication.LeavingBackground`/`EnteredBackground` | Probes inconclusive - but see the control note below |
+| Waiting on WNF | The callback is `wil::details::make_wnf_subscription_state<empty_wnf_state>` inside `windows.ui.dll` - generic WIL housekeeping, not the app |
+| Blocked in a worker thread | `utime` identical across all 15 threads in two samples 3 s apart; nothing runs anywhere |
+| Dispatcher work posted but never pumped | The app's own `CoMsgWaitInProcessEvents` runs on the view thread (`01a8`), so it is pumped |
+| Doesn't know its window size | It sets `0x0` itself through interop slots 36/37; the window is really 1280x800 |
+| D3D/graphics failure | `D3D11CreateDevice` succeeds at feature level 11_1, no failures in 599 d3d/dxgi lines |
+| Can't load its assets | It never opens `archives/` or any content at all - 27k file operations, all manifests and DLLs |
+| Blocked on network | Zero network calls in a full run |
+| `{7ca84d06}` refusal | `IValueMarshalByPropertySet`, a marshalling shortcut with a fallback; answering it with stubs made `Activate` fail outright |
+| `App.xaml` parse failure | There is no XAML in the package at all |
+| `rmclient` RPC failure | Real (`EPT_S_NOT_REGISTERED`) but it happens *before* activation completes and the app carries on past it |
+
+**A control probe must be a function you have independently confirmed runs in that configuration.**
+The `twinapi.appcore` probes above are marked inconclusive because the control I chose,
+`ApplicationActivationFactory::Activate` (RVA `0x5fc20`), never fired either - with
+`WINE_UWP_DRIVE_VIEW=run` our driver does not go through it. The patch was verified live in both
+copies and the RVA/file-offset mapping is 1:1, so the negative is about the control, not the
+plumbing. Pick something the logs already prove executes.
+
+**Static xrefs will not find the engine's log strings.** `Solitaire.exe` has a
+`StringInternPool`; there is no rip-relative reference and no absolute pointer to
+`"Command Line Arguments: {}"` anywhere in `.text`. Reading forward from a known log line is not
+available here.
+
+### What would actually move this forward
+
+Not more probing of our stack - a dozen plausible gaps have now been ruled out. The two routes
+with real prospects are:
+
+1. **Find the engine's own verbosity switch.** It has a `CommandLine` parser with named options
+   (`CommandLine::AddOption - Trying to add option [{}]`) and a `Log::Writer`. If the launch
+   arguments can be set (they arrive through `ILaunchActivatedEventArgs::get_Arguments`, which
+   `wineuwp` currently fills with an empty string), an option that raises the log level would give
+   us the engine's account of its own startup - which is the one thing that has been missing all
+   along. `LocalState\Logs\Solitaire.log` is created but stays 0 bytes even after a clean exit, so
+   stderr is the only channel.
+2. **Compare against the `WindowsAppSdk` host backend.** The engine ships more than one host
+   implementation (`universal windows`, `windows app sdk`, `android`, `generic`). Whatever the
+   `universal windows` backend waits for between command-line parse and `Startup START` is the
+   whole question, and the other backends are the cheapest way to infer its shape.
