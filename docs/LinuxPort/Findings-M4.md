@@ -6818,3 +6818,89 @@ that does not exist. The app logs it and continues, so it is not the blocker, bu
 
 Regression with everything above installed: Calculator 249 colours and `magick compare -metric AE`
 = **0** against the baseline; Feedback Hub **822** colours, 0 fail-fasts, 0 app errors.
+
+## Chasing the splash-screen stall into the engine: `get_NetworkAdapter`
+
+Still on the splash page, but the stall is now localised to one function and one refusal is fixed.
+
+### The map, established by probe rather than argument
+
+`BootflowState`'s vtable has **no `Update`** (slot 3 is a shared empty stub), so the flow is purely
+callback-driven. `BootflowState::Enter` (`0x306670`) constructs all nine items - all of them, in one
+function, which is how the item list and its order were recovered:
+
+```
+Arkadium, Font, LoadCdn, SignIn, InitializeThemes, ContentLoad, Ads, Notifications  (+Themes)
+```
+
+Each item's vtable is six slots and **slot 1 is `BeginInit`** - confirmed because
+`BootflowItemAds`' slot 1 is the only one containing `adconsent/mcg_consentconfig.json`. `Enter`
+calls `item->BeginInit()` through `movq 0x8(%rax),%rax` and then attaches a continuation
+(`0x307240`) that advances to the next item.
+
+Probing every slot-1:
+
+- The **trivial** items run: `0x6dcb0` (`mov dword [rcx+0x10], 2; ret`, shared by Arkadium /
+  ContentLoad / Notifications) and `0xc7650` (Font, identical shape). They complete synchronously,
+  so `0x306dc8` takes its `testb $0x10` "future already has a value" branch and advances without
+  the continuation - which is why `0x307240` never firing is *not* itself the bug.
+- **No item that does real work ever begins**: LoadCdn, SignIn, InitializeThemes, Themes and Ads
+  all stay silent across runs that reach login and the splash.
+
+So the flow runs the do-nothing items and stops before the first one with a dependency.
+
+### The refusal that was found, and fixed
+
+`Sgi::Network::ReachableWinRT`'s `NetworkStatusChanged` handler (`0x6b1ef4`) does, in order - slot
+offsets read straight off the disassembly:
+
+```
+NetworkInformation::GetInternetConnectionProfile   statics slot 7
+profile->GetNetworkConnectivityLevel               slot 7 (0x38)   must be > 1
+profile.as<IConnectionProfile2>()->IsWlan/Wwan     slots 6,7
+profile->get_NetworkAdapter                        slot 11 (0x58)  <-- E_NOTIMPL in Wine
+adapter->get_IanaInterfaceType                     slot 8  (0x40)
+```
+
+Every one of those Wine implements except `get_NetworkAdapter`, which is a bare `E_NOTIMPL` stub -
+and it is on the path. `shims/networkstatus` now wraps the `IConnectionProfile` that Wine returns,
+forwarding all fifteen slots except 11, which hands back an `INetworkAdapter` reporting IANA
+ifType **6** (ethernetCsmacd) at 1 Gbit/s. The trace confirms it: `get_NetworkAdapter -> ...`,
+`get_IanaInterfaceType -> 6`, and Wine's stub is no longer hit.
+
+The app's status table decodes as: ifType 6, 9, 24 or 144 -> status **4**; 71 (WiFi) -> status 2;
+anything else -> a fourth path. So it now computes a real status where before it bailed.
+
+**I had dismissed this exact stub earlier** on the grounds that the app "kept logging 200 lines past
+it". That was bad reasoning, and it is the general lesson from this round: *a process continuing to
+run is not evidence that the computation which hit the stub succeeded.* The refusal was swallowed
+into a status that silently stayed "unknown".
+
+### Still stuck, and what that rules out
+
+Fixing it did **not** unblock the app. With the adapter answered:
+
+- `UserDataFlowAppComponent::Initialize` runs (`0x4e8800`, 3/3) and registers a
+  `std::function<void(bool, Reachable::Status)>`; a `ud2` on that function object's
+  `_Func_impl_no_alloc::_Do_call` shows it **never fires**.
+- `ReachableWinRT`'s handler **does** run - the shim's synthetic `NetworkStatusChanged` reaches it
+  (`ud2` on the delegate's `Invoke`, slot 3, fires 3/3).
+- The handler stores the computed status with an `xchgl` and **notifies nobody**; listener
+  registration (`0x56f350`) only appends to a list.
+
+That last point suggested listeners only hear about *transitions*, and that the status was already
+settled before anyone registered. **Tested and disproved**: an experiment that alternated the
+adapter's ifType between 6 and 71 on every notification - making the computed status genuinely
+change between 4 and 2 - left the app exactly where it was. The experiment was reverted; it is
+behind `WINE_UWP_NETSTATUS_FLIP` in the shim's history only, and must not ship.
+
+Also confirmed this round, because it changes what the symptom means: **`Dx11RenderWindow::SwapBuffers`
+now runs**. The engine is presenting frames continuously - the splash screen is live, not a single
+stale frame - so the render loop and the engine job system are both healthy. Only the bootflow is
+gated.
+
+Five minutes of runtime produces no further app log line at all (112 lines at 60 s, 112 at 300 s)
+and no timeout or retry path, so nothing is going to shake loose on its own.
+
+Regression with all of the above: Calculator 249 colours and `AE` = **0**; Feedback Hub **822**
+colours, 0 fail-fasts, 0 app errors.
