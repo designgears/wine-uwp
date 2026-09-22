@@ -185,7 +185,8 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | Why is an app stuck, when the stack dumper cannot say? | `WINE_UWP_PROFILE=<prefix> WINE_UWP_PROFILE_MS=10` - a sampling profiler already in `wineuwp`. Writes `<prefix>.<pid>` every 2 s: an `M` line per module then `S <tid> <rip> <count> <4 callers>`. It **found the waiting thread's loop when `WINE_UWP_DUMP_STACKS` returned nothing useful**, and it distinguishes *blocked* from *spinning*, which no single stack snapshot can |
 | What is every thread actually doing? | `WINE_UWP_DUMP_STACKS=<seconds>` - suspends and unwinds every thread, prints `STACK tid N frame M rip=`. Works on an *idle* app, not just a hung one. Resolve against `/proc/<pid>/maps` from the same run |
 | Method count of a private interface | parse the MIDL proxy/stub DLL, below |
-| Did this code path run, without ending the run? | `./tramp.py <exe> <rva> <nbytes> 'MSG' [cave]` - a jmp to a code cave that logs and jumps back. **Never call the app's own logger from one** (see below); `--nolog` is the control that tells a broken probe from a real hang |
+| Did this code path run, without ending the run? | `./tramp.py <exe> <rva> <nbytes> 'MSG' [cave] [--applog]` - a jmp to a code cave that logs and jumps back, so one run answers several questions. It appends its own RWX `.tramp` section, refuses a displacement that splits an instruction, and relocates displaced rip-relative operands |
+| What is the value of a register or field at that point? | `./tramp.py ... --val=rcx` / `--val=[rcx+0x30]` / `--val=[[rcx+0x30]+0x14c]` - formats it as hex through `OutputDebugStringA`; read it with `WINEDEBUG=warn+seh` |
 | Where is this class's vtable, with no symbols? | `./rtti.py <exe> '<name substring>'` - walks the MSVC type descriptors and prints the vtable and its slots |
 | What function is this address in, with no symbols? | `./whatfn.py <exe> <addr>...` - finds the enclosing `.pdata` function and prints every string its rip-relative LEAs point at. That is how a bare stack dump gets names |
 | Where is the code behind one of the app's own log strings? | `./xref.py <exe> --string '<log string>'` - finds rip-relative LEAs to it and resolves each to its **enclosing function** via `.pdata`, which is where a `ud2` has to go. `--callers <rva>` finds direct call sites |
@@ -419,6 +420,14 @@ parked on their task queues, UI threads pumping, no spinning. **A lost continuat
 idle process, not a hung one.** When every thread is idle and the app has stopped making progress,
 look for the last refusal, not for a blocked stack. Accepting and dropping (`S_OK`) is the right
 answer for a delivery API with nowhere to deliver to.
+
+**Two vtables found from their RTTI are not aligned with each other.** I probed "slot 28" of
+`StartupSplashScreen` and of `GenericDialogScreen` and concluded the splash's `OnLoaded` runs and
+the dialog's does not. The splash **does not override `OnLoaded` at all**, and its vtable is
+shorter, so that address belonged to the next vtable in memory - a different interface's method
+entirely. `rtti.py` gives you the vtable; print both side by side and compare *addresses*, and
+check the class actually overrides the method (`grep` for `OnLoaded@<Class>@Sgi@@`) before reading
+anything into a slot index.
 
 **A stack frame whose function contains a familiar log string is not necessarily doing that work.**
 `whatfn.py` put "Inventory - Failed to Find/Load asset" in the function a parked thread was in,
@@ -752,7 +761,7 @@ the fully-qualified name. `--grep` first, always.
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | **Boots, downloads all CDN content, completes its bootflow and ticks real time.** Wine now implements `Windows.Networking.EndpointPair` and `Windows.Networking.Sockets.StreamSocket` (with a schannel TLS client), which the app's own HTTP client is built on. **Still needs the `jne`->`jmp` byte patch at file offset `0x7dee64`.** It stops on the **UserDataFlow sign-in error dialog** (`gui/screenfiles/genericpopup/genericpopup`, loc keys `UserDataFlow.Check_Get_XUID_Error` / `SignInErrorHeader`), shown because there is no Xbox identity - which is the honest outcome and is dismissible on Windows. The dialog **never draws**: `GenericDialogScreen::OnLoaded` and `ApplyPopupDescription` provably never run and the screen never gains focus. Why a screen entered at 3.3 s never finishes loading, when the splash entered at 2.4 s did, is the current front |
+| Solitaire | **Boots, downloads all CDN content, completes its bootflow and ticks real time.** Wine implements `Windows.Networking.EndpointPair` and `Windows.Networking.Sockets.StreamSocket` (schannel TLS), which the app's own HTTP client is built on. **Still needs the `jne`->`jmp` byte patch at file offset `0x7dee64`.** It stops on the **UserDataFlow sign-in error dialog** (`gui/screenfiles/genericpopup/genericpopup`), shown because there is no Xbox identity - the honest outcome, dismissible on Windows. **The dialog never gains focus, so it never loads:** the per-frame tick only advances the focused screen, the focus loop (`0x8b6000`) requires `[[screen+0x30]+0x14c]` to be non-zero, and that byte is 1 for the splash and 0 for the popup. Finding what sets it is the current front - the only static writers that set it (`0x461134`, `0x4660c0`) never run |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
