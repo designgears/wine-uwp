@@ -28,6 +28,7 @@ struct storage_folder
     IStorageFolder IStorageFolder_iface;
     IStorageItem IStorageItem_iface;
     IStorageFolderQueryOperations IStorageFolderQueryOperations_iface;
+    IStorageFolder2 IStorageFolder2_iface;
     LONG ref;
     WCHAR *path;
 };
@@ -56,6 +57,15 @@ static HRESULT WINAPI storage_folder_QueryInterface( IStorageFolder *iface, REFI
     if (IsEqualGUID( iid, &IID_IStorageItem ))
     {
         *out = &impl->IStorageItem_iface;
+        IInspectable_AddRef( *out );
+        return S_OK;
+    }
+
+    /* Refusing this made .NET's cast of the publisher cache folder throw InvalidCastException
+     * (Solitaire's AdConsent "PublisherStorageAccessFailure"). See Findings-M4. */
+    if (IsEqualGUID( iid, &IID_IStorageFolder2 ))
+    {
+        *out = &impl->IStorageFolder2_iface;
         IInspectable_AddRef( *out );
         return S_OK;
     }
@@ -125,50 +135,249 @@ static HRESULT WINAPI storage_folder_GetTrustLevel( IStorageFolder *iface, Trust
     return S_OK;
 }
 
-static HRESULT WINAPI storage_folder_CreateFileAsyncOverloadDefaultOptions( IStorageFolder *iface, HSTRING name,
-                                                                           IAsyncOperation_StorageFile **operation )
+/* "<folder path>\<name>", as an async parameter for the callbacks below. */
+static HRESULT folder_child_param( struct storage_folder *impl, HSTRING name, IUnknown **param )
 {
-    FIXME( "iface %p, name %s, operation %p stub!\n", iface, debugstr_hstring( name ), operation );
-    return E_NOTIMPL;
+    const WCHAR *buffer;
+    WCHAR *path;
+    HRESULT hr;
+    SIZE_T len;
+
+    if (!(buffer = WindowsGetStringRawBuffer( name, NULL ))) return E_INVALIDARG;
+    len = wcslen( impl->path ) + 1 + wcslen( buffer ) + 1;
+    if (!(path = malloc( len * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
+    swprintf( path, len, L"%s\\%s", impl->path, buffer );
+    hr = storage_path_param_create( path, param );
+    free( path );
+    return hr;
+}
+
+static HRESULT child_as_item( const WCHAR *path, DWORD attributes, IStorageItem **item )
+{
+    HRESULT hr;
+
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY)
+    {
+        IStorageFolder *folder;
+        if (FAILED(hr = __wine_storage_folder_create( path, &folder ))) return hr;
+        hr = IStorageFolder_QueryInterface( folder, &IID_IStorageItem, (void **)item );
+        IStorageFolder_Release( folder );
+        return hr;
+    }
+    else
+    {
+        IStorageFile *file;
+        if (FAILED(hr = storage_file_create( path, &file ))) return hr;
+        hr = IStorageFile_QueryInterface( file, &IID_IStorageItem, (void **)item );
+        IStorageFile_Release( file );
+        return hr;
+    }
+}
+
+static HRESULT get_child_file( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+{
+    const WCHAR *path = storage_path_param_buffer( param );
+    IStorageFile *file;
+    HRESULT hr;
+
+    if (GetFileAttributesW( path ) == INVALID_FILE_ATTRIBUTES)
+        return HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND );
+    if (FAILED(hr = storage_file_create( path, &file ))) return hr;
+    result->vt = VT_UNKNOWN;
+    result->punkVal = (IUnknown *)file;
+    return S_OK;
+}
+
+static HRESULT get_child_folder( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+{
+    const WCHAR *path = storage_path_param_buffer( param );
+    DWORD attributes = GetFileAttributesW( path );
+    IStorageFolder *folder;
+    HRESULT hr;
+
+    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+        return HRESULT_FROM_WIN32( ERROR_PATH_NOT_FOUND );
+    if (FAILED(hr = __wine_storage_folder_create( path, &folder ))) return hr;
+    result->vt = VT_UNKNOWN;
+    result->punkVal = (IUnknown *)folder;
+    return S_OK;
+}
+
+static HRESULT get_child_item( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+{
+    const WCHAR *path = storage_path_param_buffer( param );
+    DWORD attributes = GetFileAttributesW( path );
+    IStorageItem *item;
+    HRESULT hr;
+
+    if (attributes == INVALID_FILE_ATTRIBUTES) return HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND );
+    if (FAILED(hr = child_as_item( path, attributes, &item ))) return hr;
+    result->vt = VT_UNKNOWN;
+    result->punkVal = (IUnknown *)item;
+    return S_OK;
+}
+
+/* TryGetItemAsync differs from GetItemAsync in exactly one way: a missing item is not an error,
+ * it completes with NULL. Callers test the result for null instead of catching. */
+static HRESULT try_get_child_item( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+{
+    const WCHAR *path = storage_path_param_buffer( param );
+    DWORD attributes = GetFileAttributesW( path );
+    IStorageItem *item = NULL;
+    HRESULT hr;
+
+    result->vt = VT_UNKNOWN;
+    result->punkVal = NULL;
+    if (attributes == INVALID_FILE_ATTRIBUTES) return S_OK;
+    if (FAILED(hr = child_as_item( path, attributes, &item ))) return hr;
+    result->punkVal = (IUnknown *)item;
+    return S_OK;
+}
+
+/* Create every missing component of a (possibly multi-segment) relative path. The app asks for
+ * things like "user_data\Guest\launch_data" in one call, which CreateDirectoryW cannot do. */
+static BOOL create_directory_tree( const WCHAR *path )
+{
+    WCHAR *copy, *p;
+    BOOL ret = TRUE;
+
+    if (!(copy = wcsdup( path ))) return FALSE;
+    for (p = copy; *p; p++)
+    {
+        if (*p != '\\' && *p != '/') continue;
+        *p = 0;
+        if (wcslen( copy ) > 2) CreateDirectoryW( copy, NULL );
+        *p = '\\';
+    }
+    if (!CreateDirectoryW( copy, NULL ) && GetLastError() != ERROR_ALREADY_EXISTS) ret = FALSE;
+    free( copy );
+    return ret;
+}
+
+/* The async callbacks below only receive the path, so the collision option is applied here, before
+ * the operation is created. If the create fails the callback's open fails too, which surfaces as a
+ * faulted operation - the same thing the caller would see from Windows. */
+static HRESULT folder_create_child( struct storage_folder *impl, HSTRING name, BOOL directory,
+                                    CreationCollisionOption options, IUnknown **param )
+{
+    const WCHAR *path;
+    HRESULT hr;
+
+    if (FAILED(hr = folder_child_param( impl, name, param ))) return hr;
+    path = storage_path_param_buffer( *param );
+
+    if (directory)
+    {
+        if (options == CreationCollisionOption_ReplaceExisting) RemoveDirectoryW( path );
+        create_directory_tree( path );
+    }
+    else
+    {
+        DWORD disposition = OPEN_ALWAYS;
+        HANDLE file;
+
+        switch (options)
+        {
+        case CreationCollisionOption_ReplaceExisting: disposition = CREATE_ALWAYS; break;
+        case CreationCollisionOption_FailIfExists:    disposition = CREATE_NEW; break;
+        /* GenerateUniqueName would need a "name (2)" search; opening the existing file is closer to
+         * useful than failing, and no caller here relies on the rename. */
+        default:                                      disposition = OPEN_ALWAYS; break;
+        }
+        file = CreateFileW( path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            NULL, disposition, FILE_ATTRIBUTE_NORMAL, NULL );
+        if (file != INVALID_HANDLE_VALUE) CloseHandle( file );
+    }
+    return S_OK;
 }
 
 static HRESULT WINAPI storage_folder_CreateFileAsync( IStorageFolder *iface, HSTRING name, CreationCollisionOption options,
                                                       IAsyncOperation_StorageFile **operation )
 {
-    FIXME( "iface %p, name %s, options %d, operation %p stub!\n", iface, debugstr_hstring( name ), options, operation );
-    return E_NOTIMPL;
+    struct storage_folder *impl = impl_from_IStorageFolder( iface );
+    IUnknown *param;
+    HRESULT hr;
+
+    TRACE( "iface %p, name %s, options %d, operation %p.\n", iface, debugstr_hstring( name ), options, operation );
+
+    if (!operation) return E_POINTER;
+    if (FAILED(hr = folder_create_child( impl, name, FALSE, options, &param ))) return hr;
+    hr = async_operation_storage_file_create( (IUnknown *)iface, param, get_child_file, operation );
+    IUnknown_Release( param );
+    return hr;
 }
 
-static HRESULT WINAPI storage_folder_CreateFolderAsyncOverloadDefaultOptions( IStorageFolder *iface, HSTRING name,
-                                                                              IAsyncOperation_StorageFolder **operation )
+static HRESULT WINAPI storage_folder_CreateFileAsyncOverloadDefaultOptions( IStorageFolder *iface, HSTRING name,
+                                                                            IAsyncOperation_StorageFile **operation )
 {
-    FIXME( "iface %p, name %s, operation %p stub!\n", iface, debugstr_hstring( name ), operation );
-    return E_NOTIMPL;
+    return storage_folder_CreateFileAsync( iface, name, CreationCollisionOption_FailIfExists, operation );
 }
 
 static HRESULT WINAPI storage_folder_CreateFolderAsync( IStorageFolder *iface, HSTRING name, CreationCollisionOption options,
                                                         IAsyncOperation_StorageFolder **operation )
 {
-    FIXME( "iface %p, name %s, options %d, operation %p stub!\n", iface, debugstr_hstring( name ), options, operation );
-    return E_NOTIMPL;
+    struct storage_folder *impl = impl_from_IStorageFolder( iface );
+    IUnknown *param;
+    HRESULT hr;
+
+    TRACE( "iface %p, name %s, options %d, operation %p.\n", iface, debugstr_hstring( name ), options, operation );
+
+    if (!operation) return E_POINTER;
+    if (FAILED(hr = folder_create_child( impl, name, TRUE, options, &param ))) return hr;
+    hr = async_operation_storage_folder_create( (IUnknown *)iface, param, get_child_folder, operation );
+    IUnknown_Release( param );
+    return hr;
+}
+
+static HRESULT WINAPI storage_folder_CreateFolderAsyncOverloadDefaultOptions( IStorageFolder *iface, HSTRING name,
+                                                                              IAsyncOperation_StorageFolder **operation )
+{
+    return storage_folder_CreateFolderAsync( iface, name, CreationCollisionOption_FailIfExists, operation );
 }
 
 static HRESULT WINAPI storage_folder_GetFileAsync( IStorageFolder *iface, HSTRING name, IAsyncOperation_StorageFile **operation )
 {
-    FIXME( "iface %p, name %s, operation %p stub!\n", iface, debugstr_hstring( name ), operation );
-    return E_NOTIMPL;
+    struct storage_folder *impl = impl_from_IStorageFolder( iface );
+    IUnknown *param;
+    HRESULT hr;
+
+    TRACE( "iface %p, name %s, operation %p.\n", iface, debugstr_hstring( name ), operation );
+
+    if (!operation) return E_POINTER;
+    if (FAILED(hr = folder_child_param( impl, name, &param ))) return hr;
+    hr = async_operation_storage_file_create( (IUnknown *)iface, param, get_child_file, operation );
+    IUnknown_Release( param );
+    return hr;
 }
 
 static HRESULT WINAPI storage_folder_GetFolderAsync( IStorageFolder *iface, HSTRING name, IAsyncOperation_StorageFolder **operation )
 {
-    FIXME( "iface %p, name %s, operation %p stub!\n", iface, debugstr_hstring( name ), operation );
-    return E_NOTIMPL;
+    struct storage_folder *impl = impl_from_IStorageFolder( iface );
+    IUnknown *param;
+    HRESULT hr;
+
+    TRACE( "iface %p, name %s, operation %p.\n", iface, debugstr_hstring( name ), operation );
+
+    if (!operation) return E_POINTER;
+    if (FAILED(hr = folder_child_param( impl, name, &param ))) return hr;
+    hr = async_operation_storage_folder_create( (IUnknown *)iface, param, get_child_folder, operation );
+    IUnknown_Release( param );
+    return hr;
 }
 
 static HRESULT WINAPI storage_folder_GetItemAsync( IStorageFolder *iface, HSTRING name, IAsyncOperation_IStorageItem **operation )
 {
-    FIXME( "iface %p, name %s, operation %p stub!\n", iface, debugstr_hstring( name ), operation );
-    return E_NOTIMPL;
+    struct storage_folder *impl = impl_from_IStorageFolder( iface );
+    IUnknown *param;
+    HRESULT hr;
+
+    TRACE( "iface %p, name %s, operation %p.\n", iface, debugstr_hstring( name ), operation );
+
+    if (!operation) return E_POINTER;
+    if (FAILED(hr = folder_child_param( impl, name, &param ))) return hr;
+    hr = async_operation_storage_item_create( (IUnknown *)iface, param, get_child_item, operation );
+    IUnknown_Release( param );
+    return hr;
 }
 
 static HRESULT WINAPI storage_folder_GetFilesAsyncOverloadDefaultOptionsStartAndCount( IStorageFolder *iface,
@@ -2032,6 +2241,41 @@ static const struct IStorageFolderQueryOperationsVtbl folder_query_vtbl =
  * runtime for its ApplicationData folders: Wine's build cannot make an import library for a module
  * with a dotted name, so the two cannot be linked together.
  */
+/*
+ * IStorageFolder2 - one method, TryGetItemAsync. Windows exposes it on every StorageFolder, and
+ * .NET casts to it unconditionally, so answering it matters more than the method does.
+ */
+DEFINE_IINSPECTABLE( folder2, IStorageFolder2, struct storage_folder, IStorageFolder_iface )
+
+static HRESULT WINAPI folder2_TryGetItemAsync( IStorageFolder2 *iface, HSTRING name,
+                                               IAsyncOperation_IStorageItem **operation )
+{
+    struct storage_folder *impl = impl_from_IStorageFolder2( iface );
+    IUnknown *param;
+    HRESULT hr;
+
+    TRACE( "iface %p, name %s, operation %p.\n", iface, debugstr_hstring( name ), operation );
+
+    if (!operation) return E_POINTER;
+    if (FAILED(hr = folder_child_param( impl, name, &param ))) return hr;
+    hr = async_operation_storage_item_create( (IUnknown *)iface, param, try_get_child_item, operation );
+    IUnknown_Release( param );
+    return hr;
+}
+
+static const struct IStorageFolder2Vtbl folder2_vtbl =
+{
+    folder2_QueryInterface,
+    folder2_AddRef,
+    folder2_Release,
+    /* IInspectable methods */
+    folder2_GetIids,
+    folder2_GetRuntimeClassName,
+    folder2_GetTrustLevel,
+    /* IStorageFolder2 methods */
+    folder2_TryGetItemAsync,
+};
+
 HRESULT WINAPI __wine_storage_folder_create( const WCHAR *path, IStorageFolder **out )
 {
     struct storage_folder *impl;
@@ -2054,6 +2298,7 @@ HRESULT WINAPI __wine_storage_folder_create( const WCHAR *path, IStorageFolder *
     impl->IStorageFolder_iface.lpVtbl = &storage_folder_vtbl;
     impl->IStorageItem_iface.lpVtbl = &storage_item_vtbl;
     impl->IStorageFolderQueryOperations_iface.lpVtbl = &folder_query_vtbl;
+    impl->IStorageFolder2_iface.lpVtbl = &folder2_vtbl;
     impl->ref = 1;
 
     *out = &impl->IStorageFolder_iface;

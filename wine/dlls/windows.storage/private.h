@@ -50,6 +50,7 @@ HRESULT async_operation_buffer_uint32_create( IUnknown *invoker, IUnknown *param
 HRESULT async_operation_uint32_uint32_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
         IAsyncOperationWithProgress_UINT32_UINT32 **out );
 HRESULT storage_file_create( const WCHAR *path, IStorageFile **out );
+extern IActivationFactory *file_io_activation_factory;
 HRESULT async_operation_indexed_state_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
         IAsyncOperation_UINT32 **out );
 HRESULT async_operation_uint32_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
@@ -60,12 +61,16 @@ HRESULT async_operation_folders_create( IUnknown *invoker, IUnknown *param, asyn
         IAsyncOperation_IVectorView_StorageFolder **out );
 HRESULT async_operation_items_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
         IAsyncOperation_IVectorView_IStorageItem **out );
+HRESULT async_operation_hstring_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+        __FIAsyncOperation_1_HSTRING **out );
 HRESULT async_action_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
         IAsyncAction **out );
 HRESULT async_operation_storage_folder_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
         IAsyncOperation_StorageFolder **out );
 HRESULT async_operation_storage_file_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
         IAsyncOperation_StorageFile **out );
+HRESULT async_operation_storage_item_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+                                             IAsyncOperation_IStorageItem **out );
 HRESULT async_operation_boolean_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
         IAsyncOperation_boolean **out );
 

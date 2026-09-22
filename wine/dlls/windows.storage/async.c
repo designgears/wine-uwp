@@ -832,6 +832,301 @@ HRESULT async_operation_storage_file_create( IUnknown *invoker, IUnknown *param,
     return S_OK;
 }
 
+/* IAsyncOperation<IStorageItem*>, for IStorageFolder::GetItemAsync and
+ * IStorageFolder2::TryGetItemAsync. A NULL result is a legitimate "not found". */
+struct async_storage_item
+{
+    IAsyncOperation_IStorageItem IAsyncOperation_IStorageItem_iface;
+    IAsyncInfoImpl *IAsyncInfoImpl_inner;
+    LONG ref;
+};
+
+static inline struct async_storage_item *impl_from_IAsyncOperation_IStorageItem( IAsyncOperation_IStorageItem *iface )
+{
+    return CONTAINING_RECORD( iface, struct async_storage_item, IAsyncOperation_IStorageItem_iface );
+}
+
+static HRESULT WINAPI async_storage_item_QueryInterface( IAsyncOperation_IStorageItem *iface, REFIID iid, void **out )
+{
+    struct async_storage_item *impl = impl_from_IAsyncOperation_IStorageItem( iface );
+
+    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) ||
+        IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) ||
+        IsEqualGUID( iid, &IID_IAsyncOperation_IStorageItem ))
+    {
+        IInspectable_AddRef( (*out = &impl->IAsyncOperation_IStorageItem_iface) );
+        return S_OK;
+    }
+
+    return IAsyncInfoImpl_QueryInterface( impl->IAsyncInfoImpl_inner, iid, out );
+}
+
+static ULONG WINAPI async_storage_item_AddRef( IAsyncOperation_IStorageItem *iface )
+{
+    struct async_storage_item *impl = impl_from_IAsyncOperation_IStorageItem( iface );
+    ULONG ref = InterlockedIncrement( &impl->ref );
+    TRACE( "iface %p, ref %lu.\n", iface, ref );
+    return ref;
+}
+
+static ULONG WINAPI async_storage_item_Release( IAsyncOperation_IStorageItem *iface )
+{
+    struct async_storage_item *impl = impl_from_IAsyncOperation_IStorageItem( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    TRACE( "iface %p, ref %lu.\n", iface, ref );
+
+    if (!ref)
+    {
+        /* guard against re-entry if inner releases an outer iface */
+        InterlockedIncrement( &impl->ref );
+        IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );
+        free( impl );
+    }
+
+    return ref;
+}
+
+static HRESULT WINAPI async_storage_item_GetIids( IAsyncOperation_IStorageItem *iface, ULONG *iid_count, IID **iids )
+{
+    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI async_storage_item_GetRuntimeClassName( IAsyncOperation_IStorageItem *iface, HSTRING *class_name )
+{
+    return WindowsCreateString( L"Windows.Foundation.IAsyncOperation`1<Windows.Storage.IStorageItem>",
+                                ARRAY_SIZE(L"Windows.Foundation.IAsyncOperation`1<Windows.Storage.IStorageItem>"),
+                                class_name );
+}
+
+static HRESULT WINAPI async_storage_item_GetTrustLevel( IAsyncOperation_IStorageItem *iface, TrustLevel *trust_level )
+{
+    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI async_storage_item_put_Completed( IAsyncOperation_IStorageItem *iface, IAsyncOperationCompletedHandler_IStorageItem *bool_handler )
+{
+    IAsyncOperationCompletedHandlerImpl *handler = (IAsyncOperationCompletedHandlerImpl *)bool_handler;
+    struct async_storage_item *impl = impl_from_IAsyncOperation_IStorageItem( iface );
+    TRACE( "iface %p, handler %p.\n", iface, handler );
+    return IAsyncInfoImpl_put_Completed( impl->IAsyncInfoImpl_inner, handler );
+}
+
+static HRESULT WINAPI async_storage_item_get_Completed( IAsyncOperation_IStorageItem *iface, IAsyncOperationCompletedHandler_IStorageItem **bool_handler )
+{
+    IAsyncOperationCompletedHandlerImpl **handler = (IAsyncOperationCompletedHandlerImpl **)bool_handler;
+    struct async_storage_item *impl = impl_from_IAsyncOperation_IStorageItem( iface );
+    TRACE( "iface %p, handler %p.\n", iface, handler );
+    return IAsyncInfoImpl_get_Completed( impl->IAsyncInfoImpl_inner, handler );
+}
+
+static HRESULT WINAPI async_storage_item_GetResults( IAsyncOperation_IStorageItem *iface, IStorageItem **results )
+{
+    struct async_storage_item *impl = impl_from_IAsyncOperation_IStorageItem( iface );
+    PROPVARIANT result = {.vt = VT_UNKNOWN};
+    HRESULT hr;
+
+    TRACE( "iface %p, results %p.\n", iface, results );
+
+    hr = IAsyncInfoImpl_get_Result( impl->IAsyncInfoImpl_inner, &result );
+
+    *results = (IStorageItem *)result.punkVal;
+    if (result.punkVal) IUnknown_AddRef( result.punkVal );
+    PropVariantClear( &result );
+    return hr;
+}
+
+static const struct IAsyncOperation_IStorageItemVtbl async_storage_item_vtbl =
+{
+    /* IUnknown methods */
+    async_storage_item_QueryInterface,
+    async_storage_item_AddRef,
+    async_storage_item_Release,
+    /* IInspectable methods */
+    async_storage_item_GetIids,
+    async_storage_item_GetRuntimeClassName,
+    async_storage_item_GetTrustLevel,
+    /* IAsyncOperation<IStorageItem> */
+    async_storage_item_put_Completed,
+    async_storage_item_get_Completed,
+    async_storage_item_GetResults,
+};
+
+HRESULT async_operation_storage_item_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+                                        IAsyncOperation_IStorageItem **out )
+{
+    struct async_storage_item *impl;
+    HRESULT hr;
+
+    *out = NULL;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->IAsyncOperation_IStorageItem_iface.lpVtbl = &async_storage_item_vtbl;
+    impl->ref = 1;
+
+    if (FAILED(hr = async_info_create( invoker, param, callback, (IInspectable *)&impl->IAsyncOperation_IStorageItem_iface, &impl->IAsyncInfoImpl_inner )) ||
+        FAILED(hr = IAsyncInfoImpl_Start( impl->IAsyncInfoImpl_inner )))
+    {
+        if (impl->IAsyncInfoImpl_inner) IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );
+        free( impl );
+        return hr;
+    }
+
+    *out = &impl->IAsyncOperation_IStorageItem_iface;
+    TRACE( "created IAsyncOperation_IStorageItem %p\n", *out );
+    return S_OK;
+}
+
+/* IAsyncOperation<HSTRING>, for FileIO.ReadTextAsync: the callback leaves the text in the
+ * PROPVARIANT as a VT_LPWSTR and GetResults turns it into an HSTRING. */
+struct async_hstring
+{
+    __FIAsyncOperation_1_HSTRING __FIAsyncOperation_1_HSTRING_iface;
+    IAsyncInfoImpl *IAsyncInfoImpl_inner;
+    LONG ref;
+};
+
+static inline struct async_hstring *impl_from___FIAsyncOperation_1_HSTRING( __FIAsyncOperation_1_HSTRING *iface )
+{
+    return CONTAINING_RECORD( iface, struct async_hstring, __FIAsyncOperation_1_HSTRING_iface );
+}
+
+static HRESULT WINAPI async_hstring_QueryInterface( __FIAsyncOperation_1_HSTRING *iface, REFIID iid, void **out )
+{
+    struct async_hstring *impl = impl_from___FIAsyncOperation_1_HSTRING( iface );
+
+    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) ||
+        IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) ||
+        IsEqualGUID( iid, &IID___FIAsyncOperation_1_HSTRING ))
+    {
+        IInspectable_AddRef( (*out = &impl->__FIAsyncOperation_1_HSTRING_iface) );
+        return S_OK;
+    }
+
+    return IAsyncInfoImpl_QueryInterface( impl->IAsyncInfoImpl_inner, iid, out );
+}
+
+static ULONG WINAPI async_hstring_AddRef( __FIAsyncOperation_1_HSTRING *iface )
+{
+    struct async_hstring *impl = impl_from___FIAsyncOperation_1_HSTRING( iface );
+    ULONG ref = InterlockedIncrement( &impl->ref );
+    TRACE( "iface %p, ref %lu.\n", iface, ref );
+    return ref;
+}
+
+static ULONG WINAPI async_hstring_Release( __FIAsyncOperation_1_HSTRING *iface )
+{
+    struct async_hstring *impl = impl_from___FIAsyncOperation_1_HSTRING( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    TRACE( "iface %p, ref %lu.\n", iface, ref );
+
+    if (!ref)
+    {
+        /* guard against re-entry if inner releases an outer iface */
+        InterlockedIncrement( &impl->ref );
+        IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );
+        free( impl );
+    }
+
+    return ref;
+}
+
+static HRESULT WINAPI async_hstring_GetIids( __FIAsyncOperation_1_HSTRING *iface, ULONG *iid_count, IID **iids )
+{
+    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI async_hstring_GetRuntimeClassName( __FIAsyncOperation_1_HSTRING *iface, HSTRING *class_name )
+{
+    return WindowsCreateString( L"Windows.Foundation.IAsyncOperation`1<String>",
+                                ARRAY_SIZE(L"Windows.Foundation.IAsyncOperation`1<String>"),
+                                class_name );
+}
+
+static HRESULT WINAPI async_hstring_GetTrustLevel( __FIAsyncOperation_1_HSTRING *iface, TrustLevel *trust_level )
+{
+    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI async_hstring_put_Completed( __FIAsyncOperation_1_HSTRING *iface, __FIAsyncOperationCompletedHandler_1_HSTRING *bool_handler )
+{
+    IAsyncOperationCompletedHandlerImpl *handler = (IAsyncOperationCompletedHandlerImpl *)bool_handler;
+    struct async_hstring *impl = impl_from___FIAsyncOperation_1_HSTRING( iface );
+    TRACE( "iface %p, handler %p.\n", iface, handler );
+    return IAsyncInfoImpl_put_Completed( impl->IAsyncInfoImpl_inner, handler );
+}
+
+static HRESULT WINAPI async_hstring_get_Completed( __FIAsyncOperation_1_HSTRING *iface, __FIAsyncOperationCompletedHandler_1_HSTRING **bool_handler )
+{
+    IAsyncOperationCompletedHandlerImpl **handler = (IAsyncOperationCompletedHandlerImpl **)bool_handler;
+    struct async_hstring *impl = impl_from___FIAsyncOperation_1_HSTRING( iface );
+    TRACE( "iface %p, handler %p.\n", iface, handler );
+    return IAsyncInfoImpl_get_Completed( impl->IAsyncInfoImpl_inner, handler );
+}
+
+static HRESULT WINAPI async_hstring_GetResults( __FIAsyncOperation_1_HSTRING *iface, HSTRING *results )
+{
+    struct async_hstring *impl = impl_from___FIAsyncOperation_1_HSTRING( iface );
+    PROPVARIANT result = {.vt = VT_LPWSTR};
+    HRESULT hr;
+
+    TRACE( "iface %p, results %p.\n", iface, results );
+
+    *results = NULL;
+    if (FAILED(hr = IAsyncInfoImpl_get_Result( impl->IAsyncInfoImpl_inner, &result ))) return hr;
+    if (result.pwszVal) hr = WindowsCreateString( result.pwszVal, wcslen( result.pwszVal ), results );
+    PropVariantClear( &result );
+    return hr;
+}
+
+static const struct __FIAsyncOperation_1_HSTRINGVtbl async_hstring_vtbl =
+{
+    /* IUnknown methods */
+    async_hstring_QueryInterface,
+    async_hstring_AddRef,
+    async_hstring_Release,
+    /* IInspectable methods */
+    async_hstring_GetIids,
+    async_hstring_GetRuntimeClassName,
+    async_hstring_GetTrustLevel,
+    /* IAsyncOperation<HSTRING> */
+    async_hstring_put_Completed,
+    async_hstring_get_Completed,
+    async_hstring_GetResults,
+};
+
+HRESULT async_operation_hstring_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+                                        __FIAsyncOperation_1_HSTRING **out )
+{
+    struct async_hstring *impl;
+    HRESULT hr;
+
+    *out = NULL;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->__FIAsyncOperation_1_HSTRING_iface.lpVtbl = &async_hstring_vtbl;
+    impl->ref = 1;
+
+    if (FAILED(hr = async_info_create( invoker, param, callback, (IInspectable *)&impl->__FIAsyncOperation_1_HSTRING_iface, &impl->IAsyncInfoImpl_inner )) ||
+        FAILED(hr = IAsyncInfoImpl_Start( impl->IAsyncInfoImpl_inner )))
+    {
+        if (impl->IAsyncInfoImpl_inner) IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );
+        free( impl );
+        return hr;
+    }
+
+    *out = &impl->__FIAsyncOperation_1_HSTRING_iface;
+    TRACE( "created __FIAsyncOperation_1_HSTRING %p\n", *out );
+    return S_OK;
+}
+
 struct async_storage_folder
 {
     IAsyncOperation_StorageFolder IAsyncOperation_StorageFolder_iface;

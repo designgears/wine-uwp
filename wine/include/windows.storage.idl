@@ -89,13 +89,16 @@ namespace Windows.Storage {
     interface IStorageFileStatics;
     interface IStorageFileStatics2;
     interface IStorageFolder;
+    interface IStorageFolder2;
     interface IStorageFolderStatics;
     interface IStorageFolderStatics2;
     interface IStorageItem;
+    interface IFileIOStatics;
     interface IUserDataPaths;
     interface IUserDataPathsStatics;
 
     runtimeclass AppDataPaths;
+    runtimeclass FileIO;
     runtimeclass ApplicationData;
     runtimeclass ApplicationDataContainer;
     runtimeclass KnownFolders;
@@ -716,6 +719,19 @@ namespace Windows.Storage {
 
     [
         contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(e827e8b9-08d9-4a8e-a0ac-fe5ed3cbbbd3)
+    ]
+    interface IStorageFolder2 : IInspectable
+        requires Windows.Storage.IStorageFolder, Windows.Storage.IStorageItem
+    {
+        HRESULT TryGetItemAsync(
+            [in] HSTRING name,
+            [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.IStorageItem *> **operation
+        );
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
         uuid(4207a996-ca2f-42f7-bde8-8b10457a7f30)
     ]
     interface IStorageItem : IInspectable
@@ -814,6 +830,78 @@ namespace Windows.Storage {
 
     [
         contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Storage.FileIO),
+        uuid(887411eb-7f54-4732-a5f0-5e43e3b8c2f5)
+    ]
+    interface IFileIOStatics : IInspectable
+    {
+        [overload("ReadTextAsync")]
+        HRESULT ReadTextAsync([in] Windows.Storage.IStorageFile *file,
+                              [out, retval] Windows.Foundation.IAsyncOperation<HSTRING> **operation);
+        [overload("ReadTextAsync")]
+        HRESULT ReadTextWithEncodingAsync([in] Windows.Storage.IStorageFile *file,
+                                          [in] Windows.Storage.Streams.UnicodeEncoding encoding,
+                                          [out, retval] Windows.Foundation.IAsyncOperation<HSTRING> **operation);
+        [overload("WriteTextAsync")]
+        HRESULT WriteTextAsync([in] Windows.Storage.IStorageFile *file, [in] HSTRING contents,
+                               [out, retval] Windows.Foundation.IAsyncAction **operation);
+        [overload("WriteTextAsync")]
+        HRESULT WriteTextWithEncodingAsync([in] Windows.Storage.IStorageFile *file, [in] HSTRING contents,
+                                           [in] Windows.Storage.Streams.UnicodeEncoding encoding,
+                                           [out, retval] Windows.Foundation.IAsyncAction **operation);
+        [overload("AppendTextAsync")]
+        HRESULT AppendTextAsync([in] Windows.Storage.IStorageFile *file, [in] HSTRING contents,
+                                [out, retval] Windows.Foundation.IAsyncAction **operation);
+        [overload("AppendTextAsync")]
+        HRESULT AppendTextWithEncodingAsync([in] Windows.Storage.IStorageFile *file, [in] HSTRING contents,
+                                            [in] Windows.Storage.Streams.UnicodeEncoding encoding,
+                                            [out, retval] Windows.Foundation.IAsyncAction **operation);
+        [overload("ReadLinesAsync")]
+        HRESULT ReadLinesAsync([in] Windows.Storage.IStorageFile *file,
+                               [out, retval] IInspectable **operation); /* IAsyncOperation<IVector<HSTRING>*>; not implemented */
+        [overload("ReadLinesAsync")]
+        HRESULT ReadLinesWithEncodingAsync([in] Windows.Storage.IStorageFile *file,
+                                           [in] Windows.Storage.Streams.UnicodeEncoding encoding,
+                                           [out, retval] IInspectable **operation); /* not implemented */
+        [overload("WriteLinesAsync")]
+        HRESULT WriteLinesAsync([in] Windows.Storage.IStorageFile *file,
+                                [in] Windows.Foundation.Collections.IIterable<HSTRING> *lines,
+                                [out, retval] Windows.Foundation.IAsyncAction **operation);
+        [overload("WriteLinesAsync")]
+        HRESULT WriteLinesWithEncodingAsync([in] Windows.Storage.IStorageFile *file,
+                                            [in] Windows.Foundation.Collections.IIterable<HSTRING> *lines,
+                                            [in] Windows.Storage.Streams.UnicodeEncoding encoding,
+                                            [out, retval] Windows.Foundation.IAsyncAction **operation);
+        [overload("AppendLinesAsync")]
+        HRESULT AppendLinesAsync([in] Windows.Storage.IStorageFile *file,
+                                 [in] Windows.Foundation.Collections.IIterable<HSTRING> *lines,
+                                 [out, retval] Windows.Foundation.IAsyncAction **operation);
+        [overload("AppendLinesAsync")]
+        HRESULT AppendLinesWithEncodingAsync([in] Windows.Storage.IStorageFile *file,
+                                             [in] Windows.Foundation.Collections.IIterable<HSTRING> *lines,
+                                             [in] Windows.Storage.Streams.UnicodeEncoding encoding,
+                                             [out, retval] Windows.Foundation.IAsyncAction **operation);
+        HRESULT ReadBufferAsync([in] Windows.Storage.IStorageFile *file,
+                                [out, retval] IInspectable **operation); /* IAsyncOperation<IBuffer*>; not implemented */
+        HRESULT WriteBufferAsync([in] Windows.Storage.IStorageFile *file,
+                                 [in] Windows.Storage.Streams.IBuffer *buffer,
+                                 [out, retval] Windows.Foundation.IAsyncAction **operation);
+        HRESULT WriteBytesAsync([in] Windows.Storage.IStorageFile *file,
+                                [in] UINT32 __bufferSize, [in, size_is(__bufferSize)] BYTE *buffer,
+                                [out, retval] Windows.Foundation.IAsyncAction **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        static(Windows.Storage.IFileIOStatics, Windows.Foundation.UniversalApiContract, 1.0),
+        threading(both)
+    ]
+    runtimeclass FileIO
+    {
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
         marshaling_behavior(agile)
     ]
     runtimeclass SetVersionDeferral
@@ -862,7 +950,7 @@ namespace Windows.Storage {
         /* interface Windows.Storage.IStorageItemProperties; */
         /* [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Storage.IStorageItemProperties2; */
         /* [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Storage.IStorageItem2; */
-        /* [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Storage.IStorageFolder2; */
+        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Storage.IStorageFolder2;
         /* [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.Storage.IStorageItemPropertiesWithProvider; */
         /* [contract(Windows.Foundation.UniversalApiContract, 6.0)] interface Windows.Storage.IStorageFolder3; */
     }
