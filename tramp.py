@@ -56,17 +56,27 @@ SAVED = {"flags": 0, "rbx": 8, "r11": 16, "r10": 24, "r9": 32, "r8": 40,
          "rdx": 48, "rcx": 56, "rax": 64, "ret": 72}
 
 def value_code(val):
-    """Emit code leaving the value to print in r10, for --val=rcx / --val=ret / --val=[rcx+0x30]."""
-    deref = None
-    if val.startswith("[") and val.endswith("]"):
-        inner = val[1:-1]
-        reg, _, disp = inner.partition("+")
-        deref = int(disp, 0) if disp else 0
-        val = reg
-    if val not in SAVED: raise SystemExit("--val: use one of %s, optionally as [reg+disp]" % ", ".join(SAVED))
+    """Emit code leaving the value to print in r10.
+
+    --val=rcx, --val=ret, --val=[rcx+0x30], --val=[[rcx+0x30]+0x14c] - brackets nest, so a chain
+    of pointers can be followed in one probe.
+    """
+    derefs = []
+    val = val.strip()
+    while val.startswith("[") and val.endswith("]"):
+        inner, depth, cut = val[1:-1], 0, None
+        for i, ch in enumerate(inner):
+            if ch == "[": depth += 1
+            elif ch == "]": depth -= 1
+            elif ch == "+" and depth == 0: cut = i
+        base, disp = (inner, 0) if cut is None else (inner[:cut], int(inner[cut + 1:], 0))
+        derefs.insert(0, disp)
+        val = base.strip()
+    if val not in SAVED:
+        raise SystemExit("--val: base must be one of %s" % ", ".join(SAVED))
     code = b"\x4c\x8b\x53" + bytes([SAVED[val]])                    # mov r10, [rbx+slot]
-    if deref is not None:
-        code += b"\x4d\x8b\x92" + struct.pack("<i", deref)          # mov r10, [r10+disp]
+    for d in derefs:
+        code += b"\x4d\x8b\x92" + struct.pack("<i", d)              # mov r10, [r10+disp]
     return code
 
 def hex_code(buf_rel):

@@ -7877,3 +7877,50 @@ Ruled out along the way:
 
 Next: find what calls vtable slot 28 on a screen and what gates it, or bisect the gap between slot
 5 and slot 27 on `GenericDialogScreen`.
+
+## The popup does not draw because it never gains focus
+
+`tramp.py` became usable this session (see below), and with it the chain is now traced end to end.
+Every probe below is a trampoline that logs through the app's own logger or `OutputDebugStringA`
+and lets the run continue, so a single 70-second run answers several questions at once.
+
+The screen system, read off the probes and the disassembly:
+
+- `Gui -- EnterScreen` (`0x8b4ccc`) pushes the screen into a per-layer vector and calls
+  `SetState` (`0x8cec9c`).
+- The per-frame tick (`0x8b32b0`, ~2.5 million calls a run) advances a screen from state 1 to
+  state 2 **only if `[screen+0x89]` is set** - that byte is "has focus" - and `[screen+0x110]`,
+  a pending-work count, is zero.
+- The focus loop (`0x8b6000`) picks the screen to focus, and skips any candidate whose
+  `[screen+0x30]` is null, whose `[[screen+0x30]+0x14c]` byte is zero, or whose state is not 2.
+
+Probed values at `EnterScreen`, one run, both screens:
+
+| | splash | popup |
+| --- | --- | --- |
+| `[screen+0x30]` | `0x7f44e0980ce0` | `0x7f44e0983c20` |
+| `[[screen+0x30]+0x14c]` | **1** | **0x300 - low byte 0** |
+
+So the popup fails the second test, never gains focus, is therefore skipped by the tick, never
+advances, and never loads. That is why `GenericDialogScreen::OnLoaded` and
+`ApplyPopupDescription` never run and the dialog draws nothing.
+
+Confirmed by probe along the way: `0x4e130c` (the XUID error handler) runs at 2.746, calls
+`0x2fa69c` which builds the `UserDataFlow.Check_Get_XUID_Error` description, and
+`GenericDialogScreen`'s vtable slot 5 runs a millisecond later - so the dialog object really is a
+`GenericDialogScreen` and really is pushed. None of its other virtuals ever run.
+
+Open: what sets `[...+0x14c]` to 1. The only static writer that sets it to 1 (`0x461134`) never
+runs in a whole session, and the only other byte-store setter (`0x4660c0`) never runs either, so
+it is written some other way - a wider store, or the object is built from a template. That is the
+next thing to find.
+
+### Retraction: the splash/dialog `OnLoaded` comparison was invalid
+
+An earlier entry said "`StartupSplashScreen::OnLoaded` fires and `GenericDialogScreen::OnLoaded`
+does not". **`StartupSplashScreen` does not override `OnLoaded` at all** - it has no
+`OnLoaded@StartupSplashScreen@Sgi@@` type descriptor - and its vtable is *shorter* than
+`GenericDialogScreen`'s, so the address probed as "its slot 28" (`0x43dc50`) belongs to the next
+vtable in memory and is some other interface's method. Two vtables located from their RTTI are not
+automatically aligned with each other; print both side by side before comparing a slot index. The
+half that survives is that `GenericDialogScreen::OnLoaded` never runs.
