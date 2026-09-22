@@ -8003,3 +8003,22 @@ Three fixes, in order, took Solitaire from the splash to its real main menu
 After the fix the log reads `EnterScreen [mainmenu_ftue]`, `TransitionFromBootflow`,
 `ExitScreen [splashpage_pc]`, then the popup gains focus. The menu still needs the `0x7dee64`
 frame-loop patch. Calculator regression is AE = 0.
+
+## Solitaire is playable (2026-09-22)
+
+From the main menu: Cancel on the Sign In Error popup, then Klondike, then "I know the rules" on
+the tutorial deals a game. Clicks play it: the Ace goes to the foundation, the score goes to 10,
+the stock draws, and the timer runs (`docs/screenshots/solitaire-klondike-playing.png`).
+
+The last blocker was `kernelbase.SystemTimeToTzSpecificLocalTimeEx`, a `@ stub`. `mainmenu_modern`
+calls it as it gains focus and dies with `0x80000100`, and it had only been missed on runs where the
+screen had not gained focus yet. Both `...Ex` time-zone functions now forward to their non-Ex
+versions. `DYNAMIC_TIME_ZONE_INFORMATION` begins with a `TIME_ZONE_INFORMATION`, and dynamic DST
+years are not applied.
+
+Still open:
+- The `0x7dee64` frame-loop patch is needed: without it the app stays on the splash.
+- About half of the window captures are partial or blank frames, because the forced loop presents
+  undrawn frames.
+- The Sign In Error popup is not visible, but it holds focus until it is dismissed.
+- Some runs still stall at about 5 s after the popup gains focus (the known run variance).

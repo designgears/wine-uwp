@@ -8467,3 +8467,28 @@ int WINAPI GetTimeFormatEx( const WCHAR *name, DWORD flags, const SYSTEMTIME *sy
     TRACE( "(%s,%lx,%p,%s,%p,%d)\n", debugstr_w(name), flags, systime, debugstr_w(format), buffer, len );
     return get_time_format( locale, flags, systime, format, buffer, len );
 }
+
+
+/***********************************************************************
+ *	SystemTimeToTzSpecificLocalTimeEx   (kernelbase.@)
+ *
+ * DYNAMIC_TIME_ZONE_INFORMATION starts with a TIME_ZONE_INFORMATION; per-year
+ * dynamic DST rules are not applied, as in the non-Ex versions.
+ */
+BOOL WINAPI DECLSPEC_HOTPATCH SystemTimeToTzSpecificLocalTimeEx( const DYNAMIC_TIME_ZONE_INFORMATION *info,
+                                                                 const SYSTEMTIME *system,
+                                                                 SYSTEMTIME *local )
+{
+    return SystemTimeToTzSpecificLocalTime( (const TIME_ZONE_INFORMATION *)info, system, local );
+}
+
+
+/***********************************************************************
+ *	TzSpecificLocalTimeToSystemTimeEx   (kernelbase.@)
+ */
+BOOL WINAPI DECLSPEC_HOTPATCH TzSpecificLocalTimeToSystemTimeEx( const DYNAMIC_TIME_ZONE_INFORMATION *info,
+                                                                 const SYSTEMTIME *local,
+                                                                 SYSTEMTIME *system )
+{
+    return TzSpecificLocalTimeToSystemTime( (const TIME_ZONE_INFORMATION *)info, local, system );
+}

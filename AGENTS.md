@@ -767,7 +767,7 @@ the fully-qualified name. `--grep` first, always.
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | **Reaches its real main menu** (`docs/screenshots/solitaire-main-menu.png`) - bootflow completes, the splash is exited, and pointer input reaches the game (the Sign In Error dialog's Cancel works). The fix was registering StateRepository `PackageUser`: its absence threw `0x80040154` in the post-bootflow transition. Still needs the `0x7dee64` frame-loop patch. Next: dismiss the popup over the menu and start Klondike. See Findings-M4 |
+| Solitaire | **Playable**: main menu -> Klondike -> dealt game, and clicks move cards and score (`docs/screenshots/solitaire-klondike-playing.png`). To get there: Cancel the (invisible) Sign In Error popup at about (820,552), click Klondike, then "I know the rules". Still needs the `0x7dee64` frame-loop patch, which makes about half of captures partial frames, so take a burst. Some runs stall at about 5 s. See Findings-M4 |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
