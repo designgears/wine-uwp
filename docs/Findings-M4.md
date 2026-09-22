@@ -7653,3 +7653,80 @@ So the CDN content is the gate on actually playing, and the download's failure i
 networking. Still-missing WinRT classes that could plausibly be prerequisites, none yet tested:
 `Windows.System.Profile.HardwareIdentification`, `Windows.Security.Cryptography.Core.HashAlgorithmNames`
 (a trivial statics class of algorithm-name strings), `Windows.Networking.EndpointPair`.
+
+## Solitaire's CDN download: the blocker was WinRT sockets, not HTTP
+
+`ContentManifestAppComponent::InitiateDownload` failing "before name resolution" had a simple
+cause once the right layer was instrumented. The app's HTTP client is its own: `DLFileDownloader`
+-> `Sgi::Network::HttpRequest` -> **`Sgi::Network::TcpSecureSocketWinRT`**, which is built on
+`Windows.Networking.Sockets.StreamSocket`. Neither that class nor `Windows.Networking.EndpointPair`
+existed in Wine, so the connection failed with the app's own `LostConnection` before any DNS
+lookup - which is exactly what `+winsock` showed, and why msxml6/WinHTTP investigations came up
+empty. **Three named classes in one error line** (`EndpointPair` "not found") were sitting in the
+log the whole time.
+
+The chain of fixes, each found by running and reading the next failure:
+
+1. `Windows.Networking.EndpointPair` - unimplemented. `dlls/windows.networking.hostname/endpointpair.c`.
+2. `Windows.Networking.Sockets.StreamSocket` - `windows.networking.dll`'s `DllGetActivationFactory`
+   was a bare `CLASS_E_CLASSNOTAVAILABLE`. `dlls/windows.networking/streamsocket.c` implements the
+   socket, its control/information objects, the input and output streams, and a schannel TLS client
+   adapted from `dlls/winhttp/net.c`.
+3. `HostName::get_CanonicalName` was `E_NOTIMPL`, so the socket had no host to connect to: the
+   trace read `connecting to (null):L"443"`. It and `get_DisplayName` now answer the raw name.
+
+Two traps in the async plumbing, both of which produced a *working-looking* run that still failed:
+
+- **The async callback runs inline on the caller's thread unless it returns `STATUS_PENDING` on
+  its first, synchronous invocation.** `async_info_complete(impl, FALSE)` calls the callback
+  directly and only submits the threadpool work item if it gets `STATUS_PENDING` back. A blocking
+  `ReadAsync` that ran inline completed - with EOF - before the app had sent its request, and the
+  app closed the connection. Every `async_operation_callback` that does real work needs
+  `if (!called_async) return STATUS_PENDING;` as its first statement.
+- **The receive path must not hold a lock the send path needs.** An HTTP client posts its read
+  before sending the request; with one lock over both, the read blocks in `recv()` and the request
+  is never sent, so the peer never answers. `Close()` and reconnect have the mirror problem - they
+  need the receive lock a blocked `recv()` is holding - and call `shutdown()` first, with no lock,
+  to wake it.
+
+With those, `go.microsoft.com/fwlink/?linkid=2310143` resolves, the 302 to
+`download-ssl.msgamestudios.com` is followed, the manifest downloads and **all ~20 CDN content sets
+mount**: `MSCasualGames`, `AdConsent`, `DlcTunables`, `MCGAppConfig`, themes, everything that was
+previously "Skipping content mount ... the secondary manifest is not yet downloaded". The
+`BootflowState - Bootflow initialization finished with data flow error.` is gone.
+
+Calculator stays byte-identical (249 colours, `magick compare -metric AE` = 0).
+
+### The next blocker: an Inventory load deadlocks on `WaitOnAddress`
+
+With the content mounted, the app reaches its splash screen (`EnterScreen
+[dlc/gui/screenfiles/splashpage/splashpage_pc]`, 151118 colours) and then stops, every run, at the
+same line:
+
+```
+[   2.796] NotificationsAppComponent::Initialize -- NotificationsTuning has been reloaded.
+[   2.796] Inventory - Failed to Find/Load asset: [notifications/loc/en-us/notifications] of type [LocFile]
+```
+
+`WINE_UWP_DUMP_STACKS` (now armed from `DllGetClassObject`, not only from `ActivationHandled` -
+a run that never reaches activation is exactly the one worth dumping) puts a worker thread at:
+
+```
+0x66c8c6  <- WaitOnAddress, in a deadline loop
+0x88cd70  <- the function that logs "Inventory - Failed to Find/Load asset"
+0x8908ca
+0x684d0d  <- ucrtbase thread start
+```
+
+so the Inventory loader queues work and waits on a counter that is never bumped. Every other thread
+is parked: the main thread in `twinapi.appcore` under XAML, three in message pumps, the rest in
+`WaitForSingleObject`. Nothing is spinning, so it is a genuine lost-task deadlock, not a livelock.
+
+The timing is the tell: when the notifications archive is absent at startup the same load happens
+*after* `AppHost::EngineAppStartup -- END` and the app gets to the splash first, but it still
+deadlocks there. Removing `Cache/dlfiles/cdn/notifications` before a run is a clean way to move the
+hang later and confirm it.
+
+`whatfn.py` was written for this: given an address it finds the enclosing function from `.pdata`
+and prints every string the function's rip-relative LEAs point at. That is what identified
+`0x88cca0` as the Inventory loader with no symbols at all.
