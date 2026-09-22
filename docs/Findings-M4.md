@@ -7465,3 +7465,40 @@ HTTP 200 from inside the same prefix).
 is in `install-overrides.sh`'s **native** list, so the native Windows DLL answers instead and
 returns something useless here. Whether this causes the download failure is unproven; it is worth
 fixing on its own.
+
+#### The CDN manifest is NOT the blocker either - the app falls back
+
+One line further down in the same run, which I had missed by grepping too narrowly:
+
+```
+[1.713] CdnAppComponent::OnManifestDownloaded -- failed to load main manifest with error
+        [ManifestDownloadFailed]. Loading fallback.
+```
+
+So the download failure is **handled**. The app loads a fallback manifest, carries on to load its ad
+configs, completes the bootflow and enters the loading screen. Chasing the download further was the
+wrong target - it is a degraded path, not a dead end.
+
+The real divergence is the line right after the bootflow completes:
+
+```
+[1.917] Bootflow -- Successfully Initialized all boot flow items.
+[1.917] BootflowState - Bootflow initialization finished with data flow error.
+[1.917] Gui -- EnterScreen [gui/screenfiles/loading/loading]
+```
+
+`BootflowState`'s completion handler is `0x306ce4`. It branches on `cmpb $0x4,0x88(%rax)` - a status
+byte on the object reached through the state's vtable pointer - and only takes the "data flow error"
+branch when that byte is **4**. That branch logs the message and then calls `0x3fc19c`, `0x8b4398`
+(with the font-manager global `0x141364b80`) and a helper with the app singleton `0x14135a3c8`
+before falling through to the loading screen.
+
+**So the next question is what sets that status byte to 4**, i.e. which piece of bootflow data is
+considered failed, and what the loading screen then waits for. Everything after that point in a
+200 s run is ad-cooldown timers only.
+
+Also worth carrying: the storage stubs seen in the run (`storage_folder_GetFileAsync`,
+`GetItemAsync`, `CreateFolderAsync`, all `E_NOTIMPL` in `dlls/windows.storage/storagefolder.c`) are
+**not** on the manifest path - they are `EndpointSettings`, the Vungle ad SDK's cache folders, and
+`user_data\Guest\launch_data\solitaire_collection.json`. They are real gaps but unrelated to this
+blocker.
