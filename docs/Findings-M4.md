@@ -7405,3 +7405,34 @@ somewhere else (keys `ForwardLink` / `ForwardLinkUri` / `RequestAttemptCount` ap
 `0x507f98`-`0x508328`). The binary also has a debug setting `cdnManifestUriOverride`
 ("Used to specify a uri override for modern cdn download") next to `proxyHost`/`proxyPort`, which
 may be a cleaner lever than cache seeding.
+
+#### Correction: msxml6 / IXMLHTTPRequest2 is NOT the problem
+
+The section above suspected the XHR backend because the app's trace showed
+`NdrDllGetClassObject class {88d96a09-...} not available` and `winhttp.dll` never being opened.
+**Both readings were wrong.**
+
+Reading msxml6's `DllGetClassObject` (RVA `0x6f3f0`, image base `0x180000000`) settles it: it calls
+`NdrDllGetClassObject` **first** for its proxy classes, and only then walks its own 12-entry class
+table at `0x18018edd0`. So the `not available` warning is the *normal* path and appears in a working
+run too - the standalone `probe-http` hits it 4 times while succeeding.
+
+Proof the class works inside the app: immediately after that warning, the same trace shows the
+object being used for PlayFab -
+`SysAllocStringLen L"https://92AB.playfabapi.com/Client/LoginWithCustomID?sdk=XPlatCppSdk-3.9.190424"`.
+PlayFab's HTTP goes through this very object, which is also why `wininet` shows connections only to
+`playfabapi.com`: that is msxml6's transport, not a separate stack.
+
+`probe-http` (now able to select apartment and CLSCTX) creates the class and fetches the CDN
+manifest with **HTTP 200** in all four combinations - mta/sta x `CLSCTX_INPROC_SERVER`/`0x15` - with
+Solitaire's package identity exported.
+
+**So the real failure is inside the app's own download code.** `0x51c850` is the continuation for the
+manifest request: it tests the future state at `[this+0x120]` (`and cl,3; cmp cl,1`) and takes the
+exception branch, which ends at the logger `0x50982c`. The future completes **with an exception and
+without any request being issued**. The exception text is never logged - only the URL - so the next
+step is a trampoline on the error branch at `0x51c8aa` to print it.
+
+**Lesson, again**: a scary-looking warning in a Wine trace is only evidence if it does not also
+appear on the working path. Diffing the app trace against `probe-http`'s trace would have killed
+this theory in one step instead of five runs.
