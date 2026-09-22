@@ -7436,3 +7436,32 @@ step is a trampoline on the error branch at `0x51c8aa` to print it.
 **Lesson, again**: a scary-looking warning in a Wine trace is only evidence if it does not also
 appear on the working path. Diffing the app trace against `probe-http`'s trace would have killed
 this theory in one step instead of five runs.
+
+#### Manifest download: where it is and is not failing
+
+Traced with trampolines through the app's own logger (two hooks, separate caves):
+
+- `0x51c850` is the manifest request's **continuation**. It fires (`UWPTCONT`) at the same
+  millisecond as the failure log, and takes its exception branch - so the future is **already
+  failed** when it runs.
+- `0x515344`, which contains the LEA that registers that continuation, **never runs** (hook at
+  `0x515346` silent). So either the registration happens on another path or that function is
+  entered mid-body; do not assume the `.pdata` start is the entry.
+- **libHttpClient is not involved at all**: a hook on the wrapper that logs
+  `Failed to create http call object` (`0xba81b4`) fires **zero** times in a whole run, while PlayFab
+  succeeds. PlayFab's HTTP is the IXMLHTTPRequest2 object directly - the `+ole` trace shows
+  `SysAllocStringLen L"https://92AB.playfabapi.com/Client/LoginWithCustomID..."` right after the
+  object is created.
+
+Ruled out along the way: COM not initialised on the worker thread (no `apartment not initialised`,
+no `CO_E_NOTINITIALIZED` anywhere in the run), and the URL itself (`probe-http` fetches it with
+HTTP 200 from inside the same prefix).
+
+**Separate real defect found**: the app logs
+`Windows 10 Version: 0.0.0.0, Device Family: Windows.Desktop`. It obtains this by calling
+`strtoull` on the string from `AnalyticsInfo.VersionInfo.DeviceFamilyVersion` and unpacking four
+16-bit fields, so the string is parsing to zero. Wine's own implementation
+(`dlls/twinapi.appcore/analytics_info.c`) builds it correctly from the PEB - but `twinapi.appcore`
+is in `install-overrides.sh`'s **native** list, so the native Windows DLL answers instead and
+returns something useless here. Whether this causes the download failure is unproven; it is worth
+fixing on its own.
