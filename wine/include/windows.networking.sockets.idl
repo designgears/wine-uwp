@@ -1,0 +1,169 @@
+/*
+ * Copyright 2025 Vibhav Pant
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#ifdef __WIDL__
+#pragma winrt ns_prefix
+#endif
+
+import "windowscontracts.idl";
+#ifdef __WIDL__
+import "windows.foundation.idl";
+import "windows.networking.idl";
+import "windows.storage.streams.idl";
+#endif
+
+namespace Windows.Networking.Sockets {
+    typedef enum SocketProtectionLevel SocketProtectionLevel;
+    typedef enum SocketQualityOfService SocketQualityOfService;
+
+    interface IStreamSocket;
+    interface IStreamSocketControl;
+    interface IStreamSocketInformation;
+
+    runtimeclass StreamSocket;
+    runtimeclass StreamSocketControl;
+    runtimeclass StreamSocketInformation;
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    enum SocketProtectionLevel
+    {
+        PlainSocket = 0,
+        Ssl = 1,
+        SslAllowNullEncryption = 2,
+        [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+        BluetoothEncryptionAllowNullAuthentication = 3,
+        [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+        BluetoothEncryptionWithAuthentication = 4,
+        [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+        Ssl3AllowWeakEncryption = 5,
+        [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+        Tls10 = 6,
+        [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+        Tls11 = 7,
+        [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+        Tls12 = 8,
+        [contract(Windows.Foundation.UniversalApiContract, 5.0)]
+        Unspecified = 9,
+        [contract(Windows.Foundation.UniversalApiContract, 16.0)]
+        Tls13 = 10,
+    };
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    enum SocketQualityOfService
+    {
+        Normal            = 0,
+        LowLatency        = 1,
+    };
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Networking.Sockets.StreamSocketControl),
+        uuid(fe25adf1-92ab-4af3-9992-0f4c85e36cc4)
+    ]
+    interface IStreamSocketControl : IInspectable
+    {
+        [propget] HRESULT NoDelay([out, retval] boolean *value);
+        [propput] HRESULT NoDelay([in] boolean value);
+        [propget] HRESULT KeepAlive([out, retval] boolean *value);
+        [propput] HRESULT KeepAlive([in] boolean value);
+        [propget] HRESULT OutboundBufferSizeInBytes([out, retval] UINT32 *value);
+        [propput] HRESULT OutboundBufferSizeInBytes([in] UINT32 value);
+        [propget] HRESULT QualityOfService([out, retval] Windows.Networking.Sockets.SocketQualityOfService *value);
+        [propput] HRESULT QualityOfService([in] Windows.Networking.Sockets.SocketQualityOfService value);
+        [propget] HRESULT OutboundUnicastHopLimit([out, retval] BYTE *value);
+        [propput] HRESULT OutboundUnicastHopLimit([in] BYTE value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Networking.Sockets.StreamSocketInformation),
+        uuid(3b80ae30-5e68-4205-88f0-dc85d2e25ded)
+    ]
+    interface IStreamSocketInformation : IInspectable
+    {
+        [propget] HRESULT LocalAddress([out, retval] Windows.Networking.HostName **value);
+        [propget] HRESULT LocalPort([out, retval] HSTRING *value);
+        [propget] HRESULT RemoteHostName([out, retval] Windows.Networking.HostName **value);
+        [propget] HRESULT RemoteAddress([out, retval] Windows.Networking.HostName **value);
+        [propget] HRESULT RemoteServiceName([out, retval] HSTRING *value);
+        [propget] HRESULT RemotePort([out, retval] HSTRING *value);
+        [propget] HRESULT RoundTripTimeStatistics([out, retval] IInspectable **value);
+        [propget] HRESULT BandwidthStatistics([out, retval] IInspectable **value);
+        [propget] HRESULT ProtectionLevel([out, retval] Windows.Networking.Sockets.SocketProtectionLevel *value);
+        [propget] HRESULT SessionKey([out, retval] Windows.Storage.Streams.IBuffer **value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Networking.Sockets.StreamSocket),
+        uuid(69a22cf3-fc7b-4857-af38-f6e7de6a5b49)
+    ]
+    interface IStreamSocket : IInspectable
+    {
+        [propget] HRESULT Control([out, retval] Windows.Networking.Sockets.IStreamSocketControl **value);
+        [propget] HRESULT Information([out, retval] Windows.Networking.Sockets.IStreamSocketInformation **value);
+        [propget] HRESULT InputStream([out, retval] Windows.Storage.Streams.IInputStream **value);
+        [propget] HRESULT OutputStream([out, retval] Windows.Storage.Streams.IOutputStream **value);
+        [overload("ConnectAsync")] HRESULT ConnectAsync([in] Windows.Networking.EndpointPair *pair,
+                [out, retval] Windows.Foundation.IAsyncAction **operation);
+        [overload("ConnectAsync")] HRESULT ConnectWithHostNameAsync([in] Windows.Networking.HostName *host,
+                [in] HSTRING service, [out, retval] Windows.Foundation.IAsyncAction **operation);
+        [overload("ConnectAsync")] HRESULT ConnectWithEndpointPairAndProtectionLevelAsync(
+                [in] Windows.Networking.EndpointPair *pair,
+                [in] Windows.Networking.Sockets.SocketProtectionLevel level,
+                [out, retval] Windows.Foundation.IAsyncAction **operation);
+        [overload("ConnectAsync")] HRESULT ConnectWithProtectionLevelAsync([in] Windows.Networking.HostName *host,
+                [in] HSTRING service, [in] Windows.Networking.Sockets.SocketProtectionLevel level,
+                [out, retval] Windows.Foundation.IAsyncAction **operation);
+        HRESULT UpgradeToSslAsync([in] Windows.Networking.Sockets.SocketProtectionLevel level,
+                [in] Windows.Networking.HostName *host,
+                [out, retval] Windows.Foundation.IAsyncAction **operation);
+    }
+
+    [
+        activatable(Windows.Foundation.UniversalApiContract, 1.0),
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile),
+        threading(both)
+    ]
+    runtimeclass StreamSocket
+    {
+        [default] interface Windows.Networking.Sockets.IStreamSocket;
+        interface Windows.Foundation.IClosable;
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile),
+        threading(both)
+    ]
+    runtimeclass StreamSocketControl
+    {
+        [default] interface Windows.Networking.Sockets.IStreamSocketControl;
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile),
+        threading(both)
+    ]
+    runtimeclass StreamSocketInformation
+    {
+        [default] interface Windows.Networking.Sockets.IStreamSocketInformation;
+    }
+}

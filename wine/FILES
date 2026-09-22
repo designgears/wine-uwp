@@ -212,3 +212,12 @@ dlls/windows.networking.hostname/main.c
 dlls/windows.networking.hostname/private.h
 dlls/windows.networking.hostname/classes.idl
 dlls/windows.networking.hostname/Makefile.in
+dlls/windows.networking/streamsocket.c
+dlls/windows.networking/async.c
+dlls/windows.networking/async_private.idl
+dlls/windows.networking/private.h
+dlls/windows.networking/classes.idl
+dlls/windows.networking/main.c
+dlls/windows.networking/Makefile.in
+dlls/windows.networking.hostname/hostname.c
+include/windows.networking.sockets.idl
