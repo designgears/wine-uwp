@@ -7502,3 +7502,49 @@ Also worth carrying: the storage stubs seen in the run (`storage_folder_GetFileA
 **not** on the manifest path - they are `EndpointSettings`, the Vungle ad SDK's cache folders, and
 `user_data\Guest\launch_data\solitaire_collection.json`. They are real gaps but unrelated to this
 blocker.
+
+#### What "data flow error" actually means: the ad-consent vendor list
+
+`BootflowState`'s completion handler (`0x306ce4`) logs "data flow error" when a status word at
+`[state+0x88]` is **4**. There is exactly one place in the binary that writes 4 there - `0x6535b`,
+inside `0x65260..0x65411`:
+
+```
+0x6533e  movups (%rdi),%xmm0        ; a string_view (ptr,len)
+0x6534a  call  0x5fc7b4             ; predicate -> al
+0x65351  je    0x653ed              ; false -> skip
+0x6535b  movl  $0x4,0x88(%rax)      ; true  -> status = 4
+```
+
+`0x5fc7b4` compares that string_view against a 3-entry table at `0xf6c758`, which holds:
+
+```
+[0] '[VendorList]'
+[1] '{VendorList}'
+[2] 'VENDORLIST'
+```
+
+So the status becomes "data flow error" when a piece of consent data is still an **unsubstituted
+`VendorList` placeholder**. That ties together three things previously treated as unrelated:
+`BootflowItemAds::BeginInit -- ad consent flow error [Invalid parameter.]`, the
+`Cache\dlfiles/globaldata/adconsent/noniabvendorlist` path in the `+file` trace, and the managed Ad
+SDK's type initializer throwing next to
+`RoGetActivationFactory Class L"Windows.System.Profile.HardwareIdentification" not found`.
+
+**Wine has no `HardwareIdentification`.** `dlls/windows.system.profile.systemid` implements only
+`SystemIdentification`; the class the Ad SDK asks for is absent, and the imported Windows registry
+points it at that same DLL. That is a concrete, shim-shaped gap
+(`HardwareIdentification.GetPackageSpecificToken(nonce)` -> `HardwareToken` with Id/Signature/
+Certificate buffers).
+
+**Nothing ever asks to leave `BootflowState`.** Trampolines on both "request state" helpers
+(`0x428dc0`, which requests the state at `container+0x350`, and `0x42e6a0`, at `+0x358`) fire
+**zero** times in a run that completes the bootflow and enters the loading screen. So the loading
+screen is not waiting on a transition that fails - the transition is never requested at all.
+
+**Cache seeding cannot be faked cheaply.** `LoadCachedMainManifest` (`0x50ded8`) reads
+`contentmanifest.json` and can fail two ways: "failed to decompress primary manifest" or "failed to
+retrieve existing forward link". Dropping the real manifest there, and then a copy with
+`ForwardLink`/`ForwardLinkUri` keys merged in, both still produce "failed to retrieve existing
+forward link" - so the resolved URL lives in a separate store, not in that JSON. Do not spend more
+time on seeding; fix the download or the consent data instead.
