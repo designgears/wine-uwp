@@ -22,11 +22,31 @@ static void trace(const char *method)
     }
 }
 
+/* Nothing is ever scheduled, but the list has to be a real IVectorView of the right
+ * parameterised type: .NET Native types the RCW from GetRuntimeClassName. */
+class ScheduledList final : public RuntimeClass<RuntimeClassFlags<WinRt>,
+        __FIVectorView_1_Windows__CUI__CNotifications__CScheduledToastNotification, FtmBase>
+{
+    InspectableClass(L"Windows.Foundation.Collections.IVectorView`1<Windows.UI.Notifications.ScheduledToastNotification>", BaseTrust);
+public:
+    HRESULT STDMETHODCALLTYPE GetAt(unsigned, IScheduledToastNotification **out) override
+    { if (out) *out = nullptr; return E_BOUNDS; }
+    HRESULT STDMETHODCALLTYPE get_Size(unsigned *out) override
+    { if (!out) return E_POINTER; *out = 0; return S_OK; }
+    HRESULT STDMETHODCALLTYPE IndexOf(IScheduledToastNotification *, unsigned *index, boolean *found) override
+    { if (index) *index = 0; if (found) *found = false; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetMany(unsigned, unsigned, IScheduledToastNotification **, unsigned *copied) override
+    { if (copied) *copied = 0; return S_OK; }
+};
+
 class Notifier final : public RuntimeClass<RuntimeClassFlags<WinRt>, IToastNotifier, FtmBase>
 {
     InspectableClass(L"Windows.UI.Notifications.ToastNotifier", BaseTrust);
 public:
-    HRESULT STDMETHODCALLTYPE Show(IToastNotification *) override { trace("Show: unsupported"); return E_NOTIMPL; }
+    /* Accept and drop. A refusal here is fatal: the caller is usually C++/CX or .NET
+     * Native, which turns a failed HRESULT into a throw on a path that never completes
+     * the task it was part of. There is nothing to deliver to, but saying so is safe. */
+    HRESULT STDMETHODCALLTYPE Show(IToastNotification *) override { trace("Show: accepted and dropped"); return S_OK; }
     HRESULT STDMETHODCALLTYPE Hide(IToastNotification *) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE get_Setting(NotificationSetting *out) override
     {
@@ -36,14 +56,14 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE AddToSchedule(IScheduledToastNotification *) override
-    { trace("AddToSchedule: unsupported"); return E_NOTIMPL; }
+    { trace("AddToSchedule: accepted and dropped"); return S_OK; }
     HRESULT STDMETHODCALLTYPE RemoveFromSchedule(IScheduledToastNotification *) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetScheduledToastNotifications(
             __FIVectorView_1_Windows__CUI__CNotifications__CScheduledToastNotification **out) override
     {
+        trace("GetScheduledToastNotifications: empty");
         if (!out) return E_POINTER;
-        *out = nullptr;
-        return E_NOTIMPL;
+        return MakeAndInitialize<ScheduledList>(out);
     }
 };
 
