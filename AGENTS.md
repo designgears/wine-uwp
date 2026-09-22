@@ -426,17 +426,26 @@ which read exactly like the deadlock. It was an inlined worker loop parked on an
 a normal idle worker. Read the *code* at the frame (here, a ring-buffer dequeue then
 `WaitOnAddress(..., INFINITE)`) before believing the string.
 
-**Do not call the app's own logger from a trampoline, and do not trust a probe you have not
-controlled.** `tramp.py`'s first version called Solitaire's printf-style logger (`0x66940c`) from a
-code cave. It printed the message and then killed the process a few instructions later - so every
-run ended immediately after the probe line, which reads exactly like "the thing I probed is where
-it hangs". The logger is variadic and takes its va_list from the *caller's* home area, so it is
-not callable with an improvised frame. `OutputDebugStringA` is no better: Wine raises
-`DBG_PRINTEXCEPTION_C` and the unwinder derails on a cave with no `.pdata` entry. **`tramp.py
---nolog` (same hook, same cave, displace and jump, no call) is the control**: if the run completes
-normally with `--nolog` and dies with the call, the probe is the bug, not the code. This
-invalidated a previous session's "the download task is never created" conclusion, which came from
-a trampoline of exactly this shape.
+**A trampoline must not keep the saved `rsp` in `rax` across the call - and this one bug has now
+produced three wrong conclusions.** `rax` is the return-value register, so the callee overwrites
+it; `mov rsp, rax` on the way out then sets `rsp` to garbage, the register pops restore rubbish,
+and the app faults on the **first instruction after the hook**. The crash therefore points at the
+*hooked* code, not at the probe - Solitaire reported
+`Unhandled Exception At 0x0000000140518ccd -- Access violation writing location 0x8`, which is the
+instruction the trampoline returns to. Use `rbx` (callee-saved) to hold the pre-alignment `rsp`,
+and save/restore it with the volatiles. `tramp.py` does this now and calls the app's own logger
+successfully.
+
+This is what was behind all of:
+- "the app's own logger cannot be called from a trampoline" - written into this file, and false.
+- "`OutputDebugStringA` raises and the unwinder derails on a cave with no `.pdata`" - also false,
+  though `tramp.py` adds a real `RUNTIME_FUNCTION` for the cave now anyway.
+- a previous session's "`UWPTFUT` never fires, so the download task is never created".
+
+**Bisect a probe before blaming the code**, with the three modes `tramp.py` has: `--nolog`
+(displace and jump only), `--noop` (full register save/restore, no call), and the call itself.
+`--noop` working while any call crashed is what localised the bug to the call sequence; a call to
+`xor al,al; ret` crashing is what proved it was not the callee.
 
 **A refusal is usually the fatal thing** - `E_NOTIMPL` from an event registration, a `@ stub` in a
 .spec, an unresolvable delay-load, an interface revision answered `E_NOINTERFACE`. Registering an
