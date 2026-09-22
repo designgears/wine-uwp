@@ -97,7 +97,12 @@ done
 # path is baked to whoever generated it, which is exactly what broke every app when this tree moved
 # out of the home directory.
 UWP_BIN_WINPATH="Z:$(echo "$UWP_BIN" | sed 's|/|\\\\|g')"
-sed "s|@UWP_BIN_WINPATH@|${UWP_BIN_WINPATH}|g" "$(dirname "$0")/wineuwp.reg" > "$WINEPREFIX/.wineuwp.reg.tmp"
+# The replacement has to be escaped *again* for sed, which eats a backslash pair in a replacement.
+# Without this the imported value came out as "Z:homebobbyProjects..." - reg import then dropped
+# every unrecognised \<letter> escape - and the app died with "couldn't load in-process dll",
+# "no apartment found for ipid" and do_activate hr 0x80004005, which looks nothing like a path bug.
+UWP_BIN_WINPATH_SED=$(printf '%s' "$UWP_BIN_WINPATH" | sed 's|\\|\\\\|g')
+sed "s|@UWP_BIN_WINPATH@|${UWP_BIN_WINPATH_SED}|g" "$(dirname "$0")/wineuwp.reg" > "$WINEPREFIX/.wineuwp.reg.tmp"
 "${WINE_BIN}wine" reg import "$WINEPREFIX/.wineuwp.reg.tmp" >/dev/null 2>&1
 rm -f "$WINEPREFIX/.wineuwp.reg.tmp"
 

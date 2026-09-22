@@ -135,10 +135,19 @@ they all did.
 Every change to Wine or the host gets checked against apps that already work, *before* you believe
 a result:
 
+**The baseline lives in the repo, at `docs/baselines/calc-regress.png`** - a 1600x1000 *root*
+capture. It used to live only in `/tmp`, and `/tmp` gets wiped: the baseline, every session log and
+**the Xvfb socket for `:98`** all vanished at once. Nothing starts `:98` automatically, so the first
+symptom was every app failing activation with `PrivateCreateCoreWindow failed, hr 0x80004005` -
+which looks like a Wine regression and is not. **If a run suddenly fails at activation, check
+`DISPLAY=:98 xdpyinfo` first**, and restart the display with
+`Xvfb :98 -screen 0 1600x1000x24 -nolisten tcp &`.
+
 ```
-# Calculator must stay byte-identical to the saved baseline
-DISPLAY=:98 UWP_TIMEOUT=80 UWP_LOG=/tmp/c.log ./run.sh &  sleep 48
-DISPLAY=:98 import -window root /tmp/c.png; cmp /tmp/c.png /tmp/calc-regress.png
+# Calculator must stay identical to the saved baseline
+DISPLAY=:98 UWP_TIMEOUT=80 UWP_LOG=/tmp/c.log ./run.sh &  sleep 55
+DISPLAY=:98 xwd -root -silent > /tmp/c.xwd && magick xwd:/tmp/c.xwd /tmp/c.png
+magick compare -metric AE /tmp/c.png docs/baselines/calc-regress.png null:   # 0 = identical
 
 # Feedback Hub: no fail-fasts, no app error, ~822 unique colours
 DISPLAY=:98 UWP_STAGE=windowsfeedbackhub ... ; identify -format '%k' /tmp/fh.png
@@ -181,6 +190,7 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | What function is this address in, with no symbols? | `./whatfn.py <exe> <addr>...` - finds the enclosing `.pdata` function and prints every string its rip-relative LEAs point at. That is how a bare stack dump gets names |
 | Where is the code behind one of the app's own log strings? | `./xref.py <exe> --string '<log string>'` - finds rip-relative LEAs to it and resolves each to its **enclosing function** via `.pdata`, which is where a `ud2` has to go. `--callers <rva>` finds direct call sites |
 | Does a size change reach the app? | `$UWP_BIN/build-probes/probe-resize.exe <w> <h> [title]` - `SetWindowPos` through Wine. **`xdotool windowsize` does not reach Wine at all** |
+| Is this staged app binary still pristine? | `./appxverify.py <stage-dir> [file...]` - checks every 64 KiB block against the package's own `AppxBlockMap.xml`. An appx payload has no Authenticode signature and no PE checksum, so `pecheck.py` cannot answer this; use it instead of trusting a backup copy |
 | Is this Windows DLL one we have byte-patched? | `./pecheck.py <file>...`, or `./pecheck.py --sweep uwp-bin/win11` to list every modified file. Authenticode + PE checksum; needs no reference copy |
 | Which methods of an interface does the app actually call? | give every slot a traced thunk returning `E_NOTIMPL` and read the log - see `shims/storecontext`, which proved the app wanted only `GetDefault` out of 26 methods |
 
