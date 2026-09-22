@@ -703,7 +703,7 @@ the fully-qualified name. `--grep` first, always.
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | **Root cause of the freeze found and proven.** `BootStrap::Startup`'s loop (`0x7dfa4d`) skips the whole frame unless `[bootstrap+0x20a]` (continuous render) or `[+0x208]` (one-shot) is set; `+0x20a` is never set, so exactly one frame ever runs and everything downstream looks frozen. **One byte - `jne`->`jmp` at `0x7dfa64` - makes it run**: bootflow completes, app leaves the splash for `gui/screenfiles/loading/loading`, writes savegames and ticks real time. That byte is a diagnostic; the fix is to deliver the CoreWindow visibility/activation event that sets `+0x20a` (queued closure `0x7d96e0`, created in `0x7d2df4`, invoked via CFG indirect call). **Still not playable**: it holds on the loading screen because `ContentManifestAppComponent::InitiateDownload` fails - the download future completes with an exception *before issuing any request*. msxml6/IXMLHTTPRequest2 was investigated and **cleared** (PlayFab uses it successfully; `probe-http` fetches the manifest with HTTP 200). Next: trampoline the error branch at `0x51c8aa` to print the exception. See Findings-M4 |
+| Solitaire | **Root cause of the freeze found and proven.** `BootStrap::Startup`'s loop (`0x7dfa4d`) skips the whole frame unless `[bootstrap+0x20a]` (continuous render) or `[+0x208]` (one-shot) is set; `+0x20a` is never set, so exactly one frame ever runs and everything downstream looks frozen. **One byte - `jne`->`jmp` at `0x7dfa64` - makes it run**: bootflow completes, app leaves the splash for `gui/screenfiles/loading/loading`, writes savegames and ticks real time. That byte is a diagnostic; the fix is to deliver the CoreWindow visibility/activation event that sets `+0x20a` (queued closure `0x7d96e0`, created in `0x7d2df4`, invoked via CFG indirect call). **Still not playable**: it holds on `gui/screenfiles/loading/loading`. The CDN manifest download does fail, but the app **handles it** (`OnManifestDownloaded ... Loading fallback.`) - that is a degraded path, not the blocker, and msxml6/IXMLHTTPRequest2 is cleared (PlayFab uses it; `probe-http` gets HTTP 200). The live question is `BootflowState - Bootflow initialization finished with data flow error`, emitted by `0x306ce4` when a status byte at `[state+0x88]` is **4**. See Findings-M4 |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
@@ -749,11 +749,12 @@ the resize never reached XAML at all.
 Next: the app holds on the splash page. The CDN explanation first written here was **wrong** - the
 app had no working HTTP at all (msxml6's XMLHTTP classes were never registered, so libHttpClient's
 IXMLHTTPRequest2 backend could not create its transport), and with that fixed it logs
-`PlayFab login successful`. It still stops, one layer deeper, and that layer is now pinned: the
-bootflow runs eight items in a fixed order and stalls on the **2nd, `BootflowItemFont`**, whose
-completion is gated on a never-fulfilled future loading `gui/fonts/fonts.fontlib`. Items 3, 5 and 7
-provably never begin (`ud2` probes with a firing control). The rendering path itself is proven end
-to end, which is the part Shapr3D needs.
+`PlayFab login successful`. It still stops, but **not in the bootflow** - that was the wrong
+layer twice over. `BootflowItemFont` was named here and then disproven (forcing its gate open
+changes nothing, and its font future *does* succeed). The reason items 3, 5 and 7 "provably never
+begin" is that **nothing was ever ticked**: `+0x20a` was unset, so exactly one frame ran. With the
+frame loop running the bootflow completes in full. The rendering path itself is proven end to end,
+which is the part Shapr3D needs.
 
 **Beware ~1-in-3 run variance**: some Solitaire runs stall before `App -- AppState Transition ...
 'Sgi::BootflowState'` with no probe applied at all. A probe that "did not fire" in such a run means
