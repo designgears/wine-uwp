@@ -207,3 +207,8 @@ server/queue.c
 server/request_handlers.h
 server/request_trace.h
 server/token.c
+dlls/windows.networking.hostname/endpointpair.c
+dlls/windows.networking.hostname/main.c
+dlls/windows.networking.hostname/private.h
+dlls/windows.networking.hostname/classes.idl
+dlls/windows.networking.hostname/Makefile.in

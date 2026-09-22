@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     12232acb9107e866fdd70b680490ff214a9b802a
-                 wine-uwp: commit the accumulated working-tree state
+  wine HEAD:     08d96d74ebb0acda65e143cae5cf3175e81b6087
+                 windows.storage: implement StorageFolder get/create, add FileIO
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-22T04:36:17Z
+  captured:      2026-09-22T04:54:34Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
