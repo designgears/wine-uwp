@@ -176,6 +176,7 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | Why is an app stuck, when the stack dumper cannot say? | `WINE_UWP_PROFILE=<prefix> WINE_UWP_PROFILE_MS=10` - a sampling profiler already in `wineuwp`. Writes `<prefix>.<pid>` every 2 s: an `M` line per module then `S <tid> <rip> <count> <4 callers>`. It **found the waiting thread's loop when `WINE_UWP_DUMP_STACKS` returned nothing useful**, and it distinguishes *blocked* from *spinning*, which no single stack snapshot can |
 | What is every thread actually doing? | `WINE_UWP_DUMP_STACKS=<seconds>` - suspends and unwinds every thread, prints `STACK tid N frame M rip=`. Works on an *idle* app, not just a hung one. Resolve against `/proc/<pid>/maps` from the same run |
 | Method count of a private interface | parse the MIDL proxy/stub DLL, below |
+| What function is this address in, with no symbols? | `./whatfn.py <exe> <addr>...` - finds the enclosing `.pdata` function and prints every string its rip-relative LEAs point at. That is how a bare stack dump gets names |
 | Where is the code behind one of the app's own log strings? | `./xref.py <exe> --string '<log string>'` - finds rip-relative LEAs to it and resolves each to its **enclosing function** via `.pdata`, which is where a `ud2` has to go. `--callers <rva>` finds direct call sites |
 | Does a size change reach the app? | `$UWP_BIN/build-probes/probe-resize.exe <w> <h> [title]` - `SetWindowPos` through Wine. **`xdotool windowsize` does not reach Wine at all** |
 | Is this Windows DLL one we have byte-patched? | `./pecheck.py <file>...`, or `./pecheck.py --sweep uwp-bin/win11` to list every modified file. Authenticode + PE checksum; needs no reference copy |
@@ -397,6 +398,21 @@ before using a generated one.
 
   **Before answering a getter, find out what the caller does with the answer** - from the shipping
   implementation, or by instrumenting the call.
+
+**`E_NOTIMPL` from a shim can stop an app with every thread idle and no stack pointing at it.**
+Solitaire's toast shim answered `AddToSchedule` and `GetScheduledToastNotifications` with
+`E_NOTIMPL`. The caller turns that into a throw on a path that never completes its bootflow item,
+so the whole boot sequence stopped - and `WINE_UWP_DUMP_STACKS` showed *nothing* wrong: workers
+parked on their task queues, UI threads pumping, no spinning. **A lost continuation looks like an
+idle process, not a hung one.** When every thread is idle and the app has stopped making progress,
+look for the last refusal, not for a blocked stack. Accepting and dropping (`S_OK`) is the right
+answer for a delivery API with nowhere to deliver to.
+
+**A stack frame whose function contains a familiar log string is not necessarily doing that work.**
+`whatfn.py` put "Inventory - Failed to Find/Load asset" in the function a parked thread was in,
+which read exactly like the deadlock. It was an inlined worker loop parked on an empty MPMC queue -
+a normal idle worker. Read the *code* at the frame (here, a ring-buffer dequeue then
+`WaitOnAddress(..., INFINITE)`) before believing the string.
 
 **A refusal is usually the fatal thing** - `E_NOTIMPL` from an event registration, a `@ stub` in a
 .spec, an unresolvable delay-load, an interface revision answered `E_NOINTERFACE`. Registering an
@@ -703,7 +719,7 @@ the fully-qualified name. `--grep` first, always.
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | **Freeze root-caused and fixed in principle; still not playable.** `BootStrap::Startup`'s loop (`0x7dfa4d`) skips the whole frame unless `[bootstrap+0x20a]` (continuous render) or `[+0x208]` (one-shot) is set, and `+0x20a` is never set - so exactly one frame ever ran, which is why the bootflow and every item probe looked frozen. **One byte - `jne`->`jmp` at `0x7dfa64` - makes it run**: bootflow completes, it leaves the splash for `gui/screenfiles/loading/loading`, writes savegames and ticks real time. That byte is still a diagnostic: an attempt to deliver the real event (message `0x270` to the CoreWindow, derived from `WindowServer::OnVisibilityChangedEvent`) **did not work** and was reverted - see Findings-M4. **Blocked on CDN content**: `ContentManifestAppComponent::InitiateDownload` fails *before name resolution* (`+winhttp,+winsock`: WinHTTP never used, the only DNS lookup in the process is playfabapi.com), so ~20 content sets never mount - including `MSCasualGames` (the game list) and `AdConsent`, whose absence leaves the `VendorList` placeholder that causes the bootflow "data flow error". The storage layer is no longer a factor: `windows.storage` now implements StorageFolder get/create and `FileIO`, so consent data is written and read and **no managed exception is thrown anywhere in the run**. See Findings-M4 |
+| Solitaire | **Boots, downloads all CDN content and completes its bootflow.** Wine now implements `Windows.Networking.EndpointPair` and `Windows.Networking.Sockets.StreamSocket` (with a schannel TLS client), which is what the app's own HTTP client is built on - the manifest downloads, ~20 content sets mount, `Bootflow -- Successfully Initialized all boot flow items.` The app ticks real time. **Still needs the `jne`->`jmp` byte patch at file offset `0x7dee64`** (see below) and stops on `gui/screenfiles/genericpopup/genericpopup` with only the background gradient painted (380 colours) - that is the current front |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
@@ -717,6 +733,21 @@ all three unset behaves identically. Note the partial combinations (`MANUAL_CONF
 
 The `ConfigureCoreWindow` hang that used to lose one run in three is **fixed** - it was our own
 APC landing on Wine's RPC server thread, not anything in XAML. See Findings-M4.md.
+
+### Solitaire: the async-callback and socket-locking rules
+
+Two rules that came out of implementing `StreamSocket`, both of which produce a *working-looking*
+run that still fails, and both of which apply to any new WinRT async in Wine:
+
+- **`async_operation_callback` runs inline on the caller's thread unless it returns
+  `STATUS_PENDING`.** `async_info_complete( impl, FALSE )` calls it directly and only submits the
+  threadpool work item if it gets `STATUS_PENDING` back. Any callback that blocks needs
+  `if (!called_async) return STATUS_PENDING;` as its first statement, or the "async" operation
+  completes before the caller has done the next thing it meant to do.
+- **Never hold one lock across both the receive and send paths of a socket.** An HTTP client posts
+  its read before sending the request; with a single lock the read blocks in `recv()` and the
+  request is never sent. `Close()` and reconnect need the receive lock a blocked `recv()` holds,
+  so they `shutdown()` the socket first, unlocked, to wake it.
 
 ### Solitaire: how it was made to render, and what the dead ends were
 
