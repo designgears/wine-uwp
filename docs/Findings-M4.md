@@ -7841,3 +7841,39 @@ shape at `0x51897e`. That run died at the probe, so the absence proved nothing. 
 to be a missing `StreamSocket`, which is consistent with the task having been created all along.
 
 Open: why a screen entered at 3.3 s never finishes loading while the splash entered at 2.4 s did.
+
+### Narrowing the popup: the screen system works, this screen does not
+
+More `ud2` probes, all with the CDN URL selector as a firing control, and the ones marked *with
+size* run with the two `ActualWidth`/`ActualHeight` reads forced to 1280.0/800.0:
+
+| Probe | Address | Result |
+| --- | --- | --- |
+| `StartupSplashScreen` vtable slot 28 (`OnLoaded`) | `0x43dc50` | **fires** (app line 182) |
+| `GenericDialogScreen` vtable slot 5 (uses `layout_selector`) | `0x3e6d10` | **fires** (app line 879) |
+| `GenericDialogScreen` vtable slot 27 | `0x3e7a80` | never |
+| `GenericDialogScreen::OnLoaded`, slot 28 | `0x3e7b20` | never |
+| `GenericDialogScreen::OnLoaded`, *with size* | `0x3e7b20` | never |
+| `GenericDialogScreen::ApplyPopupDescription` | `0x3e75c4` | never |
+
+`rtti.py` located both vtables (`GenericDialogScreen` at `0xecd5f8`, `StartupSplashScreen` at
+`0xed2160`). So the screen-loading machinery works - the splash goes all the way through - and the
+dialog's object is constructed and gets as far as its layout selector, then stops.
+
+The GUI is definitely still running while this is true: the splash page keeps animating (its logo
+is caught mid-animation in a capture at 45 s, and the unique-colour count changes from capture to
+capture), and the `[ADS]` cooldown line keeps ticking every five seconds for the whole run.
+
+Ruled out along the way:
+
+- **Input.** Enter, Escape, space and a 40-point click grid, with the surface size forced to
+  1280x800 so hit-testing has a real coordinate space, change nothing.
+- **A missing screen file.** `gui/screenfiles/genericpopup/` is in the packaged archive with
+  `genericpopup.gui`, `genericpopup.vesatemplate` and `atlas.webp`.
+- **WebP.** The splash's atlas is WebP too and it loads; the app bundles its own libwebp
+  ("WebM Project VP8 Decoder v1.13.1") rather than going through WIC, and its
+  `TextureLoad::Decode -- ERROR decoding Webp.` never appears. The splash directory *also* carries
+  an `atlas_uc.png`, which made this look promising - it is not the difference.
+
+Next: find what calls vtable slot 28 on a screen and what gates it, or bisect the gap between slot
+5 and slot 27 on `GenericDialogScreen`.
