@@ -16,6 +16,7 @@
 // The state repository is a database of installed packages per user. Everything here answers for
 // the one user the process is running as, which is the only one a Wine prefix has.
 #include <windows.h>
+#include <appmodel.h>
 #include <sddl.h>
 #include <roapi.h>
 #include <winstring.h>
@@ -522,6 +523,21 @@ static HRESULT generic_slot_call(unsigned slot, void *iface, void *args[6])
         if (!GetEnvironmentVariableW(L"WINE_UWP_WINDOW_TITLE", name, ARRAYSIZE(name))) lstrcpyW(name, L"App");
         trace("  -> %ls", name);
         return WindowsCreateString(name, lstrlenW(name), (HSTRING *)out);
+    }
+
+    /* The Package row is the running package, so its full name is the process's. The native
+     * AppInfo.Package looks the package up by this name through PackageManager; an empty name
+     * found nothing, and Solitaire threw out of the step that follows its bootflow. */
+    if (impl->instance && desc->kind == SR_OUT_HSTRING && !strcmp(desc->name, "get_PackageFullName") &&
+        !lstrcmpW(impl->cls, L"Windows.Internal.StateRepository.Package"))
+    {
+        WCHAR name[PACKAGE_FULL_NAME_MAX_LENGTH + 1];
+        UINT32 len = ARRAYSIZE(name);
+        if (GetCurrentPackageFullName(&len, name) == ERROR_SUCCESS)
+        {
+            trace("  -> %ls", name);
+            return WindowsCreateString(name, lstrlenW(name), (HSTRING *)out);
+        }
     }
 
     switch (desc->kind)

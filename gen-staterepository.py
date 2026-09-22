@@ -117,7 +117,12 @@ def vtable_slots(rva, limit=96):
 
 rows = []
 for cls in classes:
-    targets = [(f"??_7{cls}Server@StateRepository@Internal@Windows@@6B@", 0)]
+    primary = f"??_7{cls}Server@StateRepository@Internal@Windows@@6B@"
+    if primary not in exact:
+        # Classes with several row interfaces (PackageUser) have one vtable per interface,
+        # named by the interface; the one named I<cls> is the base row interface.
+        primary = f"??_7{cls}Server@StateRepository@Internal@Windows@@6BI{cls}@123@@"
+    targets = [(primary, 0)]
     want = f"I{cls}Statics@StateRepository@Internal@Windows"
     # Several selector vtables mention I<cls>Statics in their template arguments; the one that *is*
     # the statics table is the one that does not start with the FtmBase selector (that is IMarshal).

@@ -759,7 +759,7 @@ the fully-qualified name. `--grep` first, always.
 - The unhandled-error text an app reports is often a *consequence*. `Delegate to an instance method
   cannot have null 'this'` was the second exception; the first, further up, was the real one.
 
-## Current state (2026-09-21)
+## Current state (2026-09-22)
 
 | App | State |
 | --- | --- |
@@ -767,7 +767,7 @@ the fully-qualified name. `--grep` first, always.
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | **Boots, downloads all CDN content, completes its bootflow, and - with a diagnostic sort patch - draws a real dialog** (`docs/screenshots/solitaire-signin-error-dialog.png`: the Xbox "Sign In Error" with Try Again / Cancel). Still needs the `0x7dee64` frame-loop patch (re-test it: `VisibilityChanged`/`Activated` are now delivered). Two open fronts: (1) the dialog is `stable_sort`ed *under* the opaque splash (priority 0 vs 100) because the splash is never exited - diagnostic patch `jae`->`jmp` at `0x8b7714`/`0x8b773c`; (2) **pointer input never reaches the game**: its `CreateCoreIndependentInputSource` worker is running `ProcessEvents` but no pointer event is ever routed to it, and the page's XAML `KeyDown` never fires either (CoreWindow `CharacterReceived` does). See Findings-M4 |
+| Solitaire | **Reaches its real main menu** (`docs/screenshots/solitaire-main-menu.png`) - bootflow completes, the splash is exited, and pointer input reaches the game (the Sign In Error dialog's Cancel works). The fix was registering StateRepository `PackageUser`: its absence threw `0x80040154` in the post-bootflow transition. Still needs the `0x7dee64` frame-loop patch. Next: dismiss the popup over the menu and start Klondike. See Findings-M4 |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against

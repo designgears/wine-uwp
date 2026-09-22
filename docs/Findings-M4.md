@@ -7977,3 +7977,29 @@ patch was justified by `+0x20a` never being set; that should be re-tested.
 
 Tooling this stretch: `tramp.py --val` grew callee-saved registers (`rsi`, `rdi`, `rbp`, `r12`-`r15`);
 `appxverify.py` caught a probe binary left patched by a killed run.
+
+## Solitaire reaches the main menu (2026-09-22)
+
+Three fixes, in order, took Solitaire from the splash to its real main menu
+(`docs/screenshots/solitaire-main-menu.png`):
+
+1. **Pointer input.** `CoreIndependentInputSource` pumps a message-only window on its own worker,
+   and Wine's synthesized `WM_POINTER*` went only to the CoreWindow's thread. `win32u/message.c`
+   now also posts them to the independent input window (`forward_pointer_to_independent_input`),
+   and `peek_message` refreshes that thread's per-thread pointer state from the posted message.
+   With this change, clicking Cancel on the Sign In Error dialog dismisses it.
+2. **`AppInfo.Package`** returned `E_NOTIMPL`, because the native `Windows.ApplicationModel.dll` calls
+   `PackageManager::FindPackageByUserSecurityIdPackageFullName` and Wine's appxdeploymentclient
+   had no answer. For the current package it now returns `Package.Current`. The StateRepository
+   shim answers `Package.get_PackageFullName` with `GetCurrentPackageFullName`.
+3. **`IPackage3.InstalledDate`** activates `Windows.Internal.StateRepository.PackageUser`, which was
+   not registered, so it failed with `0x80040154`. C++/WinRT threw inside the post-bootflow transition
+   (`0x422b74` -> `0x5c4b2c`), and the app sat on the splash forever. **This one throw explains
+   the whole "splash is never exited" problem.** The dialog-under-splash sort, and the diagnostic
+   `jae`->`jmp` patch at `0x8b7714`/`0x8b773c`, were consequences of it and are no longer needed.
+   `gen-staterepository.py` now finds vtables for classes that have several row interfaces
+   (`...@6BIPackageUser@123@@`), and `install-overrides.sh` registers `PackageUser`.
+
+After the fix the log reads `EnterScreen [mainmenu_ftue]`, `TransitionFromBootflow`,
+`ExitScreen [splashpage_pc]`, then the popup gains focus. The menu still needs the `0x7dee64`
+frame-loop patch. Calculator regression is AE = 0.

@@ -2588,6 +2588,37 @@ static WORD pointer_buttons_from_mouse_buttons( WORD mouse_flags )
     return pointer_flags;
 }
 
+/* A UWP app that renders DirectX into a XAML SwapChainPanel gets its pointer input through
+ * SwapChainPanel.CreateCoreIndependentInputSource: Windows.UI creates a message-only
+ * "Windows.UI.Core.CoreIndependentInputSource" window on a worker thread and pumps it with
+ * CoreDispatcher.ProcessEvents. On Windows the compositor's input redirection delivers pointer
+ * input over the panel to that window. Wine has no such redirection, so the window never gets a
+ * message and the app never sees a click (Solitaire: its four pointer handlers never fire).
+ * Stand in for the redirection: a pointer message delivered to a CoreWindow is also posted to
+ * the process's independent input source window, if it has one. */
+static BOOL is_window_class( HWND hwnd, const WCHAR *class, size_t len )
+{
+    WCHAR buf[64];
+    UNICODE_STRING name = { 0, sizeof(buf), buf };
+    INT n = NtUserGetClassName( hwnd, FALSE, &name );
+    return n == len && !memcmp( buf, class, len * sizeof(WCHAR) );
+}
+
+static void forward_pointer_to_independent_input( HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam )
+{
+    static const WCHAR core_windowW[] = {'W','i','n','d','o','w','s','.','U','I','.','C','o','r','e','.','C','o','r','e','W','i','n','d','o','w'};
+    static const WCHAR input_sourceW[] = {'W','i','n','d','o','w','s','.','U','I','.','C','o','r','e','.','C','o','r','e','I','n','d','e','p','e','n','d','e','n','t','I','n','p','u','t','S','o','u','r','c','e'};
+    UNICODE_STRING class = { sizeof(input_sourceW), sizeof(input_sourceW), (WCHAR *)input_sourceW };
+    HWND target;
+    DWORD pid;
+
+    if (!is_window_class( hwnd, core_windowW, ARRAY_SIZE(core_windowW) )) return;
+    if (!(target = NtUserFindWindowEx( HWND_MESSAGE, 0, &class, NULL, 0 ))) return;
+    if (!NtUserGetWindowThread( target, &pid ) || pid != GetCurrentProcessId()) return;
+    TRACE( "forwarding %#x from core window %p to independent input source %p\n", message, hwnd, target );
+    NtUserPostMessage( target, message, wparam, lparam );
+}
+
 /***********************************************************************
  *          process_mouse_message
  *
@@ -2702,6 +2733,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
 
             update_pointer_from_msg( PT_MOUSE, &pointer_msg );
             send_message( msg->hwnd, message, pointer_msg.wParam, pointer_msg.lParam );
+            forward_pointer_to_independent_input( msg->hwnd, message, pointer_msg.wParam, pointer_msg.lParam );
         }
     }
 
@@ -3176,6 +3208,16 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
             }
             continue;
         case MSG_POSTED:
+            if ((info.msg.message >= WM_POINTERUPDATE && info.msg.message <= WM_POINTERLEAVE) ||
+                info.msg.message == WM_POINTERWHEEL || info.msg.message == WM_POINTERHWHEEL)
+            {
+                /* a forwarded pointer message: pointer state is per thread, so the receiving
+                 * thread's GetPointerInfo needs it too (see forward_pointer_to_independent_input) */
+                MSG pointer_msg = info.msg;
+                pointer_msg.pt.x = (short)LOWORD( info.msg.lParam );
+                pointer_msg.pt.y = (short)HIWORD( info.msg.lParam );
+                update_pointer_from_msg( PT_MOUSE, &pointer_msg );
+            }
             if (info.msg.message & 0x80000000)  /* internal message */
             {
                 if (flags & PM_REMOVE)
