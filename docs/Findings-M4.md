@@ -7602,3 +7602,54 @@ the rebuild - no `refreshed: stale wineuwp.dll in the prefix` line, and the pref
 the 01:23 build while the tree had 22:08 (identical size, different content, so a size check would
 also have missed it). The first test of the fix was therefore meaningless. `cmp` the prefix copy
 against `~/src/wine-build/dlls/wineuwp/x86_64-windows/wineuwp.dll` after every wineuwp rebuild.
+
+### windows.storage: four real gaps fixed, and what they unblocked
+
+Working backwards from Solitaire's ad-consent failures produced a chain of genuine Wine gaps, each
+found by reading the managed exception type rather than guessing:
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `InvalidCastException` on the publisher cache folder | `IStorageFolder2` refused in QI | implemented (`TryGetItemAsync`, NULL for a missing item) |
+| `NotImplementedException` | `GetFileAsync`/`GetFolderAsync`/`GetItemAsync` were `E_NOTIMPL` | implemented; needed a new `IAsyncOperation<IStorageItem>` |
+| `mcgconsent.json` never created | `CreateFileAsync`/`CreateFolderAsync` were `E_NOTIMPL` | implemented, collision options honoured, multi-segment names created component by component |
+| `COMException` from `RoGetActivationFactory` | `Windows.Storage.FileIO` did not exist | added the class; `ReadTextAsync`/`WriteTextAsync`/`AppendTextAsync` implemented, needed a new `IAsyncOperation<HSTRING>` |
+
+Result: the consent framework now writes **and reads back** a real `mcgconsent.json`
+(`PublisherCache/mcg/`, with an MCGID and consent version), `PublisherStorageAccessFailure` is gone,
+and **no managed exception is thrown anywhere in the run** - previously there were several.
+Calculator stays byte-identical (249 colours, `AE` 0).
+
+**The exception type is the diagnosis.** `InvalidCastException` means a refused QI,
+`NotImplementedException` means an `E_NOTIMPL` method, `COMException` from
+`RoGetActivationFactory` means a missing class. Each one names its own fix, and reading it beats
+inferring from FIXME noise - the `fixme:storage:` lines that *looked* relevant earlier
+(`EndpointSettings`, Vungle, launch data) were all on unrelated paths.
+
+**Trap**: `wine/FILES` is an explicit list, so `sync-wine.sh --from-tree` silently skipped the new
+`dlls/windows.storage/fileio.c` - 398 lines lived only in the Wine tree until it was added by hand.
+After creating a *new* file in the Wine tree, add it to `wine/FILES` before syncing.
+
+### The CDN download: it never reaches the network
+
+With `WINEDEBUG=+winhttp,+winsock`:
+
+- **WinHTTP is never used at all** (zero `winhttp:` lines in a whole run).
+- The **only DNS lookup in the entire process** is `92ab.playfabapi.com`.
+
+So `ContentManifestAppComponent::InitiateDownload` fails before name resolution, never mind a
+transport. The `Windows.Web.Http` activations (`HttpBaseProtocolFilter`, `HttpMethod`,
+`HttpRequestMessage`) happen at ~1.90 s, *after* the manifest failure at ~1.83 s, and belong to the
+ad SDK - they are not the manifest's path.
+
+The failing call chain is now named: `ContentManifestAppComponent::InitiateDownload` ->
+`CdnAppComponent::LoadPrimaryManifestResource -- failed to download [MainManifest] manifest.` ->
+`OnManifestDownloaded ... ManifestDownloadFailed. Loading fallback.` Everything downstream is
+"secondary manifest is not yet downloaded" for ~20 content sets, including **MSCasualGames** (the
+game list) and **AdConsent** (whose absence leaves the `VendorList` placeholder that produces the
+bootflow "data flow error").
+
+So the CDN content is the gate on actually playing, and the download's failure is upstream of all
+networking. Still-missing WinRT classes that could plausibly be prerequisites, none yet tested:
+`Windows.System.Profile.HardwareIdentification`, `Windows.Security.Cryptography.Core.HashAlgorithmNames`
+(a trivial statics class of algorithm-name strings), `Windows.Networking.EndpointPair`.
