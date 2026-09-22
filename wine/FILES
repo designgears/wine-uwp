@@ -154,6 +154,7 @@ dlls/windows.storage/Makefile.in
 dlls/windows.storage/appdatapaths.c
 dlls/windows.storage/async.c
 dlls/windows.storage/classes.idl
+dlls/windows.storage/fileio.c
 dlls/windows.storage/fileproperties.c
 dlls/windows.storage/main.c
 dlls/windows.storage/private.h
