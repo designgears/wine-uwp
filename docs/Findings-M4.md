@@ -7730,3 +7730,43 @@ hang later and confirm it.
 `whatfn.py` was written for this: given an address it finds the enclosing function from `.pdata`
 and prints every string the function's rip-relative LEAs point at. That is what identified
 `0x88cca0` as the Inventory loader with no symbols at all.
+
+### After the bootflow: the generic popup
+
+With the toast refusal fixed (`AddToSchedule`/`GetScheduledToastNotifications` answering `S_OK` and
+a real empty `IVectorView<ScheduledToastNotification>`), the boot sequence completes for the first
+time:
+
+```
+[   2.978] BootflowItemAds::BeginInit -- finished initializing MCGShared
+[   2.978] Bootflow -- Successfully Initialized all boot flow items.
+[   2.979] BootflowState - Bootflow initialization finished.
+```
+
+and the app ticks real time from then on (`AdsAppComponent::RecordVideoAdCooldown` every 5 s for
+as long as the run lasts). It then enters `gui/screenfiles/genericpopup/genericpopup` - immediately
+after `LiveManagerXsapi2::SilentSignIn Failed with hresult [0x89235113]` and a batch of
+`ThemesAppComponent::MountCdnThemesResources -- ... needsDownload: true` - and stays there.
+
+What is known about that state:
+
+- The popup screen **does** render, as a bare background gradient (380 unique colours); the run
+  otherwise shows the splash-page artwork (151k colours), which is decorative and does *not* mean
+  the game started.
+- **Input reaches the app**: a grid of clicks and then Escape/space flips the window between the
+  380-colour popup and the 151k-colour splash, so the render loop and the input path both work.
+  Nothing dismisses the dialog, which is consistent with a dialog that has no widgets drawn.
+- Several `LocFile` assets fail to load (`notifications/loc/en-us/notifications`,
+  `tournamentloc/loc/en-us/tournament`, `xpconfigs/loc/en-us/levelnamesv3`), so an empty dialog is
+  plausible - but that has not been confirmed, and "the dialog has no text" does not by itself
+  explain having no buttons either.
+
+Candidates for which dialog it is, from the app's own symbol names, in the order the log makes them
+plausible: `DlcLoadingScreen::OnRetryDownloadDlcDialogDone` (the theme archives are all
+`needsDownload: true` and none was fetched), `FUE_OfflineContentUpsell` / `UE_XboxGamePassOffline`
+(the Xbox silent sign-in just failed), `AppVersionUpdateAppComponent::MandatoryUpdateChoiceDone`.
+Deciding between them wants a trampoline on `GenericDialog::ApplyPopupDescription`, not more
+guessing.
+
+Also unchanged and still required: the `jne`->`jmp` byte patch at file offset `0x7dee64`. Every
+result above depends on it.
