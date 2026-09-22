@@ -7770,3 +7770,74 @@ guessing.
 
 Also unchanged and still required: the `jne`->`jmp` byte patch at file offset `0x7dee64`. Every
 result above depends on it.
+
+## The generic popup: what it is, and three things it is not
+
+The popup Solitaire stops on is the **UserDataFlow sign-in error dialog**. `whatfn.py` on the
+function that builds it (`0x2fa69c`) prints its two loc keys:
+
+```
+0xf46c30  'UserDataFlow.Check_Get_XUID_Error'
+0xf46c90  'UserDataFlow.SignInErrorHeader'
+```
+
+and the log agrees - `GetXUID - Start`, then
+`LiveManagerXsapi2::SilentSignIn Failed with hresult [0x89235113]`, then the popup 40 ms later.
+That is the honest outcome for a machine with no Xbox identity; on Windows the same dialog appears
+and you dismiss it. So the blocker is not the sign-in, it is that **the dialog never draws**.
+
+`ud2` probes (control: the CDN URL selector at `0x518cc4`, which fires) established:
+
+- `GenericDialogScreen::OnLoaded` (`0x3e7b20`) **never runs**.
+- `GenericDialogScreen::ApplyPopupDescription` (`0x3e75c4`) **never runs**.
+- `Gui -- Screen Focus GAINED` is logged for the splash page and never for the popup.
+
+So the screen is pushed (`Gui -- EnterScreen [gui/screenfiles/genericpopup/genericpopup]`) and its
+load never completes. The screen file is present - `genericpopup` appears six times in the packaged
+`data-*.archive` - and the loc folder is synced five milliseconds earlier
+(`Localizer::SyncLocDir -- synced from folder: [loc/en]`).
+
+Three theories were tested and are **wrong**:
+
+**The 1x1 render surface is real, but it is not why the dialog is invisible.**
+`Setting Render Window - Surface is 1 x 1, DpiScaleFactor is 1` is logged exactly once per run and
+never updated, which looked like the whole answer: a GUI laid out in a 1x1 space would draw
+nothing but full-screen background art. The chain behind it is now fully mapped:
+
+- `Dx11RenderWindowXaml::Initialize` (`0x851134`) reads the SwapChainPanel's `get_ActualWidth`
+  (`IFrameworkElement` slot 13, call at `0x8511c9`) and `get_ActualHeight` (slot 14, `0x85122e`).
+- `XamlBootStrap::SetSwapChainPanel` runs at 0.88 s and both are still 0; the app's own
+  `ArrangeOverride` (`0x7d15f0`, reached through the `produce<XamlDxgiSwapChainPanel,
+  IFrameworkElementOverrides>` vtable at `0xeeeef8`) does not fire until *after*
+  `SetSwapChainPanel End`. XAML has not laid out yet.
+- The one path that would fix it later is dead: `XamlBootStrap::OnInitRender` (`0x7de1a0`) posts a
+  `CoreDispatcher` `DispatchedHandler` (`0x7de930`, slot 3 of the delegate vtable at `0xeeffa8`)
+  that re-runs `SetRenderWindow` - but it early-returns at `0x7de1d8` because `SetSwapChainPanel`
+  already set both `[this+0x48]` and `[this+0x50]`. Patching that `je` open does not help either:
+  `0x7e00a0` then short-circuits on `[rdi+0x50]` at `0x7e01c5`.
+
+Forcing the two reads to constants (a jmp to a code cave that writes 1280.0 / 800.0 and returns
+`S_OK`) gives `created swap chain with resolution 1280 x 800` and
+`Setting Render Window - Surface is 1280 x 800` - **and changes nothing on screen**. Keep the
+finding, drop the conclusion.
+
+**The alternating screenshots are our own byte patch, not a clue.** Six captures two seconds apart
+gave 151742, 151118, 151852, 380, 151713, 151118 unique colours - the splash artwork and the
+popup's bare gradient in alternation. That is the `jne`->`jmp` patch at `0x7dee64` forcing a frame
+every loop iteration, so frames are presented that the app never drew into.
+
+**Do not call the app's own logger from a trampoline.** `tramp.py`'s first version called
+`0x66940c` (the app's printf-style logger) from a code cave. It printed the message and then killed
+the process a few instructions later, *every time* - the run stopped dead right after the probe
+line, which reads exactly like "the thing I probed is where it hangs". `--nolog` (same hook, same
+cave, displace-and-jump with no call) is the control that proved it: 913 log lines and a normal run
+through to the popup. The logger is variadic and takes its va_list from the caller's home area, so
+it is not callable with an improvised frame; `OutputDebugStringA` is no better, because Wine raises
+`DBG_PRINTEXCEPTION_C` and the unwinder derails on a cave with no `.pdata` entry.
+
+**This retroactively invalidates one earlier conclusion.** The previous session reported
+"`UWPTFUT` never fires - the download task is never created" from a trampoline of exactly this
+shape at `0x51897e`. That run died at the probe, so the absence proved nothing. The CDN turned out
+to be a missing `StreamSocket`, which is consistent with the task having been created all along.
+
+Open: why a screen entered at 3.3 s never finishes loading while the splash entered at 2.4 s did.
