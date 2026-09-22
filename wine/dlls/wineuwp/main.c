@@ -4501,13 +4501,16 @@ HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID iid, void **out)
     static LONG resume_trace;
     if (GetEnvironmentVariableW(L"WINE_UWP_TRACE_CXX", NULL, 0) && !InterlockedExchange(&resume_trace, 1))
         AddVectoredExceptionHandler(1, resume_exception_trace);
-    static LONG profiling;
+    static LONG profiling, dumping;
     const char *profile = getenv( "WINE_UWP_PROFILE" );
     if (profile && !InterlockedExchange( &profiling, 1 ))
     {
         HANDLE thread = CreateThread( NULL, 0, profile_thread, (void *)profile, 0, NULL );
         if (thread) CloseHandle( thread );
     }
+    /* also arm the stack dumper here: a run that never reaches ActivationHandled is exactly
+     * the one worth dumping, and that hook fires too late to see it. */
+    if (!InterlockedExchange( &dumping, 1 )) maybe_start_stack_dumper();
     TRACE("%s, %s, %p\n", debugstr_guid(clsid), debugstr_guid(iid), out);
     if (IsEqualGUID(clsid, &CLSID_ActivatableApplicationRegistrar))
         return IClassFactory_QueryInterface(&registrar_factory, iid, out);

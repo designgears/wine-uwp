@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     394c45e498d44f141cc6cbbc8d934f598413d5de
-                 windows.networking.hostname: implement Windows.Networking.EndpointPair
+  wine HEAD:     00c430f23cce4652c31672ac772f4257508781d6
+                 wineuwp: arm the stack dumper from DllGetClassObject too
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-22T05:25:34Z
+  captured:      2026-09-22T05:40:13Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
