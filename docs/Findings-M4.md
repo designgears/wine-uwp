@@ -7548,3 +7548,57 @@ retrieve existing forward link". Dropping the real manifest there, and then a co
 `ForwardLink`/`ForwardLinkUri` keys merged in, both still produce "failed to retrieve existing
 forward link" - so the resolved URL lives in a separate store, not in that JSON. Do not spend more
 time on seeding; fix the download or the consent data instead.
+
+### Attempt at the real fix: message 0x270 to the CoreWindow - did NOT work
+
+The app never learns it is visible, so `+0x20a` is never set. Chasing that to its source:
+
+1. The app's handler is `0x7d4950`, registered at `0x7d380e` (inside `0x7d2df4`) as a callable passed
+   to vtable slot **`+0x1c0`** of its own platform object. A trampoline on that handler shows it
+   **never runs**.
+2. That handler is what queues the closure (`0x7d96e0`) which writes `+0x20a`.
+3. On the Windows side the event comes from windows.ui's
+   `WindowServer::OnVisibilityChangedEvent` (windows.ui.dll RVA **0xbc74**, named from the cached
+   PDB). It has three callers: two in `WindowServer::WndProc` (`0xcb00`) and one in
+   `WindowServer::OnPostResuming` (`0x4cbb0`).
+4. Of the two WndProc sites, `0xd9e6` hardcodes **0** (not visible) for `wParam == 0x101`;
+   `0xd1bf` passes `wParam` through as the visibility flag - that is the real one.
+5. `0xd1b6` (the block containing that call) is entry **15** of the jump table at `0xe08c`, which is
+   selected by the dispatch at `0xce13`: `index = msg - 0x215`, range `<= 0xe6`, byte table at
+   `0xe0e0`. Exactly one message maps to entry 15: **`0x270`**, which is undocumented (not in
+   `winuser.h`) and never sent by Wine.
+
+So the theory was: send `0x270` with `wParam = TRUE` to the CoreWindow and windows.ui raises
+`VisibilityChanged(true)`.
+
+**It does not work.** Two variants were tried in `dlls/wineuwp/main.c`, both with a pristine
+`Solitaire.exe` (no byte patch):
+
+- a single `SendMessageW(hwnd, 0x270, TRUE, 0)` right after `ShowWindow`/`SetForegroundWindow`;
+- the same on a 250 ms timer for 10 s, to cover the window between showing the HWND and the app
+  registering its handler.
+
+In both cases the app's handler still records **zero** hits and the bootflow does not complete. The
+timer variant also pushed `EnterScreen` from ~1.7 s out to ~6.3 s, so it costs startup time for
+nothing. **Both were reverted**; `dlls/wineuwp/main.c` is back to its committed state and
+`wineuwp.dll` rebuilt.
+
+Candidate reasons, untested:
+- the CoreWindow's actual window procedure here may not be `WindowServer::WndProc` (the dispatch
+  above is only reachable if it is);
+- the `0xd1b6` path may require state on the WindowServer that is unset (the sibling path at
+  `0xd9d1` checks bytes at `+0xa10`/`+0x87b`/`+0x87c` before raising anything);
+- the app's platform layer may subscribe to something other than `CoreWindow::VisibilityChanged`
+  (its own slot `+0x1c0` registration was not traced back to a WinRT `add_*` call).
+
+**The cheap next measurement** is to confirm the premise rather than the mechanism: put a `ud2` or a
+trampoline on `WindowServer::OnVisibilityChangedEvent` (`0xbc74`) in `Windows.UI.dll` and see
+whether it is reached at all, with and without the message. That separates "the message never
+dispatches" from "it dispatches but the event goes nowhere", which is the fork the two failed
+variants could not distinguish.
+
+**Trap worth keeping**: `install-overrides.sh` did **not** refresh the prefix's `wineuwp.dll` after
+the rebuild - no `refreshed: stale wineuwp.dll in the prefix` line, and the prefix copy was still
+the 01:23 build while the tree had 22:08 (identical size, different content, so a size check would
+also have missed it). The first test of the fix was therefore meaningless. `cmp` the prefix copy
+against `~/src/wine-build/dlls/wineuwp/x86_64-windows/wineuwp.dll` after every wineuwp rebuild.
