@@ -7924,3 +7924,56 @@ does not". **`StartupSplashScreen` does not override `OnLoaded` at all** - it ha
 vtable in memory and is some other interface's method. Two vtables located from their RTTI are not
 automatically aligned with each other; print both side by side before comparing a slot index. The
 half that survives is that `GenericDialogScreen::OnLoaded` never runs.
+
+## The dialog draws: it was sorted under the splash
+
+Correcting the previous entry's model. `ScreenFile+0x14c/+0x14d` are **not** load state: they are
+bytes copied straight from the `.gui` file's `DESC` header (the archive is a zip of Brotli-compressed
+`YFFI` chunk files). The splash's header ends `01 00 00 00`, the popup's `00 03 00 00`, and the
+ScreenFile constructor's default is `0x301`. Byte 0 means "opaque": the focus pass (`0x8b6000`)
+walks each layer bottom-up and an opaque screen clears the focus list, so only the topmost opaque
+screen and everything above it get focus.
+
+Both screens enter the same layer (flag `0x02`). `EnterScreen` then `stable_sort`s each layer by
+`[[screen+0x38]+0x10]`, a priority on the logic object: **splash 100, popup 0**. So the popup is
+placed *under* the opaque splash, never gets focus, and the per-frame tick never advances an
+unfocused screen - hence no `OnLoaded`, no `ApplyPopupDescription`, nothing drawn. Bootflow ends
+handing next-state 0 to `0x422b74`, which does not request a transition: the app is waiting on this
+dialog.
+
+Diagnostic: making the insertion sort keep push order (`jae`->`jmp` at `0x8b7714` and `0x8b773c`,
+file `0x8b6b14`/`0x8b6b3c`) puts the popup on top. It gains focus, `OnLoaded` and
+`ApplyPopupDescription` run, and the dialog renders completely:
+`docs/screenshots/solitaire-signin-error-dialog.png` - "Sign In Error ... error code 1170000",
+**Try Again** / **Cancel**. Text, fonts, layout and buttons all work. That is the first
+non-splash UI this app has drawn.
+
+That the splash is still up at all is the real anomaly; on Windows something exits it before this
+dialog can appear. Unresolved.
+
+## Input does not reach the game
+
+With the dialog up, clicks and keys do nothing. Probing the `Invoke` of every input delegate while
+clicking and typing:
+
+| delegate | registered by | fired |
+| --- | --- | --- |
+| `CoreWindow.CharacterReceived` (`0x7d8840`) | `XamlDxgiPage` ctor | **4** |
+| `CoreWindow.VisibilityChanged` / `Activated` (shared thunk `0x7cff90`) | `XamlDxgiPage` | **2** |
+| XAML `KeyDown`/`KeyUp` on the page (`0x7d9000`, `0x7d8f20`) | `XamlDxgiPage` ctor | 0 |
+| `PointerPressed/Moved/Released/WheelChanged` (`0x7d9290/9260/9230/91d0`) | worker thread | 0 |
+
+The pointer handlers are registered on a `WorkItemHandler` (`ThreadPool.RunAsync`) worker,
+`0x7d89d0` -> `0x7d89ec` - the `SwapChainPanel.CreateCoreIndependentInputSource` pattern. That
+worker exists and is parked in `windows.ui`'s dispatcher wait (seen in an earlier stack dump:
+`0x7d89dd` -> `0x7d8d41` -> `windows.ui` -> `win32u`), i.e. inside `ProcessEvents`. So the input
+source is created and running; **pointer input is never routed to it.** This is a Wine-side gap -
+Windows feeds an independent input source through the input-site machinery
+(`Windows.UI.Internal.Input.InputSite` and friends, all only semi-stubbed here) - and any
+DX-in-XAML app will hit it, Shapr3D included.
+
+Also worth noting: `VisibilityChanged`/`Activated` *are* delivered now. The `0x7dee64` frame-loop
+patch was justified by `+0x20a` never being set; that should be re-tested.
+
+Tooling this stretch: `tramp.py --val` grew callee-saved registers (`rsi`, `rdi`, `rbp`, `r12`-`r15`);
+`appxverify.py` caught a probe binary left patched by a killed run.

@@ -72,9 +72,16 @@ def value_code(val):
         base, disp = (inner, 0) if cut is None else (inner[:cut], int(inner[cut + 1:], 0))
         derefs.insert(0, disp)
         val = base.strip()
-    if val not in SAVED:
-        raise SystemExit("--val: base must be one of %s" % ", ".join(SAVED))
-    code = b"\x4c\x8b\x53" + bytes([SAVED[val]])                    # mov r10, [rbx+slot]
+    # callee-saved registers are untouched by the prologue, so read them directly
+    DIRECT = {"rsi": b"\x4c\x8b\xd6", "rdi": b"\x4c\x8b\xd7", "rbp": b"\x4c\x8b\xd5",
+              "r12": b"\x4d\x8b\xd4", "r13": b"\x4d\x8b\xd5", "r14": b"\x4d\x8b\xd6",
+              "r15": b"\x4d\x8b\xd7"}
+    if val in DIRECT:
+        code = DIRECT[val]
+    elif val in SAVED:
+        code = b"\x4c\x8b\x53" + bytes([SAVED[val]])                # mov r10, [rbx+slot]
+    else:
+        raise SystemExit("--val: base must be one of %s" % ", ".join(list(SAVED) + list(DIRECT)))
     for d in derefs:
         code += b"\x4d\x8b\x92" + struct.pack("<i", d)              # mov r10, [r10+disp]
     return code

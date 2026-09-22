@@ -421,6 +421,12 @@ idle process, not a hung one.** When every thread is idle and the app has stoppe
 look for the last refusal, not for a blocked stack. Accepting and dropping (`S_OK`) is the right
 answer for a delivery API with nowhere to deliver to.
 
+**A field that looks like runtime state may be file data.** `ScreenFile+0x14c = 0` on the popup
+looked like "load never finished" for a whole stretch. It is byte 0 of the `.gui` file's header -
+the popup is non-opaque by design. When a structure has a parsed-from-disk origin, extract the file
+(Solitaire's archives are zips of Brotli-compressed chunk files) and compare bytes before hunting
+for the code that "should have set" a field.
+
 **Two vtables found from their RTTI are not aligned with each other.** I probed "slot 28" of
 `StartupSplashScreen` and of `GenericDialogScreen` and concluded the splash's `OnLoaded` runs and
 the dialog's does not. The splash **does not override `OnLoaded` at all**, and its vtable is
@@ -761,7 +767,7 @@ the fully-qualified name. `--grep` first, always.
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | **Boots, downloads all CDN content, completes its bootflow and ticks real time.** Wine implements `Windows.Networking.EndpointPair` and `Windows.Networking.Sockets.StreamSocket` (schannel TLS), which the app's own HTTP client is built on. **Still needs the `jne`->`jmp` byte patch at file offset `0x7dee64`.** It stops on the **UserDataFlow sign-in error dialog** (`gui/screenfiles/genericpopup/genericpopup`), shown because there is no Xbox identity - the honest outcome, dismissible on Windows. **The dialog never gains focus, so it never loads:** the per-frame tick only advances the focused screen, the focus loop (`0x8b6000`) requires `[[screen+0x30]+0x14c]` to be non-zero, and that byte is 1 for the splash and 0 for the popup. Finding what sets it is the current front - the only static writers that set it (`0x461134`, `0x4660c0`) never run |
+| Solitaire | **Boots, downloads all CDN content, completes its bootflow, and - with a diagnostic sort patch - draws a real dialog** (`docs/screenshots/solitaire-signin-error-dialog.png`: the Xbox "Sign In Error" with Try Again / Cancel). Still needs the `0x7dee64` frame-loop patch (re-test it: `VisibilityChanged`/`Activated` are now delivered). Two open fronts: (1) the dialog is `stable_sort`ed *under* the opaque splash (priority 0 vs 100) because the splash is never exited - diagnostic patch `jae`->`jmp` at `0x8b7714`/`0x8b773c`; (2) **pointer input never reaches the game**: its `CreateCoreIndependentInputSource` worker is running `ProcessEvents` but no pointer event is ever routed to it, and the page's XAML `KeyDown` never fires either (CoreWindow `CharacterReceived` does). See Findings-M4 |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
