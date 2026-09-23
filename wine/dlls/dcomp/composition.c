@@ -2585,7 +2585,10 @@ static void CALLBACK swapchain_readback_job( PTP_CALLBACK_INSTANCE instance, voi
 
     QueryPerformanceCounter( &rb_start );
     count = surface->readback_target;
-    if (FAILED( IDXGISwapChain_GetBuffer( surface->swapchain, 0, &IID_ID3D11Texture2D, (void **)&texture ) ))
+    /* Prefer our swap chain's snapshot of that frame (see dxgi/compswapchain.c): buffer 0 may
+     * already hold half of the next one. */
+    if (FAILED( IDXGISwapChain_GetBuffer( surface->swapchain, 0x80000000 | (count & 1), &IID_ID3D11Texture2D, (void **)&texture ) ) &&
+        FAILED( IDXGISwapChain_GetBuffer( surface->swapchain, 0, &IID_ID3D11Texture2D, (void **)&texture ) ))
     {
         InterlockedExchange( &surface->readback_busy, 0 );
         return;

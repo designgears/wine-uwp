@@ -12,6 +12,7 @@ add_executable(probe-http probes/probe-http.cpp)
 target_link_libraries(probe-http PRIVATE ole32.lib)
 
 add_executable(probe-resize probes/probe-resize.cpp)
+add_executable(probe-sendmsg probes/probe-sendmsg.cpp)
 
 add_executable(probe-token probes/probe-token.cpp)
 target_link_libraries(probe-token PRIVATE ntdll.lib)

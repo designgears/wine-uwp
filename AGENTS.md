@@ -87,7 +87,9 @@ that were ours; the Calculator tree is no longer involved.
   committed in that tree; and the exporter's file list came from the bogus "not yours" claim
   below, dropping another ~5,000 lines. It captured 2,700 lines and looked complete. If you ever
   find yourself exporting diffs of our own code again, stop.
-- **Byte patches go in `$UWP_BIN/win11/...`**; `run.sh` re-copies into the prefix. Always keep a
+- **Byte patches go in `$UWP_BIN/win11/...`**, but the app loads the prefix copy, and nothing copies it
+  there on a run (`install-overrides.sh` copies only when its stamp changes, some DLLs only if
+  missing). Patch both copies. Always keep a
   backup and verify the restore with `cmp` before moving on. Leaving one behind silently poisons
   every later run - it has happened.
 - **Never patch the last pristine copy of a Windows DLL.** Three DLLs are patched today
@@ -215,6 +217,12 @@ instead.
 - `err:seh:NtRaiseException Unhandled exception code 1007` - the app's own fail-fast handler caught
   it first, so the run ends in a `RaiseFailFastException` unwind instead.
 
+- `err:wineuwp:do_activate Activate failed, hr 0xc000001d` - the probe fired during activation and
+  came back as `STATUS_ILLEGAL_INSTRUCTION`. Some callers go further and swallow the failure
+  entirely: a `ud2` in `WindowServer::Activate` showed no hit at all while that function was
+  running in every good run. **A function whose failure its caller ignores gives a false negative**;
+  trace it instead (return-address logging, a vtable hook).
+
 Which one you get depends on the app, not on the probe. I grepped for only the first and read a
 *fired* probe as a miss; this file previously documented only the second and did the same in
 reverse. `grep -aE "illegal instruction|code 1007"`.
@@ -231,7 +239,8 @@ runtime failure after the patch leaves a `ud2` in the binary. After any probe co
 non-zero, `cmp` the target against its pristine copy before doing anything else. Use distinctive
 helper names (`runprobe`, not `p`/`c`/`r`).
 
-**Patch and restore *every* copy.** `run.sh` copies `$UWP_BIN/win11/...` into the prefix, so a
+**Patch and restore *every* copy.** The app loads `$WINEPREFIX/drive_c/windows/system32/`, not
+`$UWP_BIN/win11/...`: a `ud2` in the win11 copy alone never fires (a control probe caught this). And a
 patch applied to the source is live in `$WINEPREFIX/drive_c/windows/system32/` too - restoring only
 the source leaves the probe in place for every later run. `cmp` both against the backup afterwards.
 
@@ -767,7 +776,7 @@ the fully-qualified name. `--grep` first, always.
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | **Playable**: main menu -> Klondike -> dealt game, and clicks move cards and score (`docs/screenshots/solitaire-klondike-playing.png`). To get there: Cancel the (invisible) Sign In Error popup at about (820,552), click Klondike, then "I know the rules". Still needs the `0x7dee64` frame-loop patch, which makes about half of captures partial frames, so take a burst. Some runs stall at about 5 s. See Findings-M4 |
+| Solitaire | **Playable on the unpatched `Solitaire.exe`** (`docs/screenshots/solitaire-unpatched-menu-game.png`): main menu -> Klondike -> game, and clicks move cards. No exe byte patch is needed any more: `wineuwp` delivers `CoreWindow.VisibilityChanged`. The Sign In Error popup shows on top of the menu; Cancel is at about (813,549). About 1 run in 10 the window stays blank because XAML never draws its first frame (pre-existing; see Findings-M4) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against

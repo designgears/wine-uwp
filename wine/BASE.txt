@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     6f1a405026f97ded343831ab5ce0dd9f178fee21
-                 kernelbase: implement SystemTimeToTzSpecificLocalTimeEx and TzSpecificLocalTimeToSystemTimeEx
+  wine HEAD:     c7cf8b1e72afae7d04a02007190706bdfedb3a1f
+                 wineuwp: deliver CoreWindow.VisibilityChanged; dxgi/dcomp: compositor reads a per-Present snapshot
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-22T21:15:27Z
+  captured:      2026-09-23T00:16:56Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

@@ -17,7 +17,7 @@ STAMP=$WINEPREFIX/.install-overrides.stamp
 # The shim DLLs have to be in the stamp: without them, rebuilding a shim leaves the stamp
 # unchanged, the installer skips itself, and the prefix keeps running the previous build - which
 # looks exactly like the code change having no effect.
-stamp=$( { find "$SRC" "$(dirname "$SRC")/Globalization" -printf '%p %s %T@\n' 2>/dev/null; stat -c '%Y' "$SYS32" "$WINE_BIN/dlls/ntdll/x86_64-windows/ntdll.dll" "$0" "$(dirname "$0")/globalization.reg" 2>/dev/null; stat -c '%n %s %Y' ${UWP_BIN}/build-probes/wineuwp_*.dll 2>/dev/null; echo "${1:-}"; } | md5sum | cut -d' ' -f1 )
+stamp=$( { find "$SRC" "$(dirname "$SRC")/Globalization" -printf '%p %s %T@\n' 2>/dev/null; stat -c '%Y' "$SYS32" "$WINE_BIN/dlls/ntdll/x86_64-windows/ntdll.dll" "$WINE_BIN/dlls/wineuwp/x86_64-windows/wineuwp.dll" "$0" "$(dirname "$0")/globalization.reg" 2>/dev/null; stat -c '%n %s %Y' ${UWP_BIN}/build-probes/wineuwp_*.dll 2>/dev/null; echo "${1:-}"; } | md5sum | cut -d' ' -f1 )
 if [ -z "${WINE_UWP_FORCE_OVERRIDES:-}" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$stamp" ]; then
   echo "overrides unchanged"
   exit 0

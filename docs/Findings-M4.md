@@ -8022,3 +8022,48 @@ Still open:
   undrawn frames.
 - The Sign In Error popup is not visible, but it holds focus until it is dismissed.
 - Some runs still stall at about 5 s after the popup gains focus (the known run variance).
+
+## Solitaire without the `0x7dee64` exe patch (2026-09-22)
+
+**Root cause.** The app turns continuous rendering on (`+0x20a`) from its
+`CoreWindow.VisibilityChanged` handler. The handler is registered through `ICoreWindow` slot 56 =
+`WindowServer::add_VisibilityChanged` (resolved from `[vtbl+0x1c0]` via `tramp.py --val` and the
+Windows.UI PDB). That event is never raised here. On Windows the shell sends the window the
+private message **`0x270`**. `WindowServer::WndProc` passes **lParam** to `OnVisibilityChangedEvent`
+as flags: bit 0 = visible, bit 4 = bail out. It raises the event only when visibility changes.
+
+The attempt recorded earlier failed because it sent the flag in **wParam**. It was measured with
+`probes/probe-sendmsg.cpp`:
+- `0x270, 1, 0` reaches the dispatch block (`ud2` at `0xd1b6` fired), but the handler does not run.
+- `0x270, 0, 1` runs the handler and the queued closure, and the app reaches the main menu.
+
+**Fix (`dlls/wineuwp/main.c`).**
+- `OnActivateWindow` (the app's `Window.Activate()`) posts `WM_WINE_UWP_VISIBLE`. The CoreWindow
+  subclass turns that into `0x270` with lParam 1.
+- The event fires only on a change, so a handler registered after that is never told.
+  `add_VisibilityChanged` (ICoreWindow slot 56, hooked via `GetForCurrentThread` from the subclass
+  proc) therefore posts a hidden -> visible pulse for every later registration.
+
+**Half-drawn frames (`dlls/dxgi/compswapchain.c`, `dlls/dcomp/composition.c`).** Some frames showed
+the backdrop without the cards. dcomp copied the swap chain's buffer 0 on a worker thread some time
+after Present, by which point the app was already drawing the next frame into it.
+- Present now snapshots buffer 0 into `presented[count & 1]` on the app's own context.
+- dcomp asks for that frame's snapshot with the Wine-private `GetBuffer(0x80000000 | count)`.
+
+**Measured.** With an unpatched exe the app reaches the main menu, the popup draws over it, and
+Klondike resumes and plays (`docs/screenshots/solitaire-unpatched-menu-game.png`). Calculator is
+still AE = 0.
+
+**Open: the window stays blank in about 1 run in 10.** App logic carries on (menus and ad timers
+run) but XAML never draws its first frame. `ContentManager::SetContent` sets
+`CJupiterWindow+0x144 = 1`, so `Window.Activate` is deferred (state 2) until
+`CJupiterWindow::NotifyFirstFrameDrawn`. That call never comes, so `ICoreWindow::Activate` and
+`OnActivateWindow` never happen and the CoreWindow gets 2 repaints instead of tens of thousands.
+
+The blank is **not** caused by the visibility work: 1/12 with the new code switched off, 1/12 with
+hooks only, 2/12 fully on (the old build's 0/10 was luck). The log orderings differ between blank
+runs (compositor creation, window-host slot 17), so no single marker has been found yet.
+
+Two false leads to avoid:
+- "dcomp not loaded when `connect_dcomp_target` runs" was a wrong diagnosis; the change was reverted.
+- A `ud2` in `WindowServer::Activate` gave a false negative, because its caller swallows the failure.

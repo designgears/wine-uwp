@@ -46,6 +46,9 @@ struct comp_swapchain
 
     DXGI_SWAP_CHAIN_DESC1 desc;
     ID3D11Texture2D *buffers[DXGI_MAX_SWAP_CHAIN_BUFFERS];
+    /* What the compositor reads: Present copies buffer 0 into presented[count & 1], so a frame is
+     * complete and stays intact while the app draws the next one into buffer 0. */
+    ID3D11Texture2D *presented[2];
     LONG present_count;
     DXGI_MATRIX_3X2_F transform;
     DXGI_RGBA background;
@@ -69,6 +72,11 @@ static void comp_swapchain_release_buffers(struct comp_swapchain *swapchain)
     {
         if (swapchain->buffers[i]) ID3D11Texture2D_Release(swapchain->buffers[i]);
         swapchain->buffers[i] = NULL;
+    }
+    for (i = 0; i < ARRAY_SIZE(swapchain->presented); i++)
+    {
+        if (swapchain->presented[i]) ID3D11Texture2D_Release(swapchain->presented[i]);
+        swapchain->presented[i] = NULL;
     }
 }
 
@@ -94,6 +102,18 @@ static HRESULT comp_swapchain_create_buffers(struct comp_swapchain *swapchain)
         if (FAILED(hr = ID3D11Device_CreateTexture2D(swapchain->d3d_device, &desc, NULL, &swapchain->buffers[i])))
         {
             WARN("Failed to create buffer %u, hr %#lx.\n", i, hr);
+            comp_swapchain_release_buffers(swapchain);
+            return hr;
+        }
+    }
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    for (i = 0; i < ARRAY_SIZE(swapchain->presented); i++)
+    {
+        if (FAILED(hr = ID3D11Device_CreateTexture2D(swapchain->d3d_device, &desc, NULL, &swapchain->presented[i])))
+        {
+            WARN("Failed to create presented copy %u, hr %#lx.\n", i, hr);
             comp_swapchain_release_buffers(swapchain);
             return hr;
         }
@@ -206,10 +226,22 @@ static HRESULT comp_swapchain_present(struct comp_swapchain *swapchain, UINT syn
     }
     if (flags & DXGI_PRESENT_TEST) return S_OK;
 
-    /* Make sure the frame is finished before the compositor copies it. */
+    /* Snapshot the frame for the compositor, in order on the app's own context, and make sure
+     * it is finished before the compositor copies it. The compositor reads buffer 0 on its own
+     * thread some time later; reading it directly showed frames the app was halfway through
+     * drawing (Solitaire's backdrop without its cards). */
     {
         ID3D11DeviceContext *context;
+        ID3D11Texture2D *dst = swapchain->presented[(swapchain->present_count + 1) & 1];
         ID3D11Device_GetImmediateContext(swapchain->d3d_device, &context);
+        if (dst && swapchain->buffers[0])
+        {
+            if (swapchain->desc.SampleDesc.Count > 1)
+                ID3D11DeviceContext_ResolveSubresource(context, (ID3D11Resource *)dst, 0,
+                        (ID3D11Resource *)swapchain->buffers[0], 0, swapchain->desc.Format);
+            else
+                ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)dst, (ID3D11Resource *)swapchain->buffers[0]);
+        }
         ID3D11DeviceContext_Flush(context);
         ID3D11DeviceContext_Release(context);
     }
@@ -246,6 +278,13 @@ static HRESULT STDMETHODCALLTYPE comp_swapchain_GetBuffer(IDXGISwapChain4 *iface
 
     TRACE("iface %p, buffer_idx %u, riid %s, surface %p.\n", iface, buffer_idx, debugstr_guid(riid), surface);
 
+    /* Wine-private, for dcomp: 0x80000000 | present count asks for the snapshot of that frame. */
+    if (buffer_idx & 0x80000000)
+    {
+        ID3D11Texture2D *texture = swapchain->presented[buffer_idx & 1];
+        if (!texture) return DXGI_ERROR_INVALID_CALL;
+        return ID3D11Texture2D_QueryInterface(texture, riid, surface);
+    }
     if (buffer_idx >= swapchain->desc.BufferCount || !swapchain->buffers[buffer_idx])
     {
         WARN("Invalid buffer index %u.\n", buffer_idx);

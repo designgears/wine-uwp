@@ -351,6 +351,8 @@ struct foundation_rect { FLOAT x, y, width, height; };
 /* The hosted CoreWindow, once shown. The view bounds reported to windows.ui follow its client
  * area, so the window can be resized through the normal frame it is given. */
 static HWND hosted_core_window;
+/* posted to the CoreWindow to report it visible; see core_window_subclass_proc */
+#define WM_WINE_UWP_VISIBLE (WM_APP + 0x270)
 /* WINE_UWP_WINDOW_SIZE=WxH overrides the launch size (a window that covers the whole screen is not
  * resizable through the frame, which matters on small test displays). */
 static void launch_window_size( int *width, int *height )
@@ -1041,8 +1043,73 @@ static BOOL CALLBACK show_core_window( HWND hwnd, LPARAM param )
  * XAML draws on its commits. After an expose the window stayed black until the next commit, so
  * repaint from dcomp's back buffer here. */
 static WNDPROC core_window_proc_orig;
+
+/* On Windows the shell tells the window server its window is visible with the private message
+ * 0x270: WindowServer::WndProc passes lParam to OnVisibilityChangedEvent as flags, bit 0 =
+ * visible, and CoreWindow.VisibilityChanged is raised only when that changes. Nothing sends it
+ * here, so an app that renders only while visible - Solitaire turns continuous rendering on from
+ * that event - sits on its first frame forever. (An earlier attempt put the flag in wParam.)
+ *
+ * The shell shows the window after the app has subscribed; here the window is shown before the
+ * app's own startup has run, and a handler added after the one change is never told. So
+ * add_VisibilityChanged is hooked, and every registration made after the window was shown gets a
+ * hidden -> visible pulse, which the window server delivers to all subscribers. */
+static BOOL core_window_visible;
+static HRESULT (WINAPI *add_visibility_changed_orig)( void *, void *, INT64 * );
+
+static HRESULT WINAPI add_visibility_changed_hook( void *iface, void *handler, INT64 *token )
+{
+    HRESULT hr = add_visibility_changed_orig( iface, handler, token );
+
+    TRACE( "add_VisibilityChanged %p -> %#lx, visible %d\n", handler, hr, core_window_visible );
+    if (SUCCEEDED( hr ) && core_window_visible && hosted_core_window)
+        PostMessageW( hosted_core_window, WM_WINE_UWP_VISIBLE, 0, 0 );
+    return hr;
+}
+
+/* Runs on the CoreWindow's thread, which is the only place GetForCurrentThread answers. */
+static void hook_add_visibility_changed( void )
+{
+    static const WCHAR name_str[] = L"Windows.UI.Core.CoreWindow";
+    struct statics_vtbl { HRESULT (WINAPI *slot[7])( void *, ... ); } **statics = NULL;
+    void ***window = NULL, **slot;
+    HSTRING_HEADER header;
+    HSTRING name;
+    HMODULE module;
+    DWORD old;
+
+    if (add_visibility_changed_orig) return;
+    if (FAILED( WindowsCreateStringReference( name_str, ARRAY_SIZE(name_str) - 1, &header, &name ) )) return;
+    if (FAILED( RoGetActivationFactory( name, &IID_ICoreWindowStatic, (void **)&statics ) ) || !statics) return;
+    (*statics)->slot[6]( statics, &window );    /* GetForCurrentThread */
+    IUnknown_Release( (IUnknown *)statics );
+    if (!window) return;
+    /* ICoreWindow slot 56 is add_VisibilityChanged; refuse anything that is not windows.ui code */
+    slot = &(*window)[56];
+    if (GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (const WCHAR *)*slot, &module ) &&
+        module == GetModuleHandleW( L"windows.ui.dll" ) &&
+        VirtualProtect( slot, sizeof(*slot), PAGE_READWRITE, &old ))
+    {
+        add_visibility_changed_orig = *slot;
+        *slot = add_visibility_changed_hook;
+        VirtualProtect( slot, sizeof(*slot), old, &old );
+        TRACE( "hooked add_VisibilityChanged at %p\n", add_visibility_changed_orig );
+    }
+    else WARN( "not hooking add_VisibilityChanged: slot %p does not point into windows.ui\n", *slot );
+    IUnknown_Release( (IUnknown *)window );
+}
+
 static LRESULT CALLBACK core_window_subclass_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
 {
+    hook_add_visibility_changed();
+    if (msg == WM_WINE_UWP_VISIBLE)
+    {
+        TRACE( "visibility %s\n", core_window_visible ? "pulse" : "on" );
+        if (core_window_visible) CallWindowProcW( core_window_proc_orig, hwnd, 0x270, 0, 0 );
+        core_window_visible = TRUE;
+        return CallWindowProcW( core_window_proc_orig, hwnd, 0x270, 0, 1 );
+    }
     if (msg == WM_PAINT)
     {
         typedef void (WINAPI *repaint_t)( HWND hwnd, const RECT *rect );
@@ -2550,14 +2617,18 @@ static DWORD view_activated_tick;   /* GetTickCount() of the app's Window.Activa
 
 static HRESULT WINAPI nav_OnActivateWindow( void *iface, void *window )
 {
-    TRACE( "%s: core window %p\n", "OnActivateWindow", window );
+    TRACE( "%s: core window %p, caller %p\n", "OnActivateWindow", window, __builtin_return_address( 0 ) );
     if (!view_activated_tick) view_activated_tick = GetTickCount() | 1;
     /* The app's Window.Activate(): on Windows the shell activates the CoreWindow now, and the
      * window's keyboard-cue state is initialised at that point. The host shows the window earlier
      * (before XAML subclasses it), so re-initialise here: XAML reads the resulting
      * WM_UPDATEUISTATE to decide whether focus visuals should be drawn. */
     if (hosted_core_window)
+    {
         SendMessageW( hosted_core_window, WM_CHANGEUISTATE, MAKEWPARAM( UIS_INITIALIZE, 0 ), 0 );
+        /* ...and the shell reports it visible; see WM_WINE_UWP_VISIBLE */
+        PostMessageW( hosted_core_window, WM_WINE_UWP_VISIBLE, 0, 0 );
+    }
     return S_OK;
 }
 
