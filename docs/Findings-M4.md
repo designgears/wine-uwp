@@ -8067,3 +8067,74 @@ runs (compositor creation, window-host slot 17), so no single marker has been fo
 Two false leads to avoid:
 - "dcomp not loaded when `connect_dcomp_target` runs" was a wrong diagnosis; the change was reverted.
 - A `ud2` in `WindowServer::Activate` gave a false negative, because its caller swallows the failure.
+
+## The blank-window flake: three bugs, one real cause (2026-09-22)
+
+About 1 Solitaire run in 10 put up a window that stayed black while the app kept running (menus,
+ad timers). In those runs XAML never drew its first frame. `ContentManager::SetContent` sets
+`CJupiterWindow+0x144 = 1`, so `Window.Activate` was deferred until
+`CJupiterWindow::NotifyFirstFrameDrawn`, which never came. That meant no `ICoreWindow::Activate`, no
+`OnActivateWindow`, and 2 CoreWindow repaints instead of ~50,000. The blank run's UI thread matched
+a good run line for line, except that XAML never ran a layout tick (`fixme:msg:LayoutCompleted` is
+missing).
+
+**Bug 1 (real, but not the cause): the CoreMessaging timer patch kept its data inside wil's
+globals.** The cave's due-now mailbox at `+0x10d000` is `wil RecordLog::s_cErrorCount`, and its
+counters sit on the neighbouring wil counters. The UI thread id at `+0x10d010`, which `wineuwp`
+writes, is `s_pfnRtlDllShutdownInProgress`, a cached function pointer. The pristine code does
+`lock xadd` on the first and caches a pointer in the second, so each side overwrote the other.
+- **Data moved** to `HotPatchSpareGlobals` (`+0x10dee0`), which is reserved for exactly this.
+  `wineuwp` now writes the thread id to `+0x10dee4`.
+- **The single slot**, which a second due-now timer silently overwrote, is now a spin-locked
+  32-entry ring (`/tmp/cm/ring2.s`, at cave `0xd4ab0`).
+
+**Bug 2 (real, but not the cause): message timers with a delay never fired.** The patch queued
+only due-now timers (`rbp == 0` at `SetRelative`). Every other timer arms a waitable timer at
+`Timeout+0x38` that nothing waits on.
+- The ring now takes every armed timer, once each.
+- Each drain fires an entry if `WaitForSingleObject(timer, 0)` says it is signalled, drops it if its
+  armed flag `+0x60` has been cleared, and requeues it otherwise. (Reverted; see below.)
+
+`WINE_UWP_CM_STATS=1` logs the ring counters. A good run went 3 → 85 → 160 → 222 → 346 → 470; the
+old patch saw 38 and stopped.
+
+**Bug 3 (real; thought to be the cause, it is not): dcomp kept only one XAML partner callback.** XAML calls
+`CreateInteropDevice` twice, from its background init thread and from the UI thread, in either
+order, each with its own `DCompInteropCompositorPartnerCallback`. `partner_callback` was a single
+global, so the later registration replaced the earlier one. When the background device registered
+second, the UI thread's scheduler never received `NotifyDirty`, never scheduled a tick, and never
+drew. The ring counters showed it: the blank run's timers stopped at 38, with nothing armed and
+nothing dropped. The fix keeps every callback and notifies them all.
+
+Measured (blank / crash out of 30 unless noted):
+- Before any of this: 2/20, 4/30, 2/30 blank.
+- Due-now ring: 1 in 23. Ring plus the dcomp fix: 2/30.
+- **All-delays ring (bug 2's fix): 2 crashes** in CoreMessaging, through the drain cave into
+  `TimeoutManager::OnTimerSignaled`, so firing delayed timers - and other threads' timers - on the
+  UI thread is not safe. Refcounting the queued `Timeout` (`+0x10`, `ReleaseNotFrozen` `0x27330`)
+  did not make it safe either, and restricting the ring to UI-thread timers left **Calculator** on
+  its splash (it depends on other threads' due-now timers being drained). **Bug 2's fix was
+  reverted.** The shipped ring queues due-now timers only, as the original patch did: 1/30 blank,
+  0 crashes.
+
+**So "bug 3, the cause" above was wrong too; the dcomp change stays because it is correct, not
+because it fixed this.** The blank runs all share one signature: the app stops at ~1.4 s, right
+after `PlayFab Logged in`, and XAML still runs `LayoutCompleted`. Its frame loop needs the
+visibility event, which arrives from `OnActivateWindow`, which XAML defers until its first frame.
+
+**What fixed it:** a 3 s one-shot `SetTimer` on the CoreWindow, set when `wineuwp` shows it. Its
+handler reports the window visible if `Window.Activate()` has not arrived by then. **60/60 runs
+clean afterwards, and the fallback path never fired once** (it logs at ERR). So the cure is the
+timer's own `WM_TIMER`, which wakes the UI thread's message loop once. That is the measurement,
+not an explanation: which wait the wake-up breaks is not known yet.
+
+The CoreMessaging ring is in `patches/coremessaging/` (`timer-ring.s` plus
+`apply-timer-ring.sh`, which rebuilds the patched DLL byte for byte from `.bak-mailbox`).
+`WINE_UWP_CM_STATS=1` logs its counters.
+
+Tooling traps from this hunt:
+- **A long background batch keeps running after you stop watching it.** Two rebuilds and one
+  byte patch landed under a live batch, and the "Calculator regression" captured Solitaire.
+  Kill the batch before changing anything it uses.
+- **Stack dumping hides the pre-bootflow stall entirely** (0/46 with `WINE_UWP_DUMP_STACKS`).
+  The stall is a separate, rare race, 1 in ~76 runs.

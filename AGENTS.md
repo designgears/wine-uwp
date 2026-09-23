@@ -92,6 +92,10 @@ that were ours; the Calculator tree is no longer involved.
   missing). Patch both copies. Always keep a
   backup and verify the restore with `cmp` before moving on. Leaving one behind silently poisons
   every later run - it has happened.
+- **A byte patch's "free BSS" may not be free.** The CoreMessaging timer patch kept its mailbox
+  and a thread id at `+0x10d000..+0x10d010`, which are wil's error counters and a cached function
+  pointer, so the two overwrote each other. Look an address up in the PDB `.syms` before claiming it.
+  `HotPatchSpareGlobals` is the space Microsoft reserves for exactly this.
 - **Never patch the last pristine copy of a Windows DLL.** Three DLLs are patched today
   (`CoreMessaging.dll`, `Windows.UI.dll`, `Windows.UI.Xaml.dll`, all 26100.8972); their originals are
   kept as `<name>.pristine-26100.8972` and **cannot be re-obtained** - the tree is a mix of builds,
@@ -776,7 +780,7 @@ the fully-qualified name. `--grep` first, always.
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
-| Solitaire | **Playable on the unpatched `Solitaire.exe`** (`docs/screenshots/solitaire-unpatched-menu-game.png`): main menu -> Klondike -> game, and clicks move cards. No exe byte patch is needed any more: `wineuwp` delivers `CoreWindow.VisibilityChanged`. The Sign In Error popup shows on top of the menu; Cancel is at about (813,549). About 1 run in 10 the window stays blank because XAML never draws its first frame (pre-existing; see Findings-M4) |
+| Solitaire | **Playable on the unpatched `Solitaire.exe`** (`docs/screenshots/solitaire-unpatched-menu-game.png`): main menu -> Klondike -> game, and clicks move cards. No exe byte patch is needed any more: `wineuwp` delivers `CoreWindow.VisibilityChanged`. The Sign In Error popup shows on top of the menu; Cancel is at about (813,549). The old ~1-in-10 blank window is fixed (60/60 clean) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against

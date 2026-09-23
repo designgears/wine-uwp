@@ -980,19 +980,44 @@ static void arm_twinapi_breaks(void)
  * through one static slot that every dispatcher's DrainSignaledWaits used to take: when the main
  * thread's dispatcher got there first, the timer's dispatch item was activated on the wrong
  * dispatcher and XAML's tick never ran (about one click in five). The dequeue now only runs on the
- * thread whose id wineuwp stores at CoreMessaging+0x10d010 (BSS, next to the slot at +0x10d000);
- * zero means "any thread", which covers startup before the view thread exists. See
- * docs/LinuxPort/Findings-M4.md, "the lost-tick race". */
+ * thread whose id wineuwp stores at CoreMessaging+0x10dee4, in HotPatchSpareGlobals, where the
+ * patch also keeps a 16-entry ring of due-now timers; zero means "any thread", which covers startup
+ * before the view thread exists. Both used to live at +0x10d000..+0x10d010, which is not free BSS:
+ * it is wil's error counters and its cached s_pfnRtlDllShutdownInProgress. When CoreMessaging
+ * cached that pointer after this wrote the thread id, no thread ever matched, no timer was ever
+ * drained again, and XAML's window stayed blank - about one Solitaire run in ten. See
+ * docs/Findings-M4.md, "the lost-tick race" and "the mailbox was wil's globals". */
+/* WINE_UWP_CM_STATS=1: log the patched CoreMessaging timer ring's counters every 2 s. */
+static DWORD WINAPI cm_stats_thread( void *arg )
+{
+    const BYTE *g = (const BYTE *)arg + 0x10dee0;
+    int i;
+
+    for (i = 0; i < 20; i++)
+    {
+        ERR( "cm ring: tid %lx head %lu tail %lu enq %lu deq %lu drop %lu\n", *(const DWORD *)(g + 4),
+             *(const DWORD *)(g + 8), *(const DWORD *)(g + 12), *(const DWORD *)(g + 16),
+             *(const DWORD *)(g + 20), *(const DWORD *)(g + 24) );
+        Sleep( 2000 );
+    }
+    return 0;
+}
+
 static void publish_ui_thread_to_coremessaging( void )
 {
     HMODULE cm = GetModuleHandleW( L"coremessaging.dll" );
     DWORD old;
 
     if (!cm) return;
-    if (!VirtualProtect( (char *)cm + 0x10d010, sizeof(DWORD), PAGE_READWRITE, &old )) return;
-    *(DWORD *)((char *)cm + 0x10d010) = GetCurrentThreadId();
-    VirtualProtect( (char *)cm + 0x10d010, sizeof(DWORD), old, &old );
+    if (!VirtualProtect( (char *)cm + 0x10dee4, sizeof(DWORD), PAGE_READWRITE, &old )) return;
+    *(DWORD *)((char *)cm + 0x10dee4) = GetCurrentThreadId();
+    VirtualProtect( (char *)cm + 0x10dee4, sizeof(DWORD), old, &old );
     TRACE( "CoreMessaging timer drain bound to thread %lx\n", GetCurrentThreadId() );
+    if (GetEnvironmentVariableW( L"WINE_UWP_CM_STATS", NULL, 0 ))
+    {
+        static LONG started;
+        if (!InterlockedExchange( &started, 1 )) CloseHandle( CreateThread( NULL, 0, cm_stats_thread, cm, 0, NULL ) );
+    }
 }
 
 /* The shell shows an activated app's CoreWindow on Windows: the app itself only calls
@@ -1032,6 +1057,7 @@ static BOOL CALLBACK show_core_window( HWND hwnd, LPARAM param )
         }
         ShowWindow( hwnd, SW_SHOW );
         SetForegroundWindow( hwnd );
+        SetTimer( hwnd, WM_WINE_UWP_VISIBLE, 3000, NULL );   /* see core_window_subclass_proc */
 
         *(HWND *)param = hwnd;
         return FALSE;
@@ -1103,6 +1129,19 @@ static void hook_add_visibility_changed( void )
 static LRESULT CALLBACK core_window_subclass_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
 {
     hook_add_visibility_changed();
+    if (msg == WM_TIMER && wparam == WM_WINE_UWP_VISIBLE)
+    {
+        /* Fallback: the window has been up for a while and the app's Window.Activate() has not
+         * reached us (XAML defers it until its first frame, and the app may be waiting to be told
+         * it is visible before it draws that frame). Report it visible anyway. */
+        KillTimer( hwnd, WM_WINE_UWP_VISIBLE );
+        if (!core_window_visible)
+        {
+            ERR( "no Window.Activate() %u ms after showing %p; reporting it visible\n", 3000, hwnd );
+            PostMessageW( hwnd, WM_WINE_UWP_VISIBLE, 0, 0 );
+        }
+        return 0;
+    }
     if (msg == WM_WINE_UWP_VISIBLE)
     {
         TRACE( "visibility %s\n", core_window_visible ? "pulse" : "on" );

@@ -5850,15 +5850,45 @@ static HRESULT get_probe( struct compositor *owner, REFIID iid, void **out )
 /* {22118adf-...} slot 6 */
 /* XAML's partner callback (DCompInteropCompositorPartnerCallback: 3 NotifyDirty, 4 NotifyDeferralState). XAML
  * only schedules another frame when the compositor tells it that composition became dirty. */
-static IUnknown *partner_callback;
+/* XAML creates more than one interop device - one from its background init thread and one on the
+ * UI thread, in either order - each with its own callback. Keeping only the last one registered
+ * meant that, when the background device registered second, the UI thread's scheduler was never
+ * told the scene was dirty, never scheduled a frame, and the window stayed blank (about one
+ * Solitaire run in ten). So keep them all and tell them all. */
+static IUnknown *partner_callbacks[8];
+static unsigned int partner_callback_count;
+static CRITICAL_SECTION partner_callback_cs = { NULL, -1, 0, 0, 0, 0 };
+
+static void add_partner_callback( IUnknown *callback )
+{
+    unsigned int i;
+
+    EnterCriticalSection( &partner_callback_cs );
+    for (i = 0; i < partner_callback_count; i++) if (partner_callbacks[i] == callback) break;
+    if (i == partner_callback_count && i < ARRAY_SIZE(partner_callbacks))
+    {
+        IUnknown_AddRef( callback );
+        partner_callbacks[partner_callback_count++] = callback;
+    }
+    else if (i == ARRAY_SIZE(partner_callbacks)) WARN( "too many partner callbacks, dropping %p\n", callback );
+    LeaveCriticalSection( &partner_callback_cs );
+}
 
 static void notify_partner_dirty( void )
 {
-    IUnknown *callback = partner_callback;
+    IUnknown *callbacks[ARRAY_SIZE(partner_callbacks)];
+    unsigned int i, count;
 
-    if (!callback) return;
-    TRACE( "NotifyDirty on partner callback %p.\n", callback );
-    ((HRESULT (WINAPI *)(IUnknown *))(*(void ***)callback)[3])( callback );
+    EnterCriticalSection( &partner_callback_cs );
+    count = partner_callback_count;
+    for (i = 0; i < count; i++) IUnknown_AddRef( (callbacks[i] = partner_callbacks[i]) );
+    LeaveCriticalSection( &partner_callback_cs );
+    for (i = 0; i < count; i++)
+    {
+        TRACE( "NotifyDirty on partner callback %p.\n", callbacks[i] );
+        ((HRESULT (WINAPI *)(IUnknown *))(*(void ***)callbacks[i])[3])( callbacks[i] );
+        IUnknown_Release( callbacks[i] );
+    }
 }
 
 /* XAML's DCompTreeHost::CreateWinRTInteropCompositionDevice passes NULL for the device and its
@@ -5871,12 +5901,7 @@ static HRESULT WINAPI compositor_factory_CreateInteropDevice( void *iface, IUnkn
 
     if (!out) return E_POINTER;
     remember_rendering_device( rendering_device );
-    if (callback)
-    {
-        IUnknown_AddRef( callback );
-        if ((callback = InterlockedExchangePointer( (void **)&partner_callback, callback )))
-            IUnknown_Release( callback );
-    }
+    if (callback) add_partner_callback( callback );
     return create_compositor( iid, out );
 }
 

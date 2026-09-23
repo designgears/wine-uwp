@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     c7cf8b1e72afae7d04a02007190706bdfedb3a1f
-                 wineuwp: deliver CoreWindow.VisibilityChanged; dxgi/dcomp: compositor reads a per-Present snapshot
+  wine HEAD:     fcb20cd6ffa6a4be00ded790b4a3982e0449b7b3
+                 wineuwp: CoreMessaging timer data in HotPatchSpareGlobals, visibility fallback timer; dcomp: keep every partner callback
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-23T00:16:56Z
+  captured:      2026-09-23T07:44:25Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
