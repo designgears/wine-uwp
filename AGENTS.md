@@ -193,6 +193,7 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | Why is an app stuck, when the stack dumper cannot say? | `WINE_UWP_PROFILE=<prefix> WINE_UWP_PROFILE_MS=10` - a sampling profiler already in `wineuwp`. Writes `<prefix>.<pid>` every 2 s: an `M` line per module then `S <tid> <rip> <count> <4 callers>`. It **found the waiting thread's loop when `WINE_UWP_DUMP_STACKS` returned nothing useful**, and it distinguishes *blocked* from *spinning*, which no single stack snapshot can |
 | What is every thread actually doing? | `WINE_UWP_DUMP_STACKS=<seconds>` - suspends and unwinds every thread, prints `STACK tid N frame M rip=`. Works on an *idle* app, not just a hung one. Resolve against `/proc/<pid>/maps` from the same run |
 | Method count of a private interface | parse the MIDL proxy/stub DLL, below |
+| A parameterised IID over `String`/`Object`/`Int32` | `./piid.py` does **not** know base types: `IVector<String>` silently hashes `String` as a type *name* and prints a wrong IID. Use `--signature` with `string`, `i4`, `cinterface(IInspectable)`: `pinterface({913337e9-11a1-4345-a3a2-4e7f956e222d};string)` gives `98b9acc1-...`, the known `IVector<String>` - check a control like that first |
 | Did this code path run, without ending the run? | `./tramp.py <exe> <rva> <nbytes> 'MSG' [cave] [--applog]` - a jmp to a code cave that logs and jumps back, so one run answers several questions. It appends its own RWX `.tramp` section, refuses a displacement that splits an instruction, and relocates displaced rip-relative operands |
 | What is the value of a register or field at that point? | `./tramp.py ... --val=rcx` / `--val=[rcx+0x30]` / `--val=[[rcx+0x30]+0x14c]` - formats it as hex through `OutputDebugStringA`; read it with `WINEDEBUG=warn+seh` |
 | Where is this class's vtable, with no symbols? | `./rtti.py <exe> '<name substring>'` - walks the MSVC type descriptors and prints the vtable and its slots |
@@ -600,6 +601,15 @@ timestamp. `install-overrides.sh` now asserts the shim classes again after the p
   wineserver's memory until a flush - so the first verifier reported a false failure for a shim it
   had just installed correctly. Ask `wine reg query` first, fall back to the file, and loop.
 
+**And the retry loop itself had a bug that made every *new* shim fail its first run.**
+`reassert_activatable` declared `local cls="$1" ... key="...\\$cls"` in one statement; in bash the
+`$cls` inside that same `local` still expands to the *caller's* `cls`. So each reassert wrote to
+whatever class an earlier loop had left there (`ActivatableClassId\PackageUser`), the verifier
+kept reading the untouched Z:-path value, and the run logged `shim registration did not stick`.
+It "fixed itself" on the next run only because the verify loop sets the caller's `cls` to the
+right class before calling. Certificate, FileSavePicker and FolderPicker each lost a run to it.
+Never refer to a variable declared in the same `local`/`export` statement.
+
 **Do not force `wineboot -u` to settle the prefix.** It starts a fresh `services.exe`/`explorer.exe`
 set on every launch, and those leftovers are exactly what run.sh warns break the activation race.
 `wineserver -w` plus a retry loop is enough.
@@ -771,6 +781,17 @@ the fully-qualified name. `--grep` first, always.
 
 ## Environment facts worth knowing
 
+- **A bare `wine` is the *system* Wine (11.17 in `/usr/bin`), not ours - and running it on our
+  prefix rewrites it.** `env.sh` exports `WINE_BUILD`/`WINE_BIN_DIR` but does **not** put the build
+  on `PATH` (`run.sh` does that itself), and `WINE_BIN` is empty, so `${WINE_BIN}wine` outside
+  `run.sh` is `/usr/bin/wine`. The system Wine sees a foreign `.update-timestamp`, runs a prefix
+  update and copies *its* builtins into `system32` - a DPAPI probe then hit the old
+  `NCryptCreateProtectionDescriptor` stub from `/usr/lib/wine` although the build tree had the
+  implementation. Its symptoms: `version mismatch 964/961` against a running wineserver, and
+  `setupapi:create_dest_file failed to create ... icu.dll` during a `wine reg query`. Always
+  `export PATH="$WINE_BUILD:$PATH"` first, and check `which wine`. Our Wine redoes the update on its
+  next start, which is what repairs it; the native byte-patched DLLs are not touched by either.
+
 - `winedbg` crashes on startup in this build, `gdb` cannot attach (`/proc/sys/kernel/yama/ptrace_scope`
   is 1, and changing it is a system-wide setting - do not do it unasked), and `eu-stack` returns
   nothing useful for Wine threads. **Locate crashes by mapping the fault address from a `+loaddll`
@@ -801,7 +822,7 @@ the fully-qualified name. `--grep` first, always.
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
 | Solitaire | **Playable on the unpatched `Solitaire.exe`** (`docs/screenshots/solitaire-unpatched-menu-game.png`): main menu -> Klondike -> game, and clicks move cards. No exe byte patch is needed any more: `wineuwp` delivers `CoreWindow.VisibilityChanged`. The Sign In Error popup shows on top of the menu; Cancel is at about (813,549). The old ~1-in-10 blank window is fixed (60/60 clean) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
-| Shapr3D | **Welcome page renders and is interactive** (`docs/screenshots/shapr3d-welcome-page.png`); **Log In** hands the PKCE URL to the Launcher shim and shows "Go to browser to complete login". **Protocol activation works**: `./activate-uri.sh shapr3d:...` raises `OnActivated` in the running app, which then exchanges the code. The web sign-in has a reCAPTCHA, so a human finishes it with `./browser-callback.sh shapr3d` (run with `WINE_UWP_LAUNCHER=log`). Past sign-in is unexplored. Findings-M4, 2026-09-23 |
+| Shapr3D | **Signs in and reaches its dashboard** (`docs/screenshots/shapr3d-dashboard-signed-in.png`). Log In -> `./browser-callback.sh shapr3d` (a human solves the reCAPTCHA; run the app with `WINE_UWP_LAUNCHER=log`) -> the callback is exchanged for a session. The session is **not persisted** (ApplicationData is in-memory), so every start needs a fresh sign-in. Tile thumbnails mostly draw blank. Findings-M4, "Signed in" |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
 them. **Testing that, and making them the default if it holds, is a standing job** - they change the

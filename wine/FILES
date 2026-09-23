@@ -240,3 +240,15 @@ dlls/ntdll/unix/system.c
 dlls/ntdll/unix/thread.c
 dlls/windows.storage/filestream.c
 dlls/windows.media/codecquery.c
+dlls/iertutil/decoder.c
+dlls/ncrypt/protect.c
+include/ncryptprotect.h
+dlls/iertutil/Makefile.in
+dlls/iertutil/private.h
+dlls/ncrypt/Makefile.in
+dlls/ncrypt/ncrypt.spec
+dlls/windows.storage.applicationdata/main.c
+dlls/wininet/internet.c
+include/Makefile.in
+include/ncrypt.h
+include/wininet.h

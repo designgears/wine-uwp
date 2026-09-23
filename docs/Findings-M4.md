@@ -8341,3 +8341,60 @@ activation of that process, which is what Windows' shell does.
   `activate-uri.sh`.
 
 Regression: Calculator AE 0, Feedback Hub 822 colours / 0 fail-fasts.
+
+### Signed in: Shapr3D reaches its dashboard (2026-09-23)
+
+`docs/screenshots/shapr3d-dashboard-signed-in.png`: the signed-in "Get Started" page with the
+account's team, Projects and Spaces in the sidebar. Nine blockers stood between the code exchange
+and that page, each found from the one before; in order:
+
+1. **Every HTTPS request made through `Windows.Web.Http` was dropped, silently.** At
+   `INTERNET_STATUS_SENDING_REQUEST` it wraps the server certificate in a
+   `Windows.Security.Cryptography.Certificates.Certificate` (`CertificateHelper::ParseCertificateInformation`
+   -> `ICertificateFactory::CreateCertificate`). That class is in `certenroll.dll`, which this
+   Windows image does not have, so activation failed and the client closed the WinINet handle with
+   no error originated anywhere. The WinINet trace was what showed it: `HTTPREQ_QueryOption
+   SERVER_CERT_CHAIN_CONTEXT`, the activation failure, `InternetCloseHandle`. New
+   `shims/certificate`: a real `Certificate` over crypt32 (subject, issuer, validity, serial,
+   hashes, blob); chain building and EKUs are traced `E_NOTIMPL`.
+2. **`INTERNET_OPTION_HTTP_PROTOCOL_USED` (149)** was a WinINet stub; `Windows.Web.Http` asks it on
+   every response and failed the request *after* the server had answered 200. Now answered on any
+   handle as HTTP/1.x. (Options 148, 128, 142/155/159/169/193 and `MAX_CONNS_PER_SERVER` on a
+   handle, plus `api-ms-win-net-isolation-l1-1-1`, were the earlier part of the same chase.)
+3. **The callback was reported as a Share.** `wineuwp`'s `get_Kind` said Protocol was 2 and File 1;
+   they are 4 and 3 (2 is ShareTarget, 1 is Search). The app asked the args for
+   `IShareTargetActivatedEventArgs`, got `E_NOINTERFACE`, and dropped the callback without a
+   trace. `PreviousExecutionState` is now `Running` for an activation into the live instance.
+   The tell, in hindsight, was the `args_QueryInterface ... {4bdaf9c8-...}` FIXME.
+4. **`WwwFormUrlDecoder`** - `iertutil` returned its Uri factory for every class name, so
+   `new WwwFormUrlDecoder(query)` threw `InvalidCastException`. Implemented (`dlls/iertutil/decoder.c`),
+   and `Uri.QueryParsed` uses it. Only then did the exchange go out:
+   `GET /user-management/auth/app/<id>?code=...&code_verifier=...` -> 200.
+5. **`ApplicationDataCompositeValue`** was not implemented; the app stores its session in one,
+   and the failure became a "Login failed" dialog straight after the 200. Added as the settings
+   wrapper over a PropertySet under its own class name. **In memory only**, like the rest of
+   ApplicationData here - a restart signs you out.
+6. **DPAPI-NG** - `DataProtectionProvider` (native CryptoWinRT) calls
+   `NCryptCreateProtectionDescriptor`, a `@ stub`, which fail-fasted the app. Implemented the
+   descriptor, `NCryptProtectSecret`/`UnprotectSecret` and the stream functions over
+   `CryptProtectData` (`dlls/ncrypt/protect.c`, `include/ncryptprotect.h`);
+   `probes/probe-dpapi.cpp` round-trips a secret and rejects a tampered blob.
+7. **`FileSavePicker`** and 8. **`FolderPicker`** - the dashboard's `Exporter` constructs both, and
+   the native ones (twinui.appcore) fail in their constructors without the shell broker. Added to
+   `shims/filepicker`: real properties and `FileTypeChoices` (an `IMap<String, IVector<String>>`
+   wrapper over a PropertySet, IID `{e475ca9d-...}`), picks report *cancelled*.
+   `WINE_UWP_PICKER_SAVE_FILE` names a file for a save pick.
+9. **The shim factory's QueryInterface returned the FileOpenPicker factory for every factory**, so
+   `FolderPicker` came back as an open picker and the cast failed. It returns `iface` now.
+
+Two tooling bugs cost a sign-in (and a CAPTCHA) each and are in AGENTS.md: `reassert_activatable`
+wrote every repair to the wrong key (`local cls=... key=...$cls` expands the caller's `cls`), so
+each *new* shim failed its first run; and a bare `wine` is the system Wine 11.17, which rewrites the
+prefix's builtins. Also: `piid.py` does not know base types - use `--signature`.
+
+Not yet done: the tile thumbnails mostly draw blank; `RandomAccessStream` statics are missing
+(shcore); `MediaPlayer` has no `IClosable` (the app's video-playback check throws); ApplicationData
+is not persisted.
+
+Regression: Calculator AE 0 (249 colours); Feedback Hub 822 colours, 0 fail-fasts; Media Player
+Home renders; Solitaire reaches its main menu with the known Sign In Error popup.

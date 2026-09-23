@@ -439,7 +439,11 @@ fi
 # So: let any pending update finish, then assert the shim classes again and *verify* by reading
 # system.reg, rather than trusting the write.
 reassert_activatable() {
-  local cls="$1" dll="$2" threading="${3:-1}" key="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\$cls"
+  # Two statements, not one: within a single `local`, "$cls" in key= still expands to the
+  # *caller's* cls. That wrote every reassert to whatever class an earlier loop left in cls
+  # (ActivatableClassId\PackageUser), so a new shim never registered on its first run.
+  local cls="$1" dll="$2" threading="${3:-1}"
+  local key="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\$cls"
   "${WINE_BIN}wine" reg add "$key" /v DllPath /d "C:\\windows\\system32\\$dll" /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$key" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$key" /v Threading /t REG_DWORD /d "$threading" /f >/dev/null 2>&1
@@ -480,6 +484,26 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_networkstatus.dll" ]     && SHIM_CLASSES="$SHIM_CLASSES Windows.Networking.Connectivity.NetworkInformation:wineuwp_networkstatus.dll"
 [ -f "$SYS32/wineuwp_useractivitychannel.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.UserActivities.UserActivityChannel:wineuwp_useractivitychannel.dll"
 [ -f "$SYS32/wineuwp_toastnotifier.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Notifications.ToastNotificationManager:wineuwp_toastnotifier.dll"
+# api-ms-win-net-isolation-l1-1-1 (see shims/netisolation): not in Wine's apiset schema, so the file
+# in system32 under that name is what the delay-load finds.
+NI=${UWP_BIN}/build-probes/api-ms-win-net-isolation-l1-1-1.dll
+[ -f "$NI" ] && { cmp -s "$NI" "$SYS32/api-ms-win-net-isolation-l1-1-1.dll" || cp -f "$NI" "$SYS32/api-ms-win-net-isolation-l1-1-1.dll"; }
+# Windows.Storage.Pickers.FileSavePicker (see shims/filepicker): the native constructor fails
+# without the shell broker, and Shapr3D builds one with its dashboard, straight after sign-in.
+if [ -f "$SYS32/wineuwp_filepicker.dll" ]; then
+  reassert_activatable Windows.Storage.Pickers.FileSavePicker wineuwp_filepicker.dll 1
+  SHIM_CLASSES="$SHIM_CLASSES Windows.Storage.Pickers.FileSavePicker:wineuwp_filepicker.dll:1"
+  reassert_activatable Windows.Storage.Pickers.FolderPicker wineuwp_filepicker.dll 1
+  SHIM_CLASSES="$SHIM_CLASSES Windows.Storage.Pickers.FolderPicker:wineuwp_filepicker.dll:1"
+fi
+# Windows.Security.Cryptography.Certificates.Certificate (see shims/certificate): certenroll.dll is
+# missing, and without the class Windows.Web.Http abandons every HTTPS request.
+CERT_SHIM=${UWP_BIN}/build-probes/wineuwp_certificate.dll
+if [ -f "$CERT_SHIM" ]; then
+  cmp -s "$CERT_SHIM" "$SYS32/wineuwp_certificate.dll" || cp -f "$CERT_SHIM" "$SYS32/wineuwp_certificate.dll"
+  reassert_activatable Windows.Security.Cryptography.Certificates.Certificate wineuwp_certificate.dll 0
+  SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Cryptography.Certificates.Certificate:wineuwp_certificate.dll:0"
+fi
 # Windows.System.Launcher (see shims/launcher): the genuine one goes through the shell broker and
 # fail-fasts the app; this one hands the URI to ShellExecute, i.e. the host's browser.
 LAUNCHER_SHIM=${UWP_BIN}/build-probes/wineuwp_launcher.dll
@@ -514,14 +538,16 @@ if [ -n "$SHIM_CLASSES" ]; then
   # clobber whenever it lands, which is the whole point of verifying rather than asserting once.
   "${WINE_BIN}wineserver" -w 2>/dev/null || true
 
-  for attempt in 1 2 3; do
+  # Four checks around three repairs: the last repair is verified too, rather than reported as a
+  # failure on the strength of the check before it.
+  for attempt in 1 2 3 4; do
     bad=""
     for entry in $SHIM_CLASSES; do
       cls=${entry%%:*}; dll=${entry#*:}; dll=${dll%%:*}
       want="c:\\windows\\system32\\$dll"
       [ "$(activatable_dllpath "$cls")" = "$want" ] || bad="$bad $entry"
     done
-    [ -n "$bad" ] || break
+    [ -n "$bad" ] && [ $attempt -lt 4 ] || break
     for entry in $bad; do
       rest=${entry#*:}; dll=${rest%%:*}; thr=; [ "$rest" != "$dll" ] && thr=${rest#*:}
       reassert_activatable "${entry%%:*}" "$dll" $thr

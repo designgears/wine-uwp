@@ -231,17 +231,25 @@ ARGS_IUNKNOWN(vtbl_activated) ARGS_IUNKNOWN(vtbl_launch) ARGS_IUNKNOWN(vtbl_laun
 ARGS_IUNKNOWN(vtbl_prelaunch) ARGS_IUNKNOWN(vtbl_viewswitch) ARGS_IUNKNOWN(vtbl_withuser)
 
 /* IActivatedEventArgs */
-/* ActivationKind_Launch is 0 and ActivationKind_File is 1. An app that owns a file type branches
- * on this before it looks at the args at all. */
+/* ActivationKind: Launch 0, Search 1, ShareTarget 2, File 3, Protocol 4. An app that owns a file
+ * type or a scheme branches on this before it looks at the args at all. This used to say File 1
+ * and Protocol 2, i.e. Search and ShareTarget: Shapr3D took its sign-in callback for a share,
+ * asked for IShareTargetActivatedEventArgs, got E_NOINTERFACE and dropped the callback silently. */
 static HRESULT WINAPI activated_get_Kind(void *iface, INT32 *kind)
 {
     struct launch_args *args = ARGS_FROM(iface, vtbl_activated);
-    /* ActivationKind_Protocol is 2 */
-    *kind = args->protocol_uri ? 2 : args->file_path ? 1 : 0;
+    *kind = args->protocol_uri ? 4 /* Protocol */ : args->file_path ? 3 /* File */ : 0 /* Launch */;
     TRACE("kind %d\n", *kind);
     return S_OK;
 }
-static HRESULT WINAPI activated_get_PreviousExecutionState(void *iface, INT32 *state) { TRACE("\n"); *state = 0 /* NotRunning */; return S_OK; }
+/* Protocol args only ever go to the instance that is already running (see activation_inbox_thread). */
+static HRESULT WINAPI activated_get_PreviousExecutionState(void *iface, INT32 *state)
+{
+    struct launch_args *args = ARGS_FROM(iface, vtbl_activated);
+    TRACE("\n");
+    *state = args->protocol_uri ? 1 /* Running */ : 0 /* NotRunning */;
+    return S_OK;
+}
 /* The args object is its own splash screen: a managed OnLaunched dereferences
  * LaunchActivatedEventArgs.SplashScreen without checking it. */
 static HRESULT args_get_splash(struct launch_args *args, void **screen)

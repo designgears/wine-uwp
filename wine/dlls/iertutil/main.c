@@ -203,8 +203,15 @@ static HRESULT STDMETHODCALLTYPE uri_Query(IUriRuntimeClass *iface, HSTRING *val
 static HRESULT STDMETHODCALLTYPE uri_QueryParsed(IUriRuntimeClass *iface,
                                                  IWwwFormUrlDecoderRuntimeClass **decoder)
 {
-    FIXME("iface %p, decoder %p stub!\n", iface, decoder);
-    return E_NOTIMPL;
+    HSTRING query;
+    HRESULT hr;
+
+    TRACE("iface %p, decoder %p.\n", iface, decoder);
+
+    if (FAILED(hr = IUriRuntimeClass_get_Query(iface, &query))) return hr;
+    hr = create_www_form_url_decoder(query, decoder);
+    WindowsDeleteString(query);
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE uri_RawUri(IUriRuntimeClass *iface, HSTRING *value)
@@ -556,7 +563,15 @@ HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void **out)
 
 HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **factory)
 {
+    const WCHAR *name = WindowsGetStringRawBuffer(classid, NULL);
+
     TRACE("classid %s, factory %p.\n", debugstr_hstring(classid), factory);
+    if (!wcscmp(name, RuntimeClass_Windows_Foundation_WwwFormUrlDecoder))
+    {
+        *factory = www_form_url_decoder_factory;
+        IActivationFactory_AddRef(*factory);
+        return S_OK;
+    }
     *factory = &iertutil.IActivationFactory_iface;
     IUnknown_AddRef(*factory);
     return S_OK;

@@ -38,6 +38,7 @@ struct settings
     IObservableMap_HSTRING_IInspectable IObservableMap_HSTRING_IInspectable_iface;
     IIterable_IKeyValuePair_HSTRING_IInspectable IIterable_IKeyValuePair_HSTRING_IInspectable_iface;
     LONG ref;
+    const WCHAR *class_name;
 
     IPropertySet *inner;
     IMap_HSTRING_IInspectable *inner_map;
@@ -103,10 +104,11 @@ static HRESULT WINAPI settings_GetIids( IPropertySet *iface, ULONG *count, IID *
     return IPropertySet_GetIids( impl->inner, count, iids );
 }
 
+/* .NET types the wrapper from this name, so a composite value must say it is one. */
 static HRESULT WINAPI settings_GetRuntimeClassName( IPropertySet *iface, HSTRING *name )
 {
-    static const WCHAR class_name[] = L"Windows.Storage.ApplicationDataContainerSettings";
-    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+    struct settings *impl = impl_from_IPropertySet( iface );
+    return WindowsCreateString( impl->class_name, wcslen( impl->class_name ), name );
 }
 
 static HRESULT WINAPI settings_GetTrustLevel( IPropertySet *iface, TrustLevel *level )
@@ -253,7 +255,14 @@ static const struct IIterable_IKeyValuePair_HSTRING_IInspectableVtbl settings_it
     settings_iterable_First,
 };
 
+static HRESULT settings_create_class( IPropertySet *inner, const WCHAR *class_name, IPropertySet **out );
+
 HRESULT settings_create( IPropertySet *inner, IPropertySet **out )
+{
+    return settings_create_class( inner, L"Windows.Storage.ApplicationDataContainerSettings", out );
+}
+
+static HRESULT settings_create_class( IPropertySet *inner, const WCHAR *class_name, IPropertySet **out )
 {
     struct settings *impl;
     HRESULT hr;
@@ -264,6 +273,7 @@ HRESULT settings_create( IPropertySet *inner, IPropertySet **out )
     impl->IObservableMap_HSTRING_IInspectable_iface.lpVtbl = &settings_observable_vtbl;
     impl->IIterable_IKeyValuePair_HSTRING_IInspectable_iface.lpVtbl = &settings_iterable_vtbl;
     impl->ref = 1;
+    impl->class_name = class_name;
 
     if (FAILED(hr = IPropertySet_QueryInterface( inner, &IID_IMap_HSTRING_IInspectable,
                                                  (void **)&impl->inner_map )) ||
@@ -283,3 +293,83 @@ HRESULT settings_create( IPropertySet *inner, IPropertySet **out )
     *out = &impl->IPropertySet_iface;
     return S_OK;
 }
+
+/* Windows.Storage.ApplicationDataCompositeValue: a group of settings stored under one key, which
+ * Shapr3D uses to save its sign-in session. It is a property set with the settings semantics - a
+ * missing key reads as null - so it is the same wrapper over a fresh PropertySet, under its own
+ * class name. Like the rest of ApplicationData here, it lives in memory only. */
+static HRESULT WINAPI composite_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
+{
+    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
+    {
+        *out = iface;
+        return S_OK;
+    }
+
+    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI composite_factory_AddRef( IActivationFactory *iface ) { return 2; }
+static ULONG WINAPI composite_factory_Release( IActivationFactory *iface ) { return 1; }
+
+static HRESULT WINAPI composite_factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
+{
+    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI composite_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
+{
+    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI composite_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
+{
+    *trust_level = BaseTrust;
+    return S_OK;
+}
+
+static HRESULT WINAPI composite_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+{
+    static const WCHAR property_set[] = L"Windows.Foundation.Collections.PropertySet";
+    HSTRING_HEADER header;
+    IInspectable *inspectable;
+    IPropertySet *inner, *composite;
+    HSTRING name;
+    HRESULT hr;
+
+    TRACE( "iface %p, instance %p.\n", iface, instance );
+
+    *instance = NULL;
+    if (FAILED(hr = WindowsCreateStringReference( property_set, ARRAY_SIZE(property_set) - 1, &header, &name )) ||
+        FAILED(hr = RoActivateInstance( name, &inspectable )))
+        return hr;
+    hr = IInspectable_QueryInterface( inspectable, &IID_IPropertySet, (void **)&inner );
+    IInspectable_Release( inspectable );
+    if (FAILED(hr)) return hr;
+
+    hr = settings_create_class( inner, L"Windows.Storage.ApplicationDataCompositeValue", &composite );
+    IPropertySet_Release( inner );
+    if (SUCCEEDED(hr)) *instance = (IInspectable *)composite;
+    return hr;
+}
+
+static const struct IActivationFactoryVtbl composite_factory_vtbl =
+{
+    composite_factory_QueryInterface,
+    composite_factory_AddRef,
+    composite_factory_Release,
+    composite_factory_GetIids,
+    composite_factory_GetRuntimeClassName,
+    composite_factory_GetTrustLevel,
+    composite_factory_ActivateInstance,
+};
+
+static IActivationFactory composite_factory = { &composite_factory_vtbl };
+IActivationFactory *composite_value_factory = &composite_factory;

@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(wine-uwp-probes CXX)
 add_executable(probe-load probes/probe-load.cpp)
+add_executable(probe-dpapi probes/probe-dpapi.cpp)
 add_executable(probe-activate probes/probe-activate.cpp)
 target_link_libraries(probe-activate PRIVATE runtimeobject.lib)
 add_library(mrt100 SHARED shims/mrt100/mrt100.cpp)
@@ -109,6 +110,13 @@ set_target_properties(advertisingid PROPERTIES PREFIX "" SUFFIX ""
 
 # Windows.UI.Shell.TaskbarManager. The real one needs ImmersiveShell, which does not exist here,
 # and leaves its IAsyncOperation permanently incomplete - which is what stops Solitaire's startup.
+add_library(netisolation SHARED shims/netisolation/netisolation.cpp)
+set_target_properties(netisolation PROPERTIES PREFIX "" OUTPUT_NAME "api-ms-win-net-isolation-l1-1-1")
+# Windows.Security.Cryptography.Certificates.Certificate: lives in certenroll.dll, which this image
+# lacks, and Windows.Web.Http needs it for every HTTPS response.
+add_library(certificate SHARED shims/certificate/certificate.cpp)
+set_target_properties(certificate PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_certificate")
+target_link_libraries(certificate PRIVATE runtimeobject.lib crypt32.lib ole32.lib)
 add_library(launcher SHARED shims/launcher/launcher.cpp)
 set_target_properties(launcher PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_launcher")
 target_link_libraries(launcher PRIVATE runtimeobject.lib shell32.lib)
