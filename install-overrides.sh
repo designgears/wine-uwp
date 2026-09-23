@@ -480,6 +480,14 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_networkstatus.dll" ]     && SHIM_CLASSES="$SHIM_CLASSES Windows.Networking.Connectivity.NetworkInformation:wineuwp_networkstatus.dll"
 [ -f "$SYS32/wineuwp_useractivitychannel.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.UserActivities.UserActivityChannel:wineuwp_useractivitychannel.dll"
 [ -f "$SYS32/wineuwp_toastnotifier.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Notifications.ToastNotificationManager:wineuwp_toastnotifier.dll"
+# Windows.System.Launcher (see shims/launcher): the genuine one goes through the shell broker and
+# fail-fasts the app; this one hands the URI to ShellExecute, i.e. the host's browser.
+LAUNCHER_SHIM=${UWP_BIN}/build-probes/wineuwp_launcher.dll
+if [ -f "$LAUNCHER_SHIM" ]; then
+  cmp -s "$LAUNCHER_SHIM" "$SYS32/wineuwp_launcher.dll" || cp -f "$LAUNCHER_SHIM" "$SYS32/wineuwp_launcher.dll"
+  reassert_activatable Windows.System.Launcher wineuwp_launcher.dll 0
+  SHIM_CLASSES="$SHIM_CLASSES Windows.System.Launcher:wineuwp_launcher.dll:0"
+fi
 
 # Windows.Graphics.dll's classes that Wine's builtin windows.graphics does not implement, served by
 # the genuine DLL. It is installed under another file name because a module is found by name and

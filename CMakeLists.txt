@@ -109,6 +109,9 @@ set_target_properties(advertisingid PROPERTIES PREFIX "" SUFFIX ""
 
 # Windows.UI.Shell.TaskbarManager. The real one needs ImmersiveShell, which does not exist here,
 # and leaves its IAsyncOperation permanently incomplete - which is what stops Solitaire's startup.
+add_library(launcher SHARED shims/launcher/launcher.cpp)
+set_target_properties(launcher PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_launcher")
+target_link_libraries(launcher PRIVATE runtimeobject.lib shell32.lib)
 add_library(taskbarmanager SHARED shims/taskbarmanager/taskbarmanager.cpp)
 set_target_properties(taskbarmanager PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_taskbarmanager")
 target_link_libraries(taskbarmanager PRIVATE runtimeobject.lib)

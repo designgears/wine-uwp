@@ -8282,3 +8282,31 @@ in Minutes", Sign Up, Log In, a language picker. `CodecInfo.DisplayName` comes b
 MFT registrations have no friendly name in this path); Shapr3D does not read it.
 
 Regression: Calculator AE 0, Media Player Home page with 0 fail-fasts.
+
+### Log In reaches the browser hand-off: a Launcher shim (2026-09-23)
+
+Clicking **Log In** on the Welcome page (a plain X click - input reaches the app through NInput)
+computes a PKCE challenge (`HashAlgorithmNames`, served by the genuine CryptoWinRT) and calls
+`Launcher.LaunchUriAsync`. `Windows.System.Launcher` was registered to the genuine
+`Windows.System.Launcher.dll`, which goes to the shell (`Shell.Holographic.ContextIdentifier`,
+`Shell.Popups.PopupClient`), calls through a NULL composition slot and fail-fasts the app.
+
+`shims/launcher` replaces it: URIs (`get_AbsoluteUri`), files and folders (`IStorageItem.Path`)
+go to `ShellExecuteW` - `winebrowser`, i.e. the host's browser - and each call returns an
+`IAsyncOperation<bool>` that is already Completed with the outcome. **`WINE_UWP_LAUNCHER=log` is
+a dry run** (logs, reports success, launches nothing); use it on the test display, because
+`xdg-open` reaches the user's running browser over D-Bus and would open a tab on the real desktop.
+The app now logs `https://app.shapr3d.com/auth/app?code_challenge=...` and shows its **"Go to
+browser to complete login"** screen (`docs/screenshots/shapr3d-login-browser-wait.png`).
+
+The first run after adding the shim reported `shim registration did not stick`: the key still held
+`Z:\...\uwp-bin\win11\...\Windows.System.Launcher.dll`, left by an old one-off class import (its
+source, `uwp-bin/win11/wine-uwp-classes.reg`, still carries the pre-move `/home/bobby/uwp-bin`
+paths and is no longer imported). A second write stuck and the verifier has passed since.
+
+**Next: the `shapr3d:` protocol callback.** After sign-in the site redirects to `shapr3d://...`
+(the manifest's only `windows.protocol`). That needs (1) a host-side handler for `shapr3d:` that
+forwards into the prefix, and (2) `wineuwp` delivering a `Protocol` activation, with
+`ProtocolActivatedEventArgs`, to the *running* instance. It also needs a real account.
+
+Regression: Calculator AE 0, Feedback Hub 822 colours / 0 fail-fasts.
