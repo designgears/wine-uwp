@@ -180,6 +180,53 @@ static LONG content_generation;
 
 static BOOL paint_rect_empty( const RECT *r ) { return r->left >= r->right || r->top >= r->bottom; }
 
+/* An OP_BLEND holds a pointer into a brush's cached DIB until the frame is rasterized. A brush that
+ * is drawn twice in one frame at two sizes rebuilds its cache in between, and a brush may be
+ * released by another thread at any time - freeing the DIB then left raster_blend reading freed
+ * pixels, which Shapr3D's editor hit as soon as it opened. So cached DIBs are retired here and
+ * freed once the frame that might refer to them has been rasterized. */
+static CRITICAL_SECTION retired_cs;
+static CRITICAL_SECTION_DEBUG retired_cs_debug =
+{
+    0, 0, &retired_cs,
+    { &retired_cs_debug.ProcessLocksList, &retired_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": retired_cs") }
+};
+static CRITICAL_SECTION retired_cs = { &retired_cs_debug, -1, 0, 0, 0, 0 };
+static HBITMAP *retired_bitmaps;
+static unsigned int retired_count, retired_capacity;
+
+static void retire_bitmap( HBITMAP bmp )
+{
+    if (!bmp) return;
+    EnterCriticalSection( &retired_cs );
+    if (retired_count == retired_capacity)
+    {
+        unsigned int capacity = max( 16, retired_capacity * 2 );
+        HBITMAP *grown = realloc( retired_bitmaps, capacity * sizeof(*grown) );
+        if (!grown)
+        {
+            LeaveCriticalSection( &retired_cs );
+            WARN( "leaking a retired bitmap.\n" );
+            return;
+        }
+        retired_bitmaps = grown;
+        retired_capacity = capacity;
+    }
+    retired_bitmaps[retired_count++] = bmp;
+    LeaveCriticalSection( &retired_cs );
+}
+
+static void free_retired_bitmaps( void )
+{
+    unsigned int i;
+
+    EnterCriticalSection( &retired_cs );
+    for (i = 0; i < retired_count; i++) DeleteObject( retired_bitmaps[i] );
+    retired_count = 0;
+    LeaveCriticalSection( &retired_cs );
+}
+
 static void paint_emit( const struct paint_op *op )
 {
     struct paint_list *list = &paint_lists[paint_current];
@@ -644,6 +691,7 @@ static void present_desktop_hwnd( HWND hwnd )
         for (i = 0; i < damage.count; i++)
             BitBlt( hdc, damage.rects[i].left, damage.rects[i].top, damage.rects[i].right - damage.rects[i].left,
                     damage.rects[i].bottom - damage.rects[i].top, mem, damage.rects[i].left, damage.rects[i].top, SRCCOPY );
+        free_retired_bitmaps();
         if (timing)
         {
             double walk, raster;
@@ -725,6 +773,7 @@ struct compositor
     const void **compositor4_vtbl; /* ICompositor4, see compositor4_vtbl */
     const void **compositor7_vtbl; /* ICompositor7, see compositor7_vtbl */
     const void **shadow_vtbl;      /* ICompositorWithProjectedShadow, see compositor_shadow_vtbl */
+    const void **radial_vtbl;      /* ICompositorWithRadialGradient, see compositor_radial_vtbl */
     LONG ref;
 };
 
@@ -2878,7 +2927,7 @@ static ULONG WINAPI surface_Release( void *iface )
 static void surface_free_cache( struct drawing_surface *surface )
 {
     if (surface->swapchain) return;   /* the readback thread owns these */
-    if (surface->cache_dib) DeleteObject( surface->cache_dib );
+    if (surface->cache_dib) retire_bitmap( surface->cache_dib );   /* an OP_STRETCH may still name it */
     else free( surface->cache );
     surface->cache_dib = NULL;
     surface->cache = NULL;
@@ -5973,6 +6022,9 @@ static const GUID IID_ICompositor7_local =
 static const void *compositor_shadow_vtbl[];
 static const GUID IID_ICompositorWithProjectedShadow_local =
     { 0xa2e6330e, 0x8a60, 0x5a38, { 0xbb, 0x85, 0xb4, 0x4e, 0xa9, 0x01, 0x67, 0x7c } };
+static const void *compositor_radial_vtbl[];
+static const GUID IID_ICompositorWithRadialGradient_local =
+    { 0x98b9c1a7, 0x8e71, 0x4b53, { 0xb4, 0xa8, 0x69, 0xba, 0x5d, 0x19, 0xdc, 0x5b } };
 
 static inline struct compositor *impl_from_ICompositor( ICompositor *iface )
 {
@@ -6069,6 +6121,17 @@ static HRESULT WINAPI compositor_QueryInterface( ICompositor *iface, REFIID iid,
         InterlockedIncrement( &impl->ref );
         impl->compositor7_vtbl = compositor7_vtbl;
         *out = &impl->compositor7_vtbl;
+        return S_OK;
+    }
+
+    /* WinUI 2's RadialGradientBrush asks for this and uses the answer without checking it:
+     * E_NOINTERFACE left it calling through NULL (Microsoft.UI.Xaml.dll+0x143a48, in
+     * consume_ICompositorWithRadialGradient::CreateRadialGradientBrush), which killed Shapr3D. */
+    if (IsEqualGUID( iid, &IID_ICompositorWithRadialGradient_local ))
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->radial_vtbl = compositor_radial_vtbl;
+        *out = &impl->radial_vtbl;
         return S_OK;
     }
 
@@ -13250,7 +13313,7 @@ static ULONG WINAPI mask_brush_Release( void *iface )
     {
         if (brush->mask) IUnknown_Release( brush->mask );
         if (brush->source) IUnknown_Release( brush->source );
-        if (brush->cache_bmp) DeleteObject( brush->cache_bmp );
+        retire_bitmap( brush->cache_bmp );
         free( brush );
     }
     return ref;
@@ -13421,7 +13484,7 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
         BYTE *bgra;
         void *bits;
 
-        if (brush->cache_bmp) DeleteObject( brush->cache_bmp );
+        retire_bitmap( brush->cache_bmp );
         brush->cache_bmp = NULL;
         info.bmiHeader.biSize = sizeof(info.bmiHeader);
         info.bmiHeader.biWidth = w;
@@ -14275,6 +14338,37 @@ static const void *compositor_shadow_vtbl[] =
     compositor2_GetIids, compositor2_GetRuntimeClassName, compositor2_GetTrustLevel,
     compositor_shadow_CreateProjectedShadowCaster, compositor_shadow_CreateProjectedShadowReceiver,
     compositor_shadow_CreateProjectedShadow,
+};
+
+/* ICompositorWithRadialGradient ({98b9c1a7-...}): 6 CreateRadialGradientBrush. The brush is a
+ * recorded composition object like the linear one; its properties are not drawn yet. */
+static struct compositor *impl_from_compositor_radial( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct compositor, radial_vtbl );
+}
+static HRESULT WINAPI compositor_radial_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return compositor_QueryInterface( &impl_from_compositor_radial( iface )->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI compositor_radial_AddRef( void *iface )
+{
+    return compositor_AddRef( &impl_from_compositor_radial( iface )->ICompositor_iface );
+}
+static ULONG WINAPI compositor_radial_Release( void *iface )
+{
+    return compositor_Release( &impl_from_compositor_radial( iface )->ICompositor_iface );
+}
+static HRESULT WINAPI compositor_radial_CreateRadialGradientBrush( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_comp_object( "CompositionRadialGradientBrush", result );
+}
+static const void *compositor_radial_vtbl[] =
+{
+    compositor_radial_QueryInterface, compositor_radial_AddRef, compositor_radial_Release,
+    compositor2_GetIids, compositor2_GetRuntimeClassName, compositor2_GetTrustLevel,
+    compositor_radial_CreateRadialGradientBrush,
 };
 
 /* ICompositor4 ({ae47e78a-...}). Slots from CompositorCommon's ICompositor4 vtable in dcomp.pdb:

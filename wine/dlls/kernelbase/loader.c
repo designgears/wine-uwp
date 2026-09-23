@@ -587,11 +587,55 @@ HMODULE WINAPI DECLSPEC_HOTPATCH LoadLibraryExW( LPCWSTR name, HANDLE file, DWOR
 /***********************************************************************
  *      LoadPackagedLibrary    (kernelbase.@)
  */
+LONG WINAPI GetCurrentPackagePath( UINT32 *length, WCHAR *path );
+
+/* Loads a module from the calling process's package graph. The name must be relative and must
+ * not climb out with "..". The package's own directory is tried first; failing that the name goes
+ * through the normal search, which in a packaged process covers the dependency packages. Shapr3D's
+ * ANGLE loads libGLESv2.dll this way; the old stub's APPMODEL_ERROR_NO_PACKAGE left its editor on
+ * "Processing..." for ever. */
 HMODULE WINAPI /* DECLSPEC_HOTPATCH */ LoadPackagedLibrary( LPCWSTR name, DWORD reserved )
 {
-    FIXME( "semi-stub, name %s, reserved %#lx.\n", debugstr_w(name), reserved );
-    SetLastError( APPMODEL_ERROR_NO_PACKAGE );
-    return NULL;
+    WCHAR *path;
+    UINT32 len = 0;
+    HMODULE module;
+    LONG err;
+
+    TRACE( "name %s, reserved %#lx.\n", debugstr_w(name), reserved );
+
+    if (reserved || !name || !*name || RtlIsDosDeviceName_U( name ) ||
+        RtlDetermineDosPathNameType_U( name ) != RtlPathTypeRelative || wcsstr( name, L".." ))
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return NULL;
+    }
+
+    if ((err = GetCurrentPackagePath( &len, NULL )) != ERROR_INSUFFICIENT_BUFFER)
+    {
+        SetLastError( err == ERROR_SUCCESS ? APPMODEL_ERROR_NO_PACKAGE : err );
+        return NULL;
+    }
+    if (!(path = HeapAlloc( GetProcessHeap(), 0, (len + 1 + wcslen( name ) + 1) * sizeof(WCHAR) )))
+    {
+        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
+        return NULL;
+    }
+    if ((err = GetCurrentPackagePath( &len, path )))
+    {
+        HeapFree( GetProcessHeap(), 0, path );
+        SetLastError( err );
+        return NULL;
+    }
+    lstrcatW( path, L"\\" );
+    lstrcatW( path, name );
+
+    if (GetFileAttributesW( path ) != INVALID_FILE_ATTRIBUTES)
+        module = LoadLibraryExW( path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH );
+    else
+        module = LoadLibraryExW( name, NULL, 0 );
+    TRACE( "%s -> %p\n", debugstr_w(path), module );
+    HeapFree( GetProcessHeap(), 0, path );
+    return module;
 }
 
 

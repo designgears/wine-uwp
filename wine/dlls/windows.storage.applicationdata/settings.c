@@ -39,6 +39,7 @@ struct settings
     IIterable_IKeyValuePair_HSTRING_IInspectable IIterable_IKeyValuePair_HSTRING_IInspectable_iface;
     LONG ref;
     const WCHAR *class_name;
+    BOOL container;            /* a container's Values, whose changes are persisted */
 
     IPropertySet *inner;
     IMap_HSTRING_IInspectable *inner_map;
@@ -172,20 +173,28 @@ static HRESULT WINAPI settings_map_Insert( IMap_HSTRING_IInspectable *iface, HST
                                            IInspectable *value, boolean *replaced )
 {
     struct settings *impl = impl_from_IMap_HSTRING_IInspectable( iface );
+    HRESULT hr;
+
     TRACE( "key %s, value %p.\n", debugstr_hstring( key ), value );
-    return IMap_HSTRING_IInspectable_Insert( impl->inner_map, key, value, replaced );
+    hr = IMap_HSTRING_IInspectable_Insert( impl->inner_map, key, value, replaced );
+    if (SUCCEEDED(hr) && impl->container) settings_changed();
+    return hr;
 }
 
 static HRESULT WINAPI settings_map_Remove( IMap_HSTRING_IInspectable *iface, HSTRING key )
 {
     struct settings *impl = impl_from_IMap_HSTRING_IInspectable( iface );
-    return IMap_HSTRING_IInspectable_Remove( impl->inner_map, key );
+    HRESULT hr = IMap_HSTRING_IInspectable_Remove( impl->inner_map, key );
+    if (SUCCEEDED(hr) && impl->container) settings_changed();
+    return hr;
 }
 
 static HRESULT WINAPI settings_map_Clear( IMap_HSTRING_IInspectable *iface )
 {
     struct settings *impl = impl_from_IMap_HSTRING_IInspectable( iface );
-    return IMap_HSTRING_IInspectable_Clear( impl->inner_map );
+    HRESULT hr = IMap_HSTRING_IInspectable_Clear( impl->inner_map );
+    if (SUCCEEDED(hr) && impl->container) settings_changed();
+    return hr;
 }
 
 static const struct IMap_HSTRING_IInspectableVtbl settings_map_vtbl =
@@ -259,7 +268,9 @@ static HRESULT settings_create_class( IPropertySet *inner, const WCHAR *class_na
 
 HRESULT settings_create( IPropertySet *inner, IPropertySet **out )
 {
-    return settings_create_class( inner, L"Windows.Storage.ApplicationDataContainerSettings", out );
+    HRESULT hr = settings_create_class( inner, L"Windows.Storage.ApplicationDataContainerSettings", out );
+    if (SUCCEEDED(hr)) CONTAINING_RECORD( *out, struct settings, IPropertySet_iface )->container = TRUE;
+    return hr;
 }
 
 static HRESULT settings_create_class( IPropertySet *inner, const WCHAR *class_name, IPropertySet **out )

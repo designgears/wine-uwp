@@ -252,3 +252,10 @@ dlls/wininet/internet.c
 include/Makefile.in
 include/ncrypt.h
 include/wininet.h
+dlls/d2d1/d2d1_private.h
+dlls/d2d1/device.c
+dlls/d2d1/Makefile.in
+dlls/d2d1/svg.c
+dlls/shcore/Makefile.in
+dlls/shcore/ras_stream.c
+include/d2d1_3.idl

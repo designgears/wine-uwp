@@ -433,13 +433,14 @@ void combase_dump_unhandled_language_exception( IRestrictedErrorInfo *info )
 /* With WINE_UWP_TRACE_ORIGINATE set, print who originated the error as module+rva return
  * addresses. A managed ThrowOnExternalCallFailed originates while the frame that made the failing
  * call is still on the stack, which is the only cheap way to find a .NET Native call site. */
-static void trace_origin_backtrace(void)
+static void trace_origin_backtrace( HRESULT error )
 {
     void *frames[32];
     char var[8];
     USHORT count, i;
 
     if (!GetEnvironmentVariableA( "WINE_UWP_TRACE_ORIGINATE", var, sizeof(var) )) return;
+    ERR( "originated hr %#lx, from:\n", error );
     count = RtlCaptureStackBackTrace( 1, ARRAY_SIZE(frames), frames, NULL );
     for (i = 0; i < count; i++)
     {
@@ -466,7 +467,7 @@ BOOL WINAPI RoOriginateLanguageException( HRESULT error, HSTRING message, IUnkno
     if (SUCCEEDED(error)) return FALSE;
     trace_originate( error );
     trace_language_exception( language_exception );
-    trace_origin_backtrace();
+    trace_origin_backtrace( error );
     return originate_error( error, str, len, language_exception, TRUE );
 }
 

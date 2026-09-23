@@ -2,7 +2,7 @@
 @ stdcall CommandLineToArgvW(wstr ptr)
 @ stub CreateRandomAccessStreamOnFile
 @ stdcall CreateRandomAccessStreamOverStream(ptr long ptr ptr)
-@ stub CreateStreamOverRandomAccessStream
+@ stdcall CreateStreamOverRandomAccessStream(ptr ptr ptr)
 @ stdcall -private DllCanUnloadNow()
 @ stdcall -private DllGetActivationFactory(ptr ptr)
 @ stub DllGetClassObject
@@ -85,7 +85,7 @@
 # @ stub SHTaskPoolDoNotWaitForMoreTasks
 # @ stub SHTaskPoolGetCurrentThreadLifetime
 @ stdcall SHTaskPoolGetUniqueContext(ptr)
-@ stdcall SHTaskPoolQueueTask(long ptr ptr ptr)
+@ stdcall SHTaskPoolQueueTask(long long long ptr ptr ptr)
 # @ stub SHTaskPoolSetThreadReuseAllowed
 @ stdcall SHUnicodeToAnsi(wstr ptr ptr)
 @ stdcall SHUnicodeToUnicode(wstr ptr long)

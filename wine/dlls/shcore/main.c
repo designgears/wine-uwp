@@ -2683,36 +2683,54 @@ void WINAPI RecordFeatureUsage(UINT32 feature_id, UINT32 kind, UINT32 addend, co
 /*************************************************************************
  * Private shell task pool and feature APIs used by Windows.UI / Windows.UI.Xaml.
  */
-struct shtask
+/* SHTaskPoolQueueTask is Windows::Internal::ComTaskPool's back end. From Windows' shcore.pdb,
+ * WorkThreadManager::s_QueuePoolTask( TaskApartment, TaskOptions, DWORD caller_tid, ...,
+ * IComPoolTask * ); a caller (Windows.Graphics' ComTaskPoolHandler::Start) passes
+ * ( apartment, options, GetCurrentThreadId(), NULL, task, NULL ). IComPoolTask is IUnknown plus
+ * slot 3, void Run(void) - CTaskWrapper's vtable is QI, AddRef, Release, Run, deleting dtor.
+ *
+ * This used to be read as ( flags, proc, context, cancel ) and dropped every task, because the
+ * "proc" was the options word (0x2, 0x80). Every IAsyncOperation the genuine Windows.Graphics
+ * starts - BitmapDecoder.CreateAsync among them - then never completed: Shapr3D's dashboard
+ * thumbnails stayed blank and its editor waited on a texture decode on "Processing..." for ever.
+ *
+ * The task runs on a threadpool worker in the MTA. The tasks are WRL objects built for any
+ * pool thread; the apartment hint is not honoured beyond that. */
+typedef struct IComPoolTask IComPoolTask;
+struct IComPoolTaskVtbl
 {
-    void (WINAPI *proc)(void *);
-    void *context;
+    HRESULT (WINAPI *QueryInterface)( IComPoolTask *, REFIID, void ** );
+    ULONG (WINAPI *AddRef)( IComPoolTask * );
+    ULONG (WINAPI *Release)( IComPoolTask * );
+    void (WINAPI *Run)( IComPoolTask * );
 };
+struct IComPoolTask { const struct IComPoolTaskVtbl *lpVtbl; };
 
 static void CALLBACK shtask_callback( PTP_CALLBACK_INSTANCE instance, void *arg )
 {
-    struct shtask *task = arg;
-    task->proc( task->context );
-    HeapFree( GetProcessHeap(), 0, task );
+    IComPoolTask *task = arg;
+    HRESULT hr = CoInitializeEx( NULL, COINIT_MULTITHREADED );
+
+    TRACE( "running task %p\n", task );
+    task->lpVtbl->Run( task );
+    task->lpVtbl->Release( task );
+    if (SUCCEEDED(hr)) CoUninitialize();
 }
 
-HRESULT WINAPI SHTaskPoolQueueTask( DWORD flags, void *proc, void *context, void *cancel )
+HRESULT WINAPI SHTaskPoolQueueTask( DWORD apartment, DWORD options, DWORD caller_tid, void *reserved,
+                                    IComPoolTask *task, void *reserved2 )
 {
-    struct shtask *task;
+    TRACE( "apartment %lu, options %#lx, caller %04lx, reserved %p, task %p, reserved2 %p\n",
+           apartment, options, caller_tid, reserved, task, reserved2 );
 
-    FIXME( "%#lx %p %p %p: semi-stub\n", flags, proc, context, cancel );
-    /* The argument layout is not (flags, proc, ...): native callers pass small integers in
-     * proc (e.g. 0x2) and the real callback lives elsewhere. Running the "proc" as a thread
-     * entry executed address 0x2 and killed the render walk; drop the task instead. */
-    if (!proc || (ULONG_PTR)proc < 0x10000) return S_OK;
-    if (!(task = HeapAlloc( GetProcessHeap(), 0, sizeof(*task) ))) return E_OUTOFMEMORY;
-    task->proc = proc; task->context = context;
+    if (!task) return E_INVALIDARG;
+    task->lpVtbl->AddRef( task );
     /* A pool thread, not a new one: a fresh thread's DLL_THREAD_ATTACH callouts run under the
      * loader lock, and native DllMains that do once-initialisation there deadlock against a UI
      * thread inside the same initialisation (see wineuwp's msftedit note). */
     if (!TrySubmitThreadpoolCallback( shtask_callback, task, NULL ))
     {
-        HeapFree( GetProcessHeap(), 0, task );
+        task->lpVtbl->Release( task );
         return HRESULT_FROM_WIN32( GetLastError() );
     }
     return S_OK;

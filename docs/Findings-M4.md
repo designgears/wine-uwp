@@ -8398,3 +8398,57 @@ is not persisted.
 
 Regression: Calculator AE 0 (249 colours); Feedback Hub 822 colours, 0 fail-fasts; Media Player
 Home renders; Solitaire reaches its main menu with the known Sign In Error popup.
+
+### The editor opens and renders (2026-09-23)
+
+`docs/screenshots/shapr3d-editor.png`: a new "Untitled Project" in the editor - menus, the Items
+and History panels, the full tool rail with its SVG icons, and the 3D viewport drawing the ground
+axes and the shaded view cube through ANGLE -> D3D11 -> wined3d/Vulkan. Two things came first:
+the dashboard crashed on a WinUI 2 radial gradient, and every start needed a new sign-in.
+
+- **`ICompositorWithRadialGradient`** - WinUI 2's `RadialGradientBrush` uses the answer without
+  checking it; `E_NOINTERFACE` became a call through NULL (`Microsoft.UI.Xaml.dll+0x143a48`).
+- **Settings persistence** - `ApplicationData` settings were in memory only. Each locality's tree
+  is now written to `Packages\<family>\Settings\wine-<locality>.dat` on change and read back at
+  first use; the session survives a restart (`docs/screenshots/shapr3d-recents-after-restart.png`),
+  which is what made the rest of this debuggable without a human solving a CAPTCHA per run.
+
+Then "New" sat on "Loading / Processing..." with every thread idle. In order:
+
+1. **`LoadPackagedLibrary`** was a stub failing with `APPMODEL_ERROR_NO_PACKAGE`; ANGLE's
+   `libEGL` loads `libGLESv2.dll` with it ("Error loading EGL entry points").
+2. **`Uri.EscapeComponent`** (`IUriEscapeStatics`, refused by iertutil's factory) and
+   **`Uri.CombineUri`** (a stub) - both came back as the app's "failed to build request".
+3. **`SHTaskPoolQueueTask` dropped every task.** Its signature had been guessed as
+   `(flags, proc, context, cancel)`; from Windows' shcore.pdb it is `WorkThreadManager::
+   s_QueuePoolTask(TaskApartment, TaskOptions, caller_tid, ..., IComPoolTask *)`, and the
+   `CTaskWrapper` vtable in Windows.Graphics (found by searching `.rdata` for its deleting
+   destructor, since there is no RTTI) gives `IComPoolTask` as IUnknown + slot 3 `Run()`. So every
+   async operation of the genuine Windows.Graphics - `BitmapDecoder.CreateAsync` - never
+   completed. That is the *lost continuation* shape exactly: `WINE_UWP_PROFILE` showed every
+   thread idle, and the stack dump found the render thread in C++/WinRT's `wait_for_completed`.
+   Probably also why the dashboard's thumbnails were blank.
+4. **`CreateStreamOverRandomAccessStream`** (a `@ stub`), which the decoder then reached: an IStream
+   over a WinRT stream, in `dlls/shcore/ras_stream.c`.
+5. **Direct2D SVG** - Win2D's `CanvasSvgDocument` over `ID2D1DeviceContext5::CreateSvgDocument`,
+   a stub; `ID2D1SvgDocument` was not even in Wine's IDL. `dlls/d2d1/svg.c` now has the document,
+   a read-write `ID2D1SvgElement` (the app recolours icons with `SetAttributeValue(POD COLOR)`,
+   rearranges them with `AppendChild`, reads `viewBox` back), and a renderer for the subset the
+   app's 859 icons use. Details worth keeping:
+   - the overloaded `Set/GetAttributeValue` slots were traced thunks first; the middle overload
+     (POD) is slot 28/31 in either MSVC ordering, confirmed by the app calling slot 28;
+   - an unspecified attribute reads as its initial value, not an error;
+   - Win2D's `LoadFromXml` hands over UTF-16 **without** a byte order mark;
+   - xmllite faulted in a memmove on one of the documents, so the parser is our own.
+6. **`d3d11` `IAGetVertexBuffers`** wrote strides and offsets through NULL arrays (ANGLE asks for
+   the buffers only) - a NULL write inside `wined3d_device_context_get_stream_source`.
+7. **dcomp use-after-free** - an `OP_BLEND` points into a mask brush's cached DIB until the frame
+   is rasterized, and a rebuilt or released brush freed it under `raster_blend`. Cached DIBs are
+   retired and freed after the frame's blit now.
+
+Tooling: `minidump.py` (exception + module-resolved stack scan of a Sentry dump; with
+`llvm-symbolizer --obj=<build dll>` it names Wine frames, which have DWARF), and
+`WINE_UWP_TRACE_ORIGINATE` now prints the originated HRESULT.
+
+Regression: Calculator AE 0 (249); Feedback Hub 822 / 0 fail-fasts / 0 app errors; Media Player
+Home 2205 colours; Solitaire main menu with the known popup.

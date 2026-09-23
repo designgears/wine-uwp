@@ -980,6 +980,498 @@ static HRESULT create_data_container( ApplicationDataLocality locality, const WC
     return S_OK;
 }
 
+/* Persistence. Windows keeps a package's settings in a registry hive under
+ * %LOCALAPPDATA%\Packages\<family>\Settings; here each locality's tree is written to a file of our
+ * own in that folder, wine-local.dat or wine-roaming.dat, whenever a container's values change,
+ * and read back when the root container is first handed out. Without it an app forgets everything
+ * at exit - Shapr3D keeps its sign-in session in LocalSettings, so every start meant signing in
+ * again.
+ *
+ * The format is ours and little-endian: "WUSD", a version, then the root container. A container
+ * is its name, its values and its children; a value is its key, a type and a payload. The types
+ * are PropertyType's, plus COMPOSITE for an ApplicationDataCompositeValue, whose payload is its
+ * own list of values. Values of other kinds are skipped with a FIXME. */
+static IApplicationDataContainer *local_settings, *roaming_settings;
+static CRITICAL_SECTION persist_cs;
+static CRITICAL_SECTION_DEBUG persist_cs_debug =
+{
+    0, 0, &persist_cs,
+    { &persist_cs_debug.ProcessLocksList, &persist_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": persist_cs") }
+};
+static CRITICAL_SECTION persist_cs = { &persist_cs_debug, -1, 0, 0, 0, 0 };
+static LONG loading;
+
+#define PERSIST_MAGIC     0x44535557 /* 'WUSD' */
+#define PERSIST_VERSION   1
+#define PERSIST_COMPOSITE 0xffff
+
+struct buffer
+{
+    BYTE *data;
+    SIZE_T size, capacity;
+    BOOL failed;
+};
+
+static void put( struct buffer *buf, const void *data, SIZE_T size )
+{
+    if (buf->failed) return;
+    if (buf->size + size > buf->capacity)
+    {
+        SIZE_T capacity = max( buf->capacity * 2, buf->size + size + 256 );
+        BYTE *grown = realloc( buf->data, capacity );
+        if (!grown) { buf->failed = TRUE; return; }
+        buf->data = grown;
+        buf->capacity = capacity;
+    }
+    memcpy( buf->data + buf->size, data, size );
+    buf->size += size;
+}
+static void put_u32( struct buffer *buf, UINT32 value ) { put( buf, &value, sizeof(value) ); }
+static void put_str( struct buffer *buf, const WCHAR *str, UINT32 len )
+{
+    put_u32( buf, len );
+    put( buf, str, len * sizeof(WCHAR) );
+}
+static void put_hstr( struct buffer *buf, HSTRING str )
+{
+    UINT32 len;
+    const WCHAR *raw = WindowsGetStringRawBuffer( str, &len );
+    put_str( buf, raw, len );
+}
+
+static BOOL is_composite( IInspectable *value )
+{
+    HSTRING name;
+    BOOL ret;
+
+    if (FAILED(IInspectable_GetRuntimeClassName( value, &name ))) return FALSE;
+    ret = !wcscmp( WindowsGetStringRawBuffer( name, NULL ), L"Windows.Storage.ApplicationDataCompositeValue" );
+    WindowsDeleteString( name );
+    return ret;
+}
+
+static void put_values( struct buffer *buf, IInspectable *set );
+
+/* The type and payload of one value; returns FALSE for a kind that is not persisted. */
+static BOOL put_value( struct buffer *buf, IInspectable *value )
+{
+    IPropertyValue *pv;
+    PropertyType type;
+    union { BYTE u8; INT16 i16; UINT16 u16; INT32 i32; UINT32 u32; INT64 i64; UINT64 u64; FLOAT f;
+            DOUBLE d; WCHAR c; boolean b; DateTime dt; TimeSpan ts; GUID guid; } v;
+    UINT32 size = 0;
+    HRESULT hr = E_FAIL;
+
+    if (FAILED(IInspectable_QueryInterface( value, &IID_IPropertyValue, (void **)&pv )))
+    {
+        if (!is_composite( value )) return FALSE;
+        put_u32( buf, PERSIST_COMPOSITE );
+        put_values( buf, value );
+        return TRUE;
+    }
+    if (FAILED(IPropertyValue_get_Type( pv, &type ))) { IPropertyValue_Release( pv ); return FALSE; }
+
+    switch (type)
+    {
+    case PropertyType_UInt8:    hr = IPropertyValue_GetUInt8( pv, &v.u8 ); size = sizeof(v.u8); break;
+    case PropertyType_Int16:    hr = IPropertyValue_GetInt16( pv, &v.i16 ); size = sizeof(v.i16); break;
+    case PropertyType_UInt16:   hr = IPropertyValue_GetUInt16( pv, &v.u16 ); size = sizeof(v.u16); break;
+    case PropertyType_Int32:    hr = IPropertyValue_GetInt32( pv, &v.i32 ); size = sizeof(v.i32); break;
+    case PropertyType_UInt32:   hr = IPropertyValue_GetUInt32( pv, &v.u32 ); size = sizeof(v.u32); break;
+    case PropertyType_Int64:    hr = IPropertyValue_GetInt64( pv, &v.i64 ); size = sizeof(v.i64); break;
+    case PropertyType_UInt64:   hr = IPropertyValue_GetUInt64( pv, &v.u64 ); size = sizeof(v.u64); break;
+    case PropertyType_Single:   hr = IPropertyValue_GetSingle( pv, &v.f ); size = sizeof(v.f); break;
+    case PropertyType_Double:   hr = IPropertyValue_GetDouble( pv, &v.d ); size = sizeof(v.d); break;
+    case PropertyType_Char16:   hr = IPropertyValue_GetChar16( pv, &v.c ); size = sizeof(v.c); break;
+    case PropertyType_Boolean:  hr = IPropertyValue_GetBoolean( pv, &v.b ); size = sizeof(v.b); break;
+    case PropertyType_DateTime: hr = IPropertyValue_GetDateTime( pv, &v.dt ); size = sizeof(v.dt); break;
+    case PropertyType_TimeSpan: hr = IPropertyValue_GetTimeSpan( pv, &v.ts ); size = sizeof(v.ts); break;
+    case PropertyType_Guid:     hr = IPropertyValue_GetGuid( pv, &v.guid ); size = sizeof(v.guid); break;
+    case PropertyType_String:
+    {
+        HSTRING str;
+        if (SUCCEEDED(hr = IPropertyValue_GetString( pv, &str )))
+        {
+            put_u32( buf, type );
+            put_hstr( buf, str );
+            WindowsDeleteString( str );
+        }
+        IPropertyValue_Release( pv );
+        return SUCCEEDED(hr);
+    }
+    case PropertyType_UInt8Array:
+    {
+        BYTE *bytes;
+        UINT32 count;
+        if (SUCCEEDED(hr = IPropertyValue_GetUInt8Array( pv, &count, &bytes )))
+        {
+            put_u32( buf, type );
+            put_u32( buf, count );
+            put( buf, bytes, count );
+            CoTaskMemFree( bytes );
+        }
+        IPropertyValue_Release( pv );
+        return SUCCEEDED(hr);
+    }
+    case PropertyType_StringArray:
+    {
+        HSTRING *strs;
+        UINT32 count, i;
+        if (SUCCEEDED(hr = IPropertyValue_GetStringArray( pv, &count, &strs )))
+        {
+            put_u32( buf, type );
+            put_u32( buf, count );
+            for (i = 0; i < count; i++)
+            {
+                put_hstr( buf, strs[i] );
+                WindowsDeleteString( strs[i] );
+            }
+            CoTaskMemFree( strs );
+        }
+        IPropertyValue_Release( pv );
+        return SUCCEEDED(hr);
+    }
+    default:
+        FIXME( "not persisting a value of type %d\n", type );
+        break;
+    }
+    IPropertyValue_Release( pv );
+    if (FAILED(hr) || !size) return FALSE;
+    put_u32( buf, type );
+    put_u32( buf, size );
+    put( buf, &v, size );
+    return TRUE;
+}
+
+/* The values of a set, as a count then key/value pairs. The count is patched once the pairs are
+ * written, since values of unsupported kinds are left out. */
+static void put_values( struct buffer *buf, IInspectable *set )
+{
+    IIterable_IKeyValuePair_HSTRING_IInspectable *iterable;
+    IIterator_IKeyValuePair_HSTRING_IInspectable *iter;
+    IKeyValuePair_HSTRING_IInspectable *pair;
+    SIZE_T count_at = buf->size;
+    UINT32 count = 0;
+    boolean has;
+
+    put_u32( buf, 0 );
+    if (FAILED(IInspectable_QueryInterface( set, &IID_IIterable_IKeyValuePair_HSTRING_IInspectable,
+                                            (void **)&iterable )))
+        return;
+    if (SUCCEEDED(IIterable_IKeyValuePair_HSTRING_IInspectable_First( iterable, &iter )))
+    {
+        while (SUCCEEDED(IIterator_IKeyValuePair_HSTRING_IInspectable_get_HasCurrent( iter, &has )) && has)
+        {
+            if (SUCCEEDED(IIterator_IKeyValuePair_HSTRING_IInspectable_get_Current( iter, &pair )))
+            {
+                HSTRING key;
+                IInspectable *value;
+
+                if (SUCCEEDED(IKeyValuePair_HSTRING_IInspectable_get_Key( pair, &key )))
+                {
+                    if (SUCCEEDED(IKeyValuePair_HSTRING_IInspectable_get_Value( pair, &value )) && value)
+                    {
+                        SIZE_T start = buf->size;
+                        put_hstr( buf, key );
+                        if (put_value( buf, value )) count++;
+                        else buf->size = start;
+                        IInspectable_Release( value );
+                    }
+                    WindowsDeleteString( key );
+                }
+                IKeyValuePair_HSTRING_IInspectable_Release( pair );
+            }
+            if (FAILED(IIterator_IKeyValuePair_HSTRING_IInspectable_MoveNext( iter, &has ))) break;
+        }
+        IIterator_IKeyValuePair_HSTRING_IInspectable_Release( iter );
+    }
+    IIterable_IKeyValuePair_HSTRING_IInspectable_Release( iterable );
+    if (!buf->failed) memcpy( buf->data + count_at, &count, sizeof(count) );
+}
+
+static void put_container( struct buffer *buf, IApplicationDataContainer *iface )
+{
+    struct data_container *impl = impl_from_IApplicationDataContainer( iface );
+    UINT32 i;
+
+    put_hstr( buf, impl->name );
+    put_values( buf, (IInspectable *)impl->values );
+    EnterCriticalSection( &impl->cs );
+    put_u32( buf, impl->child_count );
+    for (i = 0; i < impl->child_count; i++) put_container( buf, impl->children[i].container );
+    LeaveCriticalSection( &impl->cs );
+}
+
+static BOOL settings_file( ApplicationDataLocality locality, WCHAR *path, SIZE_T size )
+{
+    WCHAR family[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1];
+    UINT32 family_len = ARRAY_SIZE(family);
+    SIZE_T len;
+
+    if (GetCurrentPackageFamilyName( &family_len, family )) return FALSE;
+    if (!GetEnvironmentVariableW( L"LOCALAPPDATA", path, size )) return FALSE;
+    len = wcslen( path );
+    if (swprintf( path + len, size - len, L"\\Packages\\%s", family ) < 0) return FALSE;
+    CreateDirectoryW( path, NULL );
+    len = wcslen( path );
+    if (swprintf( path + len, size - len, L"\\Settings" ) < 0) return FALSE;
+    CreateDirectoryW( path, NULL );
+    len = wcslen( path );
+    return swprintf( path + len, size - len, L"\\wine-%s.dat",
+                     locality == ApplicationDataLocality_Roaming ? L"roaming" : L"local" ) >= 0;
+}
+
+static void save_root( IApplicationDataContainer *root, ApplicationDataLocality locality )
+{
+    struct buffer buf = { 0 };
+    WCHAR path[MAX_PATH], temp[MAX_PATH + 4];
+    HANDLE file;
+    DWORD written;
+
+    if (!root || !settings_file( locality, path, ARRAY_SIZE(path) )) return;
+    put_u32( &buf, PERSIST_MAGIC );
+    put_u32( &buf, PERSIST_VERSION );
+    put_container( &buf, root );
+    if (buf.failed) { ERR( "out of memory saving the settings\n" ); free( buf.data ); return; }
+
+    /* written aside and moved over, so a crash mid-write cannot lose what was there */
+    swprintf( temp, ARRAY_SIZE(temp), L"%s.new", path );
+    file = CreateFileW( temp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        ERR( "cannot write %s, error %lu\n", debugstr_w( temp ), GetLastError() );
+        free( buf.data );
+        return;
+    }
+    if (!WriteFile( file, buf.data, buf.size, &written, NULL ) || written != buf.size)
+    {
+        ERR( "cannot write %s, error %lu\n", debugstr_w( temp ), GetLastError() );
+        CloseHandle( file );
+        DeleteFileW( temp );
+        free( buf.data );
+        return;
+    }
+    CloseHandle( file );
+    if (!MoveFileExW( temp, path, MOVEFILE_REPLACE_EXISTING ))
+        ERR( "cannot replace %s, error %lu\n", debugstr_w( path ), GetLastError() );
+    TRACE( "saved %Iu bytes to %s\n", buf.size, debugstr_w( path ) );
+    free( buf.data );
+}
+
+void settings_changed( void )
+{
+    if (loading) return;
+    EnterCriticalSection( &persist_cs );
+    save_root( local_settings, ApplicationDataLocality_Local );
+    save_root( roaming_settings, ApplicationDataLocality_Roaming );
+    LeaveCriticalSection( &persist_cs );
+}
+
+struct reader
+{
+    const BYTE *data;
+    SIZE_T size, pos;
+    BOOL failed;
+};
+
+static const void *get( struct reader *r, SIZE_T size )
+{
+    const void *p;
+    if (r->failed || size > r->size - r->pos) { r->failed = TRUE; return NULL; }
+    p = r->data + r->pos;
+    r->pos += size;
+    return p;
+}
+static UINT32 get_u32( struct reader *r )
+{
+    const UINT32 *p = get( r, sizeof(*p) );
+    UINT32 v = 0;
+    if (p) memcpy( &v, p, sizeof(v) );
+    return v;
+}
+static HRESULT get_hstr( struct reader *r, HSTRING *out )
+{
+    UINT32 len = get_u32( r );
+    const WCHAR *str;
+
+    *out = NULL;
+    if (len > r->size || !(str = get( r, (SIZE_T)len * sizeof(WCHAR) ))) return E_FAIL;
+    return WindowsCreateString( str, len, out );
+}
+
+static HRESULT get_values( struct reader *r, IPropertySet *set, IPropertyValueStatics *statics );
+
+static HRESULT get_value( struct reader *r, IPropertyValueStatics *statics, IInspectable **out )
+{
+    UINT32 type = get_u32( r ), size, count, i;
+    const void *p;
+    HRESULT hr;
+
+    *out = NULL;
+    if (r->failed) return E_FAIL;
+    switch (type)
+    {
+    case PERSIST_COMPOSITE:
+    {
+        IPropertySet *set;
+        if (FAILED(hr = IActivationFactory_ActivateInstance( composite_value_factory, out ))) return hr;
+        if (FAILED(hr = IInspectable_QueryInterface( *out, &IID_IPropertySet, (void **)&set ))) return hr;
+        hr = get_values( r, set, statics );
+        IPropertySet_Release( set );
+        return hr;
+    }
+    case PropertyType_String:
+    {
+        HSTRING str;
+        if (FAILED(hr = get_hstr( r, &str ))) return hr;
+        hr = IPropertyValueStatics_CreateString( statics, str, out );
+        WindowsDeleteString( str );
+        return hr;
+    }
+    case PropertyType_UInt8Array:
+        count = get_u32( r );
+        if (!(p = get( r, count ))) return E_FAIL;
+        return IPropertyValueStatics_CreateUInt8Array( statics, count, (BYTE *)p, out );
+    case PropertyType_StringArray:
+    {
+        HSTRING *strs;
+        count = get_u32( r );
+        if (count > r->size || !(strs = calloc( max( count, 1 ), sizeof(*strs) ))) return E_FAIL;
+        for (i = 0, hr = S_OK; i < count && SUCCEEDED(hr); i++) hr = get_hstr( r, &strs[i] );
+        if (SUCCEEDED(hr)) hr = IPropertyValueStatics_CreateStringArray( statics, count, strs, out );
+        for (i = 0; i < count; i++) WindowsDeleteString( strs[i] );
+        free( strs );
+        return hr;
+    }
+    }
+
+    size = get_u32( r );
+    if (!(p = get( r, size ))) return E_FAIL;
+#define SCALAR(kind, ctype) \
+    case PropertyType_##kind: { ctype v; if (size != sizeof(v)) return E_FAIL; memcpy( &v, p, sizeof(v) ); \
+                                return IPropertyValueStatics_Create##kind( statics, v, out ); }
+    switch (type)
+    {
+    SCALAR(UInt8, BYTE) SCALAR(Int16, INT16) SCALAR(UInt16, UINT16) SCALAR(Int32, INT32)
+    SCALAR(UInt32, UINT32) SCALAR(Int64, INT64) SCALAR(UInt64, UINT64) SCALAR(Single, FLOAT)
+    SCALAR(Double, DOUBLE) SCALAR(Char16, WCHAR) SCALAR(Boolean, boolean) SCALAR(DateTime, DateTime)
+    SCALAR(TimeSpan, TimeSpan) SCALAR(Guid, GUID)
+    }
+#undef SCALAR
+    return E_FAIL;
+}
+
+static HRESULT get_values( struct reader *r, IPropertySet *set, IPropertyValueStatics *statics )
+{
+    IMap_HSTRING_IInspectable *map;
+    UINT32 count = get_u32( r ), i;
+    HRESULT hr;
+
+    if (r->failed) return E_FAIL;
+    if (FAILED(hr = IPropertySet_QueryInterface( set, &IID_IMap_HSTRING_IInspectable, (void **)&map ))) return hr;
+    for (i = 0; i < count && SUCCEEDED(hr); i++)
+    {
+        IInspectable *value;
+        HSTRING key;
+        boolean replaced;
+
+        if (FAILED(hr = get_hstr( r, &key ))) break;
+        if (SUCCEEDED(hr = get_value( r, statics, &value )))
+        {
+            hr = IMap_HSTRING_IInspectable_Insert( map, key, value, &replaced );
+            IInspectable_Release( value );
+        }
+        WindowsDeleteString( key );
+    }
+    IMap_HSTRING_IInspectable_Release( map );
+    return hr;
+}
+
+static HRESULT get_container( struct reader *r, IApplicationDataContainer *container,
+                              IPropertyValueStatics *statics )
+{
+    struct data_container *impl = impl_from_IApplicationDataContainer( container );
+    UINT32 count, i;
+    HSTRING name;
+    HRESULT hr;
+
+    if (FAILED(hr = get_hstr( r, &name ))) return hr;   /* the root's is empty; a child's was used to create it */
+    WindowsDeleteString( name );
+    if (FAILED(hr = get_values( r, impl->values, statics ))) return hr;
+    count = get_u32( r );
+    for (i = 0; i < count && !r->failed && SUCCEEDED(hr); i++)
+    {
+        IApplicationDataContainer *child;
+        SIZE_T pos = r->pos;
+
+        /* peek at the child's name to create it, then let get_container read it again */
+        if (FAILED(hr = get_hstr( r, &name ))) break;
+        r->pos = pos;
+        hr = IApplicationDataContainer_CreateContainer( container, name, ApplicationDataCreateDisposition_Always, &child );
+        WindowsDeleteString( name );
+        if (FAILED(hr)) break;
+        hr = get_container( r, child, statics );
+        IApplicationDataContainer_Release( child );
+    }
+    return r->failed ? E_FAIL : hr;
+}
+
+static void load_root( IApplicationDataContainer *root, ApplicationDataLocality locality )
+{
+    static const WCHAR property_value[] = L"Windows.Foundation.PropertyValue";
+    IPropertyValueStatics *statics;
+    struct reader r = { 0 };
+    WCHAR path[MAX_PATH];
+    HSTRING_HEADER header;
+    LARGE_INTEGER size;
+    HSTRING name;
+    HANDLE file;
+    DWORD read;
+    BYTE *data;
+    HRESULT hr;
+
+    if (!settings_file( locality, path, ARRAY_SIZE(path) )) return;
+    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+    if (file == INVALID_HANDLE_VALUE) return;   /* nothing saved yet */
+    if (!GetFileSizeEx( file, &size ) || size.QuadPart > 64 * 1024 * 1024 ||
+        !(data = malloc( size.QuadPart ? size.QuadPart : 1 )))
+    {
+        CloseHandle( file );
+        return;
+    }
+    if (!ReadFile( file, data, size.QuadPart, &read, NULL ) || read != size.QuadPart)
+    {
+        CloseHandle( file );
+        free( data );
+        return;
+    }
+    CloseHandle( file );
+
+    r.data = data;
+    r.size = size.QuadPart;
+    if (get_u32( &r ) != PERSIST_MAGIC || get_u32( &r ) != PERSIST_VERSION)
+    {
+        WARN( "%s is not a settings file of ours\n", debugstr_w( path ) );
+        free( data );
+        return;
+    }
+    if (FAILED(hr = WindowsCreateStringReference( property_value, ARRAY_SIZE(property_value) - 1, &header, &name )) ||
+        FAILED(hr = RoGetActivationFactory( name, &IID_IPropertyValueStatics, (void **)&statics )))
+    {
+        ERR( "no PropertyValue statics, hr %#lx\n", hr );
+        free( data );
+        return;
+    }
+    InterlockedIncrement( &loading );
+    hr = get_container( &r, root, statics );
+    InterlockedDecrement( &loading );
+    IPropertyValueStatics_Release( statics );
+    if (FAILED(hr)) ERR( "%s is damaged, hr %#lx; keeping what was read\n", debugstr_w( path ), hr );
+    else TRACE( "loaded %s\n", debugstr_w( path ) );
+    free( data );
+}
+
 /* The root containers are process-wide, like the folders: every ApplicationData.Current hands back
  * the same LocalSettings, so what one caller writes another reads. Their Name is empty on Windows. */
 static HRESULT get_root_container( IApplicationDataContainer **root, ApplicationDataLocality locality,
@@ -992,8 +1484,15 @@ static HRESULT get_root_container( IApplicationDataContainer **root, Application
     {
         IApplicationDataContainer *container;
         if (FAILED(hr = create_data_container( locality, L"", 0, &container ))) return hr;
-        if (InterlockedCompareExchangePointer( (void **)root, container, NULL ))
-            IApplicationDataContainer_Release( container );
+        /* filled before it is published, so no caller sees a half-loaded tree */
+        EnterCriticalSection( &persist_cs );
+        if (!*root)
+        {
+            load_root( container, locality );
+            *root = container;
+        }
+        else IApplicationDataContainer_Release( container );
+        LeaveCriticalSection( &persist_cs );
     }
     IApplicationDataContainer_AddRef( *root );
     *value = *root;
@@ -1002,8 +1501,6 @@ static HRESULT get_root_container( IApplicationDataContainer **root, Application
 
 static HRESULT WINAPI application_data_get_LocalSettings( IApplicationData *iface, IApplicationDataContainer **value )
 {
-    static IApplicationDataContainer *local_settings;
-
     TRACE( "iface %p, value %p.\n", iface, value );
     return get_root_container( &local_settings, ApplicationDataLocality_Local, value );
 }
@@ -1012,8 +1509,6 @@ static HRESULT WINAPI application_data_get_LocalSettings( IApplicationData *ifac
  * settings store, so an app writing to it gets its values back, as it would offline on Windows. */
 static HRESULT WINAPI application_data_get_RoamingSettings( IApplicationData *iface, IApplicationDataContainer **value )
 {
-    static IApplicationDataContainer *roaming_settings;
-
     TRACE( "iface %p, value %p.\n", iface, value );
     return get_root_container( &roaming_settings, ApplicationDataLocality_Roaming, value );
 }

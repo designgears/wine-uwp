@@ -204,6 +204,7 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | Is this Windows DLL one we have byte-patched? | `./pecheck.py <file>...`, or `./pecheck.py --sweep uwp-bin/win11` to list every modified file. Authenticode + PE checksum; needs no reference copy |
 | Which .NET Native call site made the WinRT call that failed? | `WINE_UWP_TRACE_ORIGINATE=1` now also prints `origin frame N: module+rva` for each `RoOriginateLanguageException`; the managed caller is still on the stack. Disassemble the frame before `Stub_N` for the slot (`r8d`) |
 | Why did the app vanish with exit status 0? | `WINE_UWP_TRACE_EXIT=1`: backtraces for `RtlExitUserProcess`, `TerminateProcess` (any target, with both pids), `TerminateThread` and ucrtbase `abort()`. `WINE_UWP_TRACE_THREAD_EXIT=1` adds every thread exit and `NtTerminateThread`. `WINE_UWP_TRACE_CLOSE=<hex>` names who closes a handle |
+| Where did a Sentry/crashpad minidump crash? | `./minidump.py <file.dmp>` - exception, module+offset, and a module-resolved scan of the faulting stack. Wine builtins carry DWARF: `llvm-symbolizer --obj=~/src/wine-build/dlls/<dll>/x86_64-windows/<dll>.dll 0x180000000+<offset>` names the function and line. That is how the dcomp use-after-free and the d3d11 NULL write were found in minutes |
 | The app ships a crash reporter (Sentry/crashpad) | read its minidump and breadcrumbs, in `LocalState/crash_report/` for Shapr3D: the dump's exception stream names the thread and address, the breadcrumbs the app's own error text |
 | Open a URI or file from an app without touching the real desktop | `WINE_UWP_LAUNCHER=log` makes the Launcher shim log instead of `ShellExecute` |
 | Deliver a URI to the running app (sign-in callbacks, `scheme:` links) | `./activate-uri.sh <uri>` - a Protocol activation of the running instance, via the inbox `wineuwp` watches. `./browser-callback.sh <scheme>` does a whole browser sign-in and delivers its callback |
@@ -638,6 +639,15 @@ tree - so a correct fix looks like it did nothing. This is already documented be
 generally and I walked into it anyway, because I checked the *timestamp* rather than `cmp`.
 `install-overrides.sh` now refreshes it and says `refreshed: stale wineuwp.dll in the prefix`.
 
+**A guessed signature for a private export can silently drop work.** `SHTaskPoolQueueTask` had
+been implemented as `(flags, proc, context, cancel)` with a comment explaining why a small "proc"
+must be ignored - it was the options word. Every async operation of the genuine Windows.Graphics
+then never completed, and the app sat idle with no error anywhere. When a native DLL calls a
+private export, read a **caller's** disassembly for the argument count, and find the callee's
+signature in its PDB (Windows' `shcore.pdb` names `WorkThreadManager::s_QueuePoolTask`'s
+parameters). With no RTTI, find a class's vtable by searching `.rdata` for a pointer to one of
+its PDB-named methods (the deleting destructor is a good one) and read the neighbours.
+
 **Give every slot a traced thunk before implementing anything.** `IStoreContext` has 26+ methods;
 a traced stand-in returning `E_NOTIMPL` (with event registrations answered `S_OK`) showed the app
 calls **`GetDefault` and nothing else**. Merely being able to *create* the object was the entire
@@ -822,7 +832,7 @@ the fully-qualified name. `--grep` first, always.
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
 | Solitaire | **Playable on the unpatched `Solitaire.exe`** (`docs/screenshots/solitaire-unpatched-menu-game.png`): main menu -> Klondike -> game, and clicks move cards. No exe byte patch is needed any more: `wineuwp` delivers `CoreWindow.VisibilityChanged`. The Sign In Error popup shows on top of the menu; Cancel is at about (813,549). The old ~1-in-10 blank window is fixed (60/60 clean) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
-| Shapr3D | **Signs in and reaches its dashboard** (`docs/screenshots/shapr3d-dashboard-signed-in.png`). Log In -> `./browser-callback.sh shapr3d` (a human solves the reCAPTCHA; run the app with `WINE_UWP_LAUNCHER=log`) -> the callback is exchanged for a session. The session is **not persisted** (ApplicationData is in-memory), so every start needs a fresh sign-in. Tile thumbnails mostly draw blank. Findings-M4, "Signed in" |
+| Shapr3D | **Signs in, stays signed in, and opens the editor with a rendering 3D viewport** (`docs/screenshots/shapr3d-editor.png`). First sign-in: Log In -> `./browser-callback.sh shapr3d` (a human solves the reCAPTCHA; run with `WINE_UWP_LAUNCHER=log`); the session then persists in `Packages\<family>\Settings\wine-local.dat`. New project -> editor works on `:98` unattended. Modelling itself is untested; dashboard thumbnails were blank before the task-pool fix and have not been rechecked. Findings-M4, "The editor opens" |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
 them. **Testing that, and making them the default if it holds, is a standing job** - they change the

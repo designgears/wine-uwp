@@ -265,18 +265,72 @@ static HRESULT STDMETHODCALLTYPE uri_Suspicious(IUriRuntimeClass *iface, boolean
     return E_NOTIMPL;
 }
 
+static const struct IUriRuntimeClassVtbl uri_vtbl;
+HRESULT WINAPI PrivateCoInternetCombineIUri(IUri *base, IUri *relative, DWORD flags, IUri **result, DWORD_PTR reserved);
+
+/* Wraps an IUri, taking over the caller's reference. */
+static HRESULT uri_object_create(IUri *uri, IUriRuntimeClass **instance)
+{
+    struct uri *uri_impl;
+
+    if (!(uri_impl = calloc(1, sizeof(*uri_impl))))
+    {
+        IUri_Release(uri);
+        *instance = NULL;
+        return E_OUTOFMEMORY;
+    }
+    uri_impl->IUriRuntimeClass_iface.lpVtbl = &uri_vtbl;
+    uri_impl->uri = uri;
+    uri_impl->ref = 1;
+    *instance = &uri_impl->IUriRuntimeClass_iface;
+    return S_OK;
+}
+
+/* Resolves a relative reference against a base, as Uri(base, relative) and CombineUri do. Shapr3D
+ * builds its project-upload URLs this way ("?includeUpload=false&..."). */
+static HRESULT combine(IUri *base, HSTRING relative_uri, IUriRuntimeClass **instance)
+{
+    IUri *relative, *combined;
+    HRESULT hr;
+
+    if (!instance) return E_POINTER;
+    *instance = NULL;
+    if (FAILED(hr = CreateUri(WindowsGetStringRawBuffer(relative_uri, NULL),
+                              Uri_CREATE_ALLOW_RELATIVE | Uri_CREATE_NO_DECODE_EXTRA_INFO, 0, &relative)))
+        return E_INVALIDARG;
+    hr = PrivateCoInternetCombineIUri(base, relative, 0, &combined, 0);
+    IUri_Release(relative);
+    if (FAILED(hr)) return E_INVALIDARG;
+    return uri_object_create(combined, instance);
+}
+
 static HRESULT STDMETHODCALLTYPE uri_Equals(IUriRuntimeClass *iface, IUriRuntimeClass *uri,
                                             boolean *value)
 {
-    FIXME("iface %p, uri %p, value %p stub!\n", iface, uri, value);
-    return E_NOTIMPL;
+    struct uri *impl = impl_from_IUriRuntimeClass(iface);
+    BOOL equal = FALSE;
+    HRESULT hr;
+
+    TRACE("iface %p, uri %p, value %p.\n", iface, uri, value);
+
+    if (!value) return E_POINTER;
+    if (!uri || uri->lpVtbl != &uri_vtbl)
+    {
+        *value = FALSE;
+        return S_OK;
+    }
+    hr = IUri_IsEqual(impl->uri, impl_from_IUriRuntimeClass(uri)->uri, &equal);
+    *value = SUCCEEDED(hr) && equal;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE uri_CombineUri(IUriRuntimeClass *iface, HSTRING relative_uri,
                                                 IUriRuntimeClass **instance)
 {
-    FIXME("iface %p, relative_uri %s, instance %p stub!\n", iface, debugstr_hstring(relative_uri), instance);
-    return E_NOTIMPL;
+    struct uri *impl = impl_from_IUriRuntimeClass(iface);
+
+    TRACE("iface %p, relative_uri %s, instance %p.\n", iface, debugstr_hstring(relative_uri), instance);
+    return combine(impl->uri, relative_uri, instance);
 }
 
 static const struct IUriRuntimeClassVtbl uri_vtbl =
@@ -312,6 +366,7 @@ struct iertutil
 {
     IActivationFactory IActivationFactory_iface;
     IUriRuntimeClassFactory IUriRuntimeClassFactory_iface;
+    IUriEscapeStatics IUriEscapeStatics_iface;
     LONG ref;
 };
 
@@ -340,6 +395,12 @@ static HRESULT STDMETHODCALLTYPE iertutil_QueryInterface(IActivationFactory *ifa
     {
         IUriRuntimeClassFactory_AddRef(&impl->IUriRuntimeClassFactory_iface);
         *out = &impl->IUriRuntimeClassFactory_iface;
+        return S_OK;
+    }
+    else if (IsEqualGUID(iid, &IID_IUriEscapeStatics))
+    {
+        IUriEscapeStatics_AddRef(&impl->IUriEscapeStatics_iface);
+        *out = &impl->IUriEscapeStatics_iface;
         return S_OK;
     }
 
@@ -449,9 +510,20 @@ static HRESULT STDMETHODCALLTYPE uri_factory_CreateWithRelativeUri(IUriRuntimeCl
                                                                    HSTRING relative_uri,
                                                                    IUriRuntimeClass **instance)
 {
-    FIXME("iface %p, base_uri %s, relative_uri %s, instance %p stub!\n", iface,
+    IUri *base;
+    HRESULT hr;
+
+    TRACE("iface %p, base_uri %s, relative_uri %s, instance %p.\n", iface,
           debugstr_hstring(base_uri), debugstr_hstring(relative_uri), instance);
-    return E_NOTIMPL;
+
+    if (!instance) return E_POINTER;
+    *instance = NULL;
+    if (FAILED(CreateUri(WindowsGetStringRawBuffer(base_uri, NULL),
+                         Uri_CREATE_ALLOW_IMPLICIT_FILE_SCHEME | Uri_CREATE_NO_DECODE_EXTRA_INFO, 0, &base)))
+        return E_INVALIDARG;
+    hr = combine(base, relative_uri, instance);
+    IUri_Release(base);
+    return hr;
 }
 
 static const struct IUriRuntimeClassFactoryVtbl uri_factory_vtbl =
@@ -468,10 +540,125 @@ static const struct IUriRuntimeClassFactoryVtbl uri_factory_vtbl =
     uri_factory_CreateWithRelativeUri,
 };
 
+/* IUriEscapeStatics. Shapr3D's HTTP layer escapes every query component through
+ * Uri.EscapeComponent; the refusal came back from C++/WinRT's .as<>() as a throw, logged as
+ * "failed to build request", and the request that creates a new project was never sent. */
+DEFINE_IINSPECTABLE(uri_escape, IUriEscapeStatics, struct iertutil, IActivationFactory_iface)
+
+/* RFC 3986's unreserved characters; everything else is percent-encoded as UTF-8. */
+static BOOL is_unreserved(char c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+           c == '-' || c == '.' || c == '_' || c == '~';
+}
+
+static HRESULT STDMETHODCALLTYPE uri_escape_EscapeComponent(IUriEscapeStatics *iface, HSTRING to_escape,
+                                                            HSTRING *value)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    UINT32 len;
+    const WCHAR *str = WindowsGetStringRawBuffer(to_escape, &len);
+    int size = len ? WideCharToMultiByte(CP_UTF8, 0, str, len, NULL, 0, NULL, NULL) : 0;
+    char *utf8;
+    WCHAR *out, *p;
+    HRESULT hr;
+    int i;
+
+    TRACE("iface %p, to_escape %s, value %p.\n", iface, debugstr_hstring(to_escape), value);
+
+    if (!value) return E_POINTER;
+    if (!(utf8 = malloc(size + 1)) || !(out = malloc((size * 3 + 1) * sizeof(WCHAR))))
+    {
+        free(utf8);
+        return E_OUTOFMEMORY;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, str, len, utf8, size, NULL, NULL);
+    for (i = 0, p = out; i < size; i++)
+    {
+        unsigned char c = utf8[i];
+        if (is_unreserved(c)) *p++ = c;
+        else
+        {
+            *p++ = '%';
+            *p++ = hex[c >> 4];
+            *p++ = hex[c & 0xf];
+        }
+    }
+    hr = WindowsCreateString(out, p - out, value);
+    free(out);
+    free(utf8);
+    return hr;
+}
+
+static int hex_value(WCHAR c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* %XX sequences become bytes, read as UTF-8; anything else, '+' included, is kept as it is. */
+static HRESULT STDMETHODCALLTYPE uri_escape_UnescapeComponent(IUriEscapeStatics *iface, HSTRING to_unescape,
+                                                              HSTRING *value)
+{
+    UINT32 len, i;
+    const WCHAR *str = WindowsGetStringRawBuffer(to_unescape, &len);
+    char *bytes, *p;
+    WCHAR *out;
+    int hi, lo, count;
+    HRESULT hr;
+
+    TRACE("iface %p, to_unescape %s, value %p.\n", iface, debugstr_hstring(to_unescape), value);
+
+    if (!value) return E_POINTER;
+    if (!(bytes = malloc(len * 3 + 1))) return E_OUTOFMEMORY;
+    for (i = 0, p = bytes; i < len; i++)
+    {
+        if (str[i] == '%' && i + 2 < len && (hi = hex_value(str[i + 1])) >= 0 && (lo = hex_value(str[i + 2])) >= 0)
+        {
+            *p++ = (char)(hi << 4 | lo);
+            i += 2;
+        }
+        else
+        {
+            int n = IS_HIGH_SURROGATE(str[i]) && i + 1 < len ? 2 : 1;
+            p += WideCharToMultiByte(CP_UTF8, 0, str + i, n, p, 4, NULL, NULL);
+            i += n - 1;
+        }
+    }
+    count = MultiByteToWideChar(CP_UTF8, 0, bytes, p - bytes, NULL, 0);
+    if (!(out = malloc((count + 1) * sizeof(WCHAR))))
+    {
+        free(bytes);
+        return E_OUTOFMEMORY;
+    }
+    MultiByteToWideChar(CP_UTF8, 0, bytes, p - bytes, out, count);
+    hr = WindowsCreateString(out, count, value);
+    free(out);
+    free(bytes);
+    return hr;
+}
+
+static const struct IUriEscapeStaticsVtbl uri_escape_vtbl =
+{
+    uri_escape_QueryInterface,
+    uri_escape_AddRef,
+    uri_escape_Release,
+    /* IInspectable methods */
+    uri_escape_GetIids,
+    uri_escape_GetRuntimeClassName,
+    uri_escape_GetTrustLevel,
+    /* IUriEscapeStatics methods */
+    uri_escape_UnescapeComponent,
+    uri_escape_EscapeComponent,
+};
+
 static struct iertutil iertutil =
 {
     {&activation_factory_vtbl},
     {&uri_factory_vtbl},
+    {&uri_escape_vtbl},
     1
 };
 

@@ -1858,22 +1858,24 @@ static void STDMETHODCALLTYPE d3d11_device_context_IAGetVertexBuffers(ID3D11Devi
     TRACE("iface %p, start_slot %u, buffer_count %u, buffers %p, strides %p, offsets %p.\n",
             iface, start_slot, buffer_count, buffers, strides, offsets);
 
+    /* each of buffers, strides and offsets is optional; ANGLE asks for the buffers alone */
     wined3d_mutex_lock();
     for (i = 0; i < buffer_count; ++i)
     {
         struct wined3d_buffer *wined3d_buffer = NULL;
         struct d3d_buffer *buffer_impl;
+        unsigned int offset = 0, stride = 0;
 
         if (FAILED(wined3d_device_context_get_stream_source(context->wined3d_context, start_slot + i,
-                &wined3d_buffer, &offsets[i], &strides[i])))
-        {
+                &wined3d_buffer, &offset, &stride)))
             FIXME("Failed to get vertex buffer %u.\n", start_slot + i);
-            if (strides)
-                strides[i] = 0;
-            if (offsets)
-                offsets[i] = 0;
-        }
+        if (strides)
+            strides[i] = stride;
+        if (offsets)
+            offsets[i] = offset;
 
+        if (!buffers)
+            continue;
         if (!wined3d_buffer)
         {
             buffers[i] = NULL;
@@ -6524,11 +6526,19 @@ static void STDMETHODCALLTYPE d3d10_device_IAGetVertexBuffers(ID3D10Device1 *ifa
     {
         struct wined3d_buffer *wined3d_buffer = NULL;
         struct d3d_buffer *buffer_impl;
+        unsigned int offset = 0, stride = 0;
 
+        /* each of buffers, strides and offsets is optional */
         if (FAILED(wined3d_device_context_get_stream_source(device->immediate_context.wined3d_context, start_slot + i,
-                &wined3d_buffer, &offsets[i], &strides[i])))
+                &wined3d_buffer, &offset, &stride)))
             ERR("Failed to get vertex buffer.\n");
+        if (strides)
+            strides[i] = stride;
+        if (offsets)
+            offsets[i] = offset;
 
+        if (!buffers)
+            continue;
         if (!wined3d_buffer)
         {
             buffers[i] = NULL;
