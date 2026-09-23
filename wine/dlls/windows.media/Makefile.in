@@ -1,9 +1,10 @@
 MODULE  = windows.media.dll
-IMPORTS = combase
+IMPORTS = combase mfplat mfuuid
 
 SOURCES = \
 	captions.c \
 	classes.idl \
+	codecquery.c \
 	main.c \
 	mediasource.c \
 	mediasource_private.idl \

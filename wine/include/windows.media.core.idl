@@ -46,6 +46,13 @@ import "windows.storage.streams.idl";
 import "windows.ui.idl";
 
 namespace Windows.Media.Core {
+    typedef enum CodecCategory CodecCategory;
+    typedef enum CodecKind CodecKind;
+
+    interface ICodecInfo;
+    interface ICodecQuery;
+    interface ICodecSubtypesStatics;
+    interface ICodecSubtypesStatics2;
     interface IAudioTrack;
     interface IMediaSource;
     interface IMediaSource2;
@@ -53,6 +60,9 @@ namespace Windows.Media.Core {
     interface IVideoTrack;
 
     runtimeclass AudioTrack;
+    runtimeclass CodecInfo;
+    runtimeclass CodecQuery;
+    runtimeclass CodecSubtypes;
     runtimeclass TimedMetadataTrack;
     runtimeclass VideoTrack;
 
@@ -127,5 +137,156 @@ namespace Windows.Media.Core {
     runtimeclass TimedMetadataTrack
     {
         [default] interface Windows.Media.Core.ITimedMetadataTrack;
+    }
+
+    declare {
+        interface Windows.Foundation.Collections.IIterable<Windows.Media.Core.CodecInfo *>;
+        interface Windows.Foundation.Collections.IIterator<Windows.Media.Core.CodecInfo *>;
+        interface Windows.Foundation.Collections.IVectorView<Windows.Media.Core.CodecInfo *>;
+        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Foundation.Collections.IVectorView<Windows.Media.Core.CodecInfo *> *>;
+        interface Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.Media.Core.CodecInfo *> *>;
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 7.0)
+    ]
+    enum CodecCategory
+    {
+        Encoder = 0,
+        Decoder = 1,
+    };
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 7.0)
+    ]
+    enum CodecKind
+    {
+        Audio = 0,
+        Video = 1,
+    };
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 7.0),
+        exclusiveto(Windows.Media.Core.CodecInfo),
+        uuid(51e89f85-ea97-499c-86ac-4ce5e73f3a42)
+    ]
+    interface ICodecInfo : IInspectable
+    {
+        [propget] HRESULT Kind([out, retval] Windows.Media.Core.CodecKind *value);
+        [propget] HRESULT Category([out, retval] Windows.Media.Core.CodecCategory *value);
+        [propget] HRESULT Subtypes([out, retval] Windows.Foundation.Collections.IVectorView<HSTRING> **value);
+        [propget] HRESULT DisplayName([out, retval] HSTRING *value);
+        [propget] HRESULT IsTrusted([out, retval] boolean *value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 7.0),
+        exclusiveto(Windows.Media.Core.CodecQuery),
+        uuid(222a953a-af61-4e04-808a-a4634e2f3ac4)
+    ]
+    interface ICodecQuery : IInspectable
+    {
+        HRESULT FindAllAsync([in] Windows.Media.Core.CodecKind kind, [in] Windows.Media.Core.CodecCategory category,
+                             [in] HSTRING subType,
+                             [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.Media.Core.CodecInfo *> *> **value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 7.0),
+        marshaling_behavior(agile)
+    ]
+    runtimeclass CodecInfo
+    {
+        [default] interface Windows.Media.Core.ICodecInfo;
+    }
+
+    [
+        activatable(Windows.Foundation.UniversalApiContract, 7.0),
+        contract(Windows.Foundation.UniversalApiContract, 7.0),
+        marshaling_behavior(agile)
+    ]
+    runtimeclass CodecQuery
+    {
+        [default] interface Windows.Media.Core.ICodecQuery;
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 7.0),
+        exclusiveto(Windows.Media.Core.CodecSubtypes),
+        uuid(a66ac4f2-888b-4224-8cf6-2a8d4eb02382)
+    ]
+    interface ICodecSubtypesStatics : IInspectable
+    {
+        [propget] HRESULT VideoFormatDV25([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatDV50([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatDvc([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatDvh1([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatDvhD([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatDvsd([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatDvsl([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatH263([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatH264([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatH265([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatH264ES([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatHevc([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatHevcES([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatM4S2([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatMjpg([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatMP43([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatMP4S([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatMP4V([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatMpeg2([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatVP80([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatVP90([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatMpg1([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatMss1([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatMss2([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatWmv1([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatWmv2([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatWmv3([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormatWvc1([out, retval] HSTRING *value);
+        [propget] HRESULT VideoFormat420O([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatAac([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatAdts([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatAlac([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatAmrNB([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatAmrWB([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatAmrWP([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatDolbyAC3([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatDolbyAC3Spdif([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatDolbyDDPlus([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatDrm([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatDts([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatFlac([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatFloat([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatMP3([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatMPeg([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatMsp1([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatOpus([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatPcm([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatWmaSpdif([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatWMAudioLossless([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatWMAudioV8([out, retval] HSTRING *value);
+        [propget] HRESULT AudioFormatWMAudioV9([out, retval] HSTRING *value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 14.0),
+        exclusiveto(Windows.Media.Core.CodecSubtypes),
+        uuid(363b0930-de26-582e-8014-f546d0753887)
+    ]
+    interface ICodecSubtypesStatics2 : IInspectable
+    {
+        [propget] HRESULT VideoFormatAv1([out, retval] HSTRING *value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 7.0),
+        marshaling_behavior(agile),
+        static(Windows.Media.Core.ICodecSubtypesStatics, Windows.Foundation.UniversalApiContract, 7.0),
+        static(Windows.Media.Core.ICodecSubtypesStatics2, Windows.Foundation.UniversalApiContract, 14.0)
+    ]
+    runtimeclass CodecSubtypes
+    {
     }
 }

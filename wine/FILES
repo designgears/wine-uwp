@@ -239,3 +239,4 @@ dlls/ntdll/thread.c
 dlls/ntdll/unix/system.c
 dlls/ntdll/unix/thread.c
 dlls/windows.storage/filestream.c
+dlls/windows.media/codecquery.c

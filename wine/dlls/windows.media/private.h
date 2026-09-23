@@ -50,6 +50,8 @@ extern HRESULT video_track_list_create( IInspectable *item, IInspectable **out )
 extern HRESULT metadata_track_list_create( IInspectable *item, IInspectable **out );
 
 extern IActivationFactory *captions_factory;
+extern IActivationFactory *codec_query_factory;
+extern IActivationFactory *codec_subtypes_factory;
 extern IActivationFactory *playback_list_factory;
 extern IActivationFactory *media_transcoder_factory;
 

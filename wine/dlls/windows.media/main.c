@@ -48,6 +48,10 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **fac
         IActivationFactory_QueryInterface( media_source_factory, &IID_IActivationFactory, (void **)factory );
     if (!wcscmp( buffer, RuntimeClass_Windows_Media_Playback_MediaPlaybackItem ))
         IActivationFactory_QueryInterface( playback_item_factory, &IID_IActivationFactory, (void **)factory );
+    if (!wcscmp( buffer, RuntimeClass_Windows_Media_Core_CodecSubtypes ))
+        IActivationFactory_QueryInterface( codec_subtypes_factory, &IID_IActivationFactory, (void **)factory );
+    if (!wcscmp( buffer, RuntimeClass_Windows_Media_Core_CodecQuery ))
+        IActivationFactory_QueryInterface( codec_query_factory, &IID_IActivationFactory, (void **)factory );
     if (!wcscmp( buffer, RuntimeClass_Windows_Media_Transcoding_MediaTranscoder ))
         IActivationFactory_QueryInterface( media_transcoder_factory, &IID_IActivationFactory, (void **)factory );
 

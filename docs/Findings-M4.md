@@ -8263,3 +8263,22 @@ colours / 0 fail-fasts twice, Solitaire reaches the main menu twice with 0 criti
 - **Handle reuse was not it.** `TpSetWait` already duplicates every waited handle.
 - The `.syms` in `uwp-bin/pdb/dcomp.pdb.syms` belong to another `dcomp.dll` build: a "vtable" read
   through them resolves to `InteropVisual` methods. Check a PDB's RSDS against the binary.
+
+### Shapr3D reaches its Welcome page: CodecQuery (2026-09-23)
+
+The "media feature pack" dialog was Shapr3D's startup codec check. It activates
+`Windows.Media.Core.CodecQuery`, reads `CodecSubtypes.VideoFormatH264` / `AudioFormatAac`, and asks
+`FindAllAsync(Video, Decoder, H264)` and `FindAllAsync(Audio, Decoder, AAC)`; an empty answer is
+the dialog. Both classes are now in Wine's `windows.media` (`codecquery.c`), with the IDL added to
+`windows.media.core.idl` (the parameterised IIDs widl generates were checked against `piid.py`).
+`FindAllAsync` enumerates the registered MFTs with `MFTEnumEx` - decoders by input subtype,
+encoders by output subtype - and Wine's GStreamer transforms answer one codec each. The 51
+`CodecSubtypes` getters are generated from Wine's own `MFVideoFormat_*` / `MFAudioFormat_*`
+GUIDs, in the slot order checked against `Windows.Media.winmd`, so a subtype string and the
+enumeration can never disagree. The operation is handed back already completed.
+
+Result: the Welcome page (`docs/screenshots/shapr3d-welcome-page.png`) - "Go from Idea to 3D Model
+in Minutes", Sign Up, Log In, a language picker. `CodecInfo.DisplayName` comes back empty (Wine's
+MFT registrations have no friendly name in this path); Shapr3D does not read it.
+
+Regression: Calculator AE 0, Media Player Home page with 0 fail-fasts.

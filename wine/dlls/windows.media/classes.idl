@@ -29,6 +29,8 @@ namespace Windows.Media.ClosedCaptioning {
     runtimeclass ClosedCaptionProperties;
 }
 namespace Windows.Media.Core {
+    runtimeclass CodecQuery;
+    runtimeclass CodecSubtypes;
     runtimeclass MediaBinder;
     runtimeclass MediaSource;
 }

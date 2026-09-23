@@ -799,7 +799,7 @@ the fully-qualified name. `--grep` first, always.
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
 | Solitaire | **Playable on the unpatched `Solitaire.exe`** (`docs/screenshots/solitaire-unpatched-menu-game.png`): main menu -> Klondike -> game, and clicks move cards. No exe byte patch is needed any more: `wineuwp` delivers `CoreWindow.VisibilityChanged`. The Sign In Error popup shows on top of the menu; Cancel is at about (813,549). The old ~1-in-10 blank window is fixed (60/60 clean) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
-| Shapr3D | **Starts, stays up and renders its startup screen** (`docs/screenshots/shapr3d-media-feature-pack-dialog.png`), then shows its own "You need a media feature pack" dialog, because `Windows.Media.Core.CodecQuery` is unimplemented - the next blocker. Its engine initialises D3D11 and compiles its shaders. Findings-M4, 2026-09-23 |
+| Shapr3D | **Reaches its Welcome page** (`docs/screenshots/shapr3d-welcome-page.png`): "Go from Idea to 3D Model in Minutes", Sign Up, Log In, language picker, all drawn by XAML; the engine initialises D3D11 and compiles its shaders behind it. Signing in (the way to the modelling workspace) is the next frontier. Findings-M4, 2026-09-23 |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
 them. **Testing that, and making them the default if it holds, is a standing job** - they change the

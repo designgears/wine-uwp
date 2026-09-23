@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     c6f5b763194e67c26c3fddc770f88e0a6d2367a5
-                 Shapr3D bring-up: file streams, fences, package display names, exit tracing
+  wine HEAD:     17a36f264386b016b180766c8c7a93a07df153da
+                 windows.media: CodecQuery and CodecSubtypes, answered from the registered MFTs
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-23T09:18:23Z
+  captured:      2026-09-23T09:30:43Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
