@@ -78,6 +78,9 @@ DEFINE_GUID(IID_ICoreWindowStatic,                  0x4d239005, 0x3c2a, 0x41b1, 
  * calls ActivationHandled (slot 6) when the app has taken the activation. */
 DEFINE_GUID(IID_IActivationEventCallback,           0xfefdc269, 0xa317, 0x4e33, 0x9f, 0x50, 0xc2, 0x85, 0xc9, 0xc2, 0x97, 0x25);
 DEFINE_GUID(IID_IApplicationStatics,                0x06499997, 0xf7b4, 0x45fe, 0xb7, 0x63, 0x75, 0x77, 0xd1, 0xd3, 0xcb, 0x4a);
+DEFINE_GUID(IID_IProtocolActivatedEventArgs,         0x6095f4dd, 0xb7c0, 0x46ab, 0x81, 0xfe, 0xd9, 0x0f, 0x36, 0xd0, 0x0d, 0x24);
+DEFINE_GUID(IID_IProtocolActivatedEventArgsWithCallerPackageFamilyNameAndData,
+                                                     0xd84a0c12, 0x5c8f, 0x438c, 0x83, 0xcb, 0xc2, 0x8f, 0xcc, 0x0b, 0x2f, 0xdb);
 DEFINE_GUID(IID_IUriRuntimeClassFactory,            0x44a9796f, 0x723e, 0x4fdf, 0xa2, 0x18, 0x03, 0x3e, 0x75, 0xb0, 0xc0, 0x84);
 DEFINE_GUID(IID_ICoreApplication,                   0x0aacf7a4, 0x5e1d, 0x49df, 0x80, 0x34, 0xfb, 0x6a, 0x68, 0xbc, 0x5e, 0xd1);
 DEFINE_GUID(IID_ICoreImmersiveApplication,         0x1ada0e3e, 0xe4a2, 0x4123, 0xb4, 0x51, 0xdc, 0x96, 0xbf, 0x80, 0x04, 0x19);
@@ -130,6 +133,9 @@ struct launch_args
     HSTRING tile_id;
     const void *vtbl_file;        /* IFileActivatedEventArgs, when launched on a file */
     WCHAR *file_path;             /* NULL for a plain Launch activation */
+    const void *vtbl_protocol;    /* IProtocolActivatedEventArgs, when activated on a URI */
+    const void *vtbl_protocol2;   /* IProtocolActivatedEventArgsWithCallerPackageFamilyNameAndData */
+    IUnknown *protocol_uri;       /* the Windows.Foundation.Uri; NULL unless a Protocol activation */
 };
 
 #define ARGS_FROM(iface, field) ((struct launch_args *)((char *)(iface) - offsetof(struct launch_args, field)))
@@ -139,6 +145,16 @@ static HRESULT WINAPI args_QueryInterface(struct launch_args *args, REFIID iid, 
     TRACE("%p, %s, %p\n", args, debugstr_guid(iid), out);
     if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IInspectable) || IsEqualGUID(iid, &IID_IActivatedEventArgs))
         *out = &args->vtbl_activated;
+    /* ProtocolActivatedEventArgs is not a launch: it has no Arguments, TileId or Prelaunch */
+    else if (args->protocol_uri && (IsEqualGUID(iid, &IID_ILaunchActivatedEventArgs) ||
+             IsEqualGUID(iid, &IID_ILaunchActivatedEventArgs2) || IsEqualGUID(iid, &IID_IPrelaunchActivatedEventArgs)))
+    {
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    else if (IsEqualGUID(iid, &IID_IProtocolActivatedEventArgs) && args->protocol_uri) *out = &args->vtbl_protocol;
+    else if (IsEqualGUID(iid, &IID_IProtocolActivatedEventArgsWithCallerPackageFamilyNameAndData) && args->protocol_uri)
+        *out = &args->vtbl_protocol2;
     else if (IsEqualGUID(iid, &IID_ILaunchActivatedEventArgs)) *out = &args->vtbl_launch;
     else if (IsEqualGUID(iid, &IID_ILaunchActivatedEventArgs2)) *out = &args->vtbl_launch2;
     else if (IsEqualGUID(iid, &IID_IApplicationViewActivatedEventArgs)) *out = &args->vtbl_appview;
@@ -183,6 +199,7 @@ static ULONG WINAPI args_Release(struct launch_args *args)
     {
         WindowsDeleteString(args->arguments);
         WindowsDeleteString(args->tile_id);
+        if (args->protocol_uri) IUnknown_Release(args->protocol_uri);
         if (args->splash) IUnknown_Release(args->splash);
         if (args->ftm) IUnknown_Release(args->ftm);
         free(args);
@@ -190,9 +207,18 @@ static ULONG WINAPI args_Release(struct launch_args *args)
     return ref;
 }
 static HRESULT WINAPI args_GetIids(void *iface, ULONG *count, IID **iids) { *count = 0; *iids = NULL; return S_OK; }
+/* The class name is how .NET types the managed wrapper, so a protocol activation must say
+ * ProtocolActivatedEventArgs. Every view of the object shares this function, and a view pointer
+ * cannot be mapped back to its object without knowing which view it is, so the protocol args
+ * answer through their own copies of the table (see protocol_name_vtbl below). */
 static HRESULT WINAPI args_GetRuntimeClassName(void *iface, HSTRING *name)
 {
     static const WCHAR cls[] = L"Windows.ApplicationModel.Activation.LaunchActivatedEventArgs";
+    return WindowsCreateString(cls, ARRAY_SIZE(cls) - 1, name);
+}
+static HRESULT WINAPI protocol_args_GetRuntimeClassName(void *iface, HSTRING *name)
+{
+    static const WCHAR cls[] = L"Windows.ApplicationModel.Activation.ProtocolActivatedEventArgs";
     return WindowsCreateString(cls, ARRAY_SIZE(cls) - 1, name);
 }
 static HRESULT WINAPI args_GetTrustLevel(void *iface, TrustLevel *level) { *level = BaseTrust; return S_OK; }
@@ -210,7 +236,8 @@ ARGS_IUNKNOWN(vtbl_prelaunch) ARGS_IUNKNOWN(vtbl_viewswitch) ARGS_IUNKNOWN(vtbl_
 static HRESULT WINAPI activated_get_Kind(void *iface, INT32 *kind)
 {
     struct launch_args *args = ARGS_FROM(iface, vtbl_activated);
-    *kind = args->file_path ? 1 : 0;
+    /* ActivationKind_Protocol is 2 */
+    *kind = args->protocol_uri ? 2 : args->file_path ? 1 : 0;
     TRACE("kind %d\n", *kind);
     return S_OK;
 }
@@ -855,6 +882,99 @@ static struct file_vector *create_file_vector(const WCHAR *path)
 
 static IInspectable *create_launch_args_for_file(const WCHAR *arguments, const WCHAR *file);
 
+/* ---------------------------------------------------------------------------------------------
+ * ProtocolActivatedEventArgs: the same object as the launch args, in protocol mode. It is how an
+ * app that owns a URI scheme gets that URI - Shapr3D's sign-in comes back as shapr3d:... from the
+ * browser, to the instance that started it (only that instance holds the PKCE verifier).
+ */
+static HRESULT WINAPI protocol_get_Uri(void *iface, IUnknown **value)
+{
+    struct launch_args *args = ARGS_FROM(iface, vtbl_protocol);
+    TRACE("\n");
+    if (!value) return E_POINTER;
+    IUnknown_AddRef((*value = args->protocol_uri));
+    return S_OK;
+}
+static HRESULT WINAPI protocol2_get_CallerPackageFamilyName(void *iface, HSTRING *value)
+{
+    TRACE("\n");
+    return WindowsCreateString(L"", 0, value);   /* the browser is not a package */
+}
+/* A ValueSet the app can read and find empty, rather than a NULL it would dereference. */
+static HRESULT WINAPI protocol2_get_Data(void *iface, IInspectable **value)
+{
+    HSTRING_HEADER header;
+    HSTRING name;
+    HRESULT hr;
+
+    TRACE("\n");
+    if (!value) return E_POINTER;
+    *value = NULL;
+    if (FAILED(hr = WindowsCreateStringReference(L"Windows.Foundation.Collections.ValueSet", 39, &header, &name)))
+        return hr;
+    return RoActivateInstance(name, value);
+}
+ARGS_IUNKNOWN(vtbl_protocol) ARGS_IUNKNOWN(vtbl_protocol2)
+static const void *protocol_vtbl[] = { vtbl_protocol_QI, vtbl_protocol_AddRef, vtbl_protocol_Release, args_GetIids,
+    protocol_args_GetRuntimeClassName, args_GetTrustLevel, protocol_get_Uri };
+static const void *protocol2_vtbl[] = { vtbl_protocol2_QI, vtbl_protocol2_AddRef, vtbl_protocol2_Release, args_GetIids,
+    protocol_args_GetRuntimeClassName, args_GetTrustLevel, protocol2_get_CallerPackageFamilyName, protocol2_get_Data };
+
+/* Copies of the shared view tables whose GetRuntimeClassName says ProtocolActivatedEventArgs. */
+static const void **protocol_view_vtbl(const void **src, size_t count, const void ***cache)
+{
+    const void **copy;
+
+    if (*cache) return *cache;
+    if (!(copy = malloc(count * sizeof(*copy)))) return src;
+    memcpy(copy, src, count * sizeof(*copy));
+    copy[4] = protocol_args_GetRuntimeClassName;
+    if (InterlockedCompareExchangePointer((void **)cache, copy, NULL)) free(copy);
+    return *cache;
+}
+
+static IInspectable *create_protocol_args(const WCHAR *uri)
+{
+    static const void **activated_copy, **appview_copy, **viewswitch_copy, **withuser_copy, **init_copy;
+    IUnknown **uri_factory;
+    HSTRING_HEADER header;
+    struct launch_args *args;
+    IInspectable *inspectable;
+    HSTRING name, value;
+    HRESULT hr;
+
+    if (!(inspectable = create_launch_args_for_file(L"", NULL))) return NULL;
+    args = ARGS_FROM(inspectable, vtbl_activated);
+
+    if (SUCCEEDED(hr = WindowsCreateStringReference(L"Windows.Foundation.Uri", 22, &header, &name)) &&
+        SUCCEEDED(hr = RoGetActivationFactory(name, &IID_IUriRuntimeClassFactory, (void **)&uri_factory)))
+    {
+        if (SUCCEEDED(hr = WindowsCreateString(uri, lstrlenW(uri), &value)))
+        {
+            /* IUriRuntimeClassFactory::CreateUri is slot 6 */
+            hr = ((HRESULT (WINAPI *)(void *, HSTRING, IUnknown **))(*(void ***)uri_factory)[6])(uri_factory, value, &args->protocol_uri);
+            WindowsDeleteString(value);
+        }
+        IUnknown_Release((IUnknown *)uri_factory);
+    }
+    if (FAILED(hr) || !args->protocol_uri)
+    {
+        ERR("cannot make a Uri of %s, hr %#lx\n", debugstr_w(uri), hr);
+        IInspectable_Release(inspectable);
+        return NULL;
+    }
+    args->vtbl_protocol = protocol_vtbl;
+    args->vtbl_protocol2 = protocol2_vtbl;
+    args->vtbl_activated = protocol_view_vtbl(activated_vtbl, ARRAY_SIZE(activated_vtbl), &activated_copy);
+    args->vtbl_appview = protocol_view_vtbl(appview_vtbl, ARRAY_SIZE(appview_vtbl), &appview_copy);
+    args->vtbl_viewswitch = protocol_view_vtbl(viewswitch_vtbl, ARRAY_SIZE(viewswitch_vtbl), &viewswitch_copy);
+    args->vtbl_withuser = protocol_view_vtbl(withuser_vtbl, ARRAY_SIZE(withuser_vtbl), &withuser_copy);
+    args->vtbl_init = protocol_view_vtbl(args_init_vtbl, ARRAY_SIZE(args_init_vtbl), &init_copy);
+    return inspectable;
+}
+
+static IInspectable *create_launch_args_for_file(const WCHAR *arguments, const WCHAR *file);
+
 /* Both activation paths come through here, so the file is picked up wherever the activation is
  * driven from. WINE_UWP_ACTIVATE_FILE is how a caller says "open this file with the app". */
 static IInspectable *create_launch_args(const WCHAR *arguments)
@@ -1187,6 +1307,33 @@ static void connect_dcomp_target( HWND hwnd )
 /* The shell's own view startup sequence, run after Activate; see drive_view_startup below. */
 static HRESULT drive_view_startup( IInspectable *args );
 
+static void start_activation_inbox( struct registrar *reg );
+
+/* The registrar drops its app object once the first activation is over, so later activations
+ * keep their own reference, taken while it was still valid. */
+static IActivatableApplication *inbox_app;
+
+/* A later activation of the app that is already running - on Windows the shell hands it to the
+ * existing instance, which raises Activated on its view rather than starting again. */
+static HRESULT activate_existing_view( IInspectable *args );
+
+/* A later activation of the app that is already running. On Windows the shell hands it to the
+ * running instance, which raises Activated on the view it already has - Application.OnActivated
+ * for a XAML app. Going through ApplicationActivationFactory::Activate again instead made twinapi
+ * build a *second* view and CoreWindow for it, which nothing showed, and the app went black. So
+ * activate the existing view directly; this runs on its thread (see activation_inbox_thread). */
+static HRESULT do_activate_protocol( struct registrar *reg, const WCHAR *uri )
+{
+    IInspectable *args;
+    HRESULT hr;
+
+    if (!(args = create_protocol_args(uri))) return E_FAIL;
+    hr = activate_existing_view( args );
+    ERR("Protocol activation on %s returned %#lx\n", debugstr_w(uri), hr);
+    IInspectable_Release(args);
+    return hr;
+}
+
 static HRESULT do_activate(struct registrar *reg)
 {
     IActivatableApplication *app;
@@ -1221,6 +1368,7 @@ static HRESULT do_activate(struct registrar *reg)
         EnumWindows( show_core_window, (LPARAM)&core_window );
         if (!core_window) WARN("no core window in this process to show\n");
         drive_view_startup( args );
+        start_activation_inbox( reg );
     }
 
     IInspectable_Release(args);
@@ -1238,6 +1386,7 @@ struct dispatched_handler
     const struct dispatched_handler_vtbl *vtbl;
     struct registrar *reg;
     LONG refcount;
+    WCHAR *protocol_uri;          /* set for a later Protocol activation */
 };
 
 struct dispatched_handler_vtbl
@@ -1267,13 +1416,23 @@ static ULONG WINAPI handler_AddRef( struct dispatched_handler *handler )
 static ULONG WINAPI handler_Release( struct dispatched_handler *handler )
 {
     ULONG ref = InterlockedDecrement( &handler->refcount );
-    if (!ref) free( handler );
+    if (!ref)
+    {
+        free( handler->protocol_uri );
+        free( handler );
+    }
     return ref;
 }
 static HRESULT WINAPI handler_Invoke( struct dispatched_handler *handler )
 {
     HRESULT hr;
     unsigned int tries;
+
+    if (handler->protocol_uri)
+    {
+        do_activate_protocol( handler->reg, handler->protocol_uri );
+        return S_OK;
+    }
 
     /* ApplicationActivationFactory::Activate reads a field filled by RunInternal;
      * early calls return E_POINTER. Retry briefly on the view thread. */
@@ -1368,6 +1527,85 @@ static HRESULT get_main_view_dispatcher( void **dispatcher )
     }
     IUnknown_Release( (IUnknown *)view );
     return hr;
+}
+
+/* WINE_UWP_ACTIVATE_INBOX (default C:\\users\\Public\\wineuwp-activate.uri): a URI written to that
+ * file is delivered to the running app as a Protocol activation, on its main view's thread, and
+ * the file is deleted. This is what the shell's single-instance redirection does on Windows; a
+ * host-side handler for the app's scheme only has to write the file (see activate-uri.sh). */
+static HRESULT do_activate_protocol( struct registrar *reg, const WCHAR *uri );
+
+static void CALLBACK protocol_activation_apc( ULONG_PTR param )
+{
+    WCHAR *uri = (WCHAR *)param;
+
+    do_activate_protocol( NULL, uri );
+    free( uri );
+}
+
+static DWORD WINAPI activation_inbox_thread( void *param )
+{
+    struct registrar *reg = param;
+    WCHAR path[MAX_PATH];
+
+    if (!GetEnvironmentVariableW( L"WINE_UWP_ACTIVATE_INBOX", path, ARRAY_SIZE(path) ))
+        lstrcpyW( path, L"C:\\users\\Public\\wineuwp-activate.uri" );
+    SetThreadDescription( GetCurrentThread(), L"wineuwp_activation_inbox" );
+    DeleteFileW( path );   /* a leftover from an earlier run is not for this one */
+    ERR( "watching %s for protocol activations\n", debugstr_w( path ) );
+    for (;;)
+    {
+        char buffer[8192];
+        DWORD size = 0;
+        HANDLE file;
+        WCHAR *uri;
+        int len;
+
+        Sleep( 500 );
+        file = CreateFileW( path, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL );
+        if (file == INVALID_HANDLE_VALUE) continue;
+        ReadFile( file, buffer, sizeof(buffer) - 1, &size, NULL );
+        CloseHandle( file );
+        DeleteFileW( path );
+        while (size && (buffer[size - 1] == '\n' || buffer[size - 1] == '\r' || buffer[size - 1] == ' ')) size--;
+        buffer[size] = 0;
+        if (!size) continue;
+        len = MultiByteToWideChar( CP_UTF8, 0, buffer, -1, NULL, 0 );
+        if (!(uri = malloc( len * sizeof(WCHAR) ))) continue;
+        MultiByteToWideChar( CP_UTF8, 0, buffer, -1, uri, len );
+        ERR( "inbox: activating on %s\n", debugstr_w( uri ) );
+        {
+            /* The view to activate is the one whose CoreWindow is on screen. An app can have more
+             * than one CoreApplicationView (Calculator and Shapr3D both do), and the main view's
+             * dispatcher ran this on a thread with no window. That thread waits alertably, which is
+             * how the first activation reaches it too (see activate_apc). */
+            DWORD tid = hosted_core_window ? GetWindowThreadProcessId( hosted_core_window, NULL ) : 0;
+            HANDLE thread = tid ? OpenThread( THREAD_SET_CONTEXT, FALSE, tid ) : NULL;
+
+            if (!thread || !QueueUserAPC( protocol_activation_apc, thread, (ULONG_PTR)uri ))
+            {
+                ERR( "no view thread to deliver %s to (window %p, tid %lu)\n", debugstr_w( uri ),
+                     hosted_core_window, tid );
+                free( uri );
+            }
+            if (thread) CloseHandle( thread );
+        }
+    }
+    return 0;
+}
+
+static void start_activation_inbox( struct registrar *reg )
+{
+    static LONG started;
+    HANDLE thread;
+
+    if (InterlockedExchange( &started, 1 )) return;
+    if (!reg->app || FAILED( IUnknown_QueryInterface( reg->app, &IID_IActivatableApplication, (void **)&inbox_app ) ))
+    {
+        ERR( "no IActivatableApplication to deliver later activations to\n" );
+        return;
+    }
+    if ((thread = CreateThread( NULL, 0, activation_inbox_thread, reg, 0, NULL ))) CloseHandle( thread );
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -1736,6 +1974,29 @@ static HRESULT drive_view_startup( IInspectable *args )
     }
     IUnknown_Release( (IUnknown *)view );
     if (own_args) IInspectable_Release( own_args );
+    return hr;
+}
+
+static HRESULT activate_existing_view( IInspectable *args )
+{
+    struct slot_vtbl **view = NULL;
+    struct view_internal *internal;
+    void *callback = NULL;
+    HRESULT hr;
+
+    if (FAILED( hr = get_current_core_application_view( &view ) )) return hr;
+    if (!(internal = find_view_internal( view )))
+    {
+        ERR( "no view internal on tid %lu\n", GetCurrentThreadId() );
+        IUnknown_Release( (IUnknown *)view );
+        return E_NOINTERFACE;
+    }
+    if (SUCCEEDED( hr = create_activation_callback( &callback ) ))
+    {
+        hr = internal->vtbl->Activate( internal, callback, args, NULL );
+        IUnknown_Release( (IUnknown *)callback );
+    }
+    IUnknown_Release( (IUnknown *)view );
     return hr;
 }
 

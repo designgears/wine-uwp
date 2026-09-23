@@ -1,0 +1,6 @@
+{
+  "name": "wine-uwp-browser-callback",
+  "private": true,
+  "description": "Open an app's sign-in URL in a visible browser and hand its custom-scheme callback back to the app",
+  "dependencies": { "playwright-core": "^1.63.0" }
+}

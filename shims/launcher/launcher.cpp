@@ -16,7 +16,8 @@
 //
 // WINE_UWP_LAUNCHER=log: log what would be launched and report success without launching. Test
 // runs on the Xvfb display must use it: xdg-open talks to the user's running browser over D-Bus,
-// so a real launch opens a tab on the *real* desktop.
+// so a real launch opens a tab on the *real* desktop. The target is also written to
+// C:\users\Public\wineuwp-launched.uri for browser-callback.sh.
 //
 //   ILauncherStatics  {277151c3-9e3e-42f6-91a4-5dfdeb232451}:
 //      6 LaunchFileAsync(file)  7 LaunchFileAsync(file, options)
@@ -225,6 +226,18 @@ static HRESULT launch(const WCHAR *what, const WCHAR *target, void **op)
     }
     if (GetEnvironmentVariableA("WINE_UWP_LAUNCHER", mode, sizeof(mode)) && !strcmp(mode, "log"))
     {
+        /* Also leave it where a host-side helper can pick it up: browser-callback.sh opens it in
+         * a browser the user can see and hands the app's scheme callback back to activate-uri.sh. */
+        HANDLE file = CreateFileW(L"C:\\users\\Public\\wineuwp-launched.uri", GENERIC_WRITE, 0, nullptr,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE)
+        {
+            char utf8[8192];
+            DWORD written;
+            int len = WideCharToMultiByte(CP_UTF8, 0, target, -1, utf8, sizeof(utf8), nullptr, nullptr);
+            if (len > 1) WriteFile(file, utf8, len - 1, &written, nullptr);
+            CloseHandle(file);
+        }
         trace("%ls %ls (dry run, WINE_UWP_LAUNCHER=log)", what, target);
         return make_completed_async(1, op);
     }

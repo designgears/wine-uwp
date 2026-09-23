@@ -8310,3 +8310,34 @@ forwards into the prefix, and (2) `wineuwp` delivering a `Protocol` activation, 
 `ProtocolActivatedEventArgs`, to the *running* instance. It also needs a real account.
 
 Regression: Calculator AE 0, Feedback Hub 822 colours / 0 fail-fasts.
+
+### Protocol activation: the sign-in callback reaches the running app (2026-09-23)
+
+The sign-in hands back to the app through its `shapr3d:` scheme, and the code exchange
+(`{apiURL}/auth/app/{id}?code={code}&code_verifier={codeVerifier}`, a `Shapr.Native.dll` string)
+needs the PKCE verifier the *running* instance generated. So the URI has to arrive as a second
+activation of that process, which is what Windows' shell does.
+
+- `wineuwp`'s launch args grew a protocol mode: `Kind` = Protocol (2), class name
+  `ProtocolActivatedEventArgs` (every view table has a copy whose `GetRuntimeClassName` says so -
+  .NET types the wrapper from it), `IProtocolActivatedEventArgs.Uri`, the caller/Data revision
+  (Data is an empty `ValueSet`, not NULL), and the Launch-only interfaces refused.
+- **Delivery** is an inbox: after the first activation, a thread watches
+  `C:\users\Public\wineuwp-activate.uri` (`WINE_UWP_ACTIVATE_INBOX`); `activate-uri.sh` writes it.
+- Three wrong turns on the way, each measured: (1) the registrar has dropped its app object by
+  then - `reg->app` was NULL and the view thread faulted in our own `do_activate_protocol`
+  (found in Sentry's minidump, not our log); (2) calling `ApplicationActivationFactory::Activate`
+  again made twinapi build a **second view and CoreWindow** that nothing showed, and the app went
+  black; (3) the *main view's* dispatcher ran the activation on a thread with no window - Shapr3D,
+  like Calculator, has two `CoreApplicationView`s. What works: an APC to the thread that owns the
+  shown CoreWindow, which calls the current view's internal `Activate(callback, args)` - the app
+  raises `OnActivated`, reports `ActivationHandled`, and its engine immediately goes to the network
+  to exchange the code.
+- The web half cannot be automated: after the password, app.shapr3d.com shows a **reCAPTCHA**
+  challenge. `browser-callback.sh` therefore opens the sign-in URL (which the Launcher shim, in
+  `WINE_UWP_LAUNCHER=log` mode, leaves in `C:\users\Public\wineuwp-launched.uri`) in a *visible*
+  Chrome with a throwaway profile, lets the human sign in, catches the first request to the
+  scheme (headless Chrome reports it as a request that fails `ERR_ABORTED`) and hands it to
+  `activate-uri.sh`.
+
+Regression: Calculator AE 0, Feedback Hub 822 colours / 0 fail-fasts.

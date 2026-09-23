@@ -205,6 +205,7 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | Why did the app vanish with exit status 0? | `WINE_UWP_TRACE_EXIT=1`: backtraces for `RtlExitUserProcess`, `TerminateProcess` (any target, with both pids), `TerminateThread` and ucrtbase `abort()`. `WINE_UWP_TRACE_THREAD_EXIT=1` adds every thread exit and `NtTerminateThread`. `WINE_UWP_TRACE_CLOSE=<hex>` names who closes a handle |
 | The app ships a crash reporter (Sentry/crashpad) | read its minidump and breadcrumbs, in `LocalState/crash_report/` for Shapr3D: the dump's exception stream names the thread and address, the breadcrumbs the app's own error text |
 | Open a URI or file from an app without touching the real desktop | `WINE_UWP_LAUNCHER=log` makes the Launcher shim log instead of `ShellExecute` |
+| Deliver a URI to the running app (sign-in callbacks, `scheme:` links) | `./activate-uri.sh <uri>` - a Protocol activation of the running instance, via the inbox `wineuwp` watches. `./browser-callback.sh <scheme>` does a whole browser sign-in and delivers its callback |
 | Which methods of an interface does the app actually call? | give every slot a traced thunk returning `E_NOTIMPL` and read the log - see `shims/storecontext`, which proved the app wanted only `GetDefault` out of 26 methods |
 
 ### Unique-HRESULT tagging
@@ -800,7 +801,7 @@ the fully-qualified name. `--grep` first, always.
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
 | Solitaire | **Playable on the unpatched `Solitaire.exe`** (`docs/screenshots/solitaire-unpatched-menu-game.png`): main menu -> Klondike -> game, and clicks move cards. No exe byte patch is needed any more: `wineuwp` delivers `CoreWindow.VisibilityChanged`. The Sign In Error popup shows on top of the menu; Cancel is at about (813,549). The old ~1-in-10 blank window is fixed (60/60 clean) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
-| Shapr3D | **Welcome page renders and is interactive** (`docs/screenshots/shapr3d-welcome-page.png`); **Log In** hands the PKCE sign-in URL to the Launcher shim and shows "Go to browser to complete login" (`shapr3d-login-browser-wait.png`). Next: `shapr3d:` protocol activation back into the running app, which also needs a real account. Test with `WINE_UWP_LAUNCHER=log`, or the URL opens in the user's real browser. Findings-M4, 2026-09-23 |
+| Shapr3D | **Welcome page renders and is interactive** (`docs/screenshots/shapr3d-welcome-page.png`); **Log In** hands the PKCE URL to the Launcher shim and shows "Go to browser to complete login". **Protocol activation works**: `./activate-uri.sh shapr3d:...` raises `OnActivated` in the running app, which then exchanges the code. The web sign-in has a reCAPTCHA, so a human finishes it with `./browser-callback.sh shapr3d` (run with `WINE_UWP_LAUNCHER=log`). Past sign-in is unexplored. Findings-M4, 2026-09-23 |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
 them. **Testing that, and making them the default if it holds, is a standing job** - they change the
