@@ -3074,20 +3074,60 @@ static void STDMETHODCALLTYPE d3d11_device_context_GetHardwareProtectionState(ID
         *enable = FALSE;
 }
 
+/* The fence takes the value once the GPU has finished everything submitted before the Signal:
+ * an event query issued here completes exactly then. Waiting for it on the CPU costs a stall per
+ * Signal, but keeps GetCompletedValue and SetEventOnCompletion honest for CPU readback. */
 static HRESULT STDMETHODCALLTYPE d3d11_device_context_Signal(ID3D11DeviceContext4 *iface,
         ID3D11Fence *fence, UINT64 value)
 {
-    FIXME("iface %p, fence %p, value %I64x stub!\n", iface, fence, value);
+    struct d3d11_device_context *context = impl_from_ID3D11DeviceContext4(iface);
+    static const D3D11_QUERY_DESC desc = {D3D11_QUERY_EVENT, 0};
+    struct d3d_query *query;
+    BOOL done = FALSE;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, fence %p, value %#I64x.\n", iface, fence, value);
+
+    if (context->type != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+        return E_INVALIDARG;
+    if (!fence)
+        return E_INVALIDARG;
+
+    if (FAILED(hr = d3d_query_create(context->device, &desc, FALSE, &query)))
+        return hr;
+
+    wined3d_mutex_lock();
+    wined3d_device_context_issue_query(context->wined3d_context, query->wined3d_query, WINED3DISSUE_END);
+    wined3d_mutex_unlock();
+    for (;;)
+    {
+        wined3d_mutex_lock();
+        hr = wined3d_query_get_data(query->wined3d_query, &done, sizeof(done), WINED3DGETDATA_FLUSH);
+        wined3d_mutex_unlock();
+        if (hr != S_FALSE)
+            break;
+        Sleep(0);
+    }
+    ID3D11Query_Release(&query->ID3D11Query_iface);
+    if (FAILED(hr))
+        WARN("Event query failed, hr %#lx; signalling anyway.\n", hr);
+
+    return d3d11_fence_signal(fence, value);
 }
 
+/* Every Signal completes before it returns, so a fence can only be short of a value some other
+ * device or a later call has yet to signal. The GPU queue cannot be stalled for that here. */
 static HRESULT STDMETHODCALLTYPE d3d11_device_context_Wait(ID3D11DeviceContext4 *iface,
         ID3D11Fence *fence, UINT64 value)
 {
-    FIXME("iface %p, fence %p, value %I64x stub!\n", iface, fence, value);
+    TRACE("iface %p, fence %p, value %#I64x.\n", iface, fence, value);
 
-    return E_NOTIMPL;
+    if (!fence)
+        return E_INVALIDARG;
+    if (d3d11_fence_value(fence) < value)
+        FIXME("Fence %p is at %#I64x, not waiting for %#I64x.\n", fence, d3d11_fence_value(fence), value);
+
+    return S_OK;
 }
 
 static const struct ID3D11DeviceContext4Vtbl d3d11_device_context_vtbl =
@@ -5450,10 +5490,18 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_OpenSharedFence(ID3D11Device5 *ifa
 static HRESULT STDMETHODCALLTYPE d3d11_device_CreateFence(ID3D11Device5 *iface, UINT64 initial_value,
         D3D11_FENCE_FLAG flags, REFIID iid, void **fence)
 {
-    FIXME("iface %p, initial_value %I64x, flags %d, iid %s, fence %p stub!\n", iface, initial_value,
+    struct d3d_device *device = impl_from_ID3D11Device5(iface);
+    ID3D11Fence *object;
+    HRESULT hr;
+
+    TRACE("iface %p, initial_value %#I64x, flags %#x, iid %s, fence %p.\n", iface, initial_value,
             flags, debugstr_guid(iid), fence);
 
-    return E_NOTIMPL;
+    if (FAILED(hr = d3d11_fence_create(device, initial_value, flags, &object)))
+        return hr;
+    hr = ID3D11Fence_QueryInterface(object, iid, fence);
+    ID3D11Fence_Release(object);
+    return hr;
 }
 
 static const struct ID3D11Device5Vtbl d3d11_device_vtbl =

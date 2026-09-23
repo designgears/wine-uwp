@@ -691,6 +691,7 @@
 @ stdcall RtlEqualUnicodeString(ptr ptr long)
 @ stdcall RtlEraseUnicodeString(ptr)
 @ stdcall RtlExitUserProcess(long)
+@ stdcall __wine_trace_exit(str long)
 @ stdcall RtlExitUserThread(long)
 @ stdcall RtlExpandEnvironmentStrings(ptr wstr long ptr long ptr)
 @ stdcall RtlExpandEnvironmentStrings_U(ptr ptr ptr ptr)

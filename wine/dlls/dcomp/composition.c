@@ -748,6 +748,22 @@ static HRESULT WINAPI compositor_QueryInterface( ICompositor *iface, REFIID iid,
 static ULONG WINAPI compositor_AddRef( ICompositor *iface );
 static ULONG WINAPI compositor_Release( ICompositor *iface );
 
+/* ICompositionAnimationGroup and IIterable<CompositionAnimation>. XAML's
+ * FacadeAnimationHelper tells a group from a single animation by asking for these, then walks the
+ * "group" with no NULL checks - so a single key-frame animation that claimed them (every recording
+ * object's QI answers anything) crashed every ContentDialog's elevation animation. Only
+ * CompositionAnimationGroup may answer them. */
+static const GUID IID_ICompositionAnimationGroup_local =
+    { 0x5e7cc90c, 0xcd14, 0x4e07, { 0x8a, 0x55, 0xc7, 0x25, 0x27, 0xaa, 0xbd, 0xac } };
+static const GUID IID_IIterable_CompositionAnimation_local =
+    { 0x0cb59942, 0xc6f3, 0x585f, { 0x9a, 0x92, 0xb4, 0x7e, 0x8d, 0xd3, 0x8e, 0xbf } };
+
+static BOOL is_animation_group_iid( REFIID iid )
+{
+    return IsEqualGUID( iid, &IID_ICompositionAnimationGroup_local ) ||
+           IsEqualGUID( iid, &IID_IIterable_CompositionAnimation_local );
+}
+
 /* IReferenceTracker {11d3b13a-180e-4789-a8be-7712882893e6}: .NET Native's RCW layer asks every WinRT
  * object for it and, when answered, drives the tracker protocol through it (ConnectFromTrackerSource,
  * FindTrackerTargets(callback) ...). The recording tables have no such methods: answering with
@@ -1397,7 +1413,7 @@ static HRESULT WINAPI comp_object_GetRuntimeClassName( void *iface, HSTRING *nam
 static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void **out )
 {
     struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
-    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+    if (is_reference_tracker_iid( iid ) || is_animation_group_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
 
     TRACE( "%s %p, iid %s.\n", object->kind, object, debugstr_guid(iid) );
 
@@ -7985,6 +8001,93 @@ static HRESULT create_propset_partner( struct property_set *set, void **out )
     return S_OK;
 }
 
+/* {fa92376b-164b-432a-bf53-c7fe2d51cabc}: the partner interface composition objects expose for
+ * SetPropertyChangedListener(DCOMPOSITION_EXPRESSION_NOTIFICATION_PROPERTY, listener) at slot 3 -
+ * native dcomp's CompositionPropertySet::Partner, VisualCommon and the clips implement it. XAML's
+ * PropertySetListener::OnAnimationStarted registers one on the property set that backs a facade
+ * (UIElement.Translation ...) and calls slot 3 on the QI result without checking it. Nothing here
+ * ever changes a property set's values behind the app's back (animations are not run), so there is
+ * never anything to notify: the registration is accepted and the listener is not kept. Later slots
+ * are traced, so a caller that needs more shows up in the log instead of jumping off the table. */
+static const GUID IID_ICompositionPropertyChangedNotifier_local =
+    { 0xfa92376b, 0x164b, 0x432a, { 0xbf, 0x53, 0xc7, 0xfe, 0x2d, 0x51, 0xca, 0xbc } };
+
+struct change_notifier
+{
+    const void **vtbl;
+    LONG ref;
+    IUnknown *owner;
+};
+
+static HRESULT WINAPI change_notifier_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct change_notifier *impl = CONTAINING_RECORD( iface, struct change_notifier, vtbl );
+
+    if (IsEqualGUID( iid, &IID_ICompositionPropertyChangedNotifier_local ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = iface;
+        return S_OK;
+    }
+    return IUnknown_QueryInterface( impl->owner, iid, out );
+}
+static ULONG WINAPI change_notifier_AddRef( void *iface )
+{
+    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct change_notifier, vtbl )->ref );
+}
+static ULONG WINAPI change_notifier_Release( void *iface )
+{
+    struct change_notifier *impl = CONTAINING_RECORD( iface, struct change_notifier, vtbl );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+
+    if (!ref)
+    {
+        IUnknown_Release( impl->owner );
+        free( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI change_notifier_SetPropertyChangedListener( void *iface, UINT32 property, IUnknown *listener )
+{
+    TRACE( "owner %p, property %u, listener %p: nothing animates it, not kept.\n",
+           CONTAINING_RECORD( iface, struct change_notifier, vtbl )->owner, property, listener );
+    return S_OK;
+}
+#define CHANGE_NOTIFIER_SLOT( n ) \
+    static HRESULT WINAPI change_notifier_slot##n( void *iface ) \
+    { \
+        FIXME( "owner %p: unknown slot %u.\n", CONTAINING_RECORD( iface, struct change_notifier, vtbl )->owner, n ); \
+        return E_NOTIMPL; \
+    }
+CHANGE_NOTIFIER_SLOT( 4 )
+CHANGE_NOTIFIER_SLOT( 5 )
+CHANGE_NOTIFIER_SLOT( 6 )
+CHANGE_NOTIFIER_SLOT( 7 )
+CHANGE_NOTIFIER_SLOT( 8 )
+CHANGE_NOTIFIER_SLOT( 9 )
+#undef CHANGE_NOTIFIER_SLOT
+
+static const void *change_notifier_vtbl[] =
+{
+    change_notifier_QueryInterface, change_notifier_AddRef, change_notifier_Release,
+    change_notifier_SetPropertyChangedListener,
+    change_notifier_slot4, change_notifier_slot5, change_notifier_slot6,
+    change_notifier_slot7, change_notifier_slot8, change_notifier_slot9,
+};
+
+static HRESULT create_change_notifier( IUnknown *owner, void **out )
+{
+    struct change_notifier *impl;
+
+    *out = NULL;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->vtbl = change_notifier_vtbl;
+    impl->ref = 1;
+    IUnknown_AddRef( (impl->owner = owner) );
+    *out = &impl->vtbl;
+    return S_OK;
+}
+
 static HRESULT WINAPI propset_QueryInterface( ICompositionPropertySet *iface, REFIID iid, void **out )
 {
     struct property_set *impl = CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface );
@@ -8014,6 +8117,8 @@ static HRESULT WINAPI propset_QueryInterface( ICompositionPropertySet *iface, RE
      * fail-fasts on E_NOINTERFACE; a recording object takes the calls. */
     if (IsEqualGUID( iid, &IID_ICompositionObjectPartner_local ))
         return create_propset_partner( impl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionPropertyChangedNotifier_local ))
+        return create_change_notifier( (IUnknown *)&impl->ICompositionPropertySet_iface, out );
     WARN( "property set: no interface %s.\n", debugstr_guid( iid ) );
     *out = NULL;
     return E_NOINTERFACE;
@@ -8757,6 +8862,7 @@ static HRESULT WINAPI kf_animation_QueryInterface( void *iface, REFIID iid, void
     struct kf_animation *impl = CONTAINING_RECORD( iface, struct kf_animation, vtbl );
 
     TRACE( "%s %p, iid %s.\n", impl->kind, impl, debugstr_guid( iid ) );
+    if (is_animation_group_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     if (IsEqualGUID( iid, &IID_ICompositionObject ))
         return create_composition_object_view( (IUnknown *)&impl->vtbl, out );
     if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
@@ -9717,6 +9823,7 @@ static HRESULT WINAPI expr_animation_QueryInterface( void *iface, REFIID iid, vo
 {
     struct expr_animation *impl = CONTAINING_RECORD( iface, struct expr_animation, vtbl );
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
+    if (is_animation_group_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     /* ICompositionObject stays the generic table, as for every recording object: XAML's expression
      * conversion walks Properties and private partner interfaces from there, which only the
      * recording table survives. */
@@ -13432,6 +13539,325 @@ static HRESULT WINAPI compositor2_GetTrustLevel( void *iface, TrustLevel *level 
     return S_OK;
 }
 
+/*
+ * CompositionAnimationGroup: a set of animations started together. XAML's elevation effect (every
+ * ContentDialog, flyout and ThemeShadow) builds one and passes it to UIElement.StartAnimation, whose
+ * FacadeAnimationHelper::StartAnimationGroup walks it through IIterable<CompositionAnimation> and
+ * dereferences First()'s iterator with no NULL check - so the generic recording object, whose
+ * First() "succeeds" with nothing, crashed every dialog.
+ */
+/* IIterator<CompositionAnimation>, from piid.py */
+static const GUID IID_IIterator_CompositionAnimation_local =
+    { 0x98efbe55, 0x0a66, 0x556a, { 0x9a, 0xdc, 0x4a, 0xb5, 0x9c, 0x69, 0x68, 0x46 } };
+
+struct animation_group
+{
+    const void **vtbl;          /* generic composition object layout, must stay first */
+    const char *kind;
+    LONG ref;
+    const void **group_vtbl;    /* ICompositionAnimationGroup */
+    const void **iterable_vtbl; /* IIterable<CompositionAnimation> */
+    CRITICAL_SECTION cs;
+    IUnknown **items;
+    UINT32 count, capacity;
+};
+
+struct animation_group_iterator
+{
+    const void **vtbl;
+    LONG ref;
+    IUnknown **items;           /* a snapshot, so the group can change while it is walked */
+    UINT32 count, index;
+};
+
+static void *animation_group_vtbl[COMP_OBJECT_SLOTS];
+static const void *animation_group_iface_vtbl[];
+static const void *animation_group_iterable_vtbl[];
+static const void *animation_group_iterator_vtbl[];
+static LONG animation_group_vtbls_ready;
+
+static struct animation_group *animation_group_from( void *iface )
+{
+    if (!iface) return NULL;
+    if (*(void ***)iface == (void **)animation_group_vtbl)
+        return CONTAINING_RECORD( iface, struct animation_group, vtbl );
+    if (*(void ***)iface == (void **)animation_group_iface_vtbl)
+        return CONTAINING_RECORD( iface, struct animation_group, group_vtbl );
+    if (*(void ***)iface == (void **)animation_group_iterable_vtbl)
+        return CONTAINING_RECORD( iface, struct animation_group, iterable_vtbl );
+    return NULL;
+}
+
+static HRESULT WINAPI animation_group_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct animation_group *group = animation_group_from( iface );
+
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+    TRACE( "animation group %p, iid %s.\n", group, debugstr_guid( iid ) );
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&group->vtbl, out );
+    InterlockedIncrement( &group->ref );
+    if (IsEqualGUID( iid, &IID_ICompositionAnimationGroup_local )) *out = &group->group_vtbl;
+    else if (IsEqualGUID( iid, &IID_IIterable_CompositionAnimation_local )) *out = &group->iterable_vtbl;
+    else *out = &group->vtbl;
+    return S_OK;
+}
+static ULONG WINAPI animation_group_AddRef( void *iface )
+{
+    return InterlockedIncrement( &animation_group_from( iface )->ref );
+}
+static ULONG WINAPI animation_group_Release( void *iface )
+{
+    struct animation_group *group = animation_group_from( iface );
+    ULONG ref = InterlockedDecrement( &group->ref );
+    UINT32 i;
+
+    if (!ref)
+    {
+        for (i = 0; i < group->count; i++) IUnknown_Release( group->items[i] );
+        free( group->items );
+        group->cs.DebugInfo->Spare[0] = 0;
+        DeleteCriticalSection( &group->cs );
+        free( group );
+    }
+    return ref;
+}
+static HRESULT WINAPI animation_group_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI animation_group_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionAnimationGroup";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI animation_group_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+
+static HRESULT WINAPI animation_group_get_Count( void *iface, INT32 *value )
+{
+    struct animation_group *group = animation_group_from( iface );
+
+    if (!value) return E_POINTER;
+    EnterCriticalSection( &group->cs );
+    *value = group->count;
+    LeaveCriticalSection( &group->cs );
+    return S_OK;
+}
+static HRESULT WINAPI animation_group_Add( void *iface, IUnknown *value )
+{
+    struct animation_group *group = animation_group_from( iface );
+    HRESULT hr = S_OK;
+
+    TRACE( "animation group %p add %p.\n", group, value );
+    if (!value) return E_INVALIDARG;
+    EnterCriticalSection( &group->cs );
+    if (group->count == group->capacity)
+    {
+        UINT32 capacity = max( 4, group->capacity * 2 );
+        IUnknown **items = realloc( group->items, capacity * sizeof(*items) );
+        if (!items) hr = E_OUTOFMEMORY;
+        else
+        {
+            group->items = items;
+            group->capacity = capacity;
+        }
+    }
+    if (SUCCEEDED(hr))
+    {
+        IUnknown_AddRef( value );
+        group->items[group->count++] = value;
+    }
+    LeaveCriticalSection( &group->cs );
+    return hr;
+}
+static HRESULT WINAPI animation_group_Remove( void *iface, IUnknown *value )
+{
+    struct animation_group *group = animation_group_from( iface );
+    UINT32 i;
+
+    TRACE( "animation group %p remove %p.\n", group, value );
+    EnterCriticalSection( &group->cs );
+    for (i = 0; i < group->count; i++)
+    {
+        if (group->items[i] != value) continue;
+        IUnknown_Release( group->items[i] );
+        memmove( &group->items[i], &group->items[i + 1], (group->count - i - 1) * sizeof(*group->items) );
+        group->count--;
+        break;
+    }
+    LeaveCriticalSection( &group->cs );
+    return S_OK;
+}
+static HRESULT WINAPI animation_group_RemoveAll( void *iface )
+{
+    struct animation_group *group = animation_group_from( iface );
+    UINT32 i;
+
+    TRACE( "animation group %p remove all.\n", group );
+    EnterCriticalSection( &group->cs );
+    for (i = 0; i < group->count; i++) IUnknown_Release( group->items[i] );
+    group->count = 0;
+    LeaveCriticalSection( &group->cs );
+    return S_OK;
+}
+
+static const void *animation_group_iface_vtbl[] =
+{
+    animation_group_QueryInterface, animation_group_AddRef, animation_group_Release,
+    animation_group_GetIids, animation_group_GetRuntimeClassName, animation_group_GetTrustLevel,
+    animation_group_get_Count, animation_group_Add, animation_group_Remove, animation_group_RemoveAll,
+};
+
+static struct animation_group_iterator *animation_group_iterator_from( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct animation_group_iterator, vtbl );
+}
+static HRESULT WINAPI animation_group_iterator_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IIterator_CompositionAnimation_local ))
+    {
+        InterlockedIncrement( &animation_group_iterator_from( iface )->ref );
+        *out = iface;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI animation_group_iterator_AddRef( void *iface )
+{
+    return InterlockedIncrement( &animation_group_iterator_from( iface )->ref );
+}
+static ULONG WINAPI animation_group_iterator_Release( void *iface )
+{
+    struct animation_group_iterator *iter = animation_group_iterator_from( iface );
+    ULONG ref = InterlockedDecrement( &iter->ref );
+    UINT32 i;
+
+    if (!ref)
+    {
+        for (i = 0; i < iter->count; i++) IUnknown_Release( iter->items[i] );
+        free( iter->items );
+        free( iter );
+    }
+    return ref;
+}
+static HRESULT WINAPI animation_group_iterator_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] =
+        L"Windows.Foundation.Collections.IIterator`1<Windows.UI.Composition.CompositionAnimation>";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI animation_group_iterator_get_Current( void *iface, IUnknown **value )
+{
+    struct animation_group_iterator *iter = animation_group_iterator_from( iface );
+
+    if (!value) return E_POINTER;
+    *value = NULL;
+    if (iter->index >= iter->count) return E_BOUNDS;
+    IUnknown_AddRef( (*value = iter->items[iter->index]) );
+    return S_OK;
+}
+static HRESULT WINAPI animation_group_iterator_get_HasCurrent( void *iface, boolean *value )
+{
+    struct animation_group_iterator *iter = animation_group_iterator_from( iface );
+
+    if (!value) return E_POINTER;
+    *value = iter->index < iter->count;
+    return S_OK;
+}
+static HRESULT WINAPI animation_group_iterator_MoveNext( void *iface, boolean *value )
+{
+    struct animation_group_iterator *iter = animation_group_iterator_from( iface );
+
+    if (iter->index < iter->count) iter->index++;
+    return animation_group_iterator_get_HasCurrent( iface, value );
+}
+static HRESULT WINAPI animation_group_iterator_GetMany( void *iface, UINT32 size, IUnknown **items, UINT32 *count )
+{
+    struct animation_group_iterator *iter = animation_group_iterator_from( iface );
+    UINT32 n = 0;
+
+    if (!count) return E_POINTER;
+    while (n < size && iter->index < iter->count)
+        IUnknown_AddRef( (items[n++] = iter->items[iter->index++]) );
+    *count = n;
+    return S_OK;
+}
+
+static const void *animation_group_iterator_vtbl[] =
+{
+    animation_group_iterator_QueryInterface, animation_group_iterator_AddRef, animation_group_iterator_Release,
+    animation_group_GetIids, animation_group_iterator_GetRuntimeClassName, animation_group_GetTrustLevel,
+    animation_group_iterator_get_Current, animation_group_iterator_get_HasCurrent,
+    animation_group_iterator_MoveNext, animation_group_iterator_GetMany,
+};
+
+static HRESULT WINAPI animation_group_First( void *iface, void **value )
+{
+    struct animation_group *group = animation_group_from( iface );
+    struct animation_group_iterator *iter;
+    UINT32 i;
+
+    if (!value) return E_POINTER;
+    *value = NULL;
+    if (!(iter = calloc( 1, sizeof(*iter) ))) return E_OUTOFMEMORY;
+    iter->vtbl = animation_group_iterator_vtbl;
+    iter->ref = 1;
+    EnterCriticalSection( &group->cs );
+    if (group->count && !(iter->items = malloc( group->count * sizeof(*iter->items) )))
+    {
+        LeaveCriticalSection( &group->cs );
+        free( iter );
+        return E_OUTOFMEMORY;
+    }
+    for (i = 0; i < group->count; i++) IUnknown_AddRef( (iter->items[i] = group->items[i]) );
+    iter->count = group->count;
+    LeaveCriticalSection( &group->cs );
+    TRACE( "animation group %p: iterator over %u animations.\n", group, iter->count );
+    *value = &iter->vtbl;
+    return S_OK;
+}
+
+static const void *animation_group_iterable_vtbl[] =
+{
+    animation_group_QueryInterface, animation_group_AddRef, animation_group_Release,
+    animation_group_GetIids, animation_group_GetRuntimeClassName, animation_group_GetTrustLevel,
+    animation_group_First,
+};
+
+static HRESULT create_animation_group( void **out )
+{
+    struct animation_group *group;
+    unsigned int i;
+
+    if (!out) return E_POINTER;
+    if (!animation_group_vtbls_ready)
+    {
+        animation_group_vtbl[1] = animation_group_AddRef;
+        animation_group_vtbl[2] = animation_group_Release;
+        for (i = 3; i < COMP_OBJECT_SLOTS; i++) animation_group_vtbl[i] = comp_object_slot_fn( i );
+        comp_object_set_inspectable( animation_group_vtbl );
+        animation_group_vtbl[0] = animation_group_QueryInterface;
+        InterlockedExchange( &animation_group_vtbls_ready, 1 );
+    }
+    if (!(group = calloc( 1, sizeof(*group) ))) return E_OUTOFMEMORY;
+    group->vtbl = (const void **)animation_group_vtbl;
+    group->kind = "CompositionAnimationGroup";
+    group->ref = 1;
+    group->group_vtbl = animation_group_iface_vtbl;
+    group->iterable_vtbl = animation_group_iterable_vtbl;
+    InitializeCriticalSectionEx( &group->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
+    group->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": animation_group.cs");
+    TRACE( "created CompositionAnimationGroup %p.\n", group );
+    /* ICompositor2::CreateAnimationGroup returns the class's default interface */
+    *out = &group->group_vtbl;
+    return S_OK;
+}
+
 #define COMPOSITOR2_RECORDING( name, kind )                                                        \
     static HRESULT WINAPI compositor2_##name( void *iface, void **result )                         \
     {                                                                                              \
@@ -13441,7 +13867,11 @@ static HRESULT WINAPI compositor2_GetTrustLevel( void *iface, TrustLevel *level 
     }
 
 COMPOSITOR2_RECORDING( CreateAmbientLight, "AmbientLight" )
-COMPOSITOR2_RECORDING( CreateAnimationGroup, "CompositionAnimationGroup" )
+static HRESULT WINAPI compositor2_CreateAnimationGroup( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    return create_animation_group( result );
+}
 COMPOSITOR2_RECORDING( CreateBackdropBrush, "BackdropBrush" )
 COMPOSITOR2_RECORDING( CreateDistantLight, "DistantLight" )
 static HRESULT WINAPI compositor2_CreateDropShadow( void *iface, void **result )
@@ -14997,3 +15427,109 @@ static HRESULT create_failing_object( const char *kind, void **out )
 static struct generic_factory interactions_factory = { { &generic_factory_vtbl }, "Interactions" };
 IActivationFactory *interactions_activation_factory = &interactions_factory.IActivationFactory_iface;
 
+/*
+ * Windows.UI.Composition.CompositionObject's statics: StartAnimationWithIAnimationObject and
+ * StartAnimationGroupWithIAnimationObject. XAML's facade animations (UIElement.StartAnimation on
+ * Translation, Opacity, Scale ... - e.g. the elevation every ContentDialog and flyout applies) end
+ * up here. On Windows the compositor asks the target's IAnimationObject::PopulatePropertyInfo which
+ * composition property backs the facade and animates that; that protocol is not implemented, so the
+ * animation is accepted and not run - the element keeps its un-animated value. Refusing the class
+ * instead failed every dialog's OnApplyTemplate.
+ */
+static const GUID IID_ICompositionObjectStatics_local =
+    { 0xc1ed052f, 0x1ba2, 0x44ba, { 0xa9, 0x04, 0x6a, 0x88, 0x2a, 0x0a, 0x5a, 0xdb } };
+
+static IActivationFactory composition_object_factory;
+static const void *const *composition_object_statics;
+
+static HRESULT WINAPI composition_object_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
+{
+    TRACE( "iid %s.\n", debugstr_guid(iid) );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
+    {
+        *out = &composition_object_factory;
+        return S_OK;
+    }
+    /* the statics' slot 6 is ActivateInstance's slot, so they need their own table */
+    if (IsEqualGUID( iid, &IID_ICompositionObjectStatics_local ))
+    {
+        *out = &composition_object_statics;
+        return S_OK;
+    }
+    WARN( "CompositionObject factory: no interface %s.\n", debugstr_guid(iid) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI composition_object_factory_AddRef( IActivationFactory *iface )
+{
+    return 2;
+}
+static ULONG WINAPI composition_object_factory_Release( IActivationFactory *iface )
+{
+    return 1;
+}
+static HRESULT WINAPI composition_object_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI composition_object_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
+{
+    return WindowsCreateString( L"Windows.UI.Composition.CompositionObject",
+                                ARRAY_SIZE(L"Windows.UI.Composition.CompositionObject") - 1, name );
+}
+static HRESULT WINAPI composition_object_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+/* CompositionObject has no public constructor */
+static HRESULT WINAPI composition_object_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+{
+    if (instance) *instance = NULL;
+    return E_NOTIMPL;
+}
+
+static const IActivationFactoryVtbl composition_object_factory_vtbl =
+{
+    composition_object_factory_QueryInterface, composition_object_factory_AddRef,
+    composition_object_factory_Release, composition_object_factory_GetIids,
+    composition_object_factory_GetRuntimeClassName, composition_object_factory_GetTrustLevel,
+    composition_object_factory_ActivateInstance,
+};
+static IActivationFactory composition_object_factory = { &composition_object_factory_vtbl };
+
+static HRESULT WINAPI composition_object_statics_StartAnimationWithIAnimationObject( void *iface, IUnknown *target,
+        HSTRING property, IUnknown *animation )
+{
+    static LONG once;
+    if (!InterlockedExchange( &once, 1 ))
+        FIXME( "target %p, property %s, animation %p: facade animations are not run.\n", target,
+               debugstr_hstring( property ), animation );
+    else
+        TRACE( "target %p, property %s, animation %p: not run.\n", target, debugstr_hstring( property ), animation );
+    if (!target || !animation) return E_INVALIDARG;
+    return S_OK;
+}
+static HRESULT WINAPI composition_object_statics_StartAnimationGroupWithIAnimationObject( void *iface, IUnknown *target,
+        IUnknown *animation )
+{
+    TRACE( "target %p, animation %p: not run.\n", target, animation );
+    if (!target || !animation) return E_INVALIDARG;
+    return S_OK;
+}
+
+static const void *composition_object_statics_vtbl[] =
+{
+    composition_object_factory_QueryInterface, composition_object_factory_AddRef,
+    composition_object_factory_Release, composition_object_factory_GetIids,
+    composition_object_factory_GetRuntimeClassName, composition_object_factory_GetTrustLevel,
+    composition_object_statics_StartAnimationWithIAnimationObject,
+    composition_object_statics_StartAnimationGroupWithIAnimationObject,
+};
+static const void *const *composition_object_statics = composition_object_statics_vtbl;
+
+IActivationFactory *composition_object_activation_factory = &composition_object_factory;

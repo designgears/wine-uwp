@@ -8138,3 +8138,128 @@ Tooling traps from this hunt:
   Kill the batch before changing anything it uses.
 - **Stack dumping hides the pre-bootflow stall entirely** (0/46 with `WINE_UWP_DUMP_STACKS`).
   The stall is a separate, rare race, 1 in ~76 runs.
+
+## Shapr3D: from an instant NotImplementedException to its own UI (2026-09-23)
+
+The target app, finally. `Shapr3D.Package_26.160.11640.0` is a genuine UWP - `EntryPoint=
+"Shapr3D.App"`, .NET Native 2.2, WinUI 2.8 - not a wrapped Win32 exe: `Shapr3D.exe` is a 24 KB
+stub that imports only `Shapr3D.dll!RHBinder__ShimExeMain`. The managed app is `Shapr3D.dll`
+(47 MB), the C++/WinRT engine is `Shapr.Native.dll` (54 MB) on Parasolid (`pskernel.dll`), and
+Win2D, WebView2, ANGLE and Sentry (crashpad) ship in the package. The stage in
+`uwp-bin/stage/shapr3d` is the installed package, `appxverify.py`-clean (4688 blocks).
+
+It now starts, stays up, renders its startup screen through XAML and shows its own
+ContentDialog (`docs/screenshots/shapr3d-media-feature-pack-dialog.png`): **"You need a media
+feature pack"** - its reaction to `Windows.Media.Core.CodecQuery` being unimplemented, which is
+the next target. Nine blockers, in the order the app hit them:
+
+1. **`StorageFile.OpenSequentialReadAsync` was `E_NOTIMPL`** (so were `OpenAsync` and
+   `OpenReadAsync`). `DashboardContentStore.Initialize` reads a packaged file with it straight
+   from `OnLaunched`. `windows.storage` now has a real `FileRandomAccessStream`/`FileInputStream`
+   (`filestream.c`): positional reads and writes on a Win32 handle, `GetInputStreamAt` and
+   `CloneStream` as duplicated handles, `IContentTypeProvider`. `async.c` grew one macro for
+   `IAsyncOperation<I*>` instead of a third copy of the 130-line typed operation.
+2. **`PackageManager.FindPackagesByUserSecurityIdPackageFamilyName` was a stub.** Shapr3D's
+   `GetConflictingInstallations` asks whether a differently-signed Shapr3D
+   (`..._j403pzjkqtqbj`) is installed. All twelve `Find*` variants now answer from the one
+   package a hosted process can see: the running one if it passes the filter, else an empty
+   `IIterable<Package>`. Empty is a real answer here, not a refusal.
+3. **`ext-ms-win-dwmapi-ext-l1-1-0!DwmpGetColorizationParameters`** is imported *by name* by
+   `Windows.UI.Xaml.dll`; Wine exported it `-noname`, and implemented it as `E_NOTIMPL`. It now
+   has a name and returns the DWM colorization values (registry, else the stock `0xC40078D4`
+   accent); `DwmGetColorizationColor` reads the same values. `grep -l` over the DLLs reported no
+   importer - `strings` found it at once. Do not trust a `grep -l` negative on binaries.
+4. **A single key-frame animation claimed to be a `CompositionAnimationGroup`.** XAML's
+   `FacadeAnimationHelper::StartAnimationGroup` decides "group or single" by QI for
+   `ICompositionAnimationGroup` / `IIterable<CompositionAnimation>`, then dereferences `First()`'s
+   iterator unchecked. The catch-all QI in `composition.c` answered for a
+   `Vector3KeyFrameAnimation` - the AGENTS.md trap exactly. Those two IIDs are now refused by the
+   generic, key-frame and expression animation QIs, and `CreateAnimationGroup` returns a real group.
+5. **`Windows.UI.Composition.CompositionObject` had no factory.** Its statics
+   (`StartAnimationWithIAnimationObject`) run every XAML facade animation - here the 0->32 px
+   `Translation` elevation each ContentDialog applies. They now accept the animation and do not
+   run it (the facade keeps its un-animated value; a one-time FIXME says so). The real protocol
+   (`IAnimationObject::PopulatePropertyInfo` into a backing property) is not done.
+6. **The property set backing a facade refused `{fa92376b-...}`**, a partner interface whose slot 3
+   is `SetPropertyChangedListener(DCOMPOSITION_EXPRESSION_NOTIFICATION_PROPERTY, listener)`
+   (named from `CompositionPropertySet::Partner` in `dcomp.pdb`; the local `.syms` do not match
+   this `dcomp.dll` build, so its vtable could not be read). `PropertySetListener::OnAnimationStarted`
+   calls it unchecked. Accepted; nothing here animates a property set, so there is never anything
+   to notify. Later slots are traced thunks.
+7. **`Package.Current.DisplayName` returned `ERROR_INVALID_DATA` - for every app, Calculator
+   included.** Shapr3D's WelcomePage `x:Bind`s it. The chain: `PackageServer::GetMrtString` ->
+   MrmCoreR `GetStringValueForManifestField` -> our `GetPackageResourcesProperty` ->
+   `ResourceReference::Set`, which rejected the bare manifest string. Windows stores an MRT
+   *reference blob*, recovered from `ReferenceBuilder::BuildReferenceBlob`: `WORD type` (0x100
+   inline string, 0x200 resource by name, 0x400 PRI index), `WORD total`, `WORD 0`,
+   `WORD length`, payload padded to 4. Two more bugs in the same function: property ids are
+   **1-based** (1 DisplayName, 2 PublisherDisplayName, 3 Description, 4 Logo - read from the
+   `mov edx` before each `get_*`'s tail call), and manifest text was not XML-decoded
+   (`Solitaire &amp; Casual Games`). **The earlier entry in this file saying this function
+   "answers them from the manifest, so `ms-resource:` references ... are resolved through MRT" was
+   wrong**; it never worked. Literal names now resolve (Shapr3D, Solitaire). `ms-resource:` names
+   (Calculator, Feedback Hub) still fail, now with `0x80073B17` (map not found) instead of
+   `0x8007000D`: a 0x200 reference by URI does not find the package map in this call path. Open.
+8. **The app then vanished after ~2 s with exit status 0 and nothing in the log.** Three layers:
+   - `twinapi.appcore`'s `CoreApplication::CreateShutdownMonitor` terminates the process when the
+     main thread's handle signals - a misleading first lead, because the main thread never exited.
+   - The real killer was **`sentry/crashpad_handler.exe`**, calling `TerminateProcess(Shapr3D,
+     0x40000015)`: Sentry catches the app's SIGABRT in-process and its out-of-process handler
+     writes a minidump and kills the client. **A crash reporter makes a crash look like a clean
+     exit.** The minidump (`LocalState/crash_report/reports/*.dmp`) and the Sentry breadcrumbs
+     next to it named the thread and the reason: `GError (RenderingEngineUtils_Win.cpp:96)
+     hresult=0x80004001`.
+   - That was **`ID3D11Device5::CreateFence` = `E_NOTIMPL`**. d3d11 now has a real `ID3D11Fence`
+     (`fence.c`): `Signal` on the immediate context issues an event query and publishes the value
+     when the GPU passes it (a CPU stall per Signal - correct first, fast later),
+     `SetEventOnCompletion` releases waiters, `Wait` is a no-op with a FIXME when the value is not
+     yet reached. `CreateSharedHandle`/`OpenSharedFence` remain stubs.
+9. **Three more uncaught C++ exceptions in the engine thread**, each found the same way (abort
+   backtrace below):
+   - `NtQuerySystemInformation(SystemMemoryUsageInformation = 182)` was `STATUS_INVALID_INFO_CLASS`,
+     surfacing as `0xD0000003` out of `SystemDiagnosticInfo.MemoryUsage`. Implemented from the
+     numbers `SystemPerformanceInformation` already computes.
+   - `HashAlgorithmProvider` is not in Wine's `cryptowinrt` (which is nearly all stubs). The
+     genuine `CryptoWinRT.dll` is now installed native (`cryptowinrt=n`): every crypto dependency
+     of it is delay-loaded, so hashing needs only bcrypt.
+   - `Windows.Graphics.Imaging.BitmapTransform` is not in Wine's `windows.graphics`, which only
+     implements `DisplayInformation` (with our composition work behind it). The genuine
+     `Windows.Graphics.dll` is installed as **`windows.graphics.native.dll`** - a module is found
+     by name, so it must not collide with the builtin - and only the classes the builtin lacks
+     (five `Imaging` classes, `DisplayMonitor`, `LogicalDisplayReference`) are pointed at it,
+     Threading=Both as in the Windows hive, verified like the shims.
+
+Regression: Calculator byte-identical to the baseline twice (AE 0, 249 colours), Feedback Hub 822
+colours / 0 fail-fasts twice, Solitaire reaches the main menu twice with 0 critical errors.
+
+### Tooling added on the way
+
+- **`WINE_UWP_TRACE_ORIGINATE` now prints a module+rva backtrace** of every
+  `RoOriginateLanguageException`. A managed `ThrowOnExternalCallFailed` originates while the
+  failing call site is still on the stack - the cheapest way to find a .NET Native call site.
+  Reading `Update_`'s disassembly there gave the slot (`r8d=6`) and showed `Stub_2` passes an
+  out-pointer, i.e. a *getter*: `Package.Current` -> `IPackage2.get_DisplayName`.
+- **`WINE_UWP_TRACE_EXIT=1`**: backtraces for `RtlExitUserProcess`, `TerminateProcess` (any
+  target, with both pids - that is what exposed crashpad), `TerminateThread`, and ucrtbase
+  `abort()`. The abort path walks with `RtlVirtualUnwind` itself, because
+  `RtlCaptureStackBackTrace` returned nothing from there.
+- **`WINE_UWP_TRACE_THREAD_EXIT=1`**: every thread exit, `NtTerminateThread` (Unix side, so direct
+  syscalls are seen) and `abort_thread`, plus each thread-pool wait callback with what its handle
+  is at that moment.
+- **`WINE_UWP_TRACE_CLOSE=<hex>`**: who `CloseHandle`s that handle value.
+- **`sync-wine.sh --check` now fails on unlisted files.** It compares the tree against its
+  upstream base and reports anything changed but absent from `wine/FILES`. It found 16, including
+  **41 committed lines of `appxdeploymentclient/package.c`** (the Solitaire `AppInfo.Package`
+  fix) that had never been vendored, and today's `applicationdata.c` `CreateContainer` work, which
+  was uncommitted in the tree.
+
+### Dead ends, recorded so they are not re-walked
+
+- **`tramp.py` kills .NET Native code.** Its logger goes through `OutputDebugStringA`, which
+  raises an SEH exception; inside managed frames mrt100 turns it into a fail-fast. Use the
+  originate backtrace instead.
+- **`+threadpool` tracing hid the exit** (it changed the timing enough that the abort did not
+  happen in that run). A result that only holds without tracing is a race or a tracing artefact.
+- **Handle reuse was not it.** `TpSetWait` already duplicates every waited handle.
+- The `.syms` in `uwp-bin/pdb/dcomp.pdb.syms` belong to another `dcomp.dll` build: a "vtable" read
+  through them resolves to `InteropVisual` methods. Check a PDB's RSDS against the binary.

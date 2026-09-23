@@ -504,6 +504,12 @@ HRESULT d3d_sampler_state_create(struct d3d_device *device, const D3D11_SAMPLER_
 struct d3d_sampler_state *unsafe_impl_from_ID3D11SamplerState(ID3D11SamplerState *iface);
 struct d3d_sampler_state *unsafe_impl_from_ID3D10SamplerState(ID3D10SamplerState *iface);
 
+/* ID3D11Fence */
+HRESULT d3d11_fence_create(struct d3d_device *device, UINT64 initial_value, D3D11_FENCE_FLAG flags,
+        ID3D11Fence **fence);
+HRESULT d3d11_fence_signal(ID3D11Fence *fence, UINT64 value);
+UINT64 d3d11_fence_value(ID3D11Fence *fence);
+
 /* ID3D11Query, ID3D10Query */
 struct d3d_query
 {

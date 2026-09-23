@@ -198,6 +198,35 @@ int main()
                 if (n1) WindowsDeleteString(n1);
                 if (n2) WindowsDeleteString(n2);
             }
+            // The IPackage2..4 getters, the first thing a page binding to Package.Current reads.
+            ComPtr<IPackage2> p2;
+            if (SUCCEEDED(cur.As(&p2))) {
+                HSTRING v = nullptr; HRESULT h;
+                h = p2->get_DisplayName(&v); wprintf(L"  IPackage2.DisplayName hr %#08x %ls\n", (unsigned)h, v ? str(v) : L""); if (v) WindowsDeleteString(v), v = nullptr;
+                h = p2->get_PublisherDisplayName(&v); wprintf(L"  IPackage2.PublisherDisplayName hr %#08x %ls\n", (unsigned)h, v ? str(v) : L""); if (v) WindowsDeleteString(v), v = nullptr;
+                h = p2->get_Description(&v); wprintf(L"  IPackage2.Description hr %#08x %ls\n", (unsigned)h, v ? str(v) : L""); if (v) WindowsDeleteString(v), v = nullptr;
+                boolean b = 0;
+                h = p2->get_IsResourcePackage(&b); wprintf(L"  IPackage2.IsResourcePackage hr %#08x %d\n", (unsigned)h, b);
+                h = p2->get_IsBundle(&b); wprintf(L"  IPackage2.IsBundle hr %#08x %d\n", (unsigned)h, b);
+                h = p2->get_IsDevelopmentMode(&b); wprintf(L"  IPackage2.IsDevelopmentMode hr %#08x %d\n", (unsigned)h, b);
+            } else wprintf(L"  no IPackage2\n");
+            ComPtr<IPackage3> p3;
+            if (SUCCEEDED(cur.As(&p3))) {
+                ABI::Windows::Foundation::DateTime t{}; HRESULT h = p3->get_InstalledDate(&t);
+                wprintf(L"  IPackage3.InstalledDate hr %#08x %lld\n", (unsigned)h, (long long)t.UniversalTime);
+                ComPtr<IPackageStatus> st; h = p3->get_Status(&st); wprintf(L"  IPackage3.Status hr %#08x\n", (unsigned)h);
+            } else wprintf(L"  no IPackage3\n");
+            ComPtr<IPackage4> p4;
+            if (SUCCEEDED(cur.As(&p4))) {
+                PackageSignatureKind k{}; HRESULT h = p4->get_SignatureKind(&k);
+                wprintf(L"  IPackage4.SignatureKind hr %#08x %d\n", (unsigned)h, (int)k);
+                boolean b = 0; h = p4->get_IsOptional(&b); wprintf(L"  IPackage4.IsOptional hr %#08x %d\n", (unsigned)h, b);
+            } else wprintf(L"  no IPackage4\n");
+            ComPtr<IPackageId> id2;
+            if (SUCCEEDED(cur->get_Id(&id2)) && id2) {
+                PackageVersion ver{}; HRESULT h = id2->get_Version(&ver);
+                wprintf(L"  IPackageId.Version hr %#08x %u.%u.%u.%u\n", (unsigned)h, ver.Major, ver.Minor, ver.Build, ver.Revision);
+            }
             ComPtr<IVectorView<Package *>> deps;
             HRESULT dhr = cur->get_Dependencies(&deps);
             unsigned dn = 0;

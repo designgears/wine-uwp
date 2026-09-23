@@ -50,6 +50,14 @@ HRESULT async_operation_buffer_uint32_create( IUnknown *invoker, IUnknown *param
 HRESULT async_operation_uint32_uint32_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
         IAsyncOperationWithProgress_UINT32_UINT32 **out );
 HRESULT storage_file_create( const WCHAR *path, IStorageFile **out );
+HRESULT async_operation_input_stream_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+        IAsyncOperation_IInputStream **out );
+HRESULT async_operation_random_access_stream_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+        IAsyncOperation_IRandomAccessStream **out );
+HRESULT async_operation_random_access_stream_ct_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+        IAsyncOperation_IRandomAccessStreamWithContentType **out );
+HRESULT file_stream_open( const WCHAR *path, FileAccessMode mode, BOOL sequential, IRandomAccessStreamWithContentType **out );
+const WCHAR *file_content_type( const WCHAR *path, WCHAR *buffer, DWORD size );
 extern IActivationFactory *file_io_activation_factory;
 HRESULT async_operation_indexed_state_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
         IAsyncOperation_UINT32 **out );

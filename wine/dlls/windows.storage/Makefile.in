@@ -5,6 +5,7 @@ SOURCES = \
 	appdatapaths.c \
 	async.c \
 	fileio.c \
+	filestream.c \
 	async_private.idl \
 	classes.idl \
 	fileproperties.c \

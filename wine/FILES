@@ -221,3 +221,21 @@ dlls/windows.networking/main.c
 dlls/windows.networking/Makefile.in
 dlls/windows.networking.hostname/hostname.c
 include/windows.networking.sockets.idl
+
+# 2026-09-23 (Shapr3D bring-up), plus appxdeploymentclient files changed earlier but never listed
+dlls/appxdeploymentclient/Makefile.in
+dlls/appxdeploymentclient/package.c
+dlls/appxdeploymentclient/packagelist.c
+dlls/appxdeploymentclient/private.h
+dlls/d3d11/fence.c
+dlls/d3d11/Makefile.in
+dlls/dwmapi/dwmapi_main.c
+dlls/dwmapi/dwmapi.spec
+dlls/dwmapi/Makefile.in
+dlls/kernelbase/process.c
+dlls/kernelbase/thread.c
+dlls/msvcrt/exit.c
+dlls/ntdll/thread.c
+dlls/ntdll/unix/system.c
+dlls/ntdll/unix/thread.c
+dlls/windows.storage/filestream.c

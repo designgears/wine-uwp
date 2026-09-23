@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     fcb20cd6ffa6a4be00ded790b4a3982e0449b7b3
-                 wineuwp: CoreMessaging timer data in HotPatchSpareGlobals, visibility fallback timer; dcomp: keep every partner callback
+  wine HEAD:     c6f5b763194e67c26c3fddc770f88e0a6d2367a5
+                 Shapr3D bring-up: file streams, fences, package display names, exit tracing
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-23T07:44:25Z
+  captured:      2026-09-23T09:18:23Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

@@ -581,6 +581,7 @@ static HRESULT uicontext_factory_query(REFIID iid, void **out)
  */
 extern IActivationFactory *compositor_activation_factory;
 extern IActivationFactory *capabilities_activation_factory;
+extern IActivationFactory *composition_object_activation_factory;
 extern IActivationFactory *composition_island_activation_factory;
 extern IActivationFactory *effect_source_parameter_activation_factory;
 extern IActivationFactory *scene_lighting_effect_activation_factory;
@@ -608,6 +609,12 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **fac
     if (name && !wcscmp(name, L"Windows.UI.Composition.CompositionCapabilities"))
     {
         IActivationFactory_AddRef( (*factory = capabilities_activation_factory) );
+        return S_OK;
+    }
+
+    if (name && !wcscmp(name, L"Windows.UI.Composition.CompositionObject"))
+    {
+        IActivationFactory_AddRef( (*factory = composition_object_activation_factory) );
         return S_OK;
     }
 

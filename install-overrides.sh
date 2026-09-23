@@ -23,7 +23,7 @@ if [ -z "${WINE_UWP_FORCE_OVERRIDES:-}" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP
   exit 0
 fi
 
-LIST=${1:-windows.ui.xaml windows.ui twinapi.appcore coremessaging windows.applicationmodel wintypes threadpoolwinrt msvcp_win mrmcorer bcp47mrm bcp47langs profapi rometadata windows.globalization icu icuuc icuin winlangdb globinputhost msftedit msxml6 msxml6r wincorlib userdatatypehelperutil fontgroupsoverride diagnosticdatasettings coreprivacysettingsstore rmclient}
+LIST=${1:-windows.ui.xaml windows.ui twinapi.appcore coremessaging windows.applicationmodel wintypes threadpoolwinrt msvcp_win mrmcorer bcp47mrm bcp47langs profapi rometadata windows.globalization icu icuuc icuin winlangdb globinputhost msftedit msxml6 msxml6r wincorlib userdatatypehelperutil fontgroupsoverride diagnosticdatasettings coreprivacysettingsstore rmclient cryptowinrt}
 for n in $LIST; do
   f=$(ls "$SRC" | grep -i "^$n\.dll$" | head -1)
   [ -n "$f" ] || { echo "missing $n"; continue; }
@@ -439,10 +439,10 @@ fi
 # So: let any pending update finish, then assert the shim classes again and *verify* by reading
 # system.reg, rather than trusting the write.
 reassert_activatable() {
-  local cls="$1" dll="$2" key="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\$cls"
+  local cls="$1" dll="$2" threading="${3:-1}" key="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\$cls"
   "${WINE_BIN}wine" reg add "$key" /v DllPath /d "C:\\windows\\system32\\$dll" /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$key" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$key" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$key" /v Threading /t REG_DWORD /d "$threading" /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$key" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
 }
 
@@ -481,6 +481,24 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_useractivitychannel.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.UserActivities.UserActivityChannel:wineuwp_useractivitychannel.dll"
 [ -f "$SYS32/wineuwp_toastnotifier.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Notifications.ToastNotificationManager:wineuwp_toastnotifier.dll"
 
+# Windows.Graphics.dll's classes that Wine's builtin windows.graphics does not implement, served by
+# the genuine DLL. It is installed under another file name because a module is found by name and
+# the builtin, which owns DisplayInformation (and our composition work behind it), must keep its
+# own. Imaging sits on WIC, which Wine has; Shapr3D's engine throws, and aborts, when
+# BitmapTransform cannot be activated. Threading is Both (0), as the Windows registry has it.
+WG_SRC=$(ls "$SRC" | grep -i '^windows.graphics.dll$' | head -1)
+if [ -n "$WG_SRC" ]; then
+  cmp -s "$SRC/$WG_SRC" "$SYS32/windows.graphics.native.dll" || cp -f "$SRC/$WG_SRC" "$SYS32/windows.graphics.native.dll"
+  for cls in Windows.Graphics.Imaging.BitmapDecoder Windows.Graphics.Imaging.BitmapEncoder \
+             Windows.Graphics.Imaging.BitmapPropertySet Windows.Graphics.Imaging.BitmapTransform \
+             Windows.Graphics.Imaging.BitmapTypedValue Windows.Devices.Display.DisplayMonitor \
+             Windows.Devices.Display.LogicalDisplayReference; do
+    reassert_activatable "$cls" windows.graphics.native.dll 0
+    SHIM_CLASSES="$SHIM_CLASSES $cls:windows.graphics.native.dll:0"
+  done
+  echo "installed: genuine Windows.Graphics.dll for imaging and display-monitor classes"
+fi
+
 if [ -n "$SHIM_CLASSES" ]; then
   # Let any update already in flight finish. Forcing one with `wineboot -u` is deliberately not
   # done here: it starts a fresh services.exe/explorer.exe set on every launch, and run.sh already
@@ -491,12 +509,15 @@ if [ -n "$SHIM_CLASSES" ]; then
   for attempt in 1 2 3; do
     bad=""
     for entry in $SHIM_CLASSES; do
-      cls=${entry%%:*}; dll=${entry#*:}
+      cls=${entry%%:*}; dll=${entry#*:}; dll=${dll%%:*}
       want="c:\\windows\\system32\\$dll"
       [ "$(activatable_dllpath "$cls")" = "$want" ] || bad="$bad $entry"
     done
     [ -n "$bad" ] || break
-    for entry in $bad; do reassert_activatable "${entry%%:*}" "${entry#*:}"; done
+    for entry in $bad; do
+      rest=${entry#*:}; dll=${rest%%:*}; thr=; [ "$rest" != "$dll" ] && thr=${rest#*:}
+      reassert_activatable "${entry%%:*}" "$dll" $thr
+    done
     "${WINE_BIN}wineserver" -w 2>/dev/null || true
   done
 

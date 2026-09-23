@@ -430,6 +430,33 @@ void combase_dump_unhandled_language_exception( IRestrictedErrorInfo *info )
     }
 }
 
+/* With WINE_UWP_TRACE_ORIGINATE set, print who originated the error as module+rva return
+ * addresses. A managed ThrowOnExternalCallFailed originates while the frame that made the failing
+ * call is still on the stack, which is the only cheap way to find a .NET Native call site. */
+static void trace_origin_backtrace(void)
+{
+    void *frames[32];
+    char var[8];
+    USHORT count, i;
+
+    if (!GetEnvironmentVariableA( "WINE_UWP_TRACE_ORIGINATE", var, sizeof(var) )) return;
+    count = RtlCaptureStackBackTrace( 1, ARRAY_SIZE(frames), frames, NULL );
+    for (i = 0; i < count; i++)
+    {
+        WCHAR path[MAX_PATH], *name;
+        HMODULE module;
+
+        if (!GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                 frames[i], &module ) || !GetModuleFileNameW( module, path, ARRAY_SIZE(path) ))
+        {
+            ERR( "origin frame %u: %p\n", i, frames[i] );
+            continue;
+        }
+        name = wcsrchr( path, '\\' ) ? wcsrchr( path, '\\' ) + 1 : path;
+        ERR( "origin frame %u: %s+%#Ix\n", i, debugstr_w( name ), (ULONG_PTR)frames[i] - (ULONG_PTR)module );
+    }
+}
+
 BOOL WINAPI RoOriginateLanguageException( HRESULT error, HSTRING message, IUnknown *language_exception )
 {
     UINT32 len = 0;
@@ -439,6 +466,7 @@ BOOL WINAPI RoOriginateLanguageException( HRESULT error, HSTRING message, IUnkno
     if (SUCCEEDED(error)) return FALSE;
     trace_originate( error );
     trace_language_exception( language_exception );
+    trace_origin_backtrace();
     return originate_error( error, str, len, language_exception, TRUE );
 }
 

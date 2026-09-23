@@ -1704,6 +1704,48 @@ static BOOL get_package_publisher( const WCHAR *package_path, WCHAR *out, DWORD 
     return ret;
 }
 
+/* Decode the five predefined XML entities and numeric character references in place. */
+static void decode_xml_entities( WCHAR *str )
+{
+    static const struct { const WCHAR *name; WCHAR ch; } entities[] =
+    {
+        { L"&amp;", '&' }, { L"&lt;", '<' }, { L"&gt;", '>' }, { L"&quot;", '"' }, { L"&apos;", '\'' },
+    };
+    WCHAR *src = str, *dst = str;
+    unsigned int i;
+
+    while (*src)
+    {
+        if (*src == '&')
+        {
+            for (i = 0; i < ARRAY_SIZE(entities); i++)
+            {
+                size_t len = wcslen( entities[i].name );
+                if (!wcsncmp( src, entities[i].name, len ))
+                {
+                    *dst++ = entities[i].ch;
+                    src += len;
+                    break;
+                }
+            }
+            if (i < ARRAY_SIZE(entities)) continue;
+            if (src[1] == '#')
+            {
+                WCHAR *end;
+                ULONG ch = (src[2] == 'x' || src[2] == 'X') ? wcstoul( src + 3, &end, 16 ) : wcstoul( src + 2, &end, 10 );
+                if (*end == ';' && ch && ch < 0x10000)
+                {
+                    *dst++ = ch;
+                    src = end + 1;
+                    continue;
+                }
+            }
+        }
+        *dst++ = *src++;
+    }
+    *dst = 0;
+}
+
 /* Text of <element>...</element> in the manifest. */
 static BOOL get_package_manifest_element( const WCHAR *package_path, const char *element, WCHAR *out, DWORD count )
 {
@@ -1718,6 +1760,8 @@ static BOOL get_package_manifest_element( const WCHAR *package_path, const char 
     if ((p = strstr( data, open_tag )) && (end = strstr( p, close_tag )))
         ret = copy_utf8_range( p + strlen( open_tag ), end, out, count );
     HeapFree( GetProcessHeap(), 0, data );
+    /* element text is XML: "Solitaire &amp; Casual Games" is "Solitaire & Casual Games" */
+    if (ret) decode_xml_entities( out );
     return ret;
 }
 
@@ -2226,19 +2270,39 @@ LONG WINAPI GetCurrentPackageGlobalizationContext(UINT32 reserved, void *reserve
     return create_package_context( 3, context );
 }
 
-/* Property blobs of a package context. Everything interesting is read from the manifest by the
- * caller instead, so no property is served here. */
-/* Localizable package properties. Windows keeps them in a serialized blob built at deployment time;
- * here they come straight out of the manifest, `ms-resource:` references included, which the caller
- * resolves through MRT exactly as it would on Windows. The property numbering follows the order the
- * manifest declares them in; unknown ids report an empty value rather than failing, because the
- * caller treats a failure as fatal. */
+/* Localizable package properties (DisplayName, PublisherDisplayName, Description, Logo), which
+ * Windows serializes at deployment time into MRT "reference blobs" and MrmCoreR's
+ * GetStringValueForManifestField (ResourceReference::Set / ValidateReferenceBlob) parses back.
+ * Handing MRT the bare manifest string failed that validation, and every Package.DisplayName read
+ * came back ERROR_INVALID_DATA - which Shapr3D's welcome page binds to. The layout, recovered from
+ * MrmCoreR's ReferenceBuilder::BuildReferenceBlob:
+ *
+ *   WORD type     0x100 inline string, 0x200 resource reference by name, 0x400 resource index
+ *   WORD total    8 + payload rounded up to 4
+ *   WORD reserved 0 (Set rejects anything else)
+ *   WORD length   payload bytes
+ *   payload       for 0x100: the UTF-16 string including its terminator
+ *
+ * A literal manifest value is stored inline, which is what deployment does for any single-valued
+ * string (ReferenceBuilder::TryGetOnlyValue). An `ms-resource:` value is left to MRT to resolve by
+ * name. The values come straight out of the manifest; unknown ids report an empty value rather
+ * than failing, because the caller treats a failure as fatal. */
+struct reference_blob_header
+{
+    WORD type;
+    WORD total;
+    WORD reserved;
+    WORD length;
+};
+
 LONG WINAPI GetPackageResourcesProperty(void *context, UINT32 property, UINT32 *size, void *buffer, UINT32 *flags)
 {
-    static const char * const elements[] = { "DisplayName", "PublisherDisplayName", "Description", "Logo", "Logo" };
+    /* the ids windows.applicationmodel's PackageServer::get_* pass; 0 is not used */
+    static const char * const elements[] = { NULL, "DisplayName", "PublisherDisplayName", "Description", "Logo" };
     struct package_context *ctx = context;
+    struct reference_blob_header *header = buffer;
     WCHAR value[512];
-    UINT32 needed;
+    UINT32 length, needed;
 
     TRACE( "%p %u %p %p %p\n", context, property, size, buffer, flags );
 
@@ -2246,19 +2310,40 @@ LONG WINAPI GetPackageResourcesProperty(void *context, UINT32 property, UINT32 *
     if (*size && !buffer) return ERROR_INVALID_PARAMETER;
 
     value[0] = 0;
-    if (property >= ARRAY_SIZE(elements) || !get_package_manifest_element( ctx->path, elements[property], value, ARRAY_SIZE(value) ))
+    if (property >= ARRAY_SIZE(elements) || !elements[property] ||
+        !get_package_manifest_element( ctx->path, elements[property], value, ARRAY_SIZE(value) ))
     {
         static int once;
         if (!once++) FIXME( "no manifest value for property %u\n", property );
     }
 
-    needed = (lstrlenW( value ) + 1) * sizeof(WCHAR);
+    /* A 0x200 reference is looked up as a resource URI, so the manifest's shorthand has to be
+     * spelt out: "ms-resource:Name" is Name in the package's Resources map, "ms-resource:/x/y"
+     * is package-relative, and "ms-resource://..." is already absolute. */
+    if (!wcsnicmp( value, L"ms-resource:", 12 ) && wcsncmp( value + 12, L"//", 2 ))
+    {
+        const WCHAR *name = value + 12, *end = wcschr( ctx->full_name, '_' );
+        WCHAR uri[ARRAY_SIZE(value)];
+        int len = end ? end - ctx->full_name : lstrlenW( ctx->full_name );
+
+        if (swprintf( uri, ARRAY_SIZE(uri), L"ms-resource://%.*s%s%s", len, ctx->full_name,
+                      *name == '/' ? L"" : L"/Resources/", name ) > 0)
+            lstrcpyW( value, uri );
+    }
+
+    length = (lstrlenW( value ) + 1) * sizeof(WCHAR);
+    needed = sizeof(*header) + ((length + 3) & ~3);
     if (*size < needed)
     {
         *size = needed;
         return ERROR_INSUFFICIENT_BUFFER;
     }
-    memcpy( buffer, value, needed );
+    memset( buffer, 0, needed );
+    header->type = wcsnicmp( value, L"ms-resource:", 12 ) ? 0x100 : 0x200;
+    header->total = needed;
+    header->length = length;
+    memcpy( header + 1, value, length );
+    TRACE( "property %u -> %#x %s\n", property, header->type, debugstr_w(value) );
     *size = needed;
     if (flags) *flags = 0;
     return ERROR_SUCCESS;

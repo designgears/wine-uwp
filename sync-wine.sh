@@ -69,7 +69,23 @@ if [ "$MODE" = --from-tree ]; then
   } > "$VENDOR/BASE.txt"
 fi
 
+# A file changed in the tree but absent from wine/FILES is work that exists nowhere else: it is
+# neither diffed nor copied, and --check used to pass anyway. That is how 41 committed lines of
+# appxdeploymentclient/package.c and a dozen of the newer files went unvendored. Compare against
+# the upstream base - committed, uncommitted and untracked changes alike.
+unlisted=0
+if [ "$MODE" = --check ]; then
+  base=$(git -C "$WINE_SRC" rev-list --max-parents=0 HEAD | head -1)
+  while read -r f; do
+    case $f in configure|autom4te.cache/*|*~|*.orig|*.rej) continue ;; esac
+    printf '%s\n' "${FILES[@]}" | grep -qxF "$f" && continue
+    echo "  unlisted: $f"; unlisted=$((unlisted+1))
+  done < <( { git -C "$WINE_SRC" diff --name-only "$base"; \
+              git -C "$WINE_SRC" ls-files --others --exclude-standard; } | sort -u )
+fi
+
 case $MODE in
-  --check) echo "checked $n file(s): $diff differing, $missing missing"; [ $((diff+missing)) -eq 0 ] || exit 1 ;;
+  --check) echo "checked $n file(s): $diff differing, $missing missing, $unlisted unlisted"
+           [ $((diff+missing+unlisted)) -eq 0 ] || exit 1 ;;
   *) echo "$MODE: $n file(s) written, $missing missing" ;;
 esac

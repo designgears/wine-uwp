@@ -3996,8 +3996,63 @@ void WINAPI LdrShutdownProcess(void)
 /******************************************************************
  *		RtlExitUserProcess (NTDLL.@)
  */
+/* WINE_UWP_TRACE_EXIT: print who asked the process to exit, as module+offset return addresses.
+ * A packaged app that decides to quit logs nothing - it just goes, with status 0 - and this is the
+ * cheapest way to find the code that made the decision. Also used by kernelbase's TerminateProcess
+ * when a process terminates itself. */
+void WINAPI __wine_trace_exit( const char *how, DWORD status )
+{
+    static const WCHAR nameW[] = {'W','I','N','E','_','U','W','P','_','T','R','A','C','E','_','E','X','I','T',0};
+    UNICODE_STRING name = RTL_CONSTANT_STRING( nameW ), value;
+    WCHAR buf[8];
+    void *frames[32];
+    USHORT count, i;
+
+    value.Buffer = buf;
+    value.MaximumLength = sizeof(buf);
+    if (RtlQueryEnvironmentVariable_U( NULL, &name, &value )) return;
+    ERR( "%s( %#lx ) on thread %04lx of %s\n", how, status, GetCurrentThreadId(),
+         debugstr_us( &NtCurrentTeb()->Peb->ProcessParameters->ImagePathName ) );
+    count = RtlCaptureStackBackTrace( 1, ARRAY_SIZE(frames), frames, NULL );
+    for (i = 0; i < count; i++)
+    {
+        LDR_DATA_TABLE_ENTRY *mod;
+        if (!LdrFindEntryForAddress( frames[i], &mod ))
+            ERR( "  exit frame %u: %s+%#Ix\n", i, debugstr_w( mod->BaseDllName.Buffer ),
+                 (ULONG_PTR)frames[i] - (ULONG_PTR)mod->DllBase );
+        else
+            ERR( "  exit frame %u: %p\n", i, frames[i] );
+    }
+}
+
+/* WINE_UWP_TRACE_THREAD_EXIT: the same for every thread that ends itself. twinapi.appcore's
+ * CoreApplication::CreateShutdownMonitor terminates the process as soon as the thread that called
+ * CoreApplication.Run exits, so an app that silently disappears is often a main thread leaving. */
+void WINAPI __wine_trace_thread_exit( ULONG status )
+{
+    static const WCHAR nameW[] = {'W','I','N','E','_','U','W','P','_','T','R','A','C','E','_','T','H','R','E','A','D','_','E','X','I','T',0};
+    UNICODE_STRING name = RTL_CONSTANT_STRING( nameW ), value;
+    WCHAR buf[8];
+    void *frames[32];
+    USHORT count, i;
+
+    value.Buffer = buf;
+    value.MaximumLength = sizeof(buf);
+    if (RtlQueryEnvironmentVariable_U( NULL, &name, &value )) return;
+    ERR( "thread %04lx exits, status %#lx\n", GetCurrentThreadId(), status );
+    count = RtlCaptureStackBackTrace( 1, ARRAY_SIZE(frames), frames, NULL );
+    for (i = 0; i < count; i++)
+    {
+        LDR_DATA_TABLE_ENTRY *mod;
+        if (!LdrFindEntryForAddress( frames[i], &mod ))
+            ERR( "  thread exit frame %u: %s+%#Ix\n", i, debugstr_w( mod->BaseDllName.Buffer ),
+                 (ULONG_PTR)frames[i] - (ULONG_PTR)mod->DllBase );
+    }
+}
+
 void WINAPI RtlExitUserProcess( DWORD status )
 {
+    __wine_trace_exit( "RtlExitUserProcess", status );
     RtlEnterCriticalSection( &loader_section );
     RtlAcquirePebLock();
     NtTerminateProcess( 0, status );

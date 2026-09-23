@@ -80,8 +80,10 @@ that were ours; the Calculator tree is no longer involved.
   at all**. They are our source, not patches.
   Commit in the Wine tree too - it is ours, and it is where `git log` for that work lives. The
   repo copy is what makes it visible and recoverable; the two are not alternatives.
-  `wine/FILES` is an **explicit list, never a glob**, so this cannot start sweeping the other
-  session's work into our history.
+  `wine/FILES` is an **explicit list, never a glob**, so build output and stray files never get
+  swept into our history.
+  `--check` also fails on files changed in the tree but **missing from the list** - it found 16,
+  including 41 committed lines of `appxdeploymentclient/package.c` that had never been vendored.
 - **This used to be a patch export, and it silently lost ~95% of the work.** Two compounding
   causes: `git diff` sees only the *uncommitted* delta, while most of the work was already
   committed in that tree; and the exporter's file list came from the bogus "not yours" claim
@@ -199,6 +201,9 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | Does a size change reach the app? | `$UWP_BIN/build-probes/probe-resize.exe <w> <h> [title]` - `SetWindowPos` through Wine. **`xdotool windowsize` does not reach Wine at all** |
 | Is this staged app binary still pristine? | `./appxverify.py <stage-dir> [file...]` - checks every 64 KiB block against the package's own `AppxBlockMap.xml`. An appx payload has no Authenticode signature and no PE checksum, so `pecheck.py` cannot answer this; use it instead of trusting a backup copy |
 | Is this Windows DLL one we have byte-patched? | `./pecheck.py <file>...`, or `./pecheck.py --sweep uwp-bin/win11` to list every modified file. Authenticode + PE checksum; needs no reference copy |
+| Which .NET Native call site made the WinRT call that failed? | `WINE_UWP_TRACE_ORIGINATE=1` now also prints `origin frame N: module+rva` for each `RoOriginateLanguageException`; the managed caller is still on the stack. Disassemble the frame before `Stub_N` for the slot (`r8d`) |
+| Why did the app vanish with exit status 0? | `WINE_UWP_TRACE_EXIT=1`: backtraces for `RtlExitUserProcess`, `TerminateProcess` (any target, with both pids), `TerminateThread` and ucrtbase `abort()`. `WINE_UWP_TRACE_THREAD_EXIT=1` adds every thread exit and `NtTerminateThread`. `WINE_UWP_TRACE_CLOSE=<hex>` names who closes a handle |
+| The app ships a crash reporter (Sentry/crashpad) | read its minidump and breadcrumbs, in `LocalState/crash_report/` for Shapr3D: the dump's exception stream names the thread and address, the breadcrumbs the app's own error text |
 | Which methods of an interface does the app actually call? | give every slot a traced thunk returning `E_NOTIMPL` and read the log - see `shims/storecontext`, which proved the app wanted only `GetDefault` out of 26 methods |
 
 ### Unique-HRESULT tagging
@@ -324,6 +329,18 @@ see, dump the strings around it, and read the sequence.
 **An app may write its own log.** Solitaire prints `[  0.002] LiveManagerXsapi2 - ...` lines to
 stderr naming its own failures, which is better evidence than anything we can infer from outside.
 `grep -aE "^\[ *[0-9]+\.[0-9]+\]" run.log` before theorising.
+
+**A crash reporter makes a crash look like a clean exit.** Shapr3D disappeared ~2 s in with exit
+status 0 and not one error line. Sentry had caught the engine thread's `abort()` in-process and its
+out-of-process `crashpad_handler.exe` wrote a minidump and called `TerminateProcess(app,
+0x40000015)`. A kill from *another* process is invisible to anything hooking the app's own exit
+paths. If a package has a `sentry/` or `crashpad_handler.exe`, look for its dump first.
+
+**`grep -l` over binaries gives false negatives.** It said no DLL imported
+`DwmpGetColorizationParameters`; `strings` found it in `Windows.UI.Xaml.dll` immediately.
+
+**`tramp.py` cannot hook .NET Native managed code.** Its logger's `OutputDebugStringA` raises an
+SEH exception, and mrt100 turns any SEH exception in managed frames into a fail-fast.
 
 **A vtable shorter than the interface is a wild jump, not an error.** `dcomp`'s `window_host_vtbl`
 had 8 entries and MrmCoreR calls slot 17; the call read past the array into `.data` and jumped
@@ -772,7 +789,7 @@ the fully-qualified name. `--grep` first, always.
 - The unhandled-error text an app reports is often a *consequence*. `Delegate to an instance method
   cannot have null 'this'` was the second exception; the first, further up, was the real one.
 
-## Current state (2026-09-22)
+## Current state (2026-09-23)
 
 | App | State |
 | --- | --- |
@@ -782,6 +799,7 @@ the fully-qualified name. `--grep` first, always.
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
 | Solitaire | **Playable on the unpatched `Solitaire.exe`** (`docs/screenshots/solitaire-unpatched-menu-game.png`): main menu -> Klondike -> game, and clicks move cards. No exe byte patch is needed any more: `wineuwp` delivers `CoreWindow.VisibilityChanged`. The Sign In Error popup shows on top of the menu; Cancel is at about (813,549). The old ~1-in-10 blank window is fixed (60/60 clean) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
+| Shapr3D | **Starts, stays up and renders its startup screen** (`docs/screenshots/shapr3d-media-feature-pack-dialog.png`), then shows its own "You need a media feature pack" dialog, because `Windows.Media.Core.CodecQuery` is unimplemented - the next blocker. Its engine initialises D3D11 and compiles its shaders. Findings-M4, 2026-09-23 |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
 them. **Testing that, and making them the default if it holds, is a standing job** - they change the

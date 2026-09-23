@@ -19,6 +19,7 @@
 
 #include "private.h"
 #include "shlwapi.h"
+#include "appmodel.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(storage);
 
@@ -159,26 +160,100 @@ static HRESULT WINAPI storage_file_get_FileType( IStorageFile *iface, HSTRING *v
 static HRESULT WINAPI storage_file_get_ContentType( IStorageFile *iface, HSTRING *value )
 {
     struct storage_file *impl = impl_from_IStorageFile( iface );
-    const WCHAR *ext;
     WCHAR type[256];
-    DWORD size = sizeof(type);
 
     TRACE( "iface %p, value %p.\n", iface, value );
 
     if (!value) return E_POINTER;
-    /* the per-extension Content Type the shell keeps under HKCR, "application/octet-stream" when
-     * there is nothing registered - which is what Windows falls back to as well */
-    ext = PathFindExtensionW( impl->path );
-    if (!*ext || RegGetValueW( HKEY_CLASSES_ROOT, ext, L"Content Type", RRF_RT_REG_SZ, NULL, type, &size ))
-        wcscpy( type, L"application/octet-stream" );
+    file_content_type( impl->path, type, ARRAY_SIZE(type) );
     return WindowsCreateString( type, wcslen( type ), value );
 }
 
-/* Reading and writing through a StorageFile needs the stream classes; only the metadata is real. */
+enum open_kind
+{
+    OPEN_RANDOM_ACCESS,     /* IStorageFile::OpenAsync */
+    OPEN_WITH_CONTENT_TYPE, /* IRandomAccessStreamReference::OpenReadAsync */
+    OPEN_SEQUENTIAL,        /* IInputStreamReference::OpenSequentialReadAsync */
+};
+
+struct open_params
+{
+    IUnknown IUnknown_iface;
+    LONG ref;
+
+    WCHAR *path;
+    FileAccessMode mode;
+    enum open_kind kind;
+};
+
+static void open_params_destroy( struct open_params *params )
+{
+    free( params->path );
+    free( params );
+}
+
+DEFINE_ASYNC_PARAMS( open_params )
+
+/* The file is opened by the operation, not by the call, so a missing or locked file fails the
+ * operation the way Windows does rather than the call that started it. */
+static HRESULT open_file_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+{
+    struct open_params *params = open_params_from_IUnknown( param );
+    IRandomAccessStreamWithContentType *stream;
+    HRESULT hr;
+
+    if (FAILED(hr = file_stream_open( params->path, params->mode, params->kind == OPEN_SEQUENTIAL, &stream )))
+        return hr;
+
+    /* the operation's GetResults hands back punkVal as-is, so it must be the exact interface */
+    result->vt = VT_UNKNOWN;
+    switch (params->kind)
+    {
+    case OPEN_RANDOM_ACCESS:
+        hr = IRandomAccessStreamWithContentType_QueryInterface( stream, &IID_IRandomAccessStream, (void **)&result->punkVal );
+        break;
+    case OPEN_WITH_CONTENT_TYPE:
+        IRandomAccessStreamWithContentType_AddRef( stream );
+        result->punkVal = (IUnknown *)stream;
+        break;
+    case OPEN_SEQUENTIAL:
+        hr = IRandomAccessStreamWithContentType_QueryInterface( stream, &IID_IInputStream, (void **)&result->punkVal );
+        break;
+    }
+    IRandomAccessStreamWithContentType_Release( stream );
+    return hr;
+}
+
+static HRESULT open_params_create( struct storage_file *impl, FileAccessMode mode, enum open_kind kind, IUnknown **out )
+{
+    struct open_params *params;
+
+    if (!(params = open_params_alloc())) return E_OUTOFMEMORY;
+    if (!(params->path = wcsdup( impl->path )))
+    {
+        free( params );
+        return E_OUTOFMEMORY;
+    }
+    params->mode = mode;
+    params->kind = kind;
+    *out = &params->IUnknown_iface;
+    return S_OK;
+}
+
 static HRESULT WINAPI storage_file_OpenAsync( IStorageFile *iface, FileAccessMode mode, IAsyncOperation_IRandomAccessStream **operation )
 {
-    FIXME( "iface %p, mode %d, operation %p stub!\n", iface, (int)mode, operation );
-    return E_NOTIMPL;
+    struct storage_file *impl = impl_from_IStorageFile( iface );
+    IUnknown *param;
+    HRESULT hr;
+
+    TRACE( "iface %p, mode %d, operation %p.\n", iface, (int)mode, operation );
+
+    if (!operation) return E_POINTER;
+    *operation = NULL;
+    if (FAILED(hr = open_params_create( impl, mode, OPEN_RANDOM_ACCESS, &param ))) return hr;
+    hr = async_operation_random_access_stream_create( (IUnknown *)iface, param, open_file_async, operation );
+    IUnknown_Release( param );
+    return hr;
 }
 
 static HRESULT WINAPI storage_file_OpenTransactedWriteAsync( IStorageFile *iface, IAsyncOperation_StorageStreamTransaction **operation )
@@ -400,8 +475,18 @@ DEFINE_IINSPECTABLE( file_stream_ref, IRandomAccessStreamReference, struct stora
 static HRESULT WINAPI file_stream_ref_OpenReadAsync( IRandomAccessStreamReference *iface,
                                                      IAsyncOperation_IRandomAccessStreamWithContentType **operation )
 {
-    FIXME( "iface %p, operation %p stub!\n", iface, operation );
-    return E_NOTIMPL;
+    struct storage_file *impl = impl_from_IRandomAccessStreamReference( iface );
+    IUnknown *param;
+    HRESULT hr;
+
+    TRACE( "iface %p, operation %p.\n", iface, operation );
+
+    if (!operation) return E_POINTER;
+    *operation = NULL;
+    if (FAILED(hr = open_params_create( impl, FileAccessMode_Read, OPEN_WITH_CONTENT_TYPE, &param ))) return hr;
+    hr = async_operation_random_access_stream_ct_create( (IUnknown *)iface, param, open_file_async, operation );
+    IUnknown_Release( param );
+    return hr;
 }
 
 static const struct IRandomAccessStreamReferenceVtbl file_stream_ref_vtbl =
@@ -422,8 +507,18 @@ DEFINE_IINSPECTABLE( file_input_ref, IInputStreamReference, struct storage_file,
 static HRESULT WINAPI file_input_ref_OpenSequentialReadAsync( IInputStreamReference *iface,
                                                               IAsyncOperation_IInputStream **operation )
 {
-    FIXME( "iface %p, operation %p stub!\n", iface, operation );
-    return E_NOTIMPL;
+    struct storage_file *impl = impl_from_IInputStreamReference( iface );
+    IUnknown *param;
+    HRESULT hr;
+
+    TRACE( "iface %p, operation %p.\n", iface, operation );
+
+    if (!operation) return E_POINTER;
+    *operation = NULL;
+    if (FAILED(hr = open_params_create( impl, FileAccessMode_Read, OPEN_SEQUENTIAL, &param ))) return hr;
+    hr = async_operation_input_stream_create( (IUnknown *)iface, param, open_file_async, operation );
+    IUnknown_Release( param );
+    return hr;
 }
 
 static const struct IInputStreamReferenceVtbl file_input_ref_vtbl =
@@ -775,10 +870,137 @@ static HRESULT WINAPI file_statics_GetFileFromPathAsync( IStorageFileStatics *if
     return hr;
 }
 
+LONG WINAPI GetCurrentPackagePath( UINT32 *length, WCHAR *path );
+LONG WINAPI GetCurrentPackageFamilyName( UINT32 *length, WCHAR *name );
+
+static int hex_digit( WCHAR c )
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Append a URI path to a directory: percent-decoded, '/' turned into '\\'. Returns FALSE for a
+ * path that would climb out of the directory, which is how Windows keeps ms-appx inside the
+ * package. Only ASCII escapes are decoded; a multi-byte UTF-8 escape is refused rather than
+ * mangled. */
+static BOOL append_uri_path( WCHAR *buf, SIZE_T size, const WCHAR *path, const WCHAR *end )
+{
+    SIZE_T len = wcslen( buf ), seg_start;
+
+    for (seg_start = len; path < end; path++)
+    {
+        WCHAR c = *path;
+
+        if (c == '?' || c == '#') break;
+        if (c == '%')
+        {
+            int hi, lo;
+            if (end - path < 3 || (hi = hex_digit( path[1] )) < 0 || (lo = hex_digit( path[2] )) < 0) return FALSE;
+            if ((c = hi * 16 + lo) >= 0x80 || !c) return FALSE;
+            path += 2;
+        }
+        if (c == '/') c = '\\';
+        if (c == '\\')
+        {
+            /* reject "." and ".." segments outright */
+            if (len - seg_start && buf[seg_start] == '.' &&
+                (len - seg_start == 1 || (len - seg_start == 2 && buf[seg_start + 1] == '.')))
+                return FALSE;
+            if (len && buf[len - 1] == '\\') continue;
+        }
+        if (len + 1 >= size) return FALSE;
+        buf[len++] = c;
+        if (c == '\\') seg_start = len;
+    }
+    if (len - seg_start && buf[seg_start] == '.' &&
+        (len - seg_start == 1 || (len - seg_start == 2 && buf[seg_start + 1] == '.')))
+        return FALSE;
+    buf[len] = 0;
+    return TRUE;
+}
+
+/* ms-appx:///<path> names a file in the package's install directory, and ms-appdata:///local/,
+ * /roaming/ and /temp/ name files in its data folders - the same %LOCALAPPDATA%\Packages\<family>
+ * layout windows.storage.applicationdata hands out for ApplicationData.LocalFolder and friends.
+ * The host part may be empty or the package name; nothing else is resolvable here. */
+static HRESULT application_uri_to_path( IUriRuntimeClass *uri, WCHAR *buf, SIZE_T size )
+{
+    static const struct { const WCHAR *prefix; const WCHAR *state; } appdata[] =
+    {
+        { L"local/", L"LocalState" }, { L"roaming/", L"RoamingState" }, { L"temp/", L"TempState" },
+    };
+    const WCHAR *str, *rest, *path, *end;
+    WCHAR family[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1];
+    UINT32 len, family_len = ARRAY_SIZE(family);
+    HSTRING absolute;
+    HRESULT hr = E_INVALIDARG;
+    BOOL appx;
+    LONG err;
+    UINT i;
+
+    if (FAILED(hr = IUriRuntimeClass_get_AbsoluteUri( uri, &absolute ))) return hr;
+    str = WindowsGetStringRawBuffer( absolute, &len );
+    end = str + len;
+    TRACE( "uri %s.\n", debugstr_wn( str, len ) );
+
+    hr = E_INVALIDARG;
+    if (len > 9 && !wcsnicmp( str, L"ms-appx://", 10 )) { appx = TRUE; rest = str + 10; }
+    else if (len > 12 && !wcsnicmp( str, L"ms-appdata://", 13 )) { appx = FALSE; rest = str + 13; }
+    else goto done;
+
+    /* skip the authority; it names the package, and we only have the one */
+    for (path = rest; path < end && *path != '/'; path++);
+    if (path++ == end) goto done;
+
+    if (appx)
+    {
+        UINT32 path_len = size;
+        if ((err = GetCurrentPackagePath( &path_len, buf ))) { hr = HRESULT_FROM_WIN32( err ); goto done; }
+    }
+    else
+    {
+        for (i = 0; i < ARRAY_SIZE(appdata); i++)
+            if (end - path >= wcslen( appdata[i].prefix ) &&
+                !wcsnicmp( path, appdata[i].prefix, wcslen( appdata[i].prefix ) )) break;
+        if (i == ARRAY_SIZE(appdata)) goto done;
+        path += wcslen( appdata[i].prefix );
+        if ((err = GetCurrentPackageFamilyName( &family_len, family ))) { hr = HRESULT_FROM_WIN32( err ); goto done; }
+        if (!GetEnvironmentVariableW( L"LOCALAPPDATA", buf, size ) ||
+            swprintf( buf + wcslen( buf ), size - wcslen( buf ), L"\\Packages\\%s\\%s", family, appdata[i].state ) < 0)
+        {
+            hr = E_FAIL;
+            goto done;
+        }
+    }
+
+    if (buf[0] && buf[wcslen( buf ) - 1] != '\\' && wcslen( buf ) + 1 < size) wcscat( buf, L"\\" );
+    if (append_uri_path( buf, size, path, end )) hr = S_OK;
+
+done:
+    if (FAILED(hr)) WARN( "cannot resolve %s, hr %#lx.\n", debugstr_wn( str, len ), hr );
+    WindowsDeleteString( absolute );
+    return hr;
+}
+
 static HRESULT WINAPI file_statics_GetFileFromApplicationUriAsync( IStorageFileStatics *iface, IUriRuntimeClass *uri, IAsyncOperation_StorageFile **operation )
 {
-    FIXME( "iface %p, uri %p, operation %p stub!\n", iface, uri, operation );
-    return E_NOTIMPL;
+    WCHAR path[MAX_PATH];
+    IUnknown *param;
+    HRESULT hr;
+
+    TRACE( "iface %p, uri %p, operation %p.\n", iface, uri, operation );
+
+    if (!uri) return E_INVALIDARG;
+    if (!operation) return E_POINTER;
+    if (FAILED(hr = application_uri_to_path( uri, path, ARRAY_SIZE(path) ))) return hr;
+    TRACE( "resolved to %s.\n", debugstr_w( path ) );
+    /* a missing file fails the operation, not the call, as GetFileFromPathAsync does */
+    if (FAILED(hr = storage_path_param_create( path, &param ))) return hr;
+    hr = async_operation_storage_file_create( (IUnknown *)iface, param, get_file_from_path, operation );
+    IUnknown_Release( param );
+    return hr;
 }
 
 static HRESULT WINAPI file_statics_CreateStreamedFileAsync( IStorageFileStatics *iface, HSTRING display_name_with_extension, IStreamedFileDataRequestedHandler *data_requested, IRandomAccessStreamReference *thumbnail, IAsyncOperation_StorageFile **operation )

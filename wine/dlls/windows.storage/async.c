@@ -2079,3 +2079,154 @@ HRESULT async_operation_uint32_create( IUnknown *invoker, IUnknown *param, async
     return S_OK;
 }
 
+
+/* IAsyncOperation<I*> whose result is an interface pointer: the callback stores that exact
+ * interface pointer (not merely something QueryInterface-able to it) in result->punkVal. */
+#define DEFINE_IASYNCOPERATION_IFACE( name, result_type, class_str )                                       \
+struct async_##name                                                                                        \
+{                                                                                                          \
+    IAsyncOperation_##result_type IAsyncOperation_iface;                                                   \
+    IAsyncInfoImpl *IAsyncInfoImpl_inner;                                                                  \
+    LONG ref;                                                                                              \
+};                                                                                                         \
+                                                                                                           \
+static inline struct async_##name *async_##name##_from_iface( IAsyncOperation_##result_type *iface )      \
+{                                                                                                          \
+    return CONTAINING_RECORD( iface, struct async_##name, IAsyncOperation_iface );                         \
+}                                                                                                          \
+                                                                                                           \
+static HRESULT WINAPI async_##name##_QueryInterface( IAsyncOperation_##result_type *iface, REFIID iid,     \
+                                                     void **out )                                          \
+{                                                                                                          \
+    struct async_##name *impl = async_##name##_from_iface( iface );                                        \
+                                                                                                           \
+    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );                             \
+                                                                                                           \
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||                      \
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAsyncOperation_##result_type ))   \
+    {                                                                                                      \
+        IInspectable_AddRef( (*out = &impl->IAsyncOperation_iface) );                                      \
+        return S_OK;                                                                                       \
+    }                                                                                                      \
+    return IAsyncInfoImpl_QueryInterface( impl->IAsyncInfoImpl_inner, iid, out );                          \
+}                                                                                                          \
+                                                                                                           \
+static ULONG WINAPI async_##name##_AddRef( IAsyncOperation_##result_type *iface )                          \
+{                                                                                                          \
+    struct async_##name *impl = async_##name##_from_iface( iface );                                        \
+    return InterlockedIncrement( &impl->ref );                                                             \
+}                                                                                                          \
+                                                                                                           \
+static ULONG WINAPI async_##name##_Release( IAsyncOperation_##result_type *iface )                         \
+{                                                                                                          \
+    struct async_##name *impl = async_##name##_from_iface( iface );                                        \
+    ULONG ref = InterlockedDecrement( &impl->ref );                                                        \
+                                                                                                           \
+    if (!ref)                                                                                              \
+    {                                                                                                      \
+        /* guard against re-entry if inner releases an outer iface */                                      \
+        InterlockedIncrement( &impl->ref );                                                                \
+        IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );                                             \
+        free( impl );                                                                                      \
+    }                                                                                                      \
+    return ref;                                                                                            \
+}                                                                                                          \
+                                                                                                           \
+static HRESULT WINAPI async_##name##_GetIids( IAsyncOperation_##result_type *iface, ULONG *iid_count,      \
+                                              IID **iids )                                                 \
+{                                                                                                          \
+    if (!iid_count || !iids) return E_POINTER;                                                             \
+    if (!(*iids = CoTaskMemAlloc( sizeof(IID) ))) return E_OUTOFMEMORY;                                    \
+    (*iids)[0] = IID_IAsyncOperation_##result_type;                                                        \
+    *iid_count = 1;                                                                                        \
+    return S_OK;                                                                                           \
+}                                                                                                          \
+                                                                                                           \
+static HRESULT WINAPI async_##name##_GetRuntimeClassName( IAsyncOperation_##result_type *iface,           \
+                                                          HSTRING *class_name )                            \
+{                                                                                                          \
+    return WindowsCreateString( class_str, ARRAY_SIZE(class_str) - 1, class_name );                        \
+}                                                                                                          \
+                                                                                                           \
+static HRESULT WINAPI async_##name##_GetTrustLevel( IAsyncOperation_##result_type *iface,                 \
+                                                    TrustLevel *trust_level )                              \
+{                                                                                                          \
+    *trust_level = BaseTrust;                                                                              \
+    return S_OK;                                                                                           \
+}                                                                                                          \
+                                                                                                           \
+static HRESULT WINAPI async_##name##_put_Completed( IAsyncOperation_##result_type *iface,                 \
+        IAsyncOperationCompletedHandler_##result_type *handler )                                           \
+{                                                                                                          \
+    struct async_##name *impl = async_##name##_from_iface( iface );                                        \
+    TRACE( "iface %p, handler %p.\n", iface, handler );                                                    \
+    return IAsyncInfoImpl_put_Completed( impl->IAsyncInfoImpl_inner,                                       \
+                                         (IAsyncOperationCompletedHandlerImpl *)handler );                 \
+}                                                                                                          \
+                                                                                                           \
+static HRESULT WINAPI async_##name##_get_Completed( IAsyncOperation_##result_type *iface,                 \
+        IAsyncOperationCompletedHandler_##result_type **handler )                                          \
+{                                                                                                          \
+    struct async_##name *impl = async_##name##_from_iface( iface );                                        \
+    return IAsyncInfoImpl_get_Completed( impl->IAsyncInfoImpl_inner,                                       \
+                                         (IAsyncOperationCompletedHandlerImpl **)handler );                \
+}                                                                                                          \
+                                                                                                           \
+static HRESULT WINAPI async_##name##_GetResults( IAsyncOperation_##result_type *iface,                    \
+                                                 result_type **results )                                   \
+{                                                                                                          \
+    struct async_##name *impl = async_##name##_from_iface( iface );                                        \
+    PROPVARIANT result = {.vt = VT_UNKNOWN};                                                               \
+    HRESULT hr;                                                                                            \
+                                                                                                           \
+    TRACE( "iface %p, results %p.\n", iface, results );                                                    \
+                                                                                                           \
+    hr = IAsyncInfoImpl_get_Result( impl->IAsyncInfoImpl_inner, &result );                                 \
+    *results = (result_type *)result.punkVal;                                                              \
+    if (result.punkVal) IUnknown_AddRef( result.punkVal );                                                 \
+    PropVariantClear( &result );                                                                           \
+    return hr;                                                                                             \
+}                                                                                                          \
+                                                                                                           \
+static const struct IAsyncOperation_##result_type##Vtbl async_##name##_vtbl =                              \
+{                                                                                                          \
+    async_##name##_QueryInterface,                                                                         \
+    async_##name##_AddRef,                                                                                 \
+    async_##name##_Release,                                                                                \
+    async_##name##_GetIids,                                                                                \
+    async_##name##_GetRuntimeClassName,                                                                    \
+    async_##name##_GetTrustLevel,                                                                          \
+    async_##name##_put_Completed,                                                                          \
+    async_##name##_get_Completed,                                                                          \
+    async_##name##_GetResults,                                                                             \
+};                                                                                                         \
+                                                                                                           \
+HRESULT async_operation_##name##_create( IUnknown *invoker, IUnknown *param,                               \
+        async_operation_callback callback, IAsyncOperation_##result_type **out )                           \
+{                                                                                                          \
+    struct async_##name *impl;                                                                             \
+    HRESULT hr;                                                                                            \
+                                                                                                           \
+    *out = NULL;                                                                                           \
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;                                        \
+    impl->IAsyncOperation_iface.lpVtbl = &async_##name##_vtbl;                                             \
+    impl->ref = 1;                                                                                         \
+                                                                                                           \
+    if (FAILED(hr = async_info_create( invoker, param, callback, (IInspectable *)&impl->IAsyncOperation_iface, \
+                                       &impl->IAsyncInfoImpl_inner )) ||                                   \
+        FAILED(hr = IAsyncInfoImpl_Start( impl->IAsyncInfoImpl_inner )))                                   \
+    {                                                                                                      \
+        if (impl->IAsyncInfoImpl_inner) IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );              \
+        free( impl );                                                                                      \
+        return hr;                                                                                         \
+    }                                                                                                      \
+    *out = &impl->IAsyncOperation_iface;                                                                   \
+    return S_OK;                                                                                           \
+}
+
+DEFINE_IASYNCOPERATION_IFACE( input_stream, IInputStream,
+        L"Windows.Foundation.IAsyncOperation`1<Windows.Storage.Streams.IInputStream>" )
+DEFINE_IASYNCOPERATION_IFACE( random_access_stream, IRandomAccessStream,
+        L"Windows.Foundation.IAsyncOperation`1<Windows.Storage.Streams.IRandomAccessStream>" )
+DEFINE_IASYNCOPERATION_IFACE( random_access_stream_ct, IRandomAccessStreamWithContentType,
+        L"Windows.Foundation.IAsyncOperation`1<Windows.Storage.Streams.IRandomAccessStreamWithContentType>" )

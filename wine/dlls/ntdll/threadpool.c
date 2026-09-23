@@ -372,6 +372,19 @@ static inline struct threadpool_instance *impl_from_TP_CALLBACK_INSTANCE( TP_CAL
 
 static void CALLBACK threadpool_worker_proc( void *param );
 static void tp_object_submit( struct threadpool_object *object, BOOL signaled );
+/* WINE_UWP_TRACE_THREAD_EXIT: report thread handles the wait queue sees signaled */
+static BOOL trace_signaled_waits(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        static const WCHAR nameW[] = {'W','I','N','E','_','U','W','P','_','T','R','A','C','E','_','T','H','R','E','A','D','_','E','X','I','T',0};
+        UNICODE_STRING name = RTL_CONSTANT_STRING( nameW ), value = { 0, 0, NULL };
+        enabled = RtlQueryEnvironmentVariable_U( NULL, &name, &value ) == STATUS_BUFFER_TOO_SMALL;
+    }
+    return enabled;
+}
+
 static void tp_object_execute( struct threadpool_object *object, BOOL wait_thread );
 static void tp_object_prepare_shutdown( struct threadpool_object *object );
 static BOOL tp_object_release( struct threadpool_object *object );
@@ -1413,6 +1426,14 @@ static void CALLBACK waitqueue_thread_proc( void *param )
                 if (wait->u.wait.bucket && wait->update_serial == update_serials[status - STATUS_WAIT_0])
                 {
                     /* Wait object signaled. */
+                    if (trace_signaled_waits())
+                    {
+                        THREAD_BASIC_INFORMATION tbi;
+                        if (!NtQueryInformationThread( handles[status - STATUS_WAIT_0], ThreadBasicInformation,
+                                                       &tbi, sizeof(tbi), NULL ))
+                            ERR( "wait %p (orig handle %p): thread %04lx, exit status %#lx\n", wait,
+                                 wait->u.wait.handle, HandleToULong( tbi.ClientId.UniqueThread ), tbi.ExitStatus );
+                    }
                     assert( wait->u.wait.bucket == bucket );
                     if ((wait->u.wait.flags & WT_EXECUTEONLYONCE))
                     {
@@ -2352,6 +2373,15 @@ static void tp_object_execute( struct threadpool_object *object, BOOL wait_threa
 
         case TP_OBJECT_TYPE_WAIT:
         {
+            if (trace_signaled_waits())
+            {
+                THREAD_BASIC_INFORMATION tbi;
+                NTSTATUS st = NtQueryInformationThread( object->u.wait.handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL );
+                ERR( "wait %p callback %p result %lu, handle %p (dup %p): %s %04lx exit %#lx\n", object,
+                     object->u.wait.callback, wait_result, object->u.wait.handle, object->u.wait.duped_handle,
+                     st ? "not a thread" : "thread", st ? 0 : HandleToULong( tbi.ClientId.UniqueThread ),
+                     st ? (ULONG)st : tbi.ExitStatus );
+            }
             TRACE( "executing wait callback %p(%p, %p, %p, %lu)\n",
                    object->u.wait.callback, callback_instance, object->userdata, object, wait_result );
             object->u.wait.callback( callback_instance, object->userdata, (TP_WAIT *)object, wait_result );
