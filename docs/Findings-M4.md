@@ -8779,3 +8779,22 @@ viewport (`docs/screenshots/shapr3d-capture-output.png`).
 
 The prefix's `Documents`, `Desktop` and `Pictures` are symlinks to the user's home folders. The
 dialogs start in Documents, so test output goes to `C:\users\Public\`.
+
+### Share dialog: copy link and the share-sheet button (2026-09-24)
+
+Both buttons beside the project link used to kill the app.
+
+- **Copy link** called `ext-ms-win-edputil-policy-l1-1-0.dll!EdpGetIsManaged` from Windows' own
+  `windows.applicationmodel.datatransfer.dll` (the Clipboard class). Nothing implemented it, so
+  the process aborted. The function takes no arguments and returns a BOOL; Windows' callers skip
+  every other EDP call when it is FALSE.
+  - There is now a builtin `dlls/edputil`, and the apiset points at it.
+  - It covers the 18 names that datatransfer, the Launcher, the share host and twinui.appcore
+    import, all answering "not managed / no context".
+  - The link now round-trips: copied, then pasted into the invite box
+    (`docs/screenshots/shapr3d-share-copy-link.png`).
+- **The share-sheet button** faulted inside `wineuwp`. The minidump's twinapi.appcore frame is
+  `ComPtr<IApplicationInvocableFlow>::As<IShareInvocableFlow>` (`{a14ef0a2}`). The flow object
+  was our window factory: `wf_QueryService` answered every service, including `{705f0106}` /
+  `{f230b678}`. It now answers only `GetWindowFactory`'s `{d98fd14a}`. The button then does
+  nothing, which is correct: there is no share host here.

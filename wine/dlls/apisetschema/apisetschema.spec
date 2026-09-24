@@ -4,6 +4,7 @@ apiset api-ms-win-appmodel-state-l1-2-0 = kernelbase.dll
 apiset ext-ms-win-appmodel-state-ext-l1-2-0 = kernelbase.dll
 apiset ext-ms-onecore-appmodel-staterepository-cache-l1-1-0 = windows.staterepositorycore.dll
 apiset ext-ms-win-resources-deployment-l1-1-0 = mrmdeploy.dll
+apiset ext-ms-win-edputil-policy-l1-1-0 = edputil.dll
 apiset ext-ms-win-mrmcorer-resmanager-l1-1-0 = mrmcorer.dll
 apiset ext-ms-win-com-psmregister-l1-1-0 = kernelbase.dll
 apiset api-ms-win-audiocore-spatial-config-l1-1-0 = windows.media.devices.dll

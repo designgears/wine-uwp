@@ -270,3 +270,6 @@ dlls/wined3d/texture.c
 dlls/dwrite/unixlib.h
 dlls/dwrite/freetype.c
 dlls/dwrite/opentype.c
+dlls/edputil/Makefile.in
+dlls/edputil/edputil.spec
+dlls/edputil/main.c

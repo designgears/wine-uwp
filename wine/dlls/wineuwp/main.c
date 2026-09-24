@@ -4475,9 +4475,16 @@ static HRESULT WINAPI wf_get_WindowReuseAllowed( struct window_factory *wf, bool
 
 static HRESULT WINAPI wf_QueryService( struct window_factory *wf, const GUID *service, const GUID *iid, void **out )
 {
+    /* the private service GetWindowFactory asks for, and then calls slot 5 on */
+    static const GUID SID_window_factory = { 0xd98fd14a, 0x522a, 0x4d59, { 0xb8, 0x75, 0x81, 0x1e, 0x83, 0x91, 0x9a, 0x9e } };
+
     TRACE( "service %s iid %s\n", debugstr_guid( service ), debugstr_guid( iid ) );
-    /* GetWindowFactory QueryService's a private guid then calls slot 5 on the result. */
-    return wf_QueryInterface( wf, &IID_IUnknown, out );
+    if (service && IsEqualGUID( service, &SID_window_factory )) return wf_QueryInterface( wf, &IID_IUnknown, out );
+    /* Anything else is a broker service this process does not have, e.g. the share UI's
+     * IApplicationInvocableFlow {f230b678}: handing back the window factory made twinapi.appcore
+     * treat it as one and fault. */
+    if (out) *out = NULL;
+    return E_NOINTERFACE;
 }
 
 static HRESULT WINAPI wf_CreateFromCookie( struct window_factory *wf, UINT64 cookie, void *opts, void **out )

@@ -1,0 +1,4 @@
+MODULE    = edputil.dll
+
+SOURCES = \
+	main.c
