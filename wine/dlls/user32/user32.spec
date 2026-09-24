@@ -215,6 +215,7 @@
 2801 stub ShellHandwritingUndelegateInput  # NtUserShellHandwritingUndelegateInput
 2802 stub ShellHandwritingHandleDelegatedInput  # NtUserShellHandwritingHandleDelegatedInput
 2804 stub EnableWindowShellWindowManagementBehavior  # NtUserEnableWindowShellWindowManagementBehavior
+2813 stdcall -noname GetKeyboardInputThreadId()
 
 @ stdcall ActivateKeyboardLayout(long long) NtUserActivateKeyboardLayout
 @ stdcall AddClipboardFormatListener(long) NtUserAddClipboardFormatListener

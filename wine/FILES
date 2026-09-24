@@ -63,6 +63,7 @@ dlls/msctf/msctf.c
 dlls/msctf/msctf.spec
 dlls/msftedit/msftedit.spec
 dlls/msvcp90/misc.c
+dlls/msvcrt/mbcs.c
 dlls/msvcrt/msvcrt.spec
 dlls/ninput/main.c
 dlls/ninput/ninput.spec
@@ -104,6 +105,7 @@ dlls/shell32/shellord.c
 dlls/ucrtbase/ucrtbase.spec
 dlls/urlmon/urlmon.spec
 dlls/urlmon/urlmon_main.c
+dlls/user32/input.c
 dlls/user32/message.c
 dlls/user32/misc.c
 dlls/user32/user32.spec

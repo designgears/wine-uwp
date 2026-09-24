@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     87ea053a042fb97dcbee85cbb3fb08018c3d7be0
-                 iertutil: Uri GetRuntimeClassName and GetTrustLevel; kernelbase: 1-based state folder types
+  wine HEAD:     caac26ff1f6fcd1776e281f7607b0c85029906ee
+                 ucrtbase: c16rtomb, c32rtomb, mbrtoc16, mbrtoc32; user32: GetKeyboardInputThreadId (ordinal 2813)
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-24T06:00:59Z
+  captured:      2026-09-24T06:46:21Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

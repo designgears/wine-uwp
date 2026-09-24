@@ -8738,3 +8738,22 @@ What is established:
 The "No models yet? Try a sample" dialog in an empty project is **modal and only accepts a
 choice**. Clicks outside it do nothing, so the editor looks frozen when it is not. Pick Drone to
 get a populated Visualization scene.
+
+### Typed dimensions while sketching (2026-09-24)
+
+Screenshot: `docs/screenshots/shapr3d-dimension-entry.png`. In a sketch, press `r`, click a corner
+and move the mouse, then type `50`, Tab, `30`, Enter. That gives an exact 50 x 30 mm rectangle.
+Two refusals had killed the process on the first keystroke, one after the other:
+
+1. `ucrtbase.c32rtomb`, a spec stub. The app converts each typed character to UTF-8. It and its
+   siblings `c16rtomb`, `mbrtoc16` and `mbrtoc32` are now in `msvcrt/mbcs.c`, for ucrtbase only.
+   They are UTF-8 whatever the locale, as the UCRT defines them. `probe-uchar.exe` checks them
+   against known byte sequences.
+2. `USER32.dll` ordinal 2813, which is `GetKeyboardInputThreadId`. `twinapi.dll` delay-loads it
+   and compares its answer with the thread that owns its window, before checking the
+   `inputInjection` capability. It now returns the thread that owns the foreground window. The
+   name comes from `user32.pdb`; the export itself is unnamed.
+
+Driving this with `xdotool type` at its default 12 ms per key loses the key after the one that
+opens the dimension field ("50" arrives as "5"). At 250 ms per key every digit arrives. A person
+types slower than 12 ms per key, so this is recorded rather than chased.

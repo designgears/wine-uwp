@@ -1713,8 +1713,8 @@
 @ cdecl _o_malloc(long) malloc
 @ cdecl _o_mblen(ptr long) mblen
 @ cdecl _o_mbrlen(ptr long ptr) mbrlen
-@ stub _o_mbrtoc16
-@ stub _o_mbrtoc32
+@ cdecl _o_mbrtoc16(ptr ptr long ptr) mbrtoc16
+@ cdecl _o_mbrtoc32(ptr ptr long ptr) mbrtoc32
 @ cdecl _o_mbrtowc(ptr str long ptr) mbrtowc
 @ cdecl _o_mbsrtowcs(ptr ptr long ptr) mbsrtowcs
 @ cdecl _o_mbsrtowcs_s(ptr ptr long ptr long ptr) mbsrtowcs_s
@@ -2181,8 +2181,8 @@
 @ cdecl bsearch(ptr ptr long long ptr)
 @ cdecl bsearch_s(ptr ptr long long ptr ptr)
 @ cdecl btowc(long)
-@ stub c16rtomb
-@ stub c32rtomb
+@ cdecl c16rtomb(ptr long ptr)
+@ cdecl c32rtomb(ptr long ptr)
 @ stub cabs
 @ stub cabsf
 @ stub cabsl
@@ -2416,8 +2416,8 @@
 @ cdecl malloc(long)
 @ cdecl mblen(ptr long)
 @ cdecl mbrlen(ptr long ptr)
-@ stub mbrtoc16
-@ stub mbrtoc32
+@ cdecl mbrtoc16(ptr ptr long ptr)
+@ cdecl mbrtoc32(ptr ptr long ptr)
 @ cdecl mbrtowc(ptr str long ptr)
 @ cdecl mbsrtowcs(ptr ptr long ptr)
 @ cdecl mbsrtowcs_s(ptr ptr long ptr long ptr)
