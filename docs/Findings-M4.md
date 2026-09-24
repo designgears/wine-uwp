@@ -8619,3 +8619,14 @@ ColorStops IVector's IID `{bf2e107e}` is in no winmd; it was identified from dco
 of 3/height (the absolute 3 px border ramp converted to relative), InterpolationSpace 2, ExtendMode
 clamp, and for bottom borders a TransformMatrix 1,0,0,-1,0,h.
 `docs/screenshots/shapr3d-gradient-borders.png`, `calc-button-borders-before-after.png`.
+
+### Drawings and PDF export work (2026-09-23)
+
+Drawings -> Create Drawing -> select the body -> Next -> 4 views -> Continue gives an A3 sheet with
+front/side/top/isometric views, and Export drawing (Ctrl+Shift+E) writes a one-page PDF 1.7 with the
+views, border grid and title block (`docs/screenshots/shapr3d-drawing-pdf.png`, rendered with
+pdftoppm). Nothing needed fixing. An earlier "Export drawing does nothing" was the save picker shim
+reporting a cancel because `WINE_UWP_PICKER_SAVE_FILE` was not set.
+
+Also: `CoBeginProcessEvents`/`CoEndProcessEvents` logged a FIXME per dispatcher wait, 220,756 lines
+in one session. They now report once.

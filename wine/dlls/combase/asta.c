@@ -35,7 +35,10 @@ HRESULT WINAPI CoRegisterServerShutdownDelay( DWORD delay )
  * Prototypes below are inferred from call sites; traces print the raw arguments so they can be verified. */
 HRESULT WINAPI CoBeginProcessEvents( void **context )
 {
-    FIXME( "%p: semi-stub\n", context );
+    /* called around every dispatcher wait, thousands of times a second in a busy app */
+    static LONG once;
+    if (!InterlockedExchange( &once, 1 )) FIXME( "%p: semi-stub\n", context );
+    else TRACE( "%p\n", context );
     if (context) *context = NULL;
     return S_OK;
 }
@@ -131,7 +134,9 @@ DWORD WINAPI CoMsgWaitInProcessEvents( void *context, DWORD count, const HANDLE 
 /* ordinal 88 */
 HRESULT WINAPI CoEndProcessEvents( void *context )
 {
-    FIXME( "%p: semi-stub\n", context );
+    static LONG once;
+    if (!InterlockedExchange( &once, 1 )) FIXME( "%p: semi-stub\n", context );
+    else TRACE( "%p\n", context );
     return S_OK;
 }
 
