@@ -17,7 +17,7 @@ STAMP=$WINEPREFIX/.install-overrides.stamp
 # The shim DLLs have to be in the stamp: without them, rebuilding a shim leaves the stamp
 # unchanged, the installer skips itself, and the prefix keeps running the previous build - which
 # looks exactly like the code change having no effect.
-stamp=$( { find "$SRC" "$(dirname "$SRC")/Globalization" -printf '%p %s %T@\n' 2>/dev/null; stat -c '%Y' "$SYS32" "$WINE_BIN/dlls/ntdll/x86_64-windows/ntdll.dll" "$WINE_BIN/dlls/wineuwp/x86_64-windows/wineuwp.dll" "$0" "$(dirname "$0")/globalization.reg" 2>/dev/null; stat -c '%n %s %Y' ${UWP_BIN}/build-probes/wineuwp_*.dll 2>/dev/null; echo "${1:-}"; } | md5sum | cut -d' ' -f1 )
+stamp=$( { find "$SRC" "$(dirname "$SRC")/Globalization" "$(dirname "$SRC")/Fonts" -printf '%p %s %T@\n' 2>/dev/null; stat -c '%Y' "$SYS32" "$WINE_BIN/dlls/ntdll/x86_64-windows/ntdll.dll" "$WINE_BIN/dlls/wineuwp/x86_64-windows/wineuwp.dll" "$0" "$(dirname "$0")/globalization.reg" 2>/dev/null; stat -c '%n %s %Y' ${UWP_BIN}/build-probes/wineuwp_*.dll 2>/dev/null; echo "${1:-}"; } | md5sum | cut -d' ' -f1 )
 if [ -z "${WINE_UWP_FORCE_OVERRIDES:-}" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$stamp" ]; then
   echo "overrides unchanged"
   exit 0
@@ -55,6 +55,22 @@ for f in $NATIVE_ONLY; do
   [ -f "$SYS32/$lower" ] && cmp -s "$SRC/$f" "$SYS32/$lower" || cp -f "$SRC/$f" "$SYS32/$lower"
 done
 echo "installed: $(echo $NATIVE_ONLY | wc -w) native-only modules"
+
+# Windows' own fonts, copied from a Windows installation into $UWP_BIN/win11/Windows/Fonts (see
+# AGENTS.md). win32u loads every file in C:\windows\Fonts at startup and registers it under its
+# bare file name, which is also where dwrite's system collection finds it, so installing the files
+# is all it takes. Fonts found there are preferred over the same faces fontconfig finds on the host.
+FONT_SRC=$(dirname "$SRC")/Fonts
+FONT_DST=$WINEPREFIX/drive_c/windows/Fonts
+if [ -d "$FONT_SRC" ]; then
+  mkdir -p "$FONT_DST"
+  n=0
+  for f in "$FONT_SRC"/*; do
+    b=$(basename "$f")
+    cmp -s "$f" "$FONT_DST/$b" || { cp -f "$f" "$FONT_DST/$b"; n=$((n + 1)); }
+  done
+  echo "installed: $(ls "$FONT_SRC" | wc -l) Windows fonts ($n copied)"
+fi
 
 # Satellite en-US MUI files: Windows DLLs keep their string tables in System32\en-US\<dll>.mui and
 # kernelbase's FindResourceExW falls back to them. Without windows.ui.xaml.dll.mui XAML fails loading

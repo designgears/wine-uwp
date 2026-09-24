@@ -8892,3 +8892,20 @@ uses a facade source only for the recognised blend recipe.
 toggling: with the `EndDraw` re-read disabled the result is AE 0 against the old baseline. XAML
 writes that border surface more than once, and the old read-back froze its first contents. The new
 image is the latest contents. Whether it matches Windows for that one border is not verified.
+
+### Fonts come from the Windows installation (2026-09-24)
+
+All 348 files of a real Windows `Windows\Fonts` (403 MB) now live in
+`$UWP_BIN/win11/Windows/Fonts`. `install-overrides.sh` installs them into the prefix's
+`C:\windows\Fonts`.
+
+win32u loads that directory before fontconfig's fonts, so the Windows copies win. But the
+registry key dwrite builds its system collection from had two problems:
+
+- It kept pointing at the host copies, because `update_external_font_keys` skipped an external
+  entry whose face had been superseded.
+- Nothing registered the Windows-directory fonts at all.
+
+It now drops the superseded entries and lists `C:\windows\fonts` faces by bare file name, as
+Windows does. The host's `SegUIVar.ttf` was byte-identical to Windows', so every app renders
+exactly as before; Calculator is AE 0.

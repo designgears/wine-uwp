@@ -273,3 +273,4 @@ dlls/dwrite/opentype.c
 dlls/edputil/Makefile.in
 dlls/edputil/edputil.spec
 dlls/edputil/main.c
+dlls/win32u/font.c
