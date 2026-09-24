@@ -8642,3 +8642,12 @@ DefaultFileExtension or the suggested name. The environment overrides still win,
 through the Save As dialog, then File > Import File... through the Open dialog, gives "dlg-body.stl"
 in Items (`docs/screenshots/filepicker-save-dialog.png`, `filepicker-open-dialog.png`,
 `shapr3d-import-stl.png`).
+
+### Presents paced at the refresh rate (2026-09-23)
+
+`WINEDEBUG=+dcompperf` during an orbit: the engine presented ~3,700 times a second with
+`Present(1, 0)` and the compositor showed ~560 of them, because the composition swap chain never
+blocked. Present now waits for the next refresh for sync interval >= 1. That gives 60 presents and
+60 frames a second, and the process used 3.9 s of CPU over a 10 s orbit where it used 23.5 s. At
+idle both builds sit near 1%: the engine renders only while something moves. The frame-latency
+waitable object is still signalled on every present; with Present blocking, that is enough.

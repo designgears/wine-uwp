@@ -51,6 +51,7 @@ struct comp_swapchain
     ID3D11Texture2D *presented[2];
     SRWLOCK presented_lock;     /* dcomp's readback worker takes presented[] while the app may resize */
     LONG present_count;
+    LONGLONG next_vblank;       /* QueryPerformanceCounter time the next synced present may return */
     DXGI_MATRIX_3X2_F transform;
     DXGI_RGBA background;
     DXGI_MODE_ROTATION rotation;
@@ -226,6 +227,40 @@ static HRESULT STDMETHODCALLTYPE comp_swapchain_GetDevice(IDXGISwapChain4 *iface
     return IUnknown_QueryInterface(swapchain->device, riid, device);
 }
 
+/* A synced present returns at the display's refresh, as the compositor's does on Windows: with no
+ * wait the Shapr3D engine presented 3,700 frames a second with sync interval 1, all of them wasted
+ * work, and the compositor read back and painted 560 of them. */
+static void comp_swapchain_wait_vblank(struct comp_swapchain *swapchain, UINT sync_interval)
+{
+    static LONGLONG period_ticks;
+    LARGE_INTEGER now, freq;
+    LONGLONG period;
+
+    QueryPerformanceFrequency(&freq);
+    if (!period_ticks)
+    {
+        DEVMODEW mode = { .dmSize = sizeof(mode) };
+        DWORD hz = 60;
+        if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1
+                && mode.dmDisplayFrequency < 1000)
+            hz = mode.dmDisplayFrequency;
+        period_ticks = freq.QuadPart / hz;
+        TRACE("pacing synced presents at %lu Hz.\n", hz);
+    }
+    period = period_ticks * sync_interval;
+
+    QueryPerformanceCounter(&now);
+    if (swapchain->next_vblank > now.QuadPart)
+    {
+        LONGLONG ms = (swapchain->next_vblank - now.QuadPart) * 1000 / freq.QuadPart;
+        if (ms > 0) Sleep(ms);
+        while (QueryPerformanceCounter(&now), now.QuadPart < swapchain->next_vblank) Sleep(0);
+    }
+    /* keep the schedule, but do not bank time when the app ran late */
+    if (swapchain->next_vblank + period < now.QuadPart) swapchain->next_vblank = now.QuadPart;
+    swapchain->next_vblank += period;
+}
+
 static HRESULT comp_swapchain_present(struct comp_swapchain *swapchain, UINT sync_interval, UINT flags)
 {
     if (sync_interval > 4)
@@ -234,6 +269,7 @@ static HRESULT comp_swapchain_present(struct comp_swapchain *swapchain, UINT syn
         return DXGI_ERROR_INVALID_CALL;
     }
     if (flags & DXGI_PRESENT_TEST) return S_OK;
+    if (sync_interval) comp_swapchain_wait_vblank(swapchain, sync_interval);
 
     /* Snapshot the frame for the compositor, in order on the app's own context, and make sure
      * it is finished before the compositor copies it. The compositor reads buffer 0 on its own
