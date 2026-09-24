@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     84fd3e4fe8a19ce25c1fbce76f75aba9b51baf58
-                 windowscodecs: filtered scaling (box/bilinear) for linear, cubic and Fant modes
+  wine HEAD:     cf3c507cbbfc32f1b3ea02e4814a8f6d526dd1c4
+                 combase: CoMsgWaitInProcessEvents reports messages at the caller's index and a capped wait as a wake
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-24T16:43:29Z
+  captured:      2026-09-24T18:23:20Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

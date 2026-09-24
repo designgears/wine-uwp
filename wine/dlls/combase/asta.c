@@ -85,7 +85,8 @@ DWORD WINAPI CoMsgWaitInProcessEvents( void *context, DWORD count, const HANDLE 
     /* Hosted UWP: CoreUI RegisterWait can add timer handles after PrepareToWait already
      * built the array for this call. An INFINITE wait then never rebuilds the set, so
      * MessageTimer callbacks never run. Cap so the EventLoop re-prepares waits. */
-    if (uwp && timeout == INFINITE) timeout = 16;
+    BOOL capped = uwp && timeout == INFINITE;
+    if (capped) timeout = 16;
     /* Add a process-local proxy wake event that SetWaitableTimerEx can pulse when a
      * due-now MessageTimer is armed (CoreUI's own wake no-ops under Windows.UI's wait). */
     if (uwp)
@@ -121,13 +122,18 @@ DWORD WINAPI CoMsgWaitInProcessEvents( void *context, DWORD count, const HANDLE 
     apartment_drain_asta_calls();
     /* A wake from one of our extra handles is reported as the app's wake handle. */
     if (res >= WAIT_OBJECT_0 + count && res < WAIT_OBJECT_0 + wait_count) res = WAIT_OBJECT_0;
+    /* Messages available comes back one past the handles we waited on, which counts our extra
+     * handles; the caller knows only its own and expects WAIT_OBJECT_0 + count. Passing the larger
+     * index through handed CoreMessaging an index past its own array. */
+    else if (res == WAIT_OBJECT_0 + wait_count) res = WAIT_OBJECT_0 + count;
+    /* The caller asked to wait for ever and we poll instead: report the poll as a wake of its own
+     * handle, so CoreMessaging looks at its queues and timers. It only does on a signalled handle,
+     * and a wake it missed (the shared proxy event is auto-reset and other UI threads take it)
+     * otherwise left a queued item, a dispatcher RunAsync or a due timer, pending for good. */
+    else if (capped && res == WAIT_TIMEOUT && count) res = WAIT_OBJECT_0;
     /* Handle-ready returns do not drain posted COM (DM_EXECUTERPC). Always peek. */
     dispatch_pending_messages();
     if (uwp) EnumThreadWindows( GetCurrentThreadId(), post_wm_null, 0 );
-    /* If only our proxy woke us, report it as the app's wake handle so ProcessMessage
-     * takes the same path as a real CoreMessaging wake. */
-    if (uwp && proxy_wake && res == WAIT_OBJECT_0 + count)
-        res = WAIT_OBJECT_0;
     return res;
 }
 

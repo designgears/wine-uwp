@@ -8936,3 +8936,39 @@ scaler, 8 runs of start → Visualization → import Drone gave 6 ok, 1 blank wi
 import that never finished. The new scaler gave the same 6 of 8. It is probably the same thing as
 Solitaire's 1-in-6 (Findings above). It disappears under the sampling profiler and under
 `warn+seh`, so it is timing-dependent.
+
+### The start-up/UI flake: CoMsgWaitInProcessEvents (2026-09-24)
+
+Solitaire went blank on about 1 start in 6 (6 of 41 runs). Shapr3D failed about 1 run in 4 at
+three different points:
+
+- the Visualization panel half-loaded, with icons missing;
+- the Drone import never navigated back from the LoaderPage (the breadcrumbs show
+  `ImportFileIntoCurrentProject` completing and nothing after it);
+- a blank window.
+
+All of it was timing-dependent: it vanished under the profiler and under `warn+seh`. All threads
+were idle, with the UI threads polling in `CoMsgWaitInProcessEvents` every 16 ms.
+
+Two bugs in our semi-stub, both in the value it returns:
+
+1. **Messages available** came back as `WAIT_OBJECT_0 + wait_count`, which counts the proxy wake
+   event and the ASTA event we append. The caller only knows its own `count` handles, so it got an
+   index past its array.
+2. **The capped wait's timeout.** The caller's INFINITE wait is shortened to 16 ms, and
+   CoreMessaging treats `WAIT_TIMEOUT` as "nothing happened". A missed wake therefore left a queued
+   dispatcher item or timer pending for ever, even though the thread woke 60 times a second. The
+   proxy wake event is auto-reset and shared by every UI thread, so one thread can consume
+   another's wake. A timeout of a capped wait is now reported as a wake of the caller's own handle,
+   so CoreMessaging re-checks its queues. That costs nothing when there is nothing to do.
+
+Results: Solitaire 0 bad in 20 runs (6 in 41 before). Shapr3D's start → Visualization → import
+Drone was 9 of 12 ok right after the change, with the remaining failures being images and icons
+that never arrive. That is not yet explained.
+
+Ruled out along the way, by measurement:
+
+- the WIC scaler: old and new both gave 6 of 8;
+- the 60/60-era dcomp, dxgi and wineuwp: 1 bad in 12;
+- a 250 ms UI-thread heartbeat timer: 6 of 10;
+- windows.storage's async handler registration: correct, and a trace showed no difference.
