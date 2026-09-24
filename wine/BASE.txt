@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     52ef739dbc06ea0545e6ceb7bdef5c9503302bf1
-                 dxgi: pace synced presents of composition swap chains at the display refresh
+  wine HEAD:     8ce6ce58faeeb958ec2454864724a2c4ae15c97e
+                 dcomp: implement CompositionRadialGradientBrush
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-24T05:21:04Z
+  captured:      2026-09-24T05:25:35Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

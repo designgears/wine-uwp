@@ -14679,6 +14679,8 @@ struct gradient_brush
     float rotation;             /* radians */
     Matrix3x2 transform;
     INT32 extend, interpolation, mapping;
+    BOOL radial;                /* CompositionRadialGradientBrush: the ellipse below, not start/end */
+    Vector2 ellipse_center, ellipse_radius, origin_offset;
     /* the rendered pixels, for sprites painted with this brush */
     HBITMAP cache_bmp;
     BYTE *cache_bits;
@@ -14687,12 +14689,14 @@ struct gradient_brush
     ULONG cache_serial;
 };
 static void *gradient_brush_vtbl[COMP_OBJECT_SLOTS];
+static void *gradient_radial_vtbl[COMP_OBJECT_SLOTS];
 static void *gradient_grad_vtbl[25];
 static void *gradient_grad2_vtbl[8];
 
 static struct gradient_brush *gradient_brush_from( void *iface )
 {
-    if (!iface || *(void ***)iface != (void **)gradient_brush_vtbl) return NULL;
+    if (!iface || (*(void ***)iface != (void **)gradient_brush_vtbl && *(void ***)iface != (void **)gradient_radial_vtbl))
+        return NULL;
     return CONTAINING_RECORD( iface, struct gradient_brush, vtbl );
 }
 static struct gradient_brush *gradient_from_grad( void *iface )
@@ -14769,6 +14773,27 @@ static HRESULT WINAPI gradient_brush_put_StartPoint( void *iface, Vector2 value 
     gradient_changed();
     return S_OK;
 }
+
+/* ICompositionRadialGradientBrush {3d3b50c5}: 6/7 EllipseCenter, 8/9 EllipseRadius,
+ * 10/11 GradientOriginOffset */
+#define RADIAL_PROPERTY( name, field )                                                            \
+static HRESULT WINAPI gradient_radial_get_##name( void *iface, Vector2 *value )                   \
+{                                                                                                 \
+    if (!value) return E_POINTER;                                                                 \
+    *value = gradient_brush_from( iface )->field;                                                 \
+    return S_OK;                                                                                  \
+}                                                                                                 \
+static HRESULT WINAPI gradient_radial_put_##name( void *iface, Vector2 value )                    \
+{                                                                                                 \
+    TRACE( "brush %p " #name " %g,%g.\n", iface, value.X, value.Y );                              \
+    gradient_brush_from( iface )->field = value;                                                  \
+    gradient_changed();                                                                           \
+    return S_OK;                                                                                  \
+}
+RADIAL_PROPERTY( EllipseCenter, ellipse_center )
+RADIAL_PROPERTY( EllipseRadius, ellipse_radius )
+RADIAL_PROPERTY( GradientOriginOffset, origin_offset )
+#undef RADIAL_PROPERTY
 
 /* ICompositionGradientBrush view */
 static HRESULT WINAPI gradient_grad_QueryInterface( void *iface, REFIID iid, void **out )
@@ -14868,7 +14893,16 @@ static HRESULT WINAPI gradient_grad2_put_MappingMode( void *iface, INT32 value )
     return S_OK;
 }
 
+static HRESULT create_gradient_brush( BOOL radial, void **out );
 static HRESULT create_linear_gradient_brush( void **out )
+{
+    return create_gradient_brush( FALSE, out );
+}
+static HRESULT create_radial_gradient_brush( void **out )
+{
+    return create_gradient_brush( TRUE, out );
+}
+static HRESULT create_gradient_brush( BOOL radial, void **out )
 {
     struct gradient_brush *brush;
     unsigned int i;
@@ -14920,6 +14954,15 @@ static HRESULT create_linear_gradient_brush( void **out )
         gradient_grad2_vtbl[5] = gradient_view_GetTrustLevel;
         gradient_grad2_vtbl[6] = gradient_grad2_get_MappingMode;
         gradient_grad2_vtbl[7] = gradient_grad2_put_MappingMode;
+
+        memcpy( gradient_radial_vtbl, gradient_brush_vtbl, sizeof(gradient_radial_vtbl) );
+        gradient_radial_vtbl[0] = gradient_brush_QueryInterface;
+        gradient_radial_vtbl[6] = gradient_radial_get_EllipseCenter;
+        gradient_radial_vtbl[7] = gradient_radial_put_EllipseCenter;
+        gradient_radial_vtbl[8] = gradient_radial_get_EllipseRadius;
+        gradient_radial_vtbl[9] = gradient_radial_put_EllipseRadius;
+        gradient_radial_vtbl[10] = gradient_radial_get_GradientOriginOffset;
+        gradient_radial_vtbl[11] = gradient_radial_put_GradientOriginOffset;
         InterlockedExchangePointer( &gradient_brush_vtbl[0], gradient_brush_QueryInterface );
     }
     if (!(brush = calloc( 1, sizeof(*brush) ))) return E_OUTOFMEMORY;
@@ -14930,16 +14973,19 @@ static HRESULT create_linear_gradient_brush( void **out )
     }
     brush->stops->vtbl = (const void **)stop_collection_vtbl;
     brush->stops->ref = 1;
-    brush->vtbl = (const void **)gradient_brush_vtbl;
+    brush->vtbl = (const void **)(radial ? gradient_radial_vtbl : gradient_brush_vtbl);
     brush->grad_vtbl = (const void **)gradient_grad_vtbl;
     brush->grad2_vtbl = (const void **)gradient_grad2_vtbl;
-    brush->kind = "LinearGradientBrush";
+    brush->kind = radial ? "RadialGradientBrush" : "LinearGradientBrush";
+    brush->radial = radial;
+    brush->ellipse_center.X = brush->ellipse_center.Y = 0.5f;   /* documented defaults, relative */
+    brush->ellipse_radius.X = brush->ellipse_radius.Y = 0.5f;
     brush->ref = 1;
     brush->end.X = 1.0f;                 /* the documented defaults: (0,0) to (1,0), relative */
     brush->scale.X = brush->scale.Y = 1.0f;
     brush->transform.M11 = brush->transform.M22 = 1.0f;
     brush->mapping = 1;                  /* CompositionMappingMode_Relative */
-    TRACE( "created linear gradient brush %p.\n", brush );
+    TRACE( "created %s gradient brush %p.\n", radial ? "radial" : "linear", brush );
     *out = &brush->vtbl;
     return S_OK;
 }
@@ -14956,7 +15002,7 @@ static void gradient_render( struct gradient_brush *brush, BYTE *out, unsigned i
 {
     struct color_stop *stops[32];
     unsigned int count = 0, i, px, py;
-    float sx, sy, ex, ey, dx, dy, len2, c, sn, f[6], m[6], det;
+    float sx, sy, ex, ey, dx, dy, len2, c, sn, f[6], m[6], det, cx, cy, rx, ry, fx, fy;
     const Matrix3x2 *tm = &brush->transform;
 
     for (i = 0; i < brush->stops->count && count < ARRAY_SIZE(stops); i++)
@@ -14975,6 +15021,15 @@ static void gradient_render( struct gradient_brush *brush, BYTE *out, unsigned i
     }
     dx = ex - sx; dy = ey - sy;
     len2 = dx * dx + dy * dy;
+    cx = brush->ellipse_center.X; cy = brush->ellipse_center.Y;
+    rx = brush->ellipse_radius.X; ry = brush->ellipse_radius.Y;
+    if (brush->mapping == 1)
+    {
+        cx *= w; cy *= h; rx *= w; ry *= h;
+    }
+    /* the focal point, in the ellipse's unit circle (the offset is in the same units as the radius) */
+    fx = rx != 0.0f ? (brush->mapping == 1 ? brush->origin_offset.X * w : brush->origin_offset.X) / rx : 0.0f;
+    fy = ry != 0.0f ? (brush->mapping == 1 ? brush->origin_offset.Y * h : brush->origin_offset.Y) / ry : 0.0f;
 
     /* brush -> area transform, as for a visual: scale and rotation about the centre point, the
      * transform matrix, then the offset less the anchor */
@@ -15004,7 +15059,24 @@ static void gradient_render( struct gradient_brush *brush, BYTE *out, unsigned i
         {
             float qx = m[0] * (px + 0.5f) + m[2] * (py + 0.5f) + m[4];
             float qy = m[1] * (px + 0.5f) + m[3] * (py + 0.5f) + m[5];
-            float t = len2 > 1e-12f ? ((qx - sx) * dx + (qy - sy) * dy) / len2 : 0.0f;
+            float t;
+
+            if (brush->radial)
+            {
+                /* in the ellipse's unit circle: the ray from the focal point through q meets the
+                 * edge at q = f + s d; the gradient runs from the focal point (0) to the edge (1) */
+                float ux = rx != 0.0f ? (qx - cx) / rx : 0.0f, uy = ry != 0.0f ? (qy - cy) / ry : 0.0f;
+                float ddx = ux - fx, ddy = uy - fy, dd = ddx * ddx + ddy * ddy, fd = fx * ddx + fy * ddy;
+                float disc = fd * fd - dd * (fx * fx + fy * fy - 1.0f), sroot;
+                if (dd < 1e-12f) t = 0.0f;
+                else if (disc < 0.0f) t = 1.0f;
+                else
+                {
+                    sroot = (-fd + sqrtf( disc )) / dd;
+                    t = sroot > 1e-6f ? 1.0f / sroot : 1.0f;
+                }
+            }
+            else t = len2 > 1e-12f ? ((qx - sx) * dx + (qy - sy) * dy) / len2 : 0.0f;
             float a, r, g, b;
             BYTE *o = out + ((size_t)py * w + px) * 4;
 
@@ -16123,8 +16195,7 @@ static ULONG WINAPI compositor_radial_Release( void *iface )
 static HRESULT WINAPI compositor_radial_CreateRadialGradientBrush( void *iface, void **result )
 {
     TRACE( "iface %p.\n", iface );
-    if (!result) return E_POINTER;
-    return create_comp_object( "CompositionRadialGradientBrush", result );
+    return create_radial_gradient_brush( result );
 }
 static const void *compositor_radial_vtbl[] =
 {
