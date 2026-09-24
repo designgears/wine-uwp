@@ -484,6 +484,9 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_networkstatus.dll" ]     && SHIM_CLASSES="$SHIM_CLASSES Windows.Networking.Connectivity.NetworkInformation:wineuwp_networkstatus.dll"
 [ -f "$SYS32/wineuwp_useractivitychannel.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.UserActivities.UserActivityChannel:wineuwp_useractivitychannel.dll"
 [ -f "$SYS32/wineuwp_toastnotifier.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Notifications.ToastNotificationManager:wineuwp_toastnotifier.dll"
+# ext-ms-win-devmgmt-policy-l1-1-1 (see shims/devmgmtpolicy): the ink stack delay-loads it.
+DP=${UWP_BIN}/build-probes/ext-ms-win-devmgmt-policy-l1-1-1.dll
+[ -f "$DP" ] && { cmp -s "$DP" "$SYS32/ext-ms-win-devmgmt-policy-l1-1-1.dll" || cp -f "$DP" "$SYS32/ext-ms-win-devmgmt-policy-l1-1-1.dll"; }
 # api-ms-win-net-isolation-l1-1-1 (see shims/netisolation): not in Wine's apiset schema, so the file
 # in system32 under that name is what the delay-load finds.
 NI=${UWP_BIN}/build-probes/api-ms-win-net-isolation-l1-1-1.dll

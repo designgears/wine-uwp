@@ -8452,3 +8452,35 @@ Tooling: `minidump.py` (exception + module-resolved stack scan of a Sentry dump;
 
 Regression: Calculator AE 0 (249); Feedback Hub 822 / 0 fail-fasts / 0 app errors; Media Player
 Home 2205 colours; Solitaire main menu with the known popup.
+
+
+## Sketch and extrude (2026-09-23)
+
+Shapr3D now models: New project -> Sketch -> Rectangle (`r`) -> exit sketch -> drag the extrude
+arrow gives Body 01, with Sketch 01 and Extrusion 01 in History
+(`docs/screenshots/shapr3d-sketch-rectangle.png`, `shapr3d-extrude.png`, `shapr3d-extruded-body.png`).
+
+- **Sketch crashed** XAML in `SetEffectiveValue`: our answer to the device partner `{7bd36c9a}`
+  left `CreateAnimationInstance`'s out-param unwritten. dcomp now has real animation instances
+  (time events fired from CommitMainDevice) and implements `IKeyFrameAnimation`/2/3.
+- **Viewport input.** The engine reads a `CoreIndependentInputSource`, whose sink window
+  (`NtCreateCompositionInputSink` desc+0x10) is a hidden WS_POPUP that win32u's forwarder never
+  looks at. dcomp installs a `WH_GETMESSAGE` hook on the creating XAML thread. The hook turns mouse
+  messages over a swapchain (the paint list tags swapchain ops; `dcomp_point_on_swapchain`) into
+  `WM_POINTER*` for the sink, in screen coordinates, with the sink moved to the panel origin and an
+  UPDATE posted before each DOWN/UP. Transparent colour-brush sprites become `OP_HIT` ops so the
+  hit test sees XAML's hit-test-only elements.
+- Ink needed `ext-ms-win-devmgmt-policy-l1-1-1.dll` (`shims/devmgmtpolicy`, `PolicyManager_GetPolicy`
+  -> not found), and Win2D's OpacityEffect needed `CLSID_D2D1Opacity` registered.
+- **Open:** a toolbar button press also reaches the engine as a viewport press. It is not in any
+  posted message we generate. Tools work from their keyboard shortcuts.
+
+SVG (`dlls/d2d1/svg.c`): linear and radial gradients (with href, units and gradientTransform),
+patterns holding a base64 `<image>` through `<use>`, direct `<image>`, masks treated as clips, and
+drop-shadow filters (offset/blur/colour-matrix chains) approximated with fading strokes. Before, the
+12 `search_toggleShow*` icons were blank and the nine-grid shadows were solid white; all 22 now
+render (`docs/screenshots/shapr3d-svg-icons.png`). Clipping goes through an offscreen bitmap because
+d2d's `PushLayer` is a stub, and see the AGENTS.md note on geometry-group fill modes.
+
+Regression: Calculator AE 0; Feedback Hub 822 / 0 fail-fasts; Media Player Home 2232 colours;
+Solitaire main menu with the known popup.

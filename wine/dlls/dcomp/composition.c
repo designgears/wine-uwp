@@ -60,6 +60,7 @@
 #include "windows.ui.composition.interop.h"
 
 #include "wine/debug.h"
+#include "wine/list.h"
 #include "wine/exception.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
@@ -150,7 +151,9 @@ static int back_w, back_h;
  * the rectangles covered by changed operations, old and new.
  *
  * WINE_DCOMP_VERIFY_DAMAGE=1 rasterizes every frame in full as well and reports differing pixels. */
-enum paint_op_kind { OP_FILL, OP_BLEND, OP_STRETCH };
+/* OP_HIT draws nothing: it is a transparent but hit-testable area (a XAML element with a
+ * Transparent background), recorded only so input over it is not routed to a swap chain below. */
+enum paint_op_kind { OP_FILL, OP_BLEND, OP_STRETCH, OP_HIT };
 struct paint_op
 {
     enum paint_op_kind kind;
@@ -164,6 +167,7 @@ struct paint_op
     const void *key;        /* the object the source bits belong to */
     ULONG gen;              /* its content generation */
     BOOL opaque;            /* covers every pixel of dest with alpha 255 */
+    BOOL swapchain;         /* OP_STRETCH of a swap chain's content: input there goes to its input sink */
 };
 struct paint_list
 {
@@ -328,6 +332,7 @@ static BOOL bits_opaque( const BYTE *bits, UINT width, UINT height )
 /* Emitters used by the tree walk. The hdc arguments are kept for the shape of the callers. */
 static BOOL soft_blend_opaque( HDC hdc, int x, int y, int w, int h, const BYTE *src, int src_stride, BYTE constant_alpha,
                                const void *key, ULONG gen, BOOL opaque );
+static BOOL paint_next_is_swapchain;   /* set around an emit whose source is a swap chain */
 static BOOL soft_blend( HDC hdc, int x, int y, int w, int h, const BYTE *src, int src_stride, BYTE constant_alpha,
                         const void *key, ULONG gen )
 {
@@ -348,6 +353,7 @@ static BOOL soft_blend_opaque( HDC hdc, int x, int y, int w, int h, const BYTE *
     op.key = key;
     op.gen = gen;
     op.opaque = opaque && constant_alpha == 255;
+    op.swapchain = paint_next_is_swapchain;
     paint_emit( &op );
     return TRUE;
 }
@@ -368,10 +374,11 @@ static BOOL soft_fill( HDC hdc, int x, int y, int w, int h, Color color, BYTE co
 }
 
 static void soft_stretch( int x, int y, int dest_w, int dest_h, HBITMAP bmp, int src_w, int src_h, BYTE constant_alpha,
-                          const void *key, ULONG gen )
+                          const void *key, ULONG gen, BOOL swapchain )
 {
     struct paint_op op = { OP_STRETCH };
 
+    op.swapchain = swapchain;
     if (dest_w <= 0 || dest_h <= 0) return;
     SetRect( &op.dest, x, y, x + dest_w, y + dest_h );
     op.clip = paint_clip;
@@ -382,6 +389,29 @@ static void soft_stretch( int x, int y, int dest_w, int dest_h, HBITMAP bmp, int
     op.key = key;
     op.gen = gen;
     paint_emit( &op );
+}
+
+/* Is the topmost thing painted at this client point a swap chain's content? Read from the last
+ * list built, on the thread that paints - the XAML UI thread, where the input hook runs too. */
+BOOL dcomp_point_on_swapchain( POINT pt, POINT *origin )
+{
+    const struct paint_list *list = &paint_lists[paint_current];
+    unsigned int i;
+    RECT r;
+
+    for (i = list->count; i > 0; i--)
+    {
+        const struct paint_op *op = &list->ops[i - 1];
+        if (!IntersectRect( &r, &op->dest, &op->clip ) || !PtInRect( &r, pt )) continue;
+        if (op->kind == OP_FILL && !DIV255( op->color.A * op->alpha )) continue;
+        if (op->swapchain && origin)
+        {
+            origin->x = op->dest.left;
+            origin->y = op->dest.top;
+        }
+        return op->swapchain;
+    }
+    return FALSE;
 }
 
 static BOOL paint_op_equal( const struct paint_op *a, const struct paint_op *b )
@@ -438,6 +468,7 @@ static void damage_add( struct paint_damage *damage, const RECT *rect, const REC
 
 static void damage_add_op( struct paint_damage *damage, const struct paint_op *op, const RECT *bounds )
 {
+    if (op->kind == OP_HIT) return;   /* nothing on screen changes */
     RECT covered;
     if (IntersectRect( &covered, &op->dest, &op->clip )) damage_add( damage, &covered, bounds );
 }
@@ -464,6 +495,7 @@ static void raster_ops( HDC dc, BYTE *target, int target_w, const struct paint_l
     for (i = first; i < list->count; i++)
     {
         const struct paint_op *op = &list->ops[i];
+        if (op->kind == OP_HIT) continue;
         if (!IntersectRect( &r, &op->dest, &op->clip ) || !IntersectRect( &r, &r, area )) continue;
         switch (op->kind)
         {
@@ -472,6 +504,8 @@ static void raster_ops( HDC dc, BYTE *target, int target_w, const struct paint_l
             break;
         case OP_BLEND:
             raster_blend( target, target_w, op->dest.left, op->dest.top, op->bits, op->src_w * 4, &r, op->alpha, op->opaque );
+            break;
+        case OP_HIT:
             break;
         case OP_STRETCH:
         {
@@ -774,6 +808,7 @@ struct compositor
     const void **compositor7_vtbl; /* ICompositor7, see compositor7_vtbl */
     const void **shadow_vtbl;      /* ICompositorWithProjectedShadow, see compositor_shadow_vtbl */
     const void **radial_vtbl;      /* ICompositorWithRadialGradient, see compositor_radial_vtbl */
+    const void **partner_device_vtbl; /* the device partner interface, see device_partner_vtbl */
     LONG ref;
 };
 
@@ -1291,6 +1326,14 @@ struct kf_animation
     BOOL sampled_once;
     /* every key frame, for sampling at a controller's progress */
     struct kf_key { float key; union { Color color; float scalar; boolean flag; Vector2 vector2; Vector3 vector3; } u; } keys[KF_KEYS];
+    const void **partner_vtbl;  /* ICompositionKeyFrameAnimationPartner, see kf_partner_vtbl */
+    float iteration_count;
+    const void **kfa_vtbl;      /* IKeyFrameAnimation, see kfa_vtbl */
+    const void **kfa2_vtbl;     /* IKeyFrameAnimation2: Direction */
+    const void **kfa3_vtbl;     /* IKeyFrameAnimation3: DelayBehavior */
+    INT64 delay_time, duration; /* TimeSpan, 100 ns units */
+    INT32 iteration_behavior, stop_behavior, direction, delay_behavior;
+    INT32 iterations;
 };
 static struct kf_animation *kf_animation_from( void *animation );
 static BOOL kf_sample( struct kf_animation *kf, float progress, struct kf_key *out );
@@ -3673,14 +3716,18 @@ static BOOL blit_surface_rect( HDC hdc, struct drawing_surface *surface, int x, 
     if (!surface_cached_pixels( surface, &desc ) || !surface->cache_dib) return FALSE;   /* masks are not a picture */
     if (dest_w <= 0) dest_w = desc.Width;
     if (dest_h <= 0) dest_h = desc.Height;
-    if (dest_w == (int)desc.Width && dest_h == (int)desc.Height &&
-        soft_blend_opaque( hdc, x, y, desc.Width, desc.Height, surface->cache, desc.Width * 4, 255, surface, surface->generation,
-                           surface->opaque ))
+    paint_next_is_swapchain = surface->swapchain != NULL;
+    done = dest_w == (int)desc.Width && dest_h == (int)desc.Height &&
+           soft_blend_opaque( hdc, x, y, desc.Width, desc.Height, surface->cache, desc.Width * 4, 255, surface,
+                              surface->generation, surface->opaque );
+    paint_next_is_swapchain = FALSE;
+    if (done)
     {
         TRACE( "blitted surface %p %ux%u directly at %d,%d.\n", surface, desc.Width, desc.Height, x, y );
         return TRUE;
     }
-    soft_stretch( x, y, dest_w, dest_h, surface->cache_dib, desc.Width, desc.Height, 255, surface, surface->generation );
+    soft_stretch( x, y, dest_w, dest_h, surface->cache_dib, desc.Width, desc.Height, 255, surface, surface->generation,
+                  surface->swapchain != NULL );
     done = TRUE;
     (void)mem; (void)old; (void)blend;
     if (done) TRACE( "blitted surface %p %ux%u to %dx%d at %d,%d.\n", surface, desc.Width, desc.Height, dest_w, dest_h, x, y );
@@ -5731,10 +5778,290 @@ DEVICE_UNNAMED(64) DEVICE_UNNAMED(65) DEVICE_UNNAMED(66) DEVICE_UNNAMED(67)
 DEVICE_UNNAMED(68)
 static void notify_partner_dirty( void );
 
+
+/* ---- animation instances ------------------------------------------------------------------
+ * The device partner interface {7bd36c9a-56ee-4fdd-ac4e-76bbd16ec8e4} (CDevice+0x28 in Windows'
+ * dcomp.dll; slots from dcomp.pdb): 3 CreateAnimationInstance(IDCompositionAnimation *,
+ * IDCompositionAnimationInstancePartner **), 4 CreateColor, 5 CreateFloodEffect,
+ * 6 CreateGdiSpriteBitmap, 7 CreateGenericInkProxy, 8 CreateInkProxy, 9-11 CreatePrimitive,
+ * 12 CreatePrimitiveGroup, 13 DrawPrimitiveGroup, 14 CreateRemoteRenderTarget,
+ * 15 CreateRemoteAppRenderTarget, 16 CreateScalar, 17 CreateWindowNode, 18 CreateYCbCrSurface,
+ * 19 UpdateCursorMouseMove, 20 ForceRender, 21 CreateRegionClip, 22 CreateVisualBitmap,
+ * 23 CreateInteraction.
+ *
+ * XAML turns each storyboard animation into a composition one and drives it with an instance
+ * from CreateAnimationInstance. The compositor answered this IID with a probe whose slot 3
+ * returned S_OK without writing the out-parameter; XAML kept the stack garbage and released it
+ * later, which crashed Shapr3D the moment its Sketch button played an animation.
+ *
+ * IDCompositionAnimationInstancePartner (CAnimationInstance's table): IUnknown, 3-8 the
+ * IDCompositionAnimation builder methods (E_NOTIMPL in Windows too), 9 Pause, 10 Resume,
+ * 11 Seek(double), 12 AddTimeEvent(double seconds, void (*)(void *), void *),
+ * 13 ResetTimeEvents, 14 GetValue(float *). Time events are how XAML learns an animation has
+ * reached a point - its end among them, which completes the storyboard - so they are fired, from
+ * the next commit on XAML's UI thread once their time has passed. */
+struct anim_time_event
+{
+    double time;
+    void (__cdecl *callback)( void * );
+    void *context;
+};
+
+struct anim_instance
+{
+    const void **vtbl;
+    LONG ref;
+    LARGE_INTEGER start;        /* when time 0 was, in QPC ticks */
+    double paused_at;           /* seconds, while paused; < 0 when running */
+    struct anim_time_event events[16];
+    unsigned int event_count;
+    struct list entry;
+};
+
+static struct list anim_instances = LIST_INIT( anim_instances );
+static CRITICAL_SECTION anim_instances_cs = { NULL, -1, 0, 0, 0, 0 };
+
+static double anim_instance_now( struct anim_instance *inst )
+{
+    LARGE_INTEGER now, freq;
+    if (inst->paused_at >= 0.0) return inst->paused_at;
+    QueryPerformanceCounter( &now );
+    QueryPerformanceFrequency( &freq );
+    return (double)(now.QuadPart - inst->start.QuadPart) / freq.QuadPart;
+}
+
+static void anim_instance_set_time( struct anim_instance *inst, double seconds )
+{
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter( &now );
+    QueryPerformanceFrequency( &freq );
+    inst->start.QuadPart = now.QuadPart - (LONGLONG)(seconds * freq.QuadPart);
+}
+
+static HRESULT WINAPI anim_instance_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct anim_instance *inst = iface;
+    if (IsEqualGUID( iid, &IID_IUnknown ))
+    {
+        InterlockedIncrement( &inst->ref );
+        *out = iface;
+        return S_OK;
+    }
+    TRACE( "animation instance %p: %s not supported.\n", iface, debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI anim_instance_AddRef( void *iface )
+{
+    return InterlockedIncrement( &((struct anim_instance *)iface)->ref );
+}
+static ULONG WINAPI anim_instance_Release( void *iface )
+{
+    struct anim_instance *inst = iface;
+    ULONG ref = InterlockedDecrement( &inst->ref );
+    if (!ref)
+    {
+        EnterCriticalSection( &anim_instances_cs );
+        list_remove( &inst->entry );
+        LeaveCriticalSection( &anim_instances_cs );
+        free( inst );
+    }
+    return ref;
+}
+static HRESULT WINAPI anim_instance_not_implemented( void *iface )
+{
+    return E_NOTIMPL;   /* the builder methods, as in Windows */
+}
+static HRESULT WINAPI anim_instance_Pause( void *iface )
+{
+    struct anim_instance *inst = iface;
+    EnterCriticalSection( &anim_instances_cs );
+    if (inst->paused_at < 0.0) inst->paused_at = anim_instance_now( inst );
+    LeaveCriticalSection( &anim_instances_cs );
+    return S_OK;
+}
+static HRESULT WINAPI anim_instance_Resume( void *iface )
+{
+    struct anim_instance *inst = iface;
+    EnterCriticalSection( &anim_instances_cs );
+    if (inst->paused_at >= 0.0)
+    {
+        anim_instance_set_time( inst, inst->paused_at );
+        inst->paused_at = -1.0;
+    }
+    LeaveCriticalSection( &anim_instances_cs );
+    return S_OK;
+}
+static HRESULT WINAPI anim_instance_Seek( void *iface, double seconds )
+{
+    struct anim_instance *inst = iface;
+    TRACE( "instance %p, seconds %f.\n", iface, seconds );
+    EnterCriticalSection( &anim_instances_cs );
+    if (inst->paused_at >= 0.0) inst->paused_at = seconds;
+    else anim_instance_set_time( inst, seconds );
+    LeaveCriticalSection( &anim_instances_cs );
+    return S_OK;
+}
+static HRESULT WINAPI anim_instance_AddTimeEvent( void *iface, double seconds, void (__cdecl *callback)( void * ),
+                                                  void *context )
+{
+    struct anim_instance *inst = iface;
+    HRESULT hr = S_OK;
+
+    TRACE( "instance %p, seconds %f, callback %p, context %p.\n", iface, seconds, callback, context );
+    if (!callback) return E_INVALIDARG;
+    EnterCriticalSection( &anim_instances_cs );
+    if (inst->event_count < ARRAY_SIZE(inst->events))
+    {
+        struct anim_time_event *event = &inst->events[inst->event_count++];
+        event->time = seconds;
+        event->callback = callback;
+        event->context = context;
+    }
+    else hr = E_OUTOFMEMORY;
+    LeaveCriticalSection( &anim_instances_cs );
+    notify_partner_dirty();   /* keep XAML committing until the event is due */
+    return hr;
+}
+static HRESULT WINAPI anim_instance_ResetTimeEvents( void *iface )
+{
+    struct anim_instance *inst = iface;
+    EnterCriticalSection( &anim_instances_cs );
+    inst->event_count = 0;
+    LeaveCriticalSection( &anim_instances_cs );
+    return S_OK;
+}
+static HRESULT WINAPI anim_instance_GetValue( void *iface, float *value )
+{
+    FIXME( "instance %p: the animated value is not computed.\n", iface );
+    if (!value) return E_POINTER;
+    *value = 0.0f;
+    return S_OK;
+}
+static const void *anim_instance_vtbl[] =
+{
+    anim_instance_QueryInterface, anim_instance_AddRef, anim_instance_Release,
+    anim_instance_not_implemented, anim_instance_not_implemented, anim_instance_not_implemented,
+    anim_instance_not_implemented, anim_instance_not_implemented, anim_instance_not_implemented,
+    anim_instance_Pause, anim_instance_Resume, anim_instance_Seek, anim_instance_AddTimeEvent,
+    anim_instance_ResetTimeEvents, anim_instance_GetValue,
+};
+
+/* Called from each commit on XAML's UI thread: runs the time events that have come due. The
+ * callbacks are collected first and run outside the lock, since XAML may add or reset events
+ * from inside one. */
+static void fire_animation_time_events( void )
+{
+    struct { void (__cdecl *callback)( void * ); void *context; } due[64];
+    unsigned int count = 0, i, j;
+    BOOL pending = FALSE;
+    struct anim_instance *inst;
+
+    EnterCriticalSection( &anim_instances_cs );
+    LIST_FOR_EACH_ENTRY( inst, &anim_instances, struct anim_instance, entry )
+    {
+        double now = anim_instance_now( inst );
+        for (i = 0; i < inst->event_count;)
+        {
+            if (inst->events[i].time <= now && count < ARRAY_SIZE(due))
+            {
+                due[count].callback = inst->events[i].callback;
+                due[count].context = inst->events[i].context;
+                count++;
+                for (j = i + 1; j < inst->event_count; j++) inst->events[j - 1] = inst->events[j];
+                inst->event_count--;
+            }
+            else
+            {
+                pending = TRUE;
+                i++;
+            }
+        }
+    }
+    LeaveCriticalSection( &anim_instances_cs );
+
+    for (i = 0; i < count; i++)
+    {
+        TRACE( "firing time event %p(%p).\n", due[i].callback, due[i].context );
+        due[i].callback( due[i].context );
+    }
+    if (pending || count) notify_partner_dirty();
+}
+
+static HRESULT WINAPI device_partner_CreateAnimationInstance( void *iface, IUnknown *animation, void **out )
+{
+    struct anim_instance *inst;
+
+    TRACE( "iface %p, animation %p, out %p.\n", iface, animation, out );
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!(inst = calloc( 1, sizeof(*inst) ))) return E_OUTOFMEMORY;
+    inst->vtbl = anim_instance_vtbl;
+    inst->ref = 1;
+    inst->paused_at = -1.0;
+    anim_instance_set_time( inst, 0.0 );
+    EnterCriticalSection( &anim_instances_cs );
+    list_add_tail( &anim_instances, &inst->entry );
+    LeaveCriticalSection( &anim_instances_cs );
+    *out = inst;
+    return S_OK;
+}
+
+static struct compositor *impl_from_device_partner( void *iface );
+static HRESULT WINAPI device_partner_QueryInterface( void *iface, REFIID iid, void **out );
+static ULONG WINAPI device_partner_AddRef( void *iface );
+static ULONG WINAPI device_partner_Release( void *iface );
+
+/* Methods whose only argument is the out-parameter get it cleared; the rest just refuse. */
+#define DEVICE_PARTNER_OUT(slot, what) \
+    static HRESULT WINAPI device_partner_slot##slot( void *iface, void **out ) \
+    { FIXME( "device partner slot %u (%s) is not implemented.\n", slot, what ); if (out) *out = NULL; return E_NOTIMPL; }
+#define DEVICE_PARTNER_STUB(slot, what) \
+    static HRESULT WINAPI device_partner_slot##slot( void *iface ) \
+    { FIXME( "device partner slot %u (%s) is not implemented.\n", slot, what ); return E_NOTIMPL; }
+DEVICE_PARTNER_OUT(4, "CreateColor")
+DEVICE_PARTNER_OUT(5, "CreateFloodEffect")
+DEVICE_PARTNER_STUB(6, "CreateGdiSpriteBitmap")
+DEVICE_PARTNER_OUT(7, "CreateGenericInkProxy")
+DEVICE_PARTNER_OUT(8, "CreateInkProxy")
+DEVICE_PARTNER_STUB(9, "CreatePrimitive")
+DEVICE_PARTNER_STUB(10, "CreatePrimitive")
+DEVICE_PARTNER_STUB(11, "CreatePrimitive")
+DEVICE_PARTNER_OUT(12, "CreatePrimitiveGroup")
+DEVICE_PARTNER_STUB(13, "DrawPrimitiveGroup")
+DEVICE_PARTNER_STUB(14, "CreateRemoteRenderTarget")
+DEVICE_PARTNER_STUB(15, "CreateRemoteAppRenderTarget")
+DEVICE_PARTNER_OUT(16, "CreateScalar")
+DEVICE_PARTNER_STUB(17, "CreateWindowNode")
+DEVICE_PARTNER_STUB(18, "CreateYCbCrSurface")
+DEVICE_PARTNER_STUB(21, "CreateRegionClip")
+DEVICE_PARTNER_OUT(22, "CreateVisualBitmap")
+DEVICE_PARTNER_STUB(23, "CreateInteraction")
+#undef DEVICE_PARTNER_OUT
+#undef DEVICE_PARTNER_STUB
+static HRESULT WINAPI device_partner_UpdateCursorMouseMove( void *iface ) { return S_OK; }
+static HRESULT WINAPI device_partner_ForceRender( void *iface )
+{
+    if (last_desktop_hwnd) present_desktop_hwnd( last_desktop_hwnd );
+    return S_OK;
+}
+static const void *device_partner_vtbl[] =
+{
+    device_partner_QueryInterface, device_partner_AddRef, device_partner_Release,
+    device_partner_CreateAnimationInstance, device_partner_slot4, device_partner_slot5, device_partner_slot6,
+    device_partner_slot7, device_partner_slot8, device_partner_slot9, device_partner_slot10, device_partner_slot11,
+    device_partner_slot12, device_partner_slot13, device_partner_slot14, device_partner_slot15,
+    device_partner_slot16, device_partner_slot17, device_partner_slot18, device_partner_UpdateCursorMouseMove,
+    device_partner_ForceRender, device_partner_slot21, device_partner_slot22, device_partner_slot23,
+};
+static const GUID IID_IDCompositionDevicePartner_local =
+    { 0x7bd36c9a, 0x56ee, 0x4fdd, { 0xac, 0x4e, 0x76, 0xbb, 0xd1, 0x6e, 0xc8, 0xe4 } };
+
 static HRESULT WINAPI device_slot_69( void *iface )
 {
     TRACE( "interop device CommitMainDevice (slot 69).\n" );
     perf.commits++;
+    fire_animation_time_events();
     if (last_desktop_hwnd) present_desktop_hwnd( last_desktop_hwnd );
     /* Telling XAML the composition is dirty after every commit keeps it scheduling frames forever.
      * Only a commit that changed the scene asks for the next frame: XAML's own animations change the
@@ -6127,6 +6454,14 @@ static HRESULT WINAPI compositor_QueryInterface( ICompositor *iface, REFIID iid,
     /* WinUI 2's RadialGradientBrush asks for this and uses the answer without checking it:
      * E_NOINTERFACE left it calling through NULL (Microsoft.UI.Xaml.dll+0x143a48, in
      * consume_ICompositorWithRadialGradient::CreateRadialGradientBrush), which killed Shapr3D. */
+    if (IsEqualGUID( iid, &IID_IDCompositionDevicePartner_local ))
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->partner_device_vtbl = device_partner_vtbl;
+        *out = &impl->partner_device_vtbl;
+        return S_OK;
+    }
+
     if (IsEqualGUID( iid, &IID_ICompositorWithRadialGradient_local ))
     {
         InterlockedIncrement( &impl->ref );
@@ -7056,6 +7391,14 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
         {
             TRACE( "skipped public sprite %p %gx%g at %d,%d matched %d alpha %u.\n", impl, width, height,
                    (int)x, (int)y, matched, matched ? c.A : 0 );
+            if (matched && !c.A && width > 0 && height > 0)
+            {
+                /* XAML's Transparent background: invisible, but it takes the pointer */
+                struct paint_op op = { OP_HIT };
+                SetRect( &op.dest, (int)x, (int)y, (int)(x + width), (int)(y + height) );
+                op.clip = paint_clip;
+                paint_emit( &op );
+            }
             goto children;
         }
         SetRect( &rect, (int)x, (int)y, (int)(x + width), (int)(y + height) );
@@ -8920,6 +9263,143 @@ static const void *kf_anim2_vtbl[] =
     kf_anim2_SetBooleanParameter, kf_anim2_get_Target, kf_anim2_put_Target,
 };
 
+/* ICompositionKeyFrameAnimationPartner {ddaabd43-226d-40dc-aa1b-e754922c37d4}, from dcomp.pdb's
+ * KeyFrameAnimation::Partner: IUnknown, 3 SetCustomTimeline(IDCompositionAnimationInstancePartner *),
+ * 4 GetIterationCount(float *), 5 SetIterationCount(float). XAML asks for it when it turns a
+ * storyboard animation into a composition one (CDoubleAnimation::MakeDCompAnimationInstances).
+ * The catch-all answered it with the generic table, whose slot 3 is GetIids: it wrote through
+ * the timeline argument, and XAML later released the garbage it found there - Shapr3D crashed as
+ * soon as its Sketch button played an animation. */
+static const GUID IID_ICompositionKeyFrameAnimationPartner_local =
+    { 0xddaabd43, 0x226d, 0x40dc, { 0xaa, 0x1b, 0xe7, 0x54, 0x92, 0x2c, 0x37, 0xd4 } };
+static struct kf_animation *kf_from_partner( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct kf_animation, partner_vtbl );
+}
+static HRESULT WINAPI kf_partner_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return kf_animation_QueryInterface( &kf_from_partner( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI kf_partner_AddRef( void *iface )
+{
+    return InterlockedIncrement( &kf_from_partner( iface )->ref );
+}
+static ULONG WINAPI kf_partner_Release( void *iface )
+{
+    struct kf_animation *impl = kf_from_partner( iface );
+    return comp_object_Release( &impl->vtbl );
+}
+/* The custom timeline is how XAML drives the animation from its own clock; animations here are
+ * sampled at a controller's progress instead, so it is accepted and not used. */
+static HRESULT WINAPI kf_partner_SetCustomTimeline( void *iface, IUnknown *timeline )
+{
+    TRACE( "iface %p, timeline %p.\n", iface, timeline );
+    return S_OK;
+}
+static HRESULT WINAPI kf_partner_GetIterationCount( void *iface, float *count )
+{
+    if (!count) return E_POINTER;
+    *count = kf_from_partner( iface )->iteration_count;
+    return S_OK;
+}
+static HRESULT WINAPI kf_partner_SetIterationCount( void *iface, float count )
+{
+    TRACE( "iface %p, count %f.\n", iface, count );
+    kf_from_partner( iface )->iteration_count = count;
+    return S_OK;
+}
+static const void *kf_partner_vtbl[] =
+{
+    kf_partner_QueryInterface, kf_partner_AddRef, kf_partner_Release,
+    kf_partner_SetCustomTimeline, kf_partner_GetIterationCount, kf_partner_SetIterationCount,
+};
+
+/* IKeyFrameAnimation {126e7f22-...} and its revisions 2 {f4b488bb-...} and 3 {845bf0b4-...}.
+ * These went to the generic table, whose slot 8 "filled" get_Duration's TimeSpan with a
+ * placeholder object pointer; XAML then released what it found there. Every property is kept.
+ *   6/7 DelayTime  8/9 Duration  10/11 IterationBehavior  12/13 IterationCount  14 KeyFrameCount
+ *   15/16 StopBehavior  17 InsertExpressionKeyFrame(key, expression)  18 (key, expression, easing)
+ *   IKeyFrameAnimation2: 6/7 Direction;  IKeyFrameAnimation3: 6/7 DelayBehavior */
+static const GUID IID_IKeyFrameAnimation_local =
+    { 0x126e7f22, 0x3ae9, 0x4540, { 0x9a, 0x8a, 0xde, 0xae, 0x8a, 0x4a, 0x4a, 0x84 } };
+static const GUID IID_IKeyFrameAnimation2_local =
+    { 0xf4b488bb, 0x2940, 0x4ec0, { 0xa4, 0x1a, 0xeb, 0x6d, 0x80, 0x1a, 0x2f, 0x18 } };
+static const GUID IID_IKeyFrameAnimation3_local =
+    { 0x845bf0b4, 0xd8de, 0x462f, { 0x87, 0x53, 0xc8, 0x0d, 0x43, 0xc6, 0xff, 0x5a } };
+
+#define KFA_VIEW(name, field) \
+    static struct kf_animation *kf_from_##name( void *iface ) \
+    { return CONTAINING_RECORD( iface, struct kf_animation, field ); } \
+    static HRESULT WINAPI name##_QueryInterface( void *iface, REFIID iid, void **out ) \
+    { return kf_animation_QueryInterface( &kf_from_##name( iface )->vtbl, iid, out ); } \
+    static ULONG WINAPI name##_AddRef( void *iface ) \
+    { return InterlockedIncrement( &kf_from_##name( iface )->ref ); } \
+    static ULONG WINAPI name##_Release( void *iface ) \
+    { return comp_object_Release( &kf_from_##name( iface )->vtbl ); } \
+    static HRESULT WINAPI name##_GetIids( void *iface, ULONG *count, IID **iids ) \
+    { if (count) *count = 0; if (iids) *iids = NULL; return S_OK; } \
+    static HRESULT WINAPI name##_GetRuntimeClassName( void *iface, HSTRING *name ) \
+    { return comp_object_GetRuntimeClassName( &kf_from_##name( iface )->vtbl, name ); } \
+    static HRESULT WINAPI name##_GetTrustLevel( void *iface, TrustLevel *level ) \
+    { *level = BaseTrust; return S_OK; }
+KFA_VIEW(kfa, kfa_vtbl)
+KFA_VIEW(kfa2, kfa2_vtbl)
+KFA_VIEW(kfa3, kfa3_vtbl)
+#undef KFA_VIEW
+
+#define KFA_PROP(view, prop, field, type) \
+    static HRESULT WINAPI view##_get_##prop( void *iface, type *value ) \
+    { if (!value) return E_POINTER; *value = kf_from_##view( iface )->field; return S_OK; } \
+    static HRESULT WINAPI view##_put_##prop( void *iface, type value ) \
+    { TRACE( "iface %p.\n", iface ); kf_from_##view( iface )->field = value; return S_OK; }
+KFA_PROP(kfa, DelayTime, delay_time, INT64)
+KFA_PROP(kfa, Duration, duration, INT64)
+KFA_PROP(kfa, IterationBehavior, iteration_behavior, INT32)
+KFA_PROP(kfa, IterationCount, iterations, INT32)
+KFA_PROP(kfa, StopBehavior, stop_behavior, INT32)
+KFA_PROP(kfa2, Direction, direction, INT32)
+KFA_PROP(kfa3, DelayBehavior, delay_behavior, INT32)
+#undef KFA_PROP
+
+static HRESULT WINAPI kfa_get_KeyFrameCount( void *iface, INT32 *value )
+{
+    if (!value) return E_POINTER;
+    *value = kf_from_kfa( iface )->key_count;
+    return S_OK;
+}
+/* Expressions are not evaluated here; the key frame is counted so the count stays true. */
+static HRESULT WINAPI kfa_InsertExpressionKeyFrame( void *iface, float key, HSTRING expression )
+{
+    struct kf_animation *impl = kf_from_kfa( iface );
+    FIXME( "key %f, expression %s: expression key frames are not evaluated.\n", key, debugstr_hstring( expression ) );
+    impl->key_count++;
+    return S_OK;
+}
+static HRESULT WINAPI kfa_InsertExpressionKeyFrameWithEasingFunction( void *iface, float key, HSTRING expression,
+                                                                    IUnknown *easing )
+{
+    return kfa_InsertExpressionKeyFrame( iface, key, expression );
+}
+
+static const void *kfa_vtbl[] =
+{
+    kfa_QueryInterface, kfa_AddRef, kfa_Release, kfa_GetIids, kfa_GetRuntimeClassName, kfa_GetTrustLevel,
+    kfa_get_DelayTime, kfa_put_DelayTime, kfa_get_Duration, kfa_put_Duration,
+    kfa_get_IterationBehavior, kfa_put_IterationBehavior, kfa_get_IterationCount, kfa_put_IterationCount,
+    kfa_get_KeyFrameCount, kfa_get_StopBehavior, kfa_put_StopBehavior,
+    kfa_InsertExpressionKeyFrame, kfa_InsertExpressionKeyFrameWithEasingFunction,
+};
+static const void *kfa2_vtbl[] =
+{
+    kfa2_QueryInterface, kfa2_AddRef, kfa2_Release, kfa2_GetIids, kfa2_GetRuntimeClassName, kfa2_GetTrustLevel,
+    kfa2_get_Direction, kfa2_put_Direction,
+};
+static const void *kfa3_vtbl[] =
+{
+    kfa3_QueryInterface, kfa3_AddRef, kfa3_Release, kfa3_GetIids, kfa3_GetRuntimeClassName, kfa3_GetTrustLevel,
+    kfa3_get_DelayBehavior, kfa3_put_DelayBehavior,
+};
+
 static HRESULT WINAPI kf_animation_QueryInterface( void *iface, REFIID iid, void **out )
 {
     struct kf_animation *impl = CONTAINING_RECORD( iface, struct kf_animation, vtbl );
@@ -8934,6 +9414,26 @@ static HRESULT WINAPI kf_animation_QueryInterface( void *iface, REFIID iid, void
     if (IsEqualGUID( iid, &IID_ICompositionAnimation2_local ))
     {
         *out = &impl->anim2_vtbl;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_ICompositionKeyFrameAnimationPartner_local ))
+    {
+        *out = &impl->partner_vtbl;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IKeyFrameAnimation_local ))
+    {
+        *out = &impl->kfa_vtbl;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IKeyFrameAnimation2_local ))
+    {
+        *out = &impl->kfa2_vtbl;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IKeyFrameAnimation3_local ))
+    {
+        *out = &impl->kfa3_vtbl;
         return S_OK;
     }
     if ((impl->value_kind == KF_COLOR && IsEqualGUID( iid, &IID_IColorKeyFrameAnimation_ )) ||
@@ -9129,6 +9629,13 @@ static HRESULT create_kf_animation( enum kf_kind kind, void **out )
     impl->typed_vtbl = kind == KF_COLOR ? kf_color_vtbl : kind == KF_SCALAR ? kf_scalar_vtbl :
                        kind == KF_BOOLEAN ? kf_boolean_vtbl : kind == KF_VECTOR2 ? kf_vector2_vtbl : kf_vector3_vtbl;
     impl->anim2_vtbl = kf_anim2_vtbl;
+    impl->partner_vtbl = kf_partner_vtbl;
+    impl->iteration_count = 1.0f;
+    impl->kfa_vtbl = kfa_vtbl;
+    impl->kfa2_vtbl = kfa2_vtbl;
+    impl->kfa3_vtbl = kfa3_vtbl;
+    impl->duration = 10000000;   /* the documented default, one second */
+    impl->iterations = 1;
     /* CreateBooleanKeyFrameAnimation's default interface is IBooleanKeyFrameAnimation itself and XAML
      * inserts its key frames through that pointer without a QI, so the generic view swallows them.
      * That is deliberate for now: applying the last key's IsVisible hid the AnimatedIcon layers the
@@ -13547,13 +14054,20 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
     blend.SourceConstantAlpha = (BYTE)(opacity * 255.0f + 0.5f);
     {
         int dest_w = grid ? (int)w : (width > 0 ? width : (int)w), dest_h = grid ? (int)h : (height > 0 ? height : (int)h);
-        if (dest_w == (int)w && dest_h == (int)h &&
-            soft_blend( hdc, x, y, w, h, brush->cache_bits, w * 4, blend.SourceConstantAlpha, brush, brush->cache_serial ))
+        BOOL blended;
+
+        /* a brush over a swap chain is how a SwapChainPanel's content is drawn */
+        paint_next_is_swapchain = source_surface && source_surface->swapchain;
+        blended = dest_w == (int)w && dest_h == (int)h &&
+                  soft_blend( hdc, x, y, w, h, brush->cache_bits, w * 4, blend.SourceConstantAlpha, brush, brush->cache_serial );
+        paint_next_is_swapchain = FALSE;
+        if (blended)
         {
             TRACE( "mask brush %p: %ux%u mask blended directly%s.\n", brush, w, h, same ? " (cached)" : "" );
             return TRUE;
         }
-        soft_stretch( x, y, dest_w, dest_h, brush->cache_bmp, w, h, blend.SourceConstantAlpha, brush, brush->cache_serial );
+        soft_stretch( x, y, dest_w, dest_h, brush->cache_bmp, w, h, blend.SourceConstantAlpha, brush, brush->cache_serial,
+                      source_surface && source_surface->swapchain );
         done = TRUE;
         (void)mem; (void)old;
     }
@@ -14339,6 +14853,23 @@ static const void *compositor_shadow_vtbl[] =
     compositor_shadow_CreateProjectedShadowCaster, compositor_shadow_CreateProjectedShadowReceiver,
     compositor_shadow_CreateProjectedShadow,
 };
+
+static struct compositor *impl_from_device_partner( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct compositor, partner_device_vtbl );
+}
+static HRESULT WINAPI device_partner_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return compositor_QueryInterface( &impl_from_device_partner( iface )->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI device_partner_AddRef( void *iface )
+{
+    return compositor_AddRef( &impl_from_device_partner( iface )->ICompositor_iface );
+}
+static ULONG WINAPI device_partner_Release( void *iface )
+{
+    return compositor_Release( &impl_from_device_partner( iface )->ICompositor_iface );
+}
 
 /* ICompositorWithRadialGradient ({98b9c1a7-...}): 6 CreateRadialGradientBrush. The brush is a
  * recorded composition object like the linear one; its properties are not drawn yet. */

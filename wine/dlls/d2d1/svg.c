@@ -33,6 +33,7 @@
 #include <float.h>
 
 #include "d2d1_private.h"
+#include "wincodec.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(d2d);
 
@@ -844,15 +845,24 @@ static HRESULT shape_geometry(ID2D1Factory *factory, const struct svg_node *node
 /* ---------------------------------------------------------------------------------------------
  * Drawing
  * ------------------------------------------------------------------------------------------- */
+struct svg_shadow
+{
+    float dx, dy, sigma, alpha;
+};
+
 struct svg_style
 {
     D2D1_COLOR_F fill, stroke;
     BOOL has_fill, has_stroke;
+    const struct svg_node *fill_server, *stroke_server;   /* a gradient or pattern, from url(#id) */
     float fill_opacity, stroke_opacity, opacity, stroke_width, miter_limit;
     BOOL evenodd, clip_evenodd;
     D2D1_CAP_STYLE cap;
     D2D1_LINE_JOIN join;
     const WCHAR *dash_array;
+    struct svg_shadow shadows[4];   /* from a drop-shadow filter */
+    unsigned int shadow_count;
+    BOOL group_shadow;              /* the shadows came from the parent group */
 };
 
 struct svg_draw
@@ -874,13 +884,126 @@ static const struct svg_node *find_by_id(const struct svg_node *node, const WCHA
     return NULL;
 }
 
-static void apply_style(const struct svg_node *node, struct svg_style *style)
+/* The element a url(#id) or an href="#id" names. */
+static const struct svg_node *reference(struct svg_draw *draw, const WCHAR *value)
+{
+    WCHAR id[128];
+    const WCHAR *start, *end;
+    size_t len;
+
+    if (!value) return NULL;
+    value = skip_space(value);
+    if (!wcsncmp(value, L"url(", 4)) value = skip_space(value + 4);
+    if (*value == '\'' || *value == '"') ++value;
+    if (*value != '#') return NULL;
+    start = ++value;
+    for (end = start; *end && *end != ')' && *end != '\'' && *end != '"' && *end != ' '; ++end) ;
+    len = min(end - start, ARRAY_SIZE(id) - 1);
+    memcpy(id, start, len * sizeof(WCHAR));
+    id[len] = 0;
+    return find_by_id(draw->root, id);
+}
+
+static const WCHAR *href(const struct svg_node *node)
+{
+    const WCHAR *value = svg_attr(node, L"xlink:href");
+    return value ? value : svg_attr(node, L"href");
+}
+
+static BOOL is_paint_server(const struct svg_node *node)
+{
+    return node && (!wcscmp(node->name, L"linearGradient") || !wcscmp(node->name, L"radialGradient") ||
+                    !wcscmp(node->name, L"pattern"));
+}
+
+/* A fill or stroke value: a colour, "none", or url(#server) with an optional fallback colour. */
+static void set_paint(struct svg_draw *draw, const WCHAR *value, BOOL *has, D2D1_COLOR_F *colour,
+        const struct svg_node **server)
+{
+    const WCHAR *p = skip_space(value);
+
+    *server = NULL;
+    if (!wcsncmp(p, L"url(", 4))
+    {
+        const struct svg_node *target = reference(draw, p);
+        const WCHAR *after = wcschr(p, ')');
+
+        if (is_paint_server(target))
+        {
+            *server = target;
+            *has = TRUE;
+            return;
+        }
+        *has = after && parse_paint(after + 1, colour);
+        return;
+    }
+    *has = parse_paint(value, colour);
+}
+
+/* A drop-shadow filter: each feOffset / feGaussianBlur pair followed by the feColorMatrix that sets
+ * its opacity (what design tools export), or an feDropShadow. Anything else is not applied. */
+static unsigned int parse_shadow_filter(const struct svg_node *filter, struct svg_shadow *shadows, unsigned int max)
+{
+    float dx = 0.0f, dy = 0.0f, sigma = 0.0f;
+    BOOL pending = FALSE;
+    unsigned int count = 0;
+    size_t i;
+
+    for (i = 0; i < filter->child_count && count < max; ++i)
+    {
+        const struct svg_node *fe = filter->children[i];
+        const WCHAR *in = svg_attr(fe, L"in"), *values;
+
+        if (!wcscmp(fe->name, L"feOffset"))
+        {
+            dx = attr_float(fe, L"dx", 0.0f);
+            dy = attr_float(fe, L"dy", 0.0f);
+            pending = TRUE;
+        }
+        else if (!wcscmp(fe->name, L"feGaussianBlur"))
+        {
+            sigma = attr_float(fe, L"stdDeviation", 0.0f);
+            pending = TRUE;
+        }
+        else if (!wcscmp(fe->name, L"feColorMatrix") && pending && !(in && !wcscmp(in, L"SourceAlpha")) &&
+                 (values = svg_attr(fe, L"values")))
+        {
+            float v[20] = {0};
+            const WCHAR *q = values;
+            unsigned int k;
+            for (k = 0; k < 20 && (q = parse_number(q, &v[k])); ++k) ;
+            if (k == 20)
+            {
+                shadows[count].dx = dx;
+                shadows[count].dy = dy;
+                shadows[count].sigma = sigma;
+                shadows[count].alpha = v[18];
+                ++count;
+            }
+            dx = dy = sigma = 0.0f;
+            pending = FALSE;
+        }
+        else if (!wcscmp(fe->name, L"feDropShadow"))
+        {
+            shadows[count].dx = attr_float(fe, L"dx", 2.0f);
+            shadows[count].dy = attr_float(fe, L"dy", 2.0f);
+            shadows[count].sigma = attr_float(fe, L"stdDeviation", 2.0f);
+            shadows[count].alpha = attr_float(fe, L"flood-opacity", 1.0f);
+            ++count;
+        }
+    }
+    if (!count) FIXME("filter %s is not a drop shadow and is not applied.\n", debugstr_w(svg_attr(filter, L"id")));
+    return count;
+}
+
+static void apply_style(struct svg_draw *draw, const struct svg_node *node, struct svg_style *style)
 {
     const WCHAR *value;
     float f;
 
-    if ((value = svg_attr(node, L"fill"))) style->has_fill = parse_paint(value, &style->fill);
-    if ((value = svg_attr(node, L"stroke"))) style->has_stroke = parse_paint(value, &style->stroke);
+    if ((value = svg_attr(node, L"fill"))) set_paint(draw, value, &style->has_fill, &style->fill, &style->fill_server);
+    if ((value = svg_attr(node, L"stroke")))
+        set_paint(draw, value, &style->has_stroke, &style->stroke, &style->stroke_server);
     if ((value = svg_attr(node, L"fill-opacity")) && parse_number(value, &f)) style->fill_opacity = f;
     if ((value = svg_attr(node, L"stroke-opacity")) && parse_number(value, &f)) style->stroke_opacity = f;
     if ((value = svg_attr(node, L"stroke-width")) && parse_number(value, &f)) style->stroke_width = f;
@@ -897,23 +1020,354 @@ static void apply_style(const struct svg_node *node, struct svg_style *style)
     /* opacity is not inherited, but it multiplies down the tree, which is what it looks like for
      * shapes that do not overlap */
     if ((value = svg_attr(node, L"opacity")) && parse_number(value, &f)) style->opacity *= f;
+    if ((value = svg_attr(node, L"filter")))
+    {
+        const struct svg_node *filter = reference(draw, value);
+        if (filter && !wcscmp(filter->name, L"filter"))
+            style->shadow_count = parse_shadow_filter(filter, style->shadows, ARRAY_SIZE(style->shadows));
+    }
     if (svg_attr(node, L"style")) FIXME("style attributes are not parsed.\n");
+}
+
+/* ---- paint servers ---- */
+
+/* An attribute of a gradient or pattern, following href to the template it inherits from. */
+static const WCHAR *server_attr(struct svg_draw *draw, const struct svg_node *node, const WCHAR *name)
+{
+    unsigned int depth;
+    for (depth = 0; node && depth < 8; ++depth)
+    {
+        const WCHAR *value = svg_attr(node, name);
+        if (value) return value;
+        node = reference(draw, href(node));
+    }
+    return NULL;
+}
+
+/* A coordinate that may be a percentage: a fraction of 1 in bounding-box units. */
+static float server_coord(struct svg_draw *draw, const struct svg_node *node, const WCHAR *name, float def)
+{
+    const WCHAR *value = server_attr(draw, node, name), *q;
+    float f;
+    if (!value || !(q = parse_number(value, &f))) return def;
+    return *q == '%' ? f / 100.0f : f;
+}
+
+static const struct svg_node *server_with_stops(struct svg_draw *draw, const struct svg_node *node)
+{
+    unsigned int depth;
+    size_t i;
+    for (depth = 0; node && depth < 8; ++depth)
+    {
+        for (i = 0; i < node->child_count; ++i)
+            if (!wcscmp(node->children[i]->name, L"stop")) return node;
+        node = reference(draw, href(node));
+    }
+    return NULL;
+}
+
+static HRESULT gradient_stops(struct svg_draw *draw, const struct svg_node *gradient, ID2D1GradientStopCollection **out)
+{
+    const struct svg_node *owner = server_with_stops(draw, gradient);
+    D2D1_GRADIENT_STOP stops[32];
+    UINT32 count = 0;
+    size_t i;
+
+    for (i = 0; owner && i < owner->child_count && count < ARRAY_SIZE(stops); ++i)
+    {
+        const struct svg_node *stop = owner->children[i];
+        const WCHAR *value, *q;
+        D2D1_COLOR_F colour = {0.0f, 0.0f, 0.0f, 1.0f};
+        float offset = 0.0f, opacity = 1.0f;
+
+        if (wcscmp(stop->name, L"stop")) continue;
+        if ((value = svg_attr(stop, L"offset")) && (q = parse_number(value, &offset)) && *q == '%') offset /= 100.0f;
+        if ((value = svg_attr(stop, L"stop-color"))) parse_paint(value, &colour);
+        if ((value = svg_attr(stop, L"stop-opacity"))) parse_number(value, &opacity);
+        colour.a *= opacity;
+        stops[count].position = min(1.0f, max(0.0f, offset));
+        if (count && stops[count].position < stops[count - 1].position) stops[count].position = stops[count - 1].position;
+        stops[count].color = colour;
+        ++count;
+    }
+    if (!count) return E_FAIL;
+    return ID2D1RenderTarget_CreateGradientStopCollection((ID2D1RenderTarget *)draw->context, stops, count, D2D1_GAMMA_2_2,
+            D2D1_EXTEND_MODE_CLAMP, out);
+}
+
+/* The server's own units mapped to user space: objectBoundingBox (the default for gradients and
+ * pattern content alike) scales 0..1 onto the shape's bounds. */
+static D2D1_MATRIX_3X2_F server_transform(struct svg_draw *draw, const struct svg_node *server, const WCHAR *units_attr,
+        const WCHAR *transform_attr, const D2D1_RECT_F *bounds, BOOL bbox_default)
+{
+    const WCHAR *units = server_attr(draw, server, units_attr), *value;
+    D2D1_MATRIX_3X2_F m = identity, bbox = identity;
+
+    if ((value = server_attr(draw, server, transform_attr))) m = parse_transform(value);
+    if (units ? !wcscmp(units, L"objectBoundingBox") : bbox_default)
+    {
+        bbox._11 = bounds->right - bounds->left;
+        bbox._22 = bounds->bottom - bounds->top;
+        bbox._31 = bounds->left;
+        bbox._32 = bounds->top;
+        m = matrix_multiply(&m, &bbox);
+    }
+    return m;
+}
+
+static int base64_value(WCHAR c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+}
+
+/* An <image>'s pixels, from a base64 data URI, as a D2D bitmap. External files are not loaded. */
+static HRESULT image_bitmap(struct svg_draw *draw, const struct svg_node *image, ID2D1Bitmap **out)
+{
+    IWICImagingFactory *wic = NULL;
+    IWICStream *stream = NULL;
+    IWICBitmapDecoder *decoder = NULL;
+    IWICBitmapFrameDecode *frame = NULL;
+    IWICFormatConverter *converter = NULL;
+    const WCHAR *uri = href(image), *p;
+    BYTE *bytes;
+    size_t len = 0;
+    unsigned int acc = 0, bits = 0;
+    HRESULT hr;
+
+    *out = NULL;
+    if (!uri || wcsncmp(uri, L"data:", 5) || !(p = wcsstr(uri, L";base64,")))
+    {
+        FIXME("image %s is not an embedded base64 image.\n", debugstr_wn(uri, uri ? 64 : 0));
+        return E_NOTIMPL;
+    }
+    p += 8;
+    if (!(bytes = malloc(wcslen(p) * 3 / 4 + 4))) return E_OUTOFMEMORY;
+    for (; *p; ++p)
+    {
+        int v = base64_value(*p);
+        if (v < 0) continue;   /* padding and whitespace */
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8)
+        {
+            bits -= 8;
+            bytes[len++] = (acc >> bits) & 0xff;
+        }
+    }
+
+    if (SUCCEEDED(hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+            &IID_IWICImagingFactory, (void **)&wic)) &&
+        SUCCEEDED(hr = IWICImagingFactory_CreateStream(wic, &stream)) &&
+        SUCCEEDED(hr = IWICStream_InitializeFromMemory(stream, bytes, len)) &&
+        SUCCEEDED(hr = IWICImagingFactory_CreateDecoderFromStream(wic, (IStream *)stream, NULL,
+            WICDecodeMetadataCacheOnLoad, &decoder)) &&
+        SUCCEEDED(hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame)) &&
+        SUCCEEDED(hr = IWICImagingFactory_CreateFormatConverter(wic, &converter)) &&
+        SUCCEEDED(hr = IWICFormatConverter_Initialize(converter, (IWICBitmapSource *)frame,
+            &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom)))
+        hr = ID2D1DeviceContext_CreateBitmapFromWicBitmap(draw->context, (IWICBitmapSource *)converter, NULL,
+                (ID2D1Bitmap1 **)out);
+    if (FAILED(hr)) WARN("embedded image did not decode, hr %#lx.\n", hr);
+
+    if (converter) IWICFormatConverter_Release(converter);
+    if (frame) IWICBitmapFrameDecode_Release(frame);
+    if (decoder) IWICBitmapDecoder_Release(decoder);
+    if (stream) IWICStream_Release(stream);
+    if (wic) IWICImagingFactory_Release(wic);
+    free(bytes);
+    return hr;
+}
+
+/* The transform from an <image>'s pixels to its user space: its x, y, width and height. */
+static D2D1_MATRIX_3X2_F image_transform(const struct svg_node *image, ID2D1Bitmap *bitmap)
+{
+    D2D1_MATRIX_3X2_F m = identity;
+    D2D1_SIZE_U size = ID2D1Bitmap_GetPixelSize(bitmap);
+    float w = attr_float(image, L"width", (float)size.width), h = attr_float(image, L"height", (float)size.height);
+
+    if (size.width && size.height)
+    {
+        m._11 = w / size.width;
+        m._22 = h / size.height;
+    }
+    m._31 = attr_float(image, L"x", 0.0f);
+    m._32 = attr_float(image, L"y", 0.0f);
+    return m;
+}
+
+/* A pattern's picture: the <image> it holds, directly or through <use>, and the transform of that
+ * image within the pattern's content units. */
+static const struct svg_node *pattern_image(struct svg_draw *draw, const struct svg_node *pattern, D2D1_MATRIX_3X2_F *m)
+{
+    unsigned int depth;
+    size_t i;
+
+    for (depth = 0; pattern && depth < 8; ++depth)
+    {
+        for (i = 0; i < pattern->child_count; ++i)
+        {
+            const struct svg_node *child = pattern->children[i], *target = child;
+            D2D1_MATRIX_3X2_F local = identity;
+            const WCHAR *value;
+
+            if (!wcscmp(child->name, L"use"))
+            {
+                target = reference(draw, href(child));
+                if ((value = svg_attr(child, L"transform"))) local = parse_transform(value);
+                local._31 += attr_float(child, L"x", 0.0f);
+                local._32 += attr_float(child, L"y", 0.0f);
+            }
+            else if ((value = svg_attr(child, L"transform"))) local = parse_transform(value);
+            if (target && !wcscmp(target->name, L"image"))
+            {
+                *m = local;
+                return target;
+            }
+        }
+        pattern = reference(draw, href(pattern));
+    }
+    FIXME("pattern %s holds no image; other pattern content is not drawn.\n", debugstr_w(svg_attr(pattern, L"id")));
+    return NULL;
+}
+
+static ID2D1Brush *server_brush(struct svg_draw *draw, const struct svg_node *server, ID2D1Geometry *geometry, float opacity)
+{
+    D2D1_BRUSH_PROPERTIES props;
+    D2D1_RECT_F bounds;
+    ID2D1Brush *brush = NULL;
+
+    if (FAILED(ID2D1Geometry_GetBounds(geometry, NULL, &bounds))) return NULL;
+    props.opacity = opacity;
+
+    if (!wcscmp(server->name, L"linearGradient") || !wcscmp(server->name, L"radialGradient"))
+    {
+        ID2D1GradientStopCollection *stops;
+        if (FAILED(gradient_stops(draw, server, &stops))) return NULL;
+        props.transform = server_transform(draw, server, L"gradientUnits", L"gradientTransform", &bounds, TRUE);
+        if (server->name[0] == 'l')
+        {
+            D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES linear;
+            linear.startPoint.x = server_coord(draw, server, L"x1", 0.0f);
+            linear.startPoint.y = server_coord(draw, server, L"y1", 0.0f);
+            linear.endPoint.x = server_coord(draw, server, L"x2", 1.0f);
+            linear.endPoint.y = server_coord(draw, server, L"y2", 0.0f);
+            ID2D1DeviceContext_CreateLinearGradientBrush(draw->context, &linear, &props, stops,
+                    (ID2D1LinearGradientBrush **)&brush);
+        }
+        else
+        {
+            D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES radial;
+            float cx = server_coord(draw, server, L"cx", 0.5f), cy = server_coord(draw, server, L"cy", 0.5f);
+            radial.center.x = cx;
+            radial.center.y = cy;
+            radial.gradientOriginOffset.x = server_coord(draw, server, L"fx", cx) - cx;
+            radial.gradientOriginOffset.y = server_coord(draw, server, L"fy", cy) - cy;
+            radial.radiusX = radial.radiusY = server_coord(draw, server, L"r", 0.5f);
+            ID2D1DeviceContext_CreateRadialGradientBrush(draw->context, &radial, &props, stops,
+                    (ID2D1RadialGradientBrush **)&brush);
+        }
+        ID2D1GradientStopCollection_Release(stops);
+        return brush;
+    }
+
+    /* pattern */
+    {
+        D2D1_BITMAP_BRUSH_PROPERTIES bitmap_props = { D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
+                                                      D2D1_BITMAP_INTERPOLATION_MODE_LINEAR };
+        D2D1_MATRIX_3X2_F in_pattern, content, pixels;
+        const struct svg_node *image;
+        ID2D1Bitmap *bitmap;
+
+        if (!(image = pattern_image(draw, server, &in_pattern))) return NULL;
+        if (FAILED(image_bitmap(draw, image, &bitmap))) return NULL;
+        /* patternContentUnits defaults to userSpaceOnUse; a viewBox is not handled */
+        content = server_transform(draw, server, L"patternContentUnits", L"patternTransform", &bounds, FALSE);
+        pixels = image_transform(image, bitmap);
+        pixels = matrix_multiply(&pixels, &in_pattern);
+        props.transform = matrix_multiply(&pixels, &content);
+        ID2D1RenderTarget_CreateBitmapBrush((ID2D1RenderTarget *)draw->context, bitmap, &bitmap_props, &props, (ID2D1BitmapBrush **)&brush);
+        ID2D1Bitmap_Release(bitmap);
+        return brush;
+    }
+}
+
+static ID2D1Brush *paint_brush(struct svg_draw *draw, const D2D1_COLOR_F *colour, const struct svg_node *server,
+        ID2D1Geometry *geometry, float opacity)
+{
+    ID2D1SolidColorBrush *brush;
+    D2D1_COLOR_F c;
+
+    if (server) return server_brush(draw, server, geometry, opacity);
+    c = *colour;
+    c.a *= opacity;
+    if (c.a <= 0.0f || FAILED(ID2D1DeviceContext_CreateSolidColorBrush(draw->context, &c, NULL, &brush))) return NULL;
+    return (ID2D1Brush *)brush;
+}
+
+/* A drop shadow: the shape's silhouette, offset and darkened. D2D's blur is not usable here, so
+ * the blur is approximated with strokes of growing width and falling opacity around a core fill. */
+static void draw_shadows(struct svg_draw *draw, ID2D1Geometry *geometry, const struct svg_style *style)
+{
+    unsigned int i, k;
+
+    for (i = 0; i < style->shadow_count; ++i)
+    {
+        const struct svg_shadow *shadow = &style->shadows[i];
+        D2D1_MATRIX_3X2_F offset = identity;
+        ID2D1TransformedGeometry *moved;
+        ID2D1SolidColorBrush *brush;
+        D2D1_COLOR_F black = {0.0f, 0.0f, 0.0f, 0.0f};
+        float alpha = shadow->alpha * style->opacity;
+
+        if (alpha <= 0.0f) continue;
+        offset._31 = shadow->dx;
+        offset._32 = shadow->dy;
+        if (FAILED(ID2D1Factory_CreateTransformedGeometry(draw->factory, geometry, &offset, &moved))) continue;
+        if (shadow->sigma <= 0.25f)
+        {
+            black.a = alpha;
+            if (SUCCEEDED(ID2D1DeviceContext_CreateSolidColorBrush(draw->context, &black, NULL, &brush)))
+            {
+                ID2D1DeviceContext_FillGeometry(draw->context, (ID2D1Geometry *)moved, (ID2D1Brush *)brush, NULL);
+                ID2D1SolidColorBrush_Release(brush);
+            }
+        }
+        else
+        {
+            black.a = alpha * 0.5f;
+            if (SUCCEEDED(ID2D1DeviceContext_CreateSolidColorBrush(draw->context, &black, NULL, &brush)))
+            {
+                ID2D1DeviceContext_FillGeometry(draw->context, (ID2D1Geometry *)moved, (ID2D1Brush *)brush, NULL);
+                /* four rings reaching out about two standard deviations, each fainter */
+                for (k = 4; k > 0; --k)
+                {
+                    black.a = alpha * 0.5f / 4.0f;
+                    ID2D1SolidColorBrush_SetColor(brush, &black);
+                    ID2D1DeviceContext_DrawGeometry(draw->context, (ID2D1Geometry *)moved, (ID2D1Brush *)brush,
+                            shadow->sigma * k, NULL);
+                }
+                ID2D1SolidColorBrush_Release(brush);
+            }
+        }
+        ID2D1TransformedGeometry_Release(moved);
+    }
 }
 
 static void draw_shape(struct svg_draw *draw, ID2D1Geometry *geometry, const struct svg_style *style)
 {
-    ID2D1SolidColorBrush *brush;
-    D2D1_COLOR_F colour;
+    ID2D1Brush *brush;
 
-    if (style->has_fill)
+    if (style->shadow_count) draw_shadows(draw, geometry, style);
+    if (style->has_fill &&
+        (brush = paint_brush(draw, &style->fill, style->fill_server, geometry, style->fill_opacity * style->opacity)))
     {
-        colour = style->fill;
-        colour.a *= style->fill_opacity * style->opacity;
-        if (colour.a > 0.0f && SUCCEEDED(ID2D1DeviceContext_CreateSolidColorBrush(draw->context, &colour, NULL, &brush)))
-        {
-            ID2D1DeviceContext_FillGeometry(draw->context, geometry, (ID2D1Brush *)brush, NULL);
-            ID2D1SolidColorBrush_Release(brush);
-        }
+        ID2D1DeviceContext_FillGeometry(draw->context, geometry, brush, NULL);
+        ID2D1Brush_Release(brush);
     }
     if (style->has_stroke && style->stroke_width > 0.0f)
     {
@@ -938,18 +1392,19 @@ static void draw_shape(struct svg_draw *draw, ID2D1Geometry *geometry, const str
         }
         ID2D1Factory_CreateStrokeStyle(draw->factory, &props, dash_count ? dashes : NULL, dash_count, &stroke_style);
 
-        colour = style->stroke;
-        colour.a *= style->stroke_opacity * style->opacity;
-        if (colour.a > 0.0f && SUCCEEDED(ID2D1DeviceContext_CreateSolidColorBrush(draw->context, &colour, NULL, &brush)))
+        if ((brush = paint_brush(draw, &style->stroke, style->stroke_server, geometry,
+                style->stroke_opacity * style->opacity)))
         {
-            ID2D1DeviceContext_DrawGeometry(draw->context, geometry, (ID2D1Brush *)brush, style->stroke_width, stroke_style);
-            ID2D1SolidColorBrush_Release(brush);
+            ID2D1DeviceContext_DrawGeometry(draw->context, geometry, brush, style->stroke_width, stroke_style);
+            ID2D1Brush_Release(brush);
         }
         if (stroke_style) ID2D1StrokeStyle_Release(stroke_style);
     }
 }
 
-/* The union of a clipPath's shapes, in the coordinate space of the element that uses it. */
+/* The union of a clipPath's or a mask's shapes, in the coordinate space of the element that uses
+ * it. A mask is taken as a clip by its shapes' outlines: masks in icon sets are solid shapes, often
+ * an alpha mask cutting a hole (fill-rule evenodd), which is exactly a clip. */
 static HRESULT clip_geometry(struct svg_draw *draw, const struct svg_node *clip, ID2D1Geometry **out)
 {
     ID2D1Geometry *geometries[64];
@@ -964,6 +1419,7 @@ static HRESULT clip_geometry(struct svg_draw *draw, const struct svg_node *clip,
         const WCHAR *rule = svg_attr(child, L"clip-rule"), *transform;
         ID2D1Geometry *geometry;
 
+        if (!rule) rule = svg_attr(child, L"fill-rule");
         if (FAILED(shape_geometry(draw->factory, child, rule && !wcscmp(rule, L"evenodd"), &geometry)) || !geometry)
             continue;
         if ((transform = svg_attr(child, L"transform")))
@@ -979,17 +1435,130 @@ static HRESULT clip_geometry(struct svg_draw *draw, const struct svg_node *clip,
         geometries[count++] = geometry;
     }
     if (!count) return S_FALSE;
+    /* a group's fill mode overrides its members', which would fill an evenodd hole */
+    if (count == 1)
+    {
+        *out = geometries[0];
+        return S_OK;
+    }
     hr = ID2D1Factory_CreateGeometryGroup(draw->factory, D2D1_FILL_MODE_WINDING, geometries, count,
             (ID2D1GeometryGroup **)out);
     for (i = 0; i < count; ++i) ID2D1Geometry_Release(geometries[i]);
     return hr;
 }
 
+/* Clip-paths and masks. Layers are not implemented in this d2d, and neither is geometry combining,
+ * so the clipped content is drawn into an offscreen bitmap the size of the target and then painted
+ * through the clip geometry with a bitmap brush. */
+struct svg_clip
+{
+    ID2D1Geometry *geometry;
+    ID2D1Image *saved_target;
+    ID2D1Bitmap1 *bitmap;
+};
+
+static BOOL invert_matrix(const D2D1_MATRIX_3X2_F *m, D2D1_MATRIX_3X2_F *out)
+{
+    float det = m->_11 * m->_22 - m->_12 * m->_21;
+    if (fabsf(det) < 1e-12f) return FALSE;
+    out->_11 = m->_22 / det;
+    out->_12 = -m->_12 / det;
+    out->_21 = -m->_21 / det;
+    out->_22 = m->_11 / det;
+    out->_31 = (m->_21 * m->_32 - m->_22 * m->_31) / det;
+    out->_32 = (m->_12 * m->_31 - m->_11 * m->_32) / det;
+    return TRUE;
+}
+
+static BOOL begin_clip(struct svg_draw *draw, const struct svg_node *clip_node, struct svg_clip *clip)
+{
+    D2D1_BITMAP_PROPERTIES1 props = {{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED}};
+    D2D1_COLOR_F clear = {0};
+    D2D1_SIZE_U size;
+    ID2D1Bitmap *target;
+
+    memset(clip, 0, sizeof(*clip));
+    if (!clip_node) return FALSE;
+    if (clip_geometry(draw, clip_node, &clip->geometry) != S_OK)
+    {
+        FIXME("clip %s has no geometry.\n", debugstr_w(svg_attr(clip_node, L"id")));
+        return FALSE;
+    }
+    TRACE("clipping to %s.\n", debugstr_w(svg_attr(clip_node, L"id")));
+    ID2D1DeviceContext_GetTarget(draw->context, &clip->saved_target);
+    if (!clip->saved_target || FAILED(ID2D1Image_QueryInterface(clip->saved_target, &IID_ID2D1Bitmap, (void **)&target)))
+        goto fail;
+    size = ID2D1Bitmap_GetPixelSize(target);
+    ID2D1Bitmap_GetDpi(target, &props.dpiX, &props.dpiY);
+    ID2D1Bitmap_Release(target);
+    props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+    if (FAILED(ID2D1DeviceContext_CreateBitmap(draw->context, size, NULL, 0, &props, &clip->bitmap))) goto fail;
+    ID2D1DeviceContext_SetTarget(draw->context, (ID2D1Image *)clip->bitmap);
+    ID2D1DeviceContext_Clear(draw->context, &clear);
+    return TRUE;
+
+fail:
+    FIXME("could not set up a clip; drawing unclipped.\n");
+    if (clip->saved_target) ID2D1Image_Release(clip->saved_target);
+    ID2D1Geometry_Release(clip->geometry);
+    memset(clip, 0, sizeof(*clip));
+    return FALSE;
+}
+
+static void end_clip(struct svg_draw *draw, struct svg_clip *clip, const D2D1_MATRIX_3X2_F *transform)
+{
+    D2D1_BITMAP_BRUSH_PROPERTIES1 bitmap_props = { D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
+                                                   D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR };
+    D2D1_BRUSH_PROPERTIES props = {1.0f};
+    ID2D1BitmapBrush1 *brush;
+
+    if (!clip->geometry) return;
+    ID2D1DeviceContext_SetTarget(draw->context, clip->saved_target);
+    /* the bitmap is in device space; the geometry is filled in the element's user space */
+    if (invert_matrix(transform, &props.transform) &&
+        SUCCEEDED(ID2D1DeviceContext_CreateBitmapBrush(draw->context, (ID2D1Bitmap *)clip->bitmap, &bitmap_props,
+            &props, &brush)))
+    {
+        ID2D1DeviceContext_SetTransform(draw->context, transform);
+        ID2D1DeviceContext_FillGeometry(draw->context, clip->geometry, (ID2D1Brush *)brush, NULL);
+        ID2D1BitmapBrush1_Release(brush);
+    }
+    ID2D1Bitmap1_Release(clip->bitmap);
+    ID2D1Image_Release(clip->saved_target);
+    ID2D1Geometry_Release(clip->geometry);
+}
+
+static void draw_image(struct svg_draw *draw, const struct svg_node *image, const struct svg_style *style)
+{
+    D2D1_MATRIX_3X2_F saved, m;
+    ID2D1Bitmap *bitmap;
+    D2D1_SIZE_U size;
+    D2D1_RECT_F dest;
+
+    if (FAILED(image_bitmap(draw, image, &bitmap))) return;
+    size = ID2D1Bitmap_GetPixelSize(bitmap);
+    m = image_transform(image, bitmap);
+    ID2D1DeviceContext_GetTransform(draw->context, &saved);
+    m = matrix_multiply(&m, &saved);
+    ID2D1DeviceContext_SetTransform(draw->context, &m);
+    dest = (D2D1_RECT_F){0.0f, 0.0f, (float)size.width, (float)size.height};
+    ID2D1DeviceContext_DrawBitmap(draw->context, bitmap, &dest, style->opacity,
+            D2D1_INTERPOLATION_MODE_LINEAR, NULL, NULL);
+    ID2D1DeviceContext_SetTransform(draw->context, &saved);
+    ID2D1Bitmap_Release(bitmap);
+}
+
+static BOOL is_ancestor_node(const struct svg_node *maybe, const struct svg_node *node)
+{
+    for (; node; node = node->parent) if (node == maybe) return TRUE;
+    return FALSE;
+}
+
 static void draw_node(struct svg_draw *draw, const struct svg_node *node, struct svg_style style,
         const D2D1_MATRIX_3X2_F *parent_transform)
 {
     D2D1_MATRIX_3X2_F transform = *parent_transform, local;
-    ID2D1Geometry *clip = NULL;
+    struct svg_clip clip, mask;
     const WCHAR *value;
     size_t i;
 
@@ -997,55 +1566,61 @@ static void draw_node(struct svg_draw *draw, const struct svg_node *node, struct
     if (!wcscmp(node->name, L"defs") || !wcscmp(node->name, L"clipPath") || !wcscmp(node->name, L"mask") ||
         !wcscmp(node->name, L"linearGradient") || !wcscmp(node->name, L"radialGradient") ||
         !wcscmp(node->name, L"pattern") || !wcscmp(node->name, L"filter") || !wcscmp(node->name, L"metadata") ||
-        !wcscmp(node->name, L"title") || !wcscmp(node->name, L"desc") || !wcscmp(node->name, L"style"))
+        !wcscmp(node->name, L"title") || !wcscmp(node->name, L"desc") || !wcscmp(node->name, L"style") ||
+        !wcscmp(node->name, L"symbol"))
         return;
-    if (!wcscmp(node->name, L"use") || !wcscmp(node->name, L"image") || !wcscmp(node->name, L"text"))
+    if (!wcscmp(node->name, L"text"))
     {
-        FIXME("<%s> is not drawn.\n", debugstr_w(node->name));
+        FIXME("<text> is not drawn.\n");
         return;
     }
     if ((value = svg_attr(node, L"display")) && !wcscmp(value, L"none")) return;
 
-    apply_style(node, &style);
+    /* a filter applies to its own element only, or to a group's children through the group */
+    if (!style.group_shadow) style.shadow_count = 0;
+    style.group_shadow = FALSE;
+    apply_style(draw, node, &style);
     if ((value = svg_attr(node, L"transform")) && node != draw->root)
     {
         local = parse_transform(value);
         transform = matrix_multiply(&local, &transform);
     }
-    if (svg_attr(node, L"filter")) FIXME("filters are not applied.\n");
-    if (svg_attr(node, L"mask")) FIXME("masks are not applied.\n");
+    if (!wcscmp(node->name, L"use"))
+    {
+        /* the referenced element, drawn at x, y */
+        const struct svg_node *target = reference(draw, href(node));
+        D2D1_MATRIX_3X2_F shift = identity;
+        shift._31 = attr_float(node, L"x", 0.0f);
+        shift._32 = attr_float(node, L"y", 0.0f);
+        transform = matrix_multiply(&shift, &transform);
+        if (target && target != node && !is_ancestor_node(target, node))
+        {
+            ID2D1DeviceContext_SetTransform(draw->context, &transform);
+            if (!wcscmp(target->name, L"image")) draw_image(draw, target, &style);
+            else draw_node(draw, target, style, &transform);
+        }
+        ID2D1DeviceContext_SetTransform(draw->context, parent_transform);
+        return;
+    }
 
     ID2D1DeviceContext_SetTransform(draw->context, &transform);
-
-    if ((value = svg_attr(node, L"clip-path")) && !wcsncmp(value, L"url(#", 5))
-    {
-        WCHAR id[128];
-        const WCHAR *end = wcschr(value + 5, ')');
-        size_t len = end ? min(end - (value + 5), ARRAY_SIZE(id) - 1) : 0;
-        const struct svg_node *clip_node;
-
-        memcpy(id, value + 5, len * sizeof(WCHAR));
-        id[len] = 0;
-        if ((clip_node = find_by_id(draw->root, id)) && clip_geometry(draw, clip_node, &clip) == S_OK)
-        {
-            D2D1_LAYER_PARAMETERS1 params = {0};
-            params.contentBounds = (D2D1_RECT_F){-FLT_MAX, -FLT_MAX, FLT_MAX, FLT_MAX};
-            params.geometricMask = clip;
-            params.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
-            params.maskTransform = identity;
-            params.opacity = 1.0f;
-            params.layerOptions = D2D1_LAYER_OPTIONS1_NONE;
-            ID2D1DeviceContext_PushLayer(draw->context, &params, NULL);
-        }
-    }
+    begin_clip(draw, reference(draw, svg_attr(node, L"clip-path")), &clip);
+    begin_clip(draw, reference(draw, svg_attr(node, L"mask")), &mask);
+    ID2D1DeviceContext_SetTransform(draw->context, &transform);
 
     if (!wcscmp(node->name, L"svg") || !wcscmp(node->name, L"g") || !wcscmp(node->name, L"a") ||
         !wcscmp(node->name, L"switch"))
     {
+        struct svg_style children = style;
+        /* a group's shadow falls from the group; drawn per child, which is right for the single
+         * shape a shadowed group holds in exported icons */
+        children.group_shadow = style.shadow_count != 0;
         for (i = 0; i < node->child_count; ++i)
-            draw_node(draw, node->children[i], style, &transform);
+            draw_node(draw, node->children[i], children, &transform);
         ID2D1DeviceContext_SetTransform(draw->context, &transform);
     }
+    else if (!wcscmp(node->name, L"image"))
+        draw_image(draw, node, &style);
     else
     {
         ID2D1Geometry *geometry;
@@ -1056,11 +1631,8 @@ static void draw_node(struct svg_draw *draw, const struct svg_node *node, struct
         }
     }
 
-    if (clip)
-    {
-        ID2D1DeviceContext_PopLayer(draw->context);
-        ID2D1Geometry_Release(clip);
-    }
+    end_clip(draw, &mask, &transform);
+    end_clip(draw, &clip, &transform);
 }
 
 void d2d_svg_document_draw(ID2D1DeviceContext *context, ID2D1SvgDocument *iface)

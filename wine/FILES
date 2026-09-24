@@ -259,3 +259,5 @@ dlls/d2d1/svg.c
 dlls/shcore/Makefile.in
 dlls/shcore/ras_stream.c
 include/d2d1_3.idl
+dlls/d2d1/effect.c
+include/d2d1effects_2.idl

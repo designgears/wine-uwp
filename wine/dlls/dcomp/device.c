@@ -659,11 +659,151 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **fac
  * the caller only keeps the handle and checks the status, so hand out a closable handle of our own.
  * The first DWORD of the 0xe8-byte descriptor is its size.
  */
+/* Pointer input for an input sink. On Windows the kernel sends input that lands on the sink's visual
+ * to the sink's target window instead of the window underneath; SwapChainPanel's
+ * CreateCoreIndependentInputSource depends on it, since that input source (and Shapr3D's whole 3D
+ * viewport, which reads PointerPressed/Moved/Released from one) only ever sees its own window. The
+ * descriptor carries the target window at +0x10 (class Windows.UI.Core.CoreIndependentInputSource,
+ * a hidden popup owned by the input thread).
+ *
+ * Here a WH_GETMESSAGE hook on the thread that created the sink - XAML's UI thread, which also
+ * paints - reposts mouse messages to the target when the topmost thing painted at that point is
+ * swap chain content, and from a button press to its release so drags stay with the sink. */
+BOOL dcomp_point_on_swapchain( POINT pt, POINT *origin );
+
+static HWND input_sink_target;
+static HHOOK input_sink_hook;
+static BOOL input_sink_captured;
+static POINT input_sink_origin;   /* the panel's top left in the window, from the last hit */
+
+/* The pointer message win32u would have produced for this mouse message (process_mouse_message):
+ * Windows.UI's input sources read pointer messages and GetPointerInfo, never mouse messages.
+ * Pointer id 1 is win32u's mouse pointer, whose state the same mouse input keeps current. */
+static BOOL pointer_message_from_mouse( const MSG *msg, UINT *message, WPARAM *wparam )
+{
+    static const struct { WORD mk; WORD flag; } buttons[] =
+    {
+        { MK_LBUTTON, POINTER_MESSAGE_FLAG_FIRSTBUTTON }, { MK_RBUTTON, POINTER_MESSAGE_FLAG_SECONDBUTTON },
+        { MK_MBUTTON, POINTER_MESSAGE_FLAG_THIRDBUTTON }, { MK_XBUTTON1, POINTER_MESSAGE_FLAG_FOURTHBUTTON },
+        { MK_XBUTTON2, POINTER_MESSAGE_FLAG_FIFTHBUTTON },
+    };
+    WORD flags = POINTER_MESSAGE_FLAG_INRANGE, pressed = 0;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(buttons); i++) if (LOWORD(msg->wParam) & buttons[i].mk) pressed |= buttons[i].flag;
+    if (pressed) flags |= pressed | POINTER_MESSAGE_FLAG_INCONTACT;
+    switch (msg->message)
+    {
+    case WM_MOUSEMOVE:
+        *message = WM_POINTERUPDATE;
+        if (!pressed) flags |= POINTER_MESSAGE_FLAG_PRIMARY;
+        break;
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_XBUTTONDOWN:
+        if (pressed & (pressed - 1)) *message = WM_POINTERUPDATE;   /* another button was already down */
+        else
+        {
+            *message = WM_POINTERDOWN;
+            flags |= POINTER_MESSAGE_FLAG_PRIMARY;
+        }
+        break;
+    case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP: case WM_XBUTTONUP:
+        *message = pressed ? WM_POINTERUPDATE : WM_POINTERUP;
+        break;
+    case WM_MOUSEWHEEL:
+        *message = WM_POINTERWHEEL;
+        flags = HIWORD(msg->wParam);
+        break;
+    case WM_MOUSEHWHEEL:
+        *message = WM_POINTERHWHEEL;
+        flags = HIWORD(msg->wParam);
+        break;
+    default:
+        return FALSE;
+    }
+    *wparam = MAKEWPARAM( 1, flags );
+    return TRUE;
+}
+
+/* The input source turns a pointer message's screen position into a point on the panel against
+ * its own window, so that window is kept at the panel's top left on screen and positions go out in
+ * screen coordinates. XAML routes a gesture's first press to the input source itself, in screen
+ * coordinates, so the two routes have to agree: with the window left at 0,0, Shapr3D put the first
+ * point of every line the window's screen offset plus the panel's top away from the click.
+ *
+ * A press and a release are each preceded by an update at the same point, as a real pointer hovers
+ * before it presses; the input source takes an event's position from the points gathered before it. */
+static LRESULT CALLBACK input_sink_hook_proc( int code, WPARAM wparam, LPARAM lparam )
+{
+    MSG *msg = (MSG *)lparam;
+
+    if (code == HC_ACTION && wparam == PM_REMOVE && input_sink_target && msg->hwnd != input_sink_target &&
+        msg->message >= WM_MOUSEFIRST && msg->message <= WM_MOUSELAST)
+    {
+        POINT pt = { (short)LOWORD(msg->lParam), (short)HIWORD(msg->lParam) }, screen;
+        BOOL down = msg->message == WM_LBUTTONDOWN || msg->message == WM_RBUTTONDOWN || msg->message == WM_MBUTTONDOWN;
+        BOOL up = msg->message == WM_LBUTTONUP || msg->message == WM_RBUTTONUP || msg->message == WM_MBUTTONUP;
+        UINT pointer_message;
+        WPARAM pointer_wparam;
+        POINT origin = input_sink_origin;
+
+        /* the wheel carries screen coordinates, the rest client ones */
+        if (msg->message == WM_MOUSEWHEEL || msg->message == WM_MOUSEHWHEEL) ScreenToClient( msg->hwnd, &pt );
+        screen = pt;
+        ClientToScreen( msg->hwnd, &screen );
+
+        if ((dcomp_point_on_swapchain( pt, &origin ) || input_sink_captured) &&
+            pointer_message_from_mouse( msg, &pointer_message, &pointer_wparam ))
+        {
+            LPARAM pos = MAKELPARAM( screen.x, screen.y );
+            POINT panel = origin;
+            RECT rect;
+
+            ClientToScreen( msg->hwnd, &panel );
+            GetWindowRect( input_sink_target, &rect );
+            if (rect.left != panel.x || rect.top != panel.y)
+                SetWindowPos( input_sink_target, NULL, panel.x, panel.y, 0, 0,
+                              SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING );
+            input_sink_origin = origin;
+            if (down) input_sink_captured = TRUE;
+            if (up && !(LOWORD(msg->wParam) & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON))) input_sink_captured = FALSE;
+            if (pointer_message == WM_POINTERDOWN || pointer_message == WM_POINTERUP)
+            {
+                /* the buttons as they were just before this message */
+                WORD before = pointer_message == WM_POINTERDOWN ? POINTER_MESSAGE_FLAG_INRANGE | POINTER_MESSAGE_FLAG_PRIMARY
+                                                                : HIWORD(pointer_wparam) | POINTER_MESSAGE_FLAG_INCONTACT |
+                                                                  POINTER_MESSAGE_FLAG_FIRSTBUTTON;
+                PostMessageW( input_sink_target, WM_POINTERUPDATE, MAKEWPARAM( 1, before ), pos );
+            }
+            TRACE( "routing %#x at %s (screen %s, panel at %s) as %#x to input sink %p\n", msg->message,
+                   wine_dbgstr_point( &pt ), wine_dbgstr_point( &screen ), wine_dbgstr_point( &panel ),
+                   pointer_message, input_sink_target );
+            PostMessageW( input_sink_target, pointer_message, pointer_wparam, pos );
+            msg->message = WM_NULL;
+        }
+    }
+    return CallNextHookEx( input_sink_hook, code, wparam, lparam );
+}
+
 NTSTATUS WINAPI create_composition_input_sink( const void *desc, HANDLE *sink )
 {
-    FIXME( "desc %p, sink %p: semi-stub.\n", desc, sink );
+    const BYTE *bytes = desc;
+    HWND target = NULL;
+
+    TRACE( "desc %p, sink %p.\n", desc, sink );
 
     if (!sink) return STATUS_INVALID_PARAMETER;
+    if (bytes && *(const DWORD *)bytes >= 0x18)
+    {
+        ULONG_PTR value = *(const ULONG_PTR *)(bytes + 0x10);
+        if (value && value < 0x100000000ull && IsWindow( (HWND)value )) target = (HWND)value;
+    }
+    if (target)
+    {
+        TRACE( "input sink for window %p, hooking thread %04lx.\n", target, GetCurrentThreadId() );
+        input_sink_target = target;
+        if (!input_sink_hook)
+            input_sink_hook = SetWindowsHookExW( WH_GETMESSAGE, input_sink_hook_proc, NULL, GetCurrentThreadId() );
+    }
     if (!(*sink = CreateEventW( NULL, TRUE, FALSE, NULL ))) return STATUS_NO_MEMORY;
     return STATUS_SUCCESS;
 }
