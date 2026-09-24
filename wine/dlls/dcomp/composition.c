@@ -127,6 +127,9 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
                                  float parent_height, float sx, float sy );
 static BOOL brush_solid_color( ICompositionBrush *brush, Color *color );
 static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int width, int height, float opacity );
+struct drawing_surface;
+static BOOL paint_mapped_surface( HDC hdc, void *brush_iface, struct drawing_surface *surface, int x, int y,
+                                  int width, int height, float opacity );
 static HDC scratch_dc( HDC hdc );
 static int apply_inset_clip( HDC hdc, void *clip_iface, float x, float y, float width, float height );
 /* The presenter's back buffer: a top-down 32-bit DIB so the painters can blend into it directly.
@@ -3278,9 +3281,27 @@ struct surface_brush
     const char *kind;
     LONG ref;
     struct drawing_surface *surface;
+    /* how the surface is laid out in the brush's area: ICompositionSurfaceBrush's Stretch and
+     * alignment ratios, then ICompositionSurfaceBrush2's transform. XAML's Image sets Stretch None
+     * and fits the picture with TransformMatrix; ignoring both painted one corner of it. */
+    const void **vtbl2;         /* ICompositionSurfaceBrush2 */
+    int stretch;                /* CompositionStretch: 0 None, 1 Fill, 2 Uniform, 3 UniformToFill */
+    float halign, valign;
+    int interpolation;
+    Vector2 anchor, center, offset, scale;
+    float rotation;             /* radians */
+    Matrix3x2 transform;
+    ULONG layout_gen;
+    /* the mapped picture, when the layout is not a plain Fill */
+    HBITMAP cache_bmp;
+    BYTE *cache_bits;
+    unsigned int cache_w, cache_h;
+    ULONG cache_source_gen, cache_layout_gen, cache_serial;
 };
 
 static void *surface_brush_vtbl[COMP_OBJECT_SLOTS];
+static void *surface_brush2_vtbl[20];
+static ULONG surface_brush_layout_counter;
 
 static struct drawing_surface *surface_from_iface( void *iface )
 {
@@ -3309,6 +3330,237 @@ static HRESULT WINAPI surface_brush_put_Surface( void *iface, void *value )
     if (brush->surface) IUnknown_Release( (IUnknown *)&brush->surface->vtbl );
     brush->surface = surface;
     return S_OK;
+}
+
+static struct surface_brush *surface_brush_from( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct surface_brush, vtbl );
+}
+static struct surface_brush *surface_brush_from2( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct surface_brush, vtbl2 );
+}
+static void surface_brush_changed( struct surface_brush *brush )
+{
+    scene_changed();
+    brush->layout_gen = InterlockedIncrement( (LONG *)&surface_brush_layout_counter );
+}
+
+static HRESULT WINAPI surface_brush_get_BitmapInterpolationMode( void *iface, int *value )
+{
+    if (!value) return E_POINTER;
+    *value = surface_brush_from( iface )->interpolation;
+    return S_OK;
+}
+static HRESULT WINAPI surface_brush_put_BitmapInterpolationMode( void *iface, int value )
+{
+    surface_brush_from( iface )->interpolation = value;
+    return S_OK;
+}
+static HRESULT WINAPI surface_brush_get_HorizontalAlignmentRatio( void *iface, float *value )
+{
+    if (!value) return E_POINTER;
+    *value = surface_brush_from( iface )->halign;
+    return S_OK;
+}
+static HRESULT WINAPI surface_brush_put_HorizontalAlignmentRatio( void *iface, float value )
+{
+    TRACE( "brush %p %g.\n", iface, value );
+    surface_brush_from( iface )->halign = value;
+    surface_brush_changed( surface_brush_from( iface ) );
+    return S_OK;
+}
+static HRESULT WINAPI surface_brush_get_Stretch( void *iface, int *value )
+{
+    if (!value) return E_POINTER;
+    *value = surface_brush_from( iface )->stretch;
+    return S_OK;
+}
+static HRESULT WINAPI surface_brush_put_Stretch( void *iface, int value )
+{
+    TRACE( "brush %p %d.\n", iface, value );
+    surface_brush_from( iface )->stretch = value;
+    surface_brush_changed( surface_brush_from( iface ) );
+    return S_OK;
+}
+static HRESULT WINAPI surface_brush_get_VerticalAlignmentRatio( void *iface, float *value )
+{
+    if (!value) return E_POINTER;
+    *value = surface_brush_from( iface )->valign;
+    return S_OK;
+}
+static HRESULT WINAPI surface_brush_put_VerticalAlignmentRatio( void *iface, float value )
+{
+    TRACE( "brush %p %g.\n", iface, value );
+    surface_brush_from( iface )->valign = value;
+    surface_brush_changed( surface_brush_from( iface ) );
+    return S_OK;
+}
+
+/* ICompositionSurfaceBrush2, a separate view: its slots 6-15 would otherwise land on
+ * ICompositionSurfaceBrush's. */
+static HRESULT WINAPI surface_brush2_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return comp_object_QueryInterface( &surface_brush_from2( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI surface_brush2_AddRef( void *iface )
+{
+    return comp_object_AddRef( &surface_brush_from2( iface )->vtbl );
+}
+static ULONG WINAPI surface_brush2_Release( void *iface )
+{
+    return comp_object_Release( &surface_brush_from2( iface )->vtbl );
+}
+static HRESULT WINAPI surface_brush2_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI surface_brush2_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( L"Windows.UI.Composition.CompositionSurfaceBrush",
+                                ARRAY_SIZE(L"Windows.UI.Composition.CompositionSurfaceBrush") - 1, name );
+}
+static HRESULT WINAPI surface_brush2_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    if (!level) return E_POINTER;
+    *level = BaseTrust;
+    return S_OK;
+}
+#define SURFACE_BRUSH2_VECTOR2( name, field )                                                   \
+static HRESULT WINAPI surface_brush2_get_##name( void *iface, Vector2 *value )                  \
+{                                                                                               \
+    if (!value) return E_POINTER;                                                               \
+    *value = surface_brush_from2( iface )->field;                                               \
+    return S_OK;                                                                                \
+}                                                                                               \
+static HRESULT WINAPI surface_brush2_put_##name( void *iface, Vector2 value )                   \
+{                                                                                               \
+    TRACE( "brush %p " #name " %g,%g.\n", iface, value.X, value.Y );                            \
+    surface_brush_from2( iface )->field = value;                                                \
+    surface_brush_changed( surface_brush_from2( iface ) );                                      \
+    return S_OK;                                                                                \
+}
+SURFACE_BRUSH2_VECTOR2( AnchorPoint, anchor )
+SURFACE_BRUSH2_VECTOR2( CenterPoint, center )
+SURFACE_BRUSH2_VECTOR2( Offset, offset )
+SURFACE_BRUSH2_VECTOR2( Scale, scale )
+#undef SURFACE_BRUSH2_VECTOR2
+static HRESULT WINAPI surface_brush2_get_RotationAngle( void *iface, float *value )
+{
+    if (!value) return E_POINTER;
+    *value = surface_brush_from2( iface )->rotation;
+    return S_OK;
+}
+static HRESULT WINAPI surface_brush2_put_RotationAngle( void *iface, float value )
+{
+    surface_brush_from2( iface )->rotation = value;
+    surface_brush_changed( surface_brush_from2( iface ) );
+    return S_OK;
+}
+static HRESULT WINAPI surface_brush2_get_RotationAngleInDegrees( void *iface, float *value )
+{
+    if (!value) return E_POINTER;
+    *value = surface_brush_from2( iface )->rotation * 180.0f / 3.14159265f;
+    return S_OK;
+}
+static HRESULT WINAPI surface_brush2_put_RotationAngleInDegrees( void *iface, float value )
+{
+    return surface_brush2_put_RotationAngle( iface, value * 3.14159265f / 180.0f );
+}
+static HRESULT WINAPI surface_brush2_get_TransformMatrix( void *iface, Matrix3x2 *value )
+{
+    if (!value) return E_POINTER;
+    *value = surface_brush_from2( iface )->transform;
+    return S_OK;
+}
+static HRESULT WINAPI surface_brush2_put_TransformMatrix( void *iface, Matrix3x2 value )
+{
+    TRACE( "brush %p %g,%g,%g,%g,%g,%g.\n", iface, value.M11, value.M12, value.M21, value.M22, value.M31, value.M32 );
+    surface_brush_from2( iface )->transform = value;
+    surface_brush_changed( surface_brush_from2( iface ) );
+    return S_OK;
+}
+
+static HRESULT WINAPI surface_brush_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    static const GUID IID_ICompositionSurfaceBrush2_local =
+        { 0xd27174d5, 0x64f5, 0x4692, { 0x9d, 0xc7, 0x71, 0xb6, 0x1d, 0x7e, 0x58, 0x80 } };
+    struct surface_brush *brush = surface_brush_from( iface );
+
+    if (IsEqualGUID( iid, &IID_ICompositionSurfaceBrush2_local ))
+    {
+        InterlockedIncrement( &brush->ref );
+        *out = &brush->vtbl2;
+        return S_OK;
+    }
+    return comp_object_QueryInterface( iface, iid, out );
+}
+
+/* The affine map from a destination pixel in a w x h brush area to a pixel of the sw x sh surface:
+ * src = (m[0] dx + m[2] dy + m[4], m[1] dx + m[3] dy + m[5]). FALSE when it is the plain Fill every
+ * other path already does, or the brush is not ours. */
+static BOOL surface_brush_mapping( void *brush_iface, float w, float h, UINT sw, UINT sh, float m[6] )
+{
+    struct surface_brush *brush;
+    float lw, lh, x0, y0, s, f[6], t[6], c, sn, det;
+    const Matrix3x2 *tm;
+
+    if (!brush_iface || *(void ***)brush_iface != (void **)surface_brush_vtbl || !sw || !sh) return FALSE;
+    brush = surface_brush_from( brush_iface );
+    tm = &brush->transform;
+    if (brush->stretch == 1 && tm->M11 == 1.0f && tm->M12 == 0.0f && tm->M21 == 0.0f && tm->M22 == 1.0f &&
+        tm->M31 == 0.0f && tm->M32 == 0.0f && brush->scale.X == 1.0f && brush->scale.Y == 1.0f &&
+        brush->offset.X == 0.0f && brush->offset.Y == 0.0f && brush->rotation == 0.0f)
+        return FALSE;
+
+    /* stretch and alignment place the surface in the brush area */
+    switch (brush->stretch)
+    {
+    case 0: lw = sw; lh = sh; break;
+    case 2: s = min( w / sw, h / sh ); lw = sw * s; lh = sh * s; break;
+    case 3: s = max( w / sw, h / sh ); lw = sw * s; lh = sh * s; break;
+    default: lw = w; lh = h; break;
+    }
+    x0 = (w - lw) * brush->halign;
+    y0 = (h - lh) * brush->valign;
+    /* surface pixel -> layout */
+    f[0] = lw / sw; f[1] = 0; f[2] = 0; f[3] = lh / sh; f[4] = x0; f[5] = y0;
+    /* then scale and rotation about the centre point, the transform matrix, and the offset less the anchor */
+    c = cosf( brush->rotation ); sn = sinf( brush->rotation );
+    t[0] = brush->scale.X * c;  t[1] = brush->scale.X * sn;
+    t[2] = -brush->scale.Y * sn; t[3] = brush->scale.Y * c;
+    t[4] = brush->center.X - (t[0] * brush->center.X + t[2] * brush->center.Y);
+    t[5] = brush->center.Y - (t[1] * brush->center.X + t[3] * brush->center.Y);
+    {
+        float a[6] = { f[0] * t[0] + f[1] * t[2], f[0] * t[1] + f[1] * t[3], f[2] * t[0] + f[3] * t[2],
+                       f[2] * t[1] + f[3] * t[3], f[4] * t[0] + f[5] * t[2] + t[4], f[4] * t[1] + f[5] * t[3] + t[5] };
+        float b[6] = { a[0] * tm->M11 + a[1] * tm->M21, a[0] * tm->M12 + a[1] * tm->M22,
+                       a[2] * tm->M11 + a[3] * tm->M21, a[2] * tm->M12 + a[3] * tm->M22,
+                       a[4] * tm->M11 + a[5] * tm->M21 + tm->M31, a[4] * tm->M12 + a[5] * tm->M22 + tm->M32 };
+        b[4] += brush->offset.X - brush->anchor.X * w;
+        b[5] += brush->offset.Y - brush->anchor.Y * h;
+        memcpy( f, b, sizeof(f) );
+    }
+    /* invert: destination -> surface */
+    det = f[0] * f[3] - f[1] * f[2];
+    if (fabsf( det ) < 1e-12f) return FALSE;
+    m[0] = f[3] / det;  m[1] = -f[1] / det;
+    m[2] = -f[2] / det; m[3] = f[0] / det;
+    m[4] = -(m[0] * f[4] + m[2] * f[5]);
+    m[5] = -(m[1] * f[4] + m[3] * f[5]);
+    return TRUE;
+}
+
+/* A premultiplied BGRA sample of the surface at a mapped point, or transparent outside it. */
+static inline const BYTE *surface_sample( const BYTE *pixels, UINT sw, UINT sh, const float m[6], unsigned int dx,
+                                          unsigned int dy )
+{
+    static const BYTE clear[4];
+    float fx = m[0] * (dx + 0.5f) + m[2] * (dy + 0.5f) + m[4], fy = m[1] * (dx + 0.5f) + m[3] * (dy + 0.5f) + m[5];
+    int sx = (int)floorf( fx ), sy = (int)floorf( fy );
+
+    if (sx < 0 || sy < 0 || sx >= (int)sw || sy >= (int)sh) return clear;
+    return pixels + ((size_t)sy * sw + sx) * 4;
 }
 
 /* A DropShadow with real property storage. IDropShadow {cb977c07-a154-4851-85e7-a8924c84fad8} slots:
@@ -3432,8 +3684,13 @@ static HRESULT create_surface_brush( void *surface_iface, void **out )
     ensure_typed_vtbls();
     if (!(brush = calloc( 1, sizeof(*brush) ))) return E_OUTOFMEMORY;
     brush->vtbl = (const void **)surface_brush_vtbl;
+    brush->vtbl2 = (const void **)surface_brush2_vtbl;
     brush->kind = "SurfaceBrush";
     brush->ref = 1;
+    brush->stretch = 1;
+    brush->halign = brush->valign = 0.5f;
+    brush->scale.X = brush->scale.Y = 1.0f;
+    brush->transform.M11 = brush->transform.M22 = 1.0f;
     if ((brush->surface = surface_from_iface( surface_iface )))
         IUnknown_AddRef( (IUnknown *)surface_iface );
 
@@ -3690,7 +3947,12 @@ static const BYTE *surface_cached_pixels( struct drawing_surface *surface, D3D11
     surface->opaque = bpp == 4 && bits_opaque( surface->cache, desc->Width, desc->Height );
     surface->cache_valid = TRUE;
     surface->generation = InterlockedIncrement( &content_generation );
-    TRACE( "surface %p %ux%u cached.\n", surface, desc->Width, desc->Height );
+    if (TRACE_ON(dcomp))
+    {
+        size_t i, n = (size_t)desc->Width * desc->Height * bpp, nonzero = 0;
+        for (i = 0; i < n; i++) nonzero += surface->cache[i] != 0;
+        TRACE( "surface %p %ux%u cached, %Iu of %Iu bytes nonzero.\n", surface, desc->Width, desc->Height, nonzero, n );
+    }
     return surface->cache;
 }
 
@@ -3873,8 +4135,37 @@ static void ensure_typed_vtbls(void)
     for (i = 3; i < COMP_OBJECT_SLOTS; i++)
         surface_brush_vtbl[i] = comp_object_slot_fn( i );
     comp_object_set_inspectable( surface_brush_vtbl );
+    surface_brush_vtbl[0] = surface_brush_QueryInterface;
+    surface_brush_vtbl[6] = surface_brush_get_BitmapInterpolationMode;
+    surface_brush_vtbl[7] = surface_brush_put_BitmapInterpolationMode;
+    surface_brush_vtbl[8] = surface_brush_get_HorizontalAlignmentRatio;
+    surface_brush_vtbl[9] = surface_brush_put_HorizontalAlignmentRatio;
+    surface_brush_vtbl[10] = surface_brush_get_Stretch;
+    surface_brush_vtbl[11] = surface_brush_put_Stretch;
     surface_brush_vtbl[12] = surface_brush_get_Surface;
     surface_brush_vtbl[13] = surface_brush_put_Surface;
+    surface_brush_vtbl[14] = surface_brush_get_VerticalAlignmentRatio;
+    surface_brush_vtbl[15] = surface_brush_put_VerticalAlignmentRatio;
+    surface_brush2_vtbl[0] = surface_brush2_QueryInterface;
+    surface_brush2_vtbl[1] = surface_brush2_AddRef;
+    surface_brush2_vtbl[2] = surface_brush2_Release;
+    surface_brush2_vtbl[3] = surface_brush2_GetIids;
+    surface_brush2_vtbl[4] = surface_brush2_GetRuntimeClassName;
+    surface_brush2_vtbl[5] = surface_brush2_GetTrustLevel;
+    surface_brush2_vtbl[6] = surface_brush2_get_AnchorPoint;
+    surface_brush2_vtbl[7] = surface_brush2_put_AnchorPoint;
+    surface_brush2_vtbl[8] = surface_brush2_get_CenterPoint;
+    surface_brush2_vtbl[9] = surface_brush2_put_CenterPoint;
+    surface_brush2_vtbl[10] = surface_brush2_get_Offset;
+    surface_brush2_vtbl[11] = surface_brush2_put_Offset;
+    surface_brush2_vtbl[12] = surface_brush2_get_RotationAngle;
+    surface_brush2_vtbl[13] = surface_brush2_put_RotationAngle;
+    surface_brush2_vtbl[14] = surface_brush2_get_RotationAngleInDegrees;
+    surface_brush2_vtbl[15] = surface_brush2_put_RotationAngleInDegrees;
+    surface_brush2_vtbl[16] = surface_brush2_get_Scale;
+    surface_brush2_vtbl[17] = surface_brush2_put_Scale;
+    surface_brush2_vtbl[18] = surface_brush2_get_TransformMatrix;
+    surface_brush2_vtbl[19] = surface_brush2_put_TransformMatrix;
 
     drop_shadow_vtbl[0] = comp_object_QueryInterface;
     drop_shadow_vtbl[1] = comp_object_AddRef;
@@ -7371,6 +7662,12 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
 
         /* A sprite whose brush is a surface carries real drawn content; paint that instead of
          * guessing a colour. */
+        if (surface && paint_mapped_surface( hdc, impl->brush, surface, (int)x, (int)y, (int)width, (int)height,
+                                             impl->opacity ))
+        {
+            TRACE( "painted public sprite %p from mapped surface %p at %d,%d.\n", impl, surface, (int)x, (int)y );
+            goto children;
+        }
         if (surface && blit_surface_rect( hdc, surface, (int)x, (int)y, (int)width, (int)height ))
         {
             TRACE( "painted public sprite %p from surface %p at %d,%d.\n", impl, surface,
@@ -13780,6 +14077,7 @@ struct mask_brush
     Color cache_color;
     FLOAT cache_grid[8];
     ULONG cache_serial;         /* content generation of cache_bits */
+    ULONG cache_source_layout;  /* the source surface brush's layout_gen */
 };
 
 static void *mask_brush_vtbl[COMP_OBJECT_SLOTS];
@@ -13920,6 +14218,56 @@ static BYTE *read_surface_pixels( struct drawing_surface *surface, D3D11_TEXTURE
     return pixels;
 }
 
+/* A surface brush whose layout is not a plain Fill: the picture resampled through the brush's
+ * stretch, alignment and transform, cached on the brush until any of those or the pixels change. */
+static BOOL paint_mapped_surface( HDC hdc, void *brush_iface, struct drawing_surface *surface, int x, int y,
+                                  int width, int height, float opacity )
+{
+    struct surface_brush *brush;
+    D3D11_TEXTURE2D_DESC desc;
+    const BYTE *pixels;
+    float m[6];
+
+    if (!brush_iface || *(void ***)brush_iface != (void **)surface_brush_vtbl || width <= 0 || height <= 0) return FALSE;
+    brush = surface_brush_from( brush_iface );
+    if (surface->swapchain) return FALSE;
+    if (!(pixels = surface_cached_pixels( surface, &desc )) || desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) return FALSE;
+    if (!surface_brush_mapping( brush_iface, width, height, desc.Width, desc.Height, m )) return FALSE;
+
+    if (!brush->cache_bmp || brush->cache_w != (unsigned int)width || brush->cache_h != (unsigned int)height ||
+        brush->cache_source_gen != surface->generation || brush->cache_layout_gen != brush->layout_gen)
+    {
+        BITMAPINFO info = { { 0 } };
+        unsigned int px, py;
+        void *bits;
+
+        retire_bitmap( brush->cache_bmp );
+        brush->cache_bmp = NULL;
+        info.bmiHeader.biSize = sizeof(info.bmiHeader);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        if (!(brush->cache_bmp = CreateDIBSection( NULL, &info, DIB_RGB_COLORS, &bits, NULL, 0 ))) return FALSE;
+        brush->cache_bits = bits;
+        for (py = 0; py < (unsigned int)height; py++)
+            for (px = 0; px < (unsigned int)width; px++)
+                memcpy( brush->cache_bits + ((size_t)py * width + px) * 4,
+                        surface_sample( pixels, desc.Width, desc.Height, m, px, py ), 4 );
+        brush->cache_w = width;
+        brush->cache_h = height;
+        brush->cache_source_gen = surface->generation;
+        brush->cache_layout_gen = brush->layout_gen;
+        brush->cache_serial = InterlockedIncrement( &content_generation );
+        TRACE( "brush %p: %ux%u surface mapped into %dx%d.\n", brush, desc.Width, desc.Height, width, height );
+    }
+    if (opacity < 0.0f) opacity = 0.0f;
+    if (opacity > 1.0f) opacity = 1.0f;
+    return soft_blend( hdc, x, y, width, height, brush->cache_bits, width * 4, (BYTE)(opacity * 255.0f + 0.5f),
+                       brush, brush->cache_serial );
+}
+
 /* Composite a mask brush onto the DC: the mask's alpha (A8, or the alpha channel of a BGRA surface)
  * scales the source, which is a colour brush or a surface. */
 static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int width, int height, float opacity )
@@ -13935,6 +14283,10 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
     FLOAT grid_key[8] = { 0 };
     HBITMAP old;
     Color color = { 0 };
+    IUnknown *src = NULL;
+    float smap[6];
+    BOOL mapped = FALSE;
+    ULONG layout = 0;
     HDC mem;
 
     if (!brush) return FALSE;
@@ -13952,7 +14304,7 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
     }
     {
         struct nine_grid_brush *source_grid = nine_grid_from( brush->source );
-        IUnknown *src = source_grid ? source_grid->source : brush->source;
+        src = source_grid ? source_grid->source : brush->source;
 
         have_color = src && brush_solid_color( (ICompositionBrush *)src, &color );
         if (!have_color && src) source_surface = brush_surface( src );
@@ -13973,6 +14325,11 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
 
     w = grid && width > 0 ? (unsigned int)width : mask_desc.Width;
     h = grid && height > 0 ? (unsigned int)height : mask_desc.Height;
+    if (source_surface)
+    {
+        mapped = surface_brush_mapping( src, w, h, source_desc.Width, source_desc.Height, smap );
+        if (*(void ***)src == (void **)surface_brush_vtbl) layout = surface_brush_from( src )->layout_gen;
+    }
     if (grid)
     {
         grid_key[0] = grid->left; grid_key[1] = grid->right; grid_key[2] = grid->top; grid_key[3] = grid->bottom;
@@ -13983,7 +14340,7 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
            brush->cache_source_surface == source_surface &&
            (!source_surface || brush->cache_source_gen == source_surface->generation) &&
            brush->cache_have_color == have_color && (!have_color || !memcmp( &brush->cache_color, &color, sizeof(color) )) &&
-           !memcmp( brush->cache_grid, grid_key, sizeof(grid_key) );
+           !memcmp( brush->cache_grid, grid_key, sizeof(grid_key) ) && brush->cache_source_layout == layout;
     if (!same)
     {
         BITMAPINFO info = { { 0 } };
@@ -14021,10 +14378,11 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
                     out[2] = color.R * a / 255;
                     out[3] = a;
                 }
-                else if (px < source_desc.Width && py < source_desc.Height)
+                else if (mapped || (px < source_desc.Width && py < source_desc.Height))
                 {
                     /* source surfaces hold premultiplied BGRA */
-                    const BYTE *in = source + ((size_t)py * source_desc.Width + px) * 4;
+                    const BYTE *in = mapped ? surface_sample( source, source_desc.Width, source_desc.Height, smap, px, py )
+                                            : source + ((size_t)py * source_desc.Width + px) * 4;
                     out[0] = in[0] * a / 255;
                     out[1] = in[1] * a / 255;
                     out[2] = in[2] * a / 255;
@@ -14045,6 +14403,7 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
         brush->cache_source_surface = source_surface; brush->cache_source_gen = source_surface ? source_surface->generation : 0;
         brush->cache_have_color = have_color; brush->cache_color = color;
         memcpy( brush->cache_grid, grid_key, sizeof(grid_key) );
+        brush->cache_source_layout = layout;
         brush->cache_serial = InterlockedIncrement( &content_generation );
     }
     /* The visual's opacity scales the whole brush: XAML draws its keypad button fills as opaque white masks

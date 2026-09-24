@@ -8505,7 +8505,12 @@ Calculator is AE 0.
   `CImagingHelper::RemoveFrameOrientationWithoutPhotoMetadataPolicy` on a NULL writer. The cause
   was the missing `[out]` in `wincodec.idl` (see AGENTS.md). Thumbnails now save
   (`docs/screenshots/shapr3d-thumbnail-saved.png`, the JPEG from `LocalState/storage/resources`).
-- **They still do not display**, and neither do the What's New images: the tiles are background
-  colour only (4 colours). XAML is not showing images from files or HTTP. Next.
+- What's New images now display (`docs/screenshots/shapr3d-recents-images.png`). XAML decoded
+  them correctly all along; a dump of the 976x540 surfaces showed the real pictures. dcomp ignored
+  the surface brush's Stretch, alignment and `ICompositionSurfaceBrush2::TransformMatrix`, so each
+  image painted as one corner of itself. XAML's Image uses Stretch None plus a fitting matrix.
+- **Project thumbnails still do not display**, even though the JPEGs are saved. The app never
+  opens the files: `+file` shows only a directory listing and one path lookup, and there is nothing
+  through windows.storage. No surface of their size is ever created. Unexplained.
 - Seen once and not reproduced: a fault in `adapter_vk_copy_bo_address`'s memcpy during a texture
   Map on wined3d's CS thread. Shapr3D's crash handler then died on that thread.

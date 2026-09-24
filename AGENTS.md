@@ -541,6 +541,11 @@ got a NULL `IWICMetadataQueryWriter` from a call that succeeded, because `wincod
 the writer, never sent it back and freed it. `WINEDEBUG=trace+rpc` shows it:
 `stub_do_args param[0] ... IsIn` with no `IsOut`.
 
+**To see what XAML actually put in a composition surface, dump it.** Writing
+`surface->cache` to `Z:\tmp\*.raw` from `surface_cached_pixels` and converting with
+`magick -size WxH -depth 8 bgra:f.raw f.png` ended a "decode is broken" theory in one run. The
+pictures were there, and the bug was in how the brush was painted.
+
 **`.as<>()` vs `try_as<>()` is the whole difference, and you can tell which one threw.** C++/WinRT's
 `throw_hresult` is a switch on the HRESULT with one `call` + `int3` per value, so the **return
 address in the app's own crash callstack lands in the branch for the specific HRESULT**. For
