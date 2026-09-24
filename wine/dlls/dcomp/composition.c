@@ -127,6 +127,7 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
                                  float parent_height, float sx, float sy );
 static BOOL brush_solid_color( ICompositionBrush *brush, Color *color );
 static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int width, int height, float opacity );
+static BOOL paint_gradient_sprite( HDC hdc, void *brush_iface, int x, int y, int width, int height, float opacity );
 struct drawing_surface;
 static BOOL paint_mapped_surface( HDC hdc, void *brush_iface, struct drawing_surface *surface, int x, int y,
                                   int width, int height, float opacity );
@@ -7845,6 +7846,11 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
             TRACE( "painted public sprite %p with mask brush at %d,%d.\n", impl, (int)x, (int)y );
             goto children;
         }
+        if (paint_gradient_sprite( hdc, impl->brush, (int)x, (int)y, (int)width, (int)height, impl->opacity ))
+        {
+            TRACE( "painted public sprite %p with gradient brush at %d,%d.\n", impl, (int)x, (int)y );
+            goto children;
+        }
         matched = brush_solid_color( impl->brush, &c );
         /* Colour brushes carry alpha: a transparent (A=0) fill is XAML's default for unset
          * backgrounds and hover/pressed overlays and must not cover what is below. Brushes we
@@ -14387,6 +14393,688 @@ static BYTE *read_surface_pixels( struct drawing_surface *surface, D3D11_TEXTURE
     return pixels;
 }
 
+/* ---- CompositionLinearGradientBrush ----
+ * WinUI draws control borders, focus rings and accents with these. Every call used to land on
+ * recording objects: get_ColorStops handed out a fresh recording object that swallowed the stops'
+ * Append, and the brush's three interfaces shared one generic vtable, so nothing was drawn at all.
+ *
+ * CompositionColorGradientStop (default interface ICompositionColorGradientStop):
+ *   6 get_Color, 7 put_Color, 8 get_Offset, 9 put_Offset
+ * CompositionColorGradientStopCollection, IVector<CompositionColorGradientStop> {bf2e107e}:
+ *   6 GetAt, 7 get_Size, 8 GetView, 9 IndexOf, 10 SetAt, 11 InsertAt, 12 RemoveAt, 13 Append,
+ *   14 RemoveAtEnd, 15 Clear, 16 GetMany, 17 ReplaceAll
+ * CompositionLinearGradientBrush: ICompositionLinearGradientBrush {983bc519} (default)
+ *   6 get_EndPoint, 7 put_EndPoint, 8 get_StartPoint, 9 put_StartPoint;
+ * ICompositionGradientBrush {1d9709e0}: 6/7 AnchorPoint, 8/9 CenterPoint, 10 get_ColorStops,
+ *   11/12 ExtendMode, 13/14 InterpolationSpace, 15/16 Offset, 17/18 RotationAngle,
+ *   19/20 RotationAngleInDegrees, 21/22 Scale, 23/24 TransformMatrix;
+ * ICompositionGradientBrush2 {899dd5a1}: 6/7 MappingMode. */
+struct color_stop
+{
+    const void **vtbl;          /* generic composition object layout, must stay first */
+    const char *kind;
+    LONG ref;
+    Color color;
+    float offset;
+};
+static void *color_stop_vtbl[COMP_OBJECT_SLOTS];
+static LONG gradient_generation;
+
+static struct color_stop *color_stop_from( void *iface )
+{
+    if (!iface || *(void ***)iface != (void **)color_stop_vtbl) return NULL;
+    return CONTAINING_RECORD( iface, struct color_stop, vtbl );
+}
+static HRESULT WINAPI color_stop_get_Color( void *iface, Color *value )
+{
+    if (!value) return E_POINTER;
+    *value = color_stop_from( iface )->color;
+    return S_OK;
+}
+static HRESULT WINAPI color_stop_put_Color( void *iface, Color value )
+{
+    color_stop_from( iface )->color = value;
+    InterlockedIncrement( &gradient_generation );
+    scene_changed();
+    return S_OK;
+}
+static HRESULT WINAPI color_stop_get_Offset( void *iface, float *value )
+{
+    if (!value) return E_POINTER;
+    *value = color_stop_from( iface )->offset;
+    return S_OK;
+}
+static HRESULT WINAPI color_stop_put_Offset( void *iface, float value )
+{
+    color_stop_from( iface )->offset = value;
+    InterlockedIncrement( &gradient_generation );
+    scene_changed();
+    return S_OK;
+}
+static HRESULT create_color_stop( float offset, Color color, void **out )
+{
+    struct color_stop *stop;
+    unsigned int i;
+
+    if (!out) return E_POINTER;
+    if (!color_stop_vtbl[0])
+    {
+        color_stop_vtbl[1] = comp_object_AddRef;
+        color_stop_vtbl[2] = comp_object_Release;
+        for (i = 3; i < COMP_OBJECT_SLOTS; i++) color_stop_vtbl[i] = comp_object_slot_fn( i );
+        comp_object_set_inspectable( color_stop_vtbl );
+        color_stop_vtbl[6] = color_stop_get_Color;
+        color_stop_vtbl[7] = color_stop_put_Color;
+        color_stop_vtbl[8] = color_stop_get_Offset;
+        color_stop_vtbl[9] = color_stop_put_Offset;
+        InterlockedExchangePointer( &color_stop_vtbl[0], comp_object_QueryInterface );
+    }
+    if (!(stop = calloc( 1, sizeof(*stop) ))) return E_OUTOFMEMORY;
+    stop->vtbl = (const void **)color_stop_vtbl;
+    stop->kind = "ColorGradientStop";
+    stop->ref = 1;
+    stop->offset = offset;
+    stop->color = color;
+    *out = &stop->vtbl;
+    return S_OK;
+}
+
+struct stop_collection
+{
+    const void **vtbl;          /* IVector<CompositionColorGradientStop> */
+    LONG ref;
+    IUnknown **stops;
+    UINT32 count, capacity;
+};
+static struct stop_collection *stop_collection_from( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct stop_collection, vtbl );
+}
+static HRESULT WINAPI stop_collection_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    static const GUID IID_IVector_ColorGradientStop =
+        { 0xbf2e107e, 0xf3db, 0x56cd, { 0x91, 0xed, 0xc1, 0x12, 0x94, 0x06, 0xd5, 0x52 } };
+    static const GUID IID_ICompositionColorGradientStopCollection =
+        { 0x9f1d20ec, 0x7b04, 0x4b1d, { 0x90, 0xbc, 0x9f, 0xa3, 0x2c, 0x0c, 0xfd, 0x26 } };
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IVector_ColorGradientStop ) ||
+        IsEqualGUID( iid, &IID_ICompositionColorGradientStopCollection ))
+    {
+        InterlockedIncrement( &stop_collection_from( iface )->ref );
+        *out = iface;
+        return S_OK;
+    }
+    TRACE( "%s not implemented.\n", debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI stop_collection_AddRef( void *iface )
+{
+    return InterlockedIncrement( &stop_collection_from( iface )->ref );
+}
+static ULONG WINAPI stop_collection_Release( void *iface )
+{
+    struct stop_collection *impl = stop_collection_from( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref ), i;
+
+    if (!ref)
+    {
+        for (i = 0; i < impl->count; i++) IUnknown_Release( impl->stops[i] );
+        free( impl->stops );
+        free( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI stop_collection_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI stop_collection_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class[] = L"Windows.UI.Composition.CompositionColorGradientStopCollection";
+    return WindowsCreateString( class, ARRAY_SIZE(class) - 1, name );
+}
+static HRESULT WINAPI stop_collection_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    if (!level) return E_POINTER;
+    *level = BaseTrust;
+    return S_OK;
+}
+static HRESULT WINAPI stop_collection_GetAt( void *iface, UINT32 index, IUnknown **item )
+{
+    struct stop_collection *impl = stop_collection_from( iface );
+    if (!item) return E_POINTER;
+    if (index >= impl->count) return E_BOUNDS;
+    IUnknown_AddRef( (*item = impl->stops[index]) );
+    return S_OK;
+}
+static HRESULT WINAPI stop_collection_get_Size( void *iface, UINT32 *size )
+{
+    if (!size) return E_POINTER;
+    *size = stop_collection_from( iface )->count;
+    return S_OK;
+}
+static HRESULT WINAPI stop_collection_GetView( void *iface, void **view )
+{
+    FIXME( "not implemented.\n" );
+    if (view) *view = NULL;
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI stop_collection_IndexOf( void *iface, IUnknown *item, UINT32 *index, boolean *found )
+{
+    struct stop_collection *impl = stop_collection_from( iface );
+    UINT32 i;
+
+    if (!index || !found) return E_POINTER;
+    for (i = 0; i < impl->count; i++)
+        if (impl->stops[i] == item) break;
+    *found = i < impl->count;
+    *index = *found ? i : 0;
+    return S_OK;
+}
+static BOOL stop_collection_reserve( struct stop_collection *impl, UINT32 count )
+{
+    IUnknown **stops;
+    if (count <= impl->capacity) return TRUE;
+    if (!(stops = realloc( impl->stops, max( count, impl->capacity * 2 ) * sizeof(*stops) ))) return FALSE;
+    impl->stops = stops;
+    impl->capacity = max( count, impl->capacity * 2 );
+    return TRUE;
+}
+static void stop_collection_changed(void)
+{
+    InterlockedIncrement( &gradient_generation );
+    scene_changed();
+}
+static HRESULT WINAPI stop_collection_SetAt( void *iface, UINT32 index, IUnknown *item )
+{
+    struct stop_collection *impl = stop_collection_from( iface );
+    if (index >= impl->count) return E_BOUNDS;
+    if (!color_stop_from( item )) return E_INVALIDARG;
+    IUnknown_AddRef( item );
+    IUnknown_Release( impl->stops[index] );
+    impl->stops[index] = item;
+    stop_collection_changed();
+    return S_OK;
+}
+static HRESULT WINAPI stop_collection_InsertAt( void *iface, UINT32 index, IUnknown *item )
+{
+    struct stop_collection *impl = stop_collection_from( iface );
+    if (index > impl->count) return E_BOUNDS;
+    if (!color_stop_from( item )) return E_INVALIDARG;
+    if (!stop_collection_reserve( impl, impl->count + 1 )) return E_OUTOFMEMORY;
+    memmove( impl->stops + index + 1, impl->stops + index, (impl->count - index) * sizeof(*impl->stops) );
+    IUnknown_AddRef( (impl->stops[index] = item) );
+    impl->count++;
+    stop_collection_changed();
+    return S_OK;
+}
+static HRESULT WINAPI stop_collection_RemoveAt( void *iface, UINT32 index )
+{
+    struct stop_collection *impl = stop_collection_from( iface );
+    if (index >= impl->count) return E_BOUNDS;
+    IUnknown_Release( impl->stops[index] );
+    memmove( impl->stops + index, impl->stops + index + 1, (impl->count - index - 1) * sizeof(*impl->stops) );
+    impl->count--;
+    stop_collection_changed();
+    return S_OK;
+}
+static HRESULT WINAPI stop_collection_Append( void *iface, IUnknown *item )
+{
+    return stop_collection_InsertAt( iface, stop_collection_from( iface )->count, item );
+}
+static HRESULT WINAPI stop_collection_RemoveAtEnd( void *iface )
+{
+    struct stop_collection *impl = stop_collection_from( iface );
+    if (!impl->count) return E_BOUNDS;
+    return stop_collection_RemoveAt( iface, impl->count - 1 );
+}
+static HRESULT WINAPI stop_collection_Clear( void *iface )
+{
+    struct stop_collection *impl = stop_collection_from( iface );
+    while (impl->count) IUnknown_Release( impl->stops[--impl->count] );
+    stop_collection_changed();
+    return S_OK;
+}
+static HRESULT WINAPI stop_collection_GetMany( void *iface, UINT32 start, UINT32 size, IUnknown **items, UINT32 *actual )
+{
+    struct stop_collection *impl = stop_collection_from( iface );
+    UINT32 i;
+
+    if (!actual) return E_POINTER;
+    *actual = 0;
+    for (i = start; i < impl->count && *actual < size; i++, (*actual)++)
+        IUnknown_AddRef( (items[*actual] = impl->stops[i]) );
+    return S_OK;
+}
+static HRESULT WINAPI stop_collection_ReplaceAll( void *iface, UINT32 count, IUnknown **items )
+{
+    UINT32 i;
+    HRESULT hr;
+
+    stop_collection_Clear( iface );
+    for (i = 0; i < count; i++)
+        if (FAILED(hr = stop_collection_Append( iface, items[i] ))) return hr;
+    return S_OK;
+}
+static const void *stop_collection_vtbl[] =
+{
+    stop_collection_QueryInterface, stop_collection_AddRef, stop_collection_Release,
+    stop_collection_GetIids, stop_collection_GetRuntimeClassName, stop_collection_GetTrustLevel,
+    stop_collection_GetAt, stop_collection_get_Size, stop_collection_GetView, stop_collection_IndexOf,
+    stop_collection_SetAt, stop_collection_InsertAt, stop_collection_RemoveAt, stop_collection_Append,
+    stop_collection_RemoveAtEnd, stop_collection_Clear, stop_collection_GetMany, stop_collection_ReplaceAll,
+};
+
+struct gradient_brush
+{
+    const void **vtbl;          /* ICompositionLinearGradientBrush; generic composition object layout */
+    const char *kind;
+    LONG ref;
+    const void **grad_vtbl;     /* ICompositionGradientBrush */
+    const void **grad2_vtbl;    /* ICompositionGradientBrush2 */
+    struct stop_collection *stops;
+    Vector2 start, end, anchor, center, offset, scale;
+    float rotation;             /* radians */
+    Matrix3x2 transform;
+    INT32 extend, interpolation, mapping;
+    /* the rendered pixels, for sprites painted with this brush */
+    HBITMAP cache_bmp;
+    BYTE *cache_bits;
+    unsigned int cache_w, cache_h;
+    LONG cache_gen;
+    ULONG cache_serial;
+};
+static void *gradient_brush_vtbl[COMP_OBJECT_SLOTS];
+static void *gradient_grad_vtbl[25];
+static void *gradient_grad2_vtbl[8];
+
+static struct gradient_brush *gradient_brush_from( void *iface )
+{
+    if (!iface || *(void ***)iface != (void **)gradient_brush_vtbl) return NULL;
+    return CONTAINING_RECORD( iface, struct gradient_brush, vtbl );
+}
+static struct gradient_brush *gradient_from_grad( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct gradient_brush, grad_vtbl );
+}
+static struct gradient_brush *gradient_from_grad2( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct gradient_brush, grad2_vtbl );
+}
+static void gradient_changed(void)
+{
+    InterlockedIncrement( &gradient_generation );
+    scene_changed();
+}
+static ULONG WINAPI gradient_brush_Release( void *iface )
+{
+    struct gradient_brush *impl = CONTAINING_RECORD( iface, struct gradient_brush, vtbl );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+
+    if (!ref)
+    {
+        if (impl->stops) stop_collection_Release( &impl->stops->vtbl );
+        retire_bitmap( impl->cache_bmp );
+        free( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI gradient_brush_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    static const GUID IID_ICompositionGradientBrush_local =
+        { 0x1d9709e0, 0xffc6, 0x4c0e, { 0xa9, 0xab, 0x34, 0x14, 0x4d, 0x4c, 0x90, 0x98 } };
+    static const GUID IID_ICompositionGradientBrush2_local =
+        { 0x899dd5a1, 0xb4c7, 0x4b33, { 0xa1, 0xb6, 0x26, 0x4a, 0xdd, 0xc2, 0x6d, 0x10 } };
+    struct gradient_brush *impl = CONTAINING_RECORD( iface, struct gradient_brush, vtbl );
+
+    if (IsEqualGUID( iid, &IID_ICompositionGradientBrush_local ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = &impl->grad_vtbl;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_ICompositionGradientBrush2_local ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = &impl->grad2_vtbl;
+        return S_OK;
+    }
+    return comp_object_QueryInterface( iface, iid, out );
+}
+static HRESULT WINAPI gradient_brush_get_EndPoint( void *iface, Vector2 *value )
+{
+    if (!value) return E_POINTER;
+    *value = gradient_brush_from( iface )->end;
+    return S_OK;
+}
+static HRESULT WINAPI gradient_brush_put_EndPoint( void *iface, Vector2 value )
+{
+    TRACE( "brush %p end %g,%g.\n", iface, value.X, value.Y );
+    gradient_brush_from( iface )->end = value;
+    gradient_changed();
+    return S_OK;
+}
+static HRESULT WINAPI gradient_brush_get_StartPoint( void *iface, Vector2 *value )
+{
+    if (!value) return E_POINTER;
+    *value = gradient_brush_from( iface )->start;
+    return S_OK;
+}
+static HRESULT WINAPI gradient_brush_put_StartPoint( void *iface, Vector2 value )
+{
+    TRACE( "brush %p start %g,%g.\n", iface, value.X, value.Y );
+    gradient_brush_from( iface )->start = value;
+    gradient_changed();
+    return S_OK;
+}
+
+/* ICompositionGradientBrush view */
+static HRESULT WINAPI gradient_grad_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return gradient_brush_QueryInterface( &gradient_from_grad( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI gradient_grad_AddRef( void *iface )
+{
+    return InterlockedIncrement( &gradient_from_grad( iface )->ref );
+}
+static ULONG WINAPI gradient_grad_Release( void *iface )
+{
+    return gradient_brush_Release( &gradient_from_grad( iface )->vtbl );
+}
+static HRESULT WINAPI gradient_view_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI gradient_view_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class[] = L"Windows.UI.Composition.CompositionLinearGradientBrush";
+    return WindowsCreateString( class, ARRAY_SIZE(class) - 1, name );
+}
+static HRESULT WINAPI gradient_view_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    if (!level) return E_POINTER;
+    *level = BaseTrust;
+    return S_OK;
+}
+#define GRADIENT_PROPERTY( name, type, field, fmt, ... )                                          \
+static HRESULT WINAPI gradient_grad_get_##name( void *iface, type *value )                        \
+{                                                                                                 \
+    if (!value) return E_POINTER;                                                                 \
+    *value = gradient_from_grad( iface )->field;                                                  \
+    return S_OK;                                                                                  \
+}                                                                                                 \
+static HRESULT WINAPI gradient_grad_put_##name( void *iface, type value )                         \
+{                                                                                                 \
+    TRACE( "brush %p " #name " " fmt ".\n", gradient_from_grad( iface ), __VA_ARGS__ );           \
+    gradient_from_grad( iface )->field = value;                                                   \
+    gradient_changed();                                                                           \
+    return S_OK;                                                                                  \
+}
+GRADIENT_PROPERTY( AnchorPoint, Vector2, anchor, "%g,%g", value.X, value.Y )
+GRADIENT_PROPERTY( CenterPoint, Vector2, center, "%g,%g", value.X, value.Y )
+GRADIENT_PROPERTY( ExtendMode, INT32, extend, "%d", value )
+GRADIENT_PROPERTY( InterpolationSpace, INT32, interpolation, "%d", value )
+GRADIENT_PROPERTY( Offset, Vector2, offset, "%g,%g", value.X, value.Y )
+GRADIENT_PROPERTY( RotationAngle, float, rotation, "%g", value )
+GRADIENT_PROPERTY( Scale, Vector2, scale, "%g,%g", value.X, value.Y )
+GRADIENT_PROPERTY( TransformMatrix, Matrix3x2, transform, "%g,%g,%g,%g,%g,%g", value.M11, value.M12, value.M21,
+                   value.M22, value.M31, value.M32 )
+#undef GRADIENT_PROPERTY
+static HRESULT WINAPI gradient_grad_get_RotationAngleInDegrees( void *iface, float *value )
+{
+    if (!value) return E_POINTER;
+    *value = gradient_from_grad( iface )->rotation * 180.0f / 3.14159265f;
+    return S_OK;
+}
+static HRESULT WINAPI gradient_grad_put_RotationAngleInDegrees( void *iface, float value )
+{
+    return gradient_grad_put_RotationAngle( iface, value * 3.14159265f / 180.0f );
+}
+static HRESULT WINAPI gradient_grad_get_ColorStops( void *iface, void **value )
+{
+    struct gradient_brush *impl = gradient_from_grad( iface );
+    if (!value) return E_POINTER;
+    stop_collection_AddRef( &impl->stops->vtbl );
+    *value = &impl->stops->vtbl;
+    return S_OK;
+}
+
+/* ICompositionGradientBrush2 view */
+static HRESULT WINAPI gradient_grad2_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return gradient_brush_QueryInterface( &gradient_from_grad2( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI gradient_grad2_AddRef( void *iface )
+{
+    return InterlockedIncrement( &gradient_from_grad2( iface )->ref );
+}
+static ULONG WINAPI gradient_grad2_Release( void *iface )
+{
+    return gradient_brush_Release( &gradient_from_grad2( iface )->vtbl );
+}
+static HRESULT WINAPI gradient_grad2_get_MappingMode( void *iface, INT32 *value )
+{
+    if (!value) return E_POINTER;
+    *value = gradient_from_grad2( iface )->mapping;
+    return S_OK;
+}
+static HRESULT WINAPI gradient_grad2_put_MappingMode( void *iface, INT32 value )
+{
+    TRACE( "brush %p mapping %d.\n", gradient_from_grad2( iface ), value );
+    gradient_from_grad2( iface )->mapping = value;
+    gradient_changed();
+    return S_OK;
+}
+
+static HRESULT create_linear_gradient_brush( void **out )
+{
+    struct gradient_brush *brush;
+    unsigned int i;
+
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!gradient_brush_vtbl[0])
+    {
+        gradient_brush_vtbl[1] = comp_object_AddRef;
+        gradient_brush_vtbl[2] = gradient_brush_Release;
+        for (i = 3; i < COMP_OBJECT_SLOTS; i++) gradient_brush_vtbl[i] = comp_object_slot_fn( i );
+        comp_object_set_inspectable( gradient_brush_vtbl );
+        gradient_brush_vtbl[6] = gradient_brush_get_EndPoint;
+        gradient_brush_vtbl[7] = gradient_brush_put_EndPoint;
+        gradient_brush_vtbl[8] = gradient_brush_get_StartPoint;
+        gradient_brush_vtbl[9] = gradient_brush_put_StartPoint;
+
+        gradient_grad_vtbl[0] = gradient_grad_QueryInterface;
+        gradient_grad_vtbl[1] = gradient_grad_AddRef;
+        gradient_grad_vtbl[2] = gradient_grad_Release;
+        gradient_grad_vtbl[3] = gradient_view_GetIids;
+        gradient_grad_vtbl[4] = gradient_view_GetRuntimeClassName;
+        gradient_grad_vtbl[5] = gradient_view_GetTrustLevel;
+        gradient_grad_vtbl[6] = gradient_grad_get_AnchorPoint;
+        gradient_grad_vtbl[7] = gradient_grad_put_AnchorPoint;
+        gradient_grad_vtbl[8] = gradient_grad_get_CenterPoint;
+        gradient_grad_vtbl[9] = gradient_grad_put_CenterPoint;
+        gradient_grad_vtbl[10] = gradient_grad_get_ColorStops;
+        gradient_grad_vtbl[11] = gradient_grad_get_ExtendMode;
+        gradient_grad_vtbl[12] = gradient_grad_put_ExtendMode;
+        gradient_grad_vtbl[13] = gradient_grad_get_InterpolationSpace;
+        gradient_grad_vtbl[14] = gradient_grad_put_InterpolationSpace;
+        gradient_grad_vtbl[15] = gradient_grad_get_Offset;
+        gradient_grad_vtbl[16] = gradient_grad_put_Offset;
+        gradient_grad_vtbl[17] = gradient_grad_get_RotationAngle;
+        gradient_grad_vtbl[18] = gradient_grad_put_RotationAngle;
+        gradient_grad_vtbl[19] = gradient_grad_get_RotationAngleInDegrees;
+        gradient_grad_vtbl[20] = gradient_grad_put_RotationAngleInDegrees;
+        gradient_grad_vtbl[21] = gradient_grad_get_Scale;
+        gradient_grad_vtbl[22] = gradient_grad_put_Scale;
+        gradient_grad_vtbl[23] = gradient_grad_get_TransformMatrix;
+        gradient_grad_vtbl[24] = gradient_grad_put_TransformMatrix;
+
+        gradient_grad2_vtbl[0] = gradient_grad2_QueryInterface;
+        gradient_grad2_vtbl[1] = gradient_grad2_AddRef;
+        gradient_grad2_vtbl[2] = gradient_grad2_Release;
+        gradient_grad2_vtbl[3] = gradient_view_GetIids;
+        gradient_grad2_vtbl[4] = gradient_view_GetRuntimeClassName;
+        gradient_grad2_vtbl[5] = gradient_view_GetTrustLevel;
+        gradient_grad2_vtbl[6] = gradient_grad2_get_MappingMode;
+        gradient_grad2_vtbl[7] = gradient_grad2_put_MappingMode;
+        InterlockedExchangePointer( &gradient_brush_vtbl[0], gradient_brush_QueryInterface );
+    }
+    if (!(brush = calloc( 1, sizeof(*brush) ))) return E_OUTOFMEMORY;
+    if (!(brush->stops = calloc( 1, sizeof(*brush->stops) )))
+    {
+        free( brush );
+        return E_OUTOFMEMORY;
+    }
+    brush->stops->vtbl = (const void **)stop_collection_vtbl;
+    brush->stops->ref = 1;
+    brush->vtbl = (const void **)gradient_brush_vtbl;
+    brush->grad_vtbl = (const void **)gradient_grad_vtbl;
+    brush->grad2_vtbl = (const void **)gradient_grad2_vtbl;
+    brush->kind = "LinearGradientBrush";
+    brush->ref = 1;
+    brush->end.X = 1.0f;                 /* the documented defaults: (0,0) to (1,0), relative */
+    brush->scale.X = brush->scale.Y = 1.0f;
+    brush->transform.M11 = brush->transform.M22 = 1.0f;
+    brush->mapping = 1;                  /* CompositionMappingMode_Relative */
+    TRACE( "created linear gradient brush %p.\n", brush );
+    *out = &brush->vtbl;
+    return S_OK;
+}
+
+static int stop_compare( const void *a, const void *b )
+{
+    float oa = (*(struct color_stop *const *)a)->offset, ob = (*(struct color_stop *const *)b)->offset;
+    return oa < ob ? -1 : oa > ob;
+}
+
+/* The brush's pixels over a w x h area, premultiplied BGRA: every pixel's centre is mapped back
+ * through the brush transform and projected onto the start-end line. */
+static void gradient_render( struct gradient_brush *brush, BYTE *out, unsigned int w, unsigned int h )
+{
+    struct color_stop *stops[32];
+    unsigned int count = 0, i, px, py;
+    float sx, sy, ex, ey, dx, dy, len2, c, sn, f[6], m[6], det;
+    const Matrix3x2 *tm = &brush->transform;
+
+    for (i = 0; i < brush->stops->count && count < ARRAY_SIZE(stops); i++)
+        if ((stops[count] = color_stop_from( brush->stops->stops[i] ))) count++;
+    if (!count)
+    {
+        memset( out, 0, (size_t)w * h * 4 );
+        return;
+    }
+    qsort( stops, count, sizeof(*stops), stop_compare );
+
+    sx = brush->start.X; sy = brush->start.Y; ex = brush->end.X; ey = brush->end.Y;
+    if (brush->mapping == 1)
+    {
+        sx *= w; sy *= h; ex *= w; ey *= h;
+    }
+    dx = ex - sx; dy = ey - sy;
+    len2 = dx * dx + dy * dy;
+
+    /* brush -> area transform, as for a visual: scale and rotation about the centre point, the
+     * transform matrix, then the offset less the anchor */
+    c = cosf( brush->rotation ); sn = sinf( brush->rotation );
+    f[0] = brush->scale.X * c;  f[1] = brush->scale.X * sn;
+    f[2] = -brush->scale.Y * sn; f[3] = brush->scale.Y * c;
+    f[4] = brush->center.X - (f[0] * brush->center.X + f[2] * brush->center.Y);
+    f[5] = brush->center.Y - (f[1] * brush->center.X + f[3] * brush->center.Y);
+    {
+        float g[6] = { f[0] * tm->M11 + f[1] * tm->M21, f[0] * tm->M12 + f[1] * tm->M22,
+                       f[2] * tm->M11 + f[3] * tm->M21, f[2] * tm->M12 + f[3] * tm->M22,
+                       f[4] * tm->M11 + f[5] * tm->M21 + tm->M31, f[4] * tm->M12 + f[5] * tm->M22 + tm->M32 };
+        g[4] += brush->offset.X - brush->anchor.X * w;
+        g[5] += brush->offset.Y - brush->anchor.Y * h;
+        memcpy( f, g, sizeof(f) );
+    }
+    det = f[0] * f[3] - f[1] * f[2];
+    if (fabsf( det ) < 1e-12f) det = 1.0f, f[0] = f[3] = 1.0f, f[1] = f[2] = f[4] = f[5] = 0.0f;
+    m[0] = f[3] / det;  m[1] = -f[1] / det;
+    m[2] = -f[2] / det; m[3] = f[0] / det;
+    m[4] = -(m[0] * f[4] + m[2] * f[5]);
+    m[5] = -(m[1] * f[4] + m[3] * f[5]);
+
+    for (py = 0; py < h; py++)
+    {
+        for (px = 0; px < w; px++)
+        {
+            float qx = m[0] * (px + 0.5f) + m[2] * (py + 0.5f) + m[4];
+            float qy = m[1] * (px + 0.5f) + m[3] * (py + 0.5f) + m[5];
+            float t = len2 > 1e-12f ? ((qx - sx) * dx + (qy - sy) * dy) / len2 : 0.0f;
+            float a, r, g, b;
+            BYTE *o = out + ((size_t)py * w + px) * 4;
+
+            if (brush->extend == 1) t -= floorf( t );                                   /* wrap */
+            else if (brush->extend == 2) { t = fmodf( fabsf( t ), 2.0f ); if (t > 1.0f) t = 2.0f - t; } /* mirror */
+
+            if (t <= stops[0]->offset)
+            {
+                const Color *s = &stops[0]->color;
+                a = s->A; r = s->R; g = s->G; b = s->B;
+            }
+            else if (t >= stops[count - 1]->offset)
+            {
+                const Color *s = &stops[count - 1]->color;
+                a = s->A; r = s->R; g = s->G; b = s->B;
+            }
+            else
+            {
+                const struct color_stop *s0, *s1;
+                float k;
+                for (i = 1; i < count && stops[i]->offset < t; i++) ;
+                s0 = stops[i - 1]; s1 = stops[i];
+                k = s1->offset > s0->offset ? (t - s0->offset) / (s1->offset - s0->offset) : 0.0f;
+                a = s0->color.A + (s1->color.A - s0->color.A) * k;
+                r = s0->color.R + (s1->color.R - s0->color.R) * k;
+                g = s0->color.G + (s1->color.G - s0->color.G) * k;
+                b = s0->color.B + (s1->color.B - s0->color.B) * k;
+            }
+            o[0] = (BYTE)(b * a / 255.0f + 0.5f);
+            o[1] = (BYTE)(g * a / 255.0f + 0.5f);
+            o[2] = (BYTE)(r * a / 255.0f + 0.5f);
+            o[3] = (BYTE)(a + 0.5f);
+        }
+    }
+}
+
+/* A sprite painted with a gradient brush. */
+static BOOL paint_gradient_sprite( HDC hdc, void *brush_iface, int x, int y, int width, int height, float opacity )
+{
+    struct gradient_brush *brush = gradient_brush_from( brush_iface );
+
+    if (!brush || width <= 0 || height <= 0) return FALSE;
+    if (!brush->cache_bmp || brush->cache_w != (unsigned int)width || brush->cache_h != (unsigned int)height ||
+        brush->cache_gen != gradient_generation)
+    {
+        BITMAPINFO info = { { 0 } };
+        void *bits;
+
+        retire_bitmap( brush->cache_bmp );
+        brush->cache_bmp = NULL;
+        info.bmiHeader.biSize = sizeof(info.bmiHeader);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        if (!(brush->cache_bmp = CreateDIBSection( NULL, &info, DIB_RGB_COLORS, &bits, NULL, 0 ))) return FALSE;
+        brush->cache_bits = bits;
+        gradient_render( brush, brush->cache_bits, width, height );
+        brush->cache_w = width;
+        brush->cache_h = height;
+        brush->cache_gen = gradient_generation;
+        brush->cache_serial = InterlockedIncrement( &content_generation );
+    }
+    if (opacity < 0.0f) opacity = 0.0f;
+    if (opacity > 1.0f) opacity = 1.0f;
+    return soft_blend( hdc, x, y, width, height, brush->cache_bits, width * 4, (BYTE)(opacity * 255.0f + 0.5f),
+                       brush, brush->cache_serial );
+}
+
 /* A surface brush whose layout is not a plain Fill: the picture resampled through the brush's
  * stretch, alignment and transform, cached on the brush until any of those or the pixels change. */
 static BOOL paint_mapped_surface( HDC hdc, void *brush_iface, struct drawing_surface *surface, int x, int y,
@@ -14456,6 +15144,8 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
     float smap[6];
     BOOL mapped = FALSE;
     ULONG layout = 0;
+    struct gradient_brush *gradient = NULL;
+    BYTE *gradient_bits = NULL;
     HDC mem;
 
     if (!brush) return FALSE;
@@ -14477,8 +15167,9 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
 
         have_color = src && brush_solid_color( (ICompositionBrush *)src, &color );
         if (!have_color && src) source_surface = brush_surface( src );
+        if (!have_color && !source_surface) gradient = gradient_brush_from( src );
     }
-    if (!have_color && !source_surface)
+    if (!have_color && !source_surface && !gradient)
     {
         TRACE( "mask brush %p: source %p is neither a colour nor a surface brush (vtbl %p).\n", brush,
                brush->source, brush->source ? *(void **)brush->source : NULL );
@@ -14494,6 +15185,16 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
 
     w = grid && width > 0 ? (unsigned int)width : mask_desc.Width;
     h = grid && height > 0 ? (unsigned int)height : mask_desc.Height;
+    if (gradient)
+    {
+        /* the gradient spans the brush area, which is the mask's */
+        if (!(gradient_bits = malloc( (size_t)w * h * 4 ))) return FALSE;
+        gradient_render( gradient, gradient_bits, w, h );
+        source = gradient_bits;
+        source_desc.Width = w;
+        source_desc.Height = h;
+        layout = gradient_generation;
+    }
     if (source_surface)
     {
         mapped = surface_brush_mapping( src, w, h, source_desc.Width, source_desc.Height, smap );
@@ -14506,7 +15207,7 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
     }
     same = brush->cache_bmp && brush->cache_w == w && brush->cache_h == h &&
            brush->cache_mask_surface == mask_surface && brush->cache_mask_gen == mask_surface->generation &&
-           brush->cache_source_surface == source_surface &&
+           brush->cache_source_surface == (source_surface ? (const void *)source_surface : (const void *)gradient) &&
            (!source_surface || brush->cache_source_gen == source_surface->generation) &&
            brush->cache_have_color == have_color && (!have_color || !memcmp( &brush->cache_color, &color, sizeof(color) )) &&
            !memcmp( brush->cache_grid, grid_key, sizeof(grid_key) ) && brush->cache_source_layout == layout;
@@ -14569,12 +15270,14 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
         }
         brush->cache_w = w; brush->cache_h = h;
         brush->cache_mask_surface = mask_surface; brush->cache_mask_gen = mask_surface->generation;
-        brush->cache_source_surface = source_surface; brush->cache_source_gen = source_surface ? source_surface->generation : 0;
+        brush->cache_source_surface = source_surface ? (const void *)source_surface : (const void *)gradient;
+        brush->cache_source_gen = source_surface ? source_surface->generation : 0;
         brush->cache_have_color = have_color; brush->cache_color = color;
         memcpy( brush->cache_grid, grid_key, sizeof(grid_key) );
         brush->cache_source_layout = layout;
         brush->cache_serial = InterlockedIncrement( &content_generation );
     }
+    free( gradient_bits );
     /* The visual's opacity scales the whole brush: XAML draws its keypad button fills as opaque white masks
      * on sprites with an opacity of about 0.09. */
     if (opacity < 0.0f) opacity = 0.0f;
@@ -15451,23 +16154,23 @@ static ULONG WINAPI compositor4_Release( void *iface )
 }
 static HRESULT WINAPI compositor4_CreateColorGradientStop( void *iface, void **result )
 {
+    static const Color transparent;
     TRACE( "iface %p.\n", iface );
-    if (!result) return E_POINTER;
-    return create_comp_object( "CompositionColorGradientStop", result );
+    return create_color_stop( 0.0f, transparent, result );
 }
 /* (FLOAT offset, Color color, out): the float goes in xmm1 and the Color is passed by value in r8. */
 static HRESULT WINAPI compositor4_CreateColorGradientStopWithOffsetAndColor( void *iface, FLOAT offset, UINT32 color,
                                                                             void **result )
 {
+    Color value;
     TRACE( "iface %p, offset %f, color %#x.\n", iface, offset, color );
-    if (!result) return E_POINTER;
-    return create_comp_object( "CompositionColorGradientStop", result );
+    memcpy( &value, &color, sizeof(value) );
+    return create_color_stop( offset, value, result );
 }
 static HRESULT WINAPI compositor4_CreateLinearGradientBrush( void *iface, void **result )
 {
     TRACE( "iface %p.\n", iface );
-    if (!result) return E_POINTER;
-    return create_comp_object( "CompositionLinearGradientBrush", result );
+    return create_linear_gradient_brush( result );
 }
 static HRESULT WINAPI compositor4_CreateSpringScalarAnimation( void *iface, void **result )
 {

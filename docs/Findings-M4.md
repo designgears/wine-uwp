@@ -8607,3 +8607,15 @@ files, found through fontconfig. Three things were wrong with how they were used
 
 Regression: Calculator re-baselined (771 px of antialiasing, identical across runs), Feedback Hub
 852 colours / 0 fail-fasts, Media Player 2246, Solitaire game reached.
+
+### Linear gradient brushes (2026-09-23)
+
+WinUI's control elevation borders (buttons, text box underlines) are `CompositionLinearGradientBrush`
+objects used as mask brush sources, and none was drawn. Everything about them was a recording object:
+the stops, the brush with its three interfaces sharing one generic vtable, and above all
+`get_ColorStops`, which returned a fresh recording object that swallowed every `Append`. The
+ColorStops IVector's IID `{bf2e107e}` is in no winmd; it was identified from dcomp.dll's
+`CompositionColorGradientStopCollection::s_InterfaceParts`. What XAML sets: start 0,0, an end point
+of 3/height (the absolute 3 px border ramp converted to relative), InterpolationSpace 2, ExtendMode
+clamp, and for bottom borders a TransformMatrix 1,0,0,-1,0,h.
+`docs/screenshots/shapr3d-gradient-borders.png`, `calc-button-borders-before-after.png`.

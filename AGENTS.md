@@ -149,7 +149,8 @@ XAML's text then takes its normal font path instead of an E_NOTIMPL fallback, wh
 one pixel (3486 pixels differ). The change was confirmed to come from dwrite alone (the old dwrite
 gives AE 0), and the new rendering is identical across runs. Re-baseline only like that: attribute
 the difference to one change, look at it, and run twice. Re-taken again the same day for dwrite's
-subpixel glyph positioning (771 pixels, antialiasing inside glyphs; layout identical). It used to live only in `/tmp`, and `/tmp` gets wiped: the baseline, every session log and
+subpixel glyph positioning (771 pixels, antialiasing inside glyphs; layout identical), and again for
+linear gradient brushes (950 pixels, the buttons' elevation borders now drawn). It used to live only in `/tmp`, and `/tmp` gets wiped: the baseline, every session log and
 **the Xvfb socket for `:98`** all vanished at once. Nothing starts `:98` automatically, so the first
 symptom was every app failing activation with `PrivateCreateCoreWindow failed, hr 0x80004005` -
 which looks like a Wine regression and is not. **If a run suddenly fails at activation, check
