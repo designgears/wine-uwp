@@ -8569,3 +8569,20 @@ extruded rectangle. Found by following the ignored FailFasts and managed excepti
 The save picker shim needs `WINE_UWP_PICKER_SAVE_FILE`; without it the pick is reported as
 cancelled, which looks exactly like "export does nothing". The export-format promo dialog shows only
 the first time.
+
+### Workspace switcher background too short (2026-09-23)
+
+The rounded panel behind Modeling/Visualization/Drawings ended before Drawings
+(`docs/screenshots/shapr3d-workspace-panel-before.png` / `-after.png`). Its sprite was set to 44x124
+but painted at 99.2 = 124 x 0.8: the panel's render transform follows `Matrix4x4(LOCAL.Render)`,
+built from a property set whose `ScaleY` starts at 0.8 for a grow-in animation attached through
+`CreateAnimatorPartner`. dcomp settles such properties at the animation's last key frame, but this one
+had none. `create_kf_animation` handed scalar and colour animations out as the generic recording
+view, so XAML's `InsertKeyFrame` (slots 6/7) was "ignored". Every key frame animation now returns its
+typed interface.
+
+Regression: Calculator AE 0, Feedback Hub 815 / 0 fail-fasts, Media Player 2232. Solitaire reached
+the game in 2 of 3 runs. The other one died at 72 s with an access violation in
+`CoreMessaging.dll+0x27ed3` (one of the byte-patched DLLs), called from `windows.ui.dll`'s
+dispatcher. It was not seen in the previous 60+ runs, and this session cannot say whether this
+change makes it more likely. Watch for it.

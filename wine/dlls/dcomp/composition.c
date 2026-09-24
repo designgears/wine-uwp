@@ -10103,9 +10103,12 @@ static HRESULT create_kf_animation( enum kf_kind kind, void **out )
      * inserts its key frames through that pointer without a QI, so the generic view swallows them.
      * That is deliberate for now: applying the last key's IsVisible hid the AnimatedIcon layers the
      * hamburger is drawn with (which layer shows depends on the icon's Progress state), so only
-     * single-key boolean animations are applied. The vector and boolean animations' default
-     * interface is the typed one and XAML inserts their key frames without a QI. */
-    *out = kind == KF_VECTOR2 || kind == KF_VECTOR3 || kind == KF_BOOLEAN ? (void *)&impl->typed_vtbl : (void *)&impl->vtbl;
+     * single-key boolean animations are applied. Every key frame animation's default interface is
+     * the typed one and XAML inserts key frames through it without a QI. Scalar and colour animations
+     * used to hand out the generic view, which swallowed their InsertKeyFrame calls: an animation
+     * attached to a property then had no value to settle at, and Shapr3D's workspace switcher
+     * background stayed at the 0.8 ScaleY its grow-in animation starts from. */
+    *out = &impl->typed_vtbl;
     return S_OK;
 }
 

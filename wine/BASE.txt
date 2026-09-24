@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     5c58a1f9ec269ee1c61119eb9283a7f0b8e58837
-                 windows.storage: implement StorageFile copy and move
+  wine HEAD:     2b9db730155d4df29e9cd3943561eaea9eb7f340
+                 dcomp: hand out the typed interface from scalar and colour key frame animations
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-24T03:44:50Z
+  captured:      2026-09-24T04:02:13Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
