@@ -264,3 +264,4 @@ include/d2d1effects_2.idl
 dlls/windows.storage/streamcopy.c
 include/wincodec.idl
 dlls/windows.globalization/Makefile.in
+dlls/wined3d/texture.c

@@ -8542,5 +8542,10 @@ Read it before theorising about Shapr3D. The `"internet_connection":"cellular"` 
   makes (256x256) is the acrylic noise, which XAML releases undrawn.
 - `CompositionLinearGradientBrush` is not drawn (control-border gradients, skipped as "neither a
   colour nor a surface brush"). A fidelity gap, not a missing image.
-- The `adapter_vk_copy_bo_address` fault hit 2 of about 4 editor exits. With an ERR per copy it hit
-  0 of 7, so it is timing-dependent. Next step: log only when a mapped pointer is NULL.
+- The `adapter_vk_copy_bo_address` fault is timing-dependent. An ERR on every copy hid it (0 of 7);
+  logging only when a mapped pointer was NULL caught it in 1 of 14: `src NULL (bo NULL addr NULL)`,
+  a sub-resource flagged current in SYSMEM after `heap_memory` was freed. `wined3d_texture_load_location`
+  now drops such a stale location with an ERR instead of copying from NULL. In the next 10 runs the
+  guard never fired, so the fix is unproven. Grep for `marked current in system memory` when it recurs.
+  The root cause of the stale flag is still unknown. Separately fixed on the way: dxgi's composition
+  swap chain now locks `presented[]` against dcomp's readback worker.

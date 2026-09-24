@@ -49,6 +49,7 @@ struct comp_swapchain
     /* What the compositor reads: Present copies buffer 0 into presented[count & 1], so a frame is
      * complete and stays intact while the app draws the next one into buffer 0. */
     ID3D11Texture2D *presented[2];
+    SRWLOCK presented_lock;     /* dcomp's readback worker takes presented[] while the app may resize */
     LONG present_count;
     DXGI_MATRIX_3X2_F transform;
     DXGI_RGBA background;
@@ -73,11 +74,13 @@ static void comp_swapchain_release_buffers(struct comp_swapchain *swapchain)
         if (swapchain->buffers[i]) ID3D11Texture2D_Release(swapchain->buffers[i]);
         swapchain->buffers[i] = NULL;
     }
+    AcquireSRWLockExclusive(&swapchain->presented_lock);
     for (i = 0; i < ARRAY_SIZE(swapchain->presented); i++)
     {
         if (swapchain->presented[i]) ID3D11Texture2D_Release(swapchain->presented[i]);
         swapchain->presented[i] = NULL;
     }
+    ReleaseSRWLockExclusive(&swapchain->presented_lock);
 }
 
 static HRESULT comp_swapchain_create_buffers(struct comp_swapchain *swapchain)
@@ -111,7 +114,13 @@ static HRESULT comp_swapchain_create_buffers(struct comp_swapchain *swapchain)
     desc.SampleDesc.Quality = 0;
     for (i = 0; i < ARRAY_SIZE(swapchain->presented); i++)
     {
-        if (FAILED(hr = ID3D11Device_CreateTexture2D(swapchain->d3d_device, &desc, NULL, &swapchain->presented[i])))
+        ID3D11Texture2D *texture;
+
+        hr = ID3D11Device_CreateTexture2D(swapchain->d3d_device, &desc, NULL, &texture);
+        AcquireSRWLockExclusive(&swapchain->presented_lock);
+        swapchain->presented[i] = SUCCEEDED(hr) ? texture : NULL;
+        ReleaseSRWLockExclusive(&swapchain->presented_lock);
+        if (FAILED(hr))
         {
             WARN("Failed to create presented copy %u, hr %#lx.\n", i, hr);
             comp_swapchain_release_buffers(swapchain);
@@ -281,9 +290,16 @@ static HRESULT STDMETHODCALLTYPE comp_swapchain_GetBuffer(IDXGISwapChain4 *iface
     /* Wine-private, for dcomp: 0x80000000 | present count asks for the snapshot of that frame. */
     if (buffer_idx & 0x80000000)
     {
-        ID3D11Texture2D *texture = swapchain->presented[buffer_idx & 1];
-        if (!texture) return DXGI_ERROR_INVALID_CALL;
-        return ID3D11Texture2D_QueryInterface(texture, riid, surface);
+        ID3D11Texture2D *texture;
+        HRESULT hr;
+
+        AcquireSRWLockShared(&swapchain->presented_lock);
+        if ((texture = swapchain->presented[buffer_idx & 1]))
+            hr = ID3D11Texture2D_QueryInterface(texture, riid, surface);
+        else
+            hr = DXGI_ERROR_INVALID_CALL;
+        ReleaseSRWLockShared(&swapchain->presented_lock);
+        return hr;
     }
     if (buffer_idx >= swapchain->desc.BufferCount || !swapchain->buffers[buffer_idx])
     {
