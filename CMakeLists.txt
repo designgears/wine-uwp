@@ -148,3 +148,6 @@ set_target_properties(toastnotifier PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_to
 target_link_libraries(toastnotifier PRIVATE runtimeobject.lib ole32.lib)
 add_executable(probe-uchar probes/probe-uchar.cpp)
 set_target_properties(probe-uchar PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
+add_executable(probe-wicscale probes/probe-wicscale.cpp)
+target_link_libraries(probe-wicscale PRIVATE windowscodecs.lib ole32.lib)
+set_target_properties(probe-wicscale PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")

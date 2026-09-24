@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     db6961a31cda383848d92db3f509c0c20c0b5b57
-                 win32u: register fonts in C:\windows\fonts by bare file name; drop host entries they supersede
+  wine HEAD:     84fd3e4fe8a19ce25c1fbce76f75aba9b51baf58
+                 windowscodecs: filtered scaling (box/bilinear) for linear, cubic and Fant modes
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-24T13:13:47Z
+  captured:      2026-09-24T16:43:29Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

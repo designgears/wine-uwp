@@ -274,3 +274,4 @@ dlls/edputil/Makefile.in
 dlls/edputil/edputil.spec
 dlls/edputil/main.c
 dlls/win32u/font.c
+dlls/windowscodecs/scaler.c

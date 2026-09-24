@@ -8909,3 +8909,30 @@ registry key dwrite builds its system collection from had two problems:
 It now drops the superseded entries and lists `C:\windows\fonts` faces by bare file name, as
 Windows does. The host's `SegUIVar.ttf` was byte-identical to Windows', so every app renders
 exactly as before; Calculator is AE 0.
+
+### WIC scaler: real filtering (2026-09-24)
+
+Screenshot: `docs/screenshots/wic-scaler-before-after.png` (nearest-neighbour on the left, the new
+filter on the right).
+
+Wine's `IWICBitmapScaler` did nearest-neighbour only. It logged "unsupported mode" for linear,
+cubic, Fant and high-quality cubic. XAML decodes every picture at its display size with Fant or
+linear, so swatches, thumbnails and What's New images were all point-sampled, with stair-stepped
+edges. The scaler now filters 8-bit-per-channel formats (BGRA, RGBA, premultiplied BGRA/RGBA, BGR,
+RGB, Gray8):
+
+- a box filter over each destination pixel's source footprint when shrinking, which is Fant;
+- bilinear when enlarging;
+- alpha-weighted for straight-alpha formats, so edges do not darken.
+
+Other formats keep nearest-neighbour. `probes/probe-wicscale.cpp` scales a file with any mode.
+
+A trap on the way: the object is `malloc`ed and initialised field by field, so a new field that is
+not initialised is garbage. A garbage `col_cache` pointer corrupted the heap and killed Shapr3D on
+every run. The probe had passed by luck.
+
+**Shapr3D has a general flake of about 1 run in 4, independent of this change.** With the old
+scaler, 8 runs of start → Visualization → import Drone gave 6 ok, 1 blank window at start-up and 1
+import that never finished. The new scaler gave the same 6 of 8. It is probably the same thing as
+Solitaire's 1-in-6 (Findings above). It disappears under the sampling profiler and under
+`warn+seh`, so it is timing-dependent.
