@@ -522,6 +522,13 @@ of it. Also: an `ID2D1GeometryGroup`'s fill mode **overrides its members'**, so 
 inside a WINDING group is filled solid. Test SVG changes with `probe-svg.exe`, which draws through a
 bitmap target the way Win2D does, not straight into its WIC target.
 
+**Two paths feed a CoreIndependentInputSource, and they must not both fire.** win32u's
+`forward_pointer_to_independent_input` copies *every* pointer message on the CoreWindow to it
+(Solitaire needs that); dcomp's input-sink hook routes only the input over a swapchain (Shapr3D
+needs that). Both at once handed Shapr3D every toolbar click as a viewport press - which also made
+Sketch "pick a plane" by itself. dcomp sets `__wine_dcomp_input_sink` on its sink and the forwarder
+skips it. When input arrives that nothing you wrote posted, `WINEDEBUG=trace+msg` and grep `forwarding`.
+
 **`.as<>()` vs `try_as<>()` is the whole difference, and you can tell which one threw.** C++/WinRT's
 `throw_hresult` is a switch on the HRESULT with one `call` + `int3` per value, so the **return
 address in the app's own crash callstack lands in the branch for the specific HRESULT**. For
@@ -839,7 +846,7 @@ the fully-qualified name. `--grep` first, always.
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
 | Solitaire | **Playable on the unpatched `Solitaire.exe`** (`docs/screenshots/solitaire-unpatched-menu-game.png`): main menu -> Klondike -> game, and clicks move cards. No exe byte patch is needed any more: `wineuwp` delivers `CoreWindow.VisibilityChanged`. The Sign In Error popup shows on top of the menu; Cancel is at about (813,549). The old ~1-in-10 blank window is fixed (60/60 clean) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
-| Shapr3D | **Models: sketch a rectangle and extrude it into a body** (`docs/screenshots/shapr3d-extruded-body.png`). Signs in once (Log In -> `./browser-callback.sh shapr3d`, a human solves the reCAPTCHA, run with `WINE_UWP_LAUNCHER=log`) and the session persists. Viewport input goes through dcomp's input-sink hook as `WM_POINTER*`. **Known bug: a click on a toolbar button also reaches the engine as a viewport press** (the Rectangle button's click becomes the first corner, and Display Modes does not open); pick tools with keyboard shortcuts (`r`) meanwhile. SVG icons (gradients, patterns, masks, shadows) render. Findings-M4, "Sketch and extrude" |
+| Shapr3D | **Models: sketch a rectangle and extrude it into a body** (`docs/screenshots/shapr3d-extruded-body.png`). Signs in once (Log In -> `./browser-callback.sh shapr3d`, a human solves the reCAPTCHA, run with `WINE_UWP_LAUNCHER=log`) and the session persists. Viewport input goes through dcomp's input-sink hook as `WM_POINTER*`. Toolbar buttons and menus work (`docs/screenshots/shapr3d-display-modes.png`); Sketch waits for you to click a plane. SVG icons (gradients, patterns, masks, shadows) render. Findings-M4, "Sketch and extrude" |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
 them. **Testing that, and making them the default if it holds, is a standing job** - they change the

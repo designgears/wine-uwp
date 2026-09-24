@@ -8484,3 +8484,12 @@ d2d's `PushLayer` is a stub, and see the AGENTS.md note on geometry-group fill m
 
 Regression: Calculator AE 0; Feedback Hub 822 / 0 fail-fasts; Media Player Home 2232 colours;
 Solitaire main menu with the known popup.
+
+### Toolbar clicks leaking into the viewport: fixed
+
+The press did not come from the dcomp hook (it routed nothing for the click). It came from
+win32u's blind forwarder, which copies every pointer message on the CoreWindow to the
+CoreIndependentInputSource window. That is the same window dcomp's sink targets (`0xa40098` in
+both traces). dcomp now marks its sink and the forwarder skips it. Toolbar tools and the Display
+Modes menu work (`docs/screenshots/shapr3d-display-modes.png`). Solitaire still plays and
+Calculator is AE 0.

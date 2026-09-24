@@ -801,6 +801,9 @@ NTSTATUS WINAPI create_composition_input_sink( const void *desc, HANDLE *sink )
     {
         TRACE( "input sink for window %p, hooking thread %04lx.\n", target, GetCurrentThreadId() );
         input_sink_target = target;
+        /* win32u copies every pointer message on the CoreWindow to this window; this hook routes
+         * only the ones over the swapchain, so tell win32u to leave it alone */
+        SetPropW( target, L"__wine_dcomp_input_sink", (HANDLE)1 );
         if (!input_sink_hook)
             input_sink_hook = SetWindowsHookExW( WH_GETMESSAGE, input_sink_hook_proc, NULL, GetCurrentThreadId() );
     }

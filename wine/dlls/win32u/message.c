@@ -2608,6 +2608,7 @@ static void forward_pointer_to_independent_input( HWND hwnd, UINT message, WPARA
 {
     static const WCHAR core_windowW[] = {'W','i','n','d','o','w','s','.','U','I','.','C','o','r','e','.','C','o','r','e','W','i','n','d','o','w'};
     static const WCHAR input_sourceW[] = {'W','i','n','d','o','w','s','.','U','I','.','C','o','r','e','.','C','o','r','e','I','n','d','e','p','e','n','d','e','n','t','I','n','p','u','t','S','o','u','r','c','e'};
+    static const WCHAR dcomp_sinkW[] = {'_','_','w','i','n','e','_','d','c','o','m','p','_','i','n','p','u','t','_','s','i','n','k',0};
     UNICODE_STRING class = { sizeof(input_sourceW), sizeof(input_sourceW), (WCHAR *)input_sourceW };
     HWND target;
     DWORD pid;
@@ -2615,6 +2616,9 @@ static void forward_pointer_to_independent_input( HWND hwnd, UINT message, WPARA
     if (!is_window_class( hwnd, core_windowW, ARRAY_SIZE(core_windowW) )) return;
     if (!(target = NtUserFindWindowEx( HWND_MESSAGE, 0, &class, NULL, 0 ))) return;
     if (!NtUserGetWindowThread( target, &pid ) || pid != GetCurrentProcessId()) return;
+    /* dcomp routes input over the swapchain to this window itself (dlls/dcomp/device.c); forwarding
+     * everything as well would hand the engine clicks meant for the XAML controls above it */
+    if (NtUserGetProp( target, dcomp_sinkW )) return;
     TRACE( "forwarding %#x from core window %p to independent input source %p\n", message, hwnd, target );
     NtUserPostMessage( target, message, wparam, lparam );
 }
