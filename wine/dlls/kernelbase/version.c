@@ -2690,11 +2690,12 @@ struct app_state
     WCHAR family[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1];
 };
 
+/* The type is 1-based: KernelBase's table has exactly these four entries, and anything else fails with
+ * ERROR_INTERNAL_ERROR. Windows.UI.Xaml resolves ms-appdata:///local, /roaming and /temp as 1, 2, 3. */
 static const WCHAR *state_folder_name( DWORD type )
 {
-    static const WCHAR *names[] = { L"LocalState", L"RoamingState", L"TempState", L"LocalCache",
-                                    L"SharedLocal", L"Settings", L"AC", L"SystemAppData" };
-    return type < ARRAY_SIZE(names) ? names[type] : NULL;
+    static const WCHAR *names[] = { L"LocalState", L"RoamingState", L"TempState", L"LocalCache" };
+    return type - 1 < ARRAY_SIZE(names) ? names[type - 1] : NULL;
 }
 
 static HANDLE open_state_for_family( const WCHAR *family )
@@ -2826,7 +2827,7 @@ BOOL WINAPI GetStateFolder( HANDLE handle, DWORD type, WCHAR *buffer, DWORD *len
     if (!name)
     {
         FIXME( "unknown state folder type %lu\n", type );
-        SetLastError( ERROR_INVALID_PARAMETER );
+        SetLastError( ERROR_INTERNAL_ERROR );
         return FALSE;
     }
     if (!get_state_root( path, ARRAY_SIZE(path) )) { SetLastError( ERROR_PATH_NOT_FOUND ); return FALSE; }

@@ -85,14 +85,19 @@ static HRESULT STDMETHODCALLTYPE uri_GetIids(IUriRuntimeClass *iface, ULONG *iid
 static HRESULT STDMETHODCALLTYPE uri_GetRuntimeClassName(IUriRuntimeClass *iface,
                                                          HSTRING *class_name)
 {
-    FIXME("iface %p, class_name %p stub!\n", iface, class_name);
-    return E_NOTIMPL;
+    static const WCHAR name[] = L"Windows.Foundation.Uri";
+
+    TRACE("iface %p, class_name %p.\n", iface, class_name);
+    if (!class_name) return E_POINTER;
+    return WindowsCreateString(name, ARRAY_SIZE(name) - 1, class_name);
 }
 
 static HRESULT STDMETHODCALLTYPE uri_GetTrustLevel(IUriRuntimeClass *iface, TrustLevel *trust_level)
 {
-    FIXME("iface %p, trust_level %p stub!\n", iface, trust_level);
-    return E_NOTIMPL;
+    TRACE("iface %p, trust_level %p.\n", iface, trust_level);
+    if (!trust_level) return E_POINTER;
+    *trust_level = BaseTrust;
+    return S_OK;
 }
 
 static HRESULT uri_prop_to_hstring(IUri *uri, Uri_PROPERTY prop, HSTRING *out)
@@ -486,6 +491,7 @@ static HRESULT STDMETHODCALLTYPE uri_factory_CreateUri(IUriRuntimeClassFactory *
     hr = CreateUri(raw_buffer, Uri_CREATE_ALLOW_IMPLICIT_FILE_SCHEME | Uri_CREATE_NO_DECODE_EXTRA_INFO, 0, &uri);
     if (FAILED(hr))
     {
+        WARN("CreateUri(%s) failed, hr %#lx.\n", debugstr_w(raw_buffer), hr);
         *instance = NULL;
         return E_INVALIDARG;
     }

@@ -8509,7 +8509,7 @@ Calculator is AE 0.
   them correctly all along; a dump of the 976x540 surfaces showed the real pictures. dcomp ignored
   the surface brush's Stretch, alignment and `ICompositionSurfaceBrush2::TransformMatrix`, so each
   image painted as one corner of itself. XAML's Image uses Stretch None plus a fitting matrix.
-- **Project thumbnails still do not display**, even though the JPEGs are saved. The app never
+- **Project thumbnails still do not display** (fixed 2026-09-24, see below), even though the JPEGs are saved. The app never
   opens the files: `+file` shows only a directory listing and one path lookup, and there is nothing
   through windows.storage. No surface of their size is ever created. Unexplained.
 - Seen once and not reproduced: a fault in `adapter_vk_copy_bo_address`'s memcpy during a texture
@@ -8672,3 +8672,36 @@ and every regression passed.
 The general rule, again: **the catch-all QI is a loaded gun for any object whose slot 6 is not
 harmless.** IClosable is the IID most likely to be asked for, because XAML and WinUI close what
 they drop.
+
+### Project thumbnails display (2026-09-24)
+
+Screenshot: `docs/screenshots/shapr3d-project-thumbnails.png`. The Recents grid now shows each
+project's saved picture. The dark tiles in that screenshot are correct: those projects are empty
+scenes, and their JPEGs are a single colour.
+
+The earlier write-up said "the app never asks for the pictures". **That was wrong.** It asks
+through a `Windows.Foundation.Uri`, `ms-appdata:///local/storage\resources\<id>`. The trail is
+readable with `trace+iertutil`:
+
+- **iertutil** stubbed the Uri's `GetRuntimeClassName` (and `GetTrustLevel`) with E_NOTIMPL. The
+  app hands the Uri back to managed code; `CachedUriToBitmapImageConverter` then dropped it.
+  Returning `Windows.Foundation.Uri` fixed it. The app then calls
+  `StorageFile.GetFileFromApplicationUriAsync` and reads the JPEG. This is the same rule as the
+  AGENTS entry on empty collections: .NET types an object from `GetRuntimeClassName`.
+- **kernelbase** `GetStateFolder` used a 0-based folder type. KernelBase's own table, read at
+  `KernelBase.dll+0x1a8fe0`, has four 40-byte entries:
+  - 1 = LocalState
+  - 2 = RoamingState
+  - 3 = TempState
+  - 4 = LocalCache
+
+  Any other type fails with 0x54f. XAML's `ApplicationDataProvider` asks for 1, 2 and 3, so
+  `ms-appdata:///local/` had been resolving to RoamingState. Fixed, although this one alone
+  changed nothing on screen: a run with only this fix never opened the file.
+
+A tile with no thumbnail in `projectStorage.db` shows the placeholder icon, which is correct. A
+tile with a thumbnail used to show no placeholder and no picture, and that was the tell that the
+image was known but lost.
+
+Still blank: the Visualization material swatches (`ms-appx:///Assets/Images/Visualization/Thumbnails/*.png`).
+XAML does open those files, so they are lost after the decode, not before.
