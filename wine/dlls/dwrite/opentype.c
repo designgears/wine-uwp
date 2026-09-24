@@ -6854,6 +6854,7 @@ unsigned int opentype_get_named_instances(const struct file_stream_desc *stream_
         instance->weight = 400.0f;
         instance->width = 100.0f;
         instance->default_opsz = TRUE;
+        instance->opsz = -1.0f;
         instance->is_default = TRUE;
         for (j = 0; j < axis_count; ++j)
         {
@@ -6866,7 +6867,11 @@ unsigned int opentype_get_named_instances(const struct file_stream_desc *stream_
             else if (tag == DWRITE_FONT_AXIS_TAG_WIDTH) instance->width = value;
             else if (tag == DWRITE_FONT_AXIS_TAG_ITALIC) instance->italic = value;
             else if (tag == DWRITE_FONT_AXIS_TAG_SLANT) instance->slant = value;
-            else if (tag == DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE && value != def) instance->default_opsz = FALSE;
+            else if (tag == DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE)
+            {
+                instance->opsz = value;
+                if (value != def) instance->default_opsz = FALSE;
+            }
         }
     }
     count = instance_count;

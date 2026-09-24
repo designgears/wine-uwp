@@ -1984,7 +1984,7 @@ static HRESULT WINAPI dwritefactory6_CreateTextFormat(IDWriteFactory7 *iface, co
     }
 
     /* Faces are chosen by weight, stretch and style; a variable font's named instances are faces of
-     * their own (see fontset_builder_add_file). The optical size is left to the default instance. */
+     * their own (see fontset_builder_add_file). The optical size is applied per run by the layout. */
     {
         static const float stretches[] = { 50.0f, 62.5f, 75.0f, 87.5f, 100.0f, 112.5f, 125.0f, 150.0f, 200.0f };
         DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL;
@@ -2021,6 +2021,9 @@ static HRESULT WINAPI dwritefactory6_CreateTextFormat(IDWriteFactory7 *iface, co
 
         hr = create_text_format(family_name, collection, weight, style, stretch, size, locale,
                 &IID_IDWriteTextFormat3, (void **)format);
+        /* kept on the format too: layout applies the optical size per run */
+        if (SUCCEEDED(hr) && axis_values && num_axis)
+            IDWriteTextFormat3_SetFontAxisValues(*format, axis_values, num_axis);
     }
     IDWriteFontCollection_Release(collection);
     return hr;

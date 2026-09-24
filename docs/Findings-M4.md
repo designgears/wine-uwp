@@ -8798,3 +8798,54 @@ Both buttons beside the project link used to kill the app.
   was our window factory: `wf_QueryService` answered every service, including `{705f0106}` /
   `{f230b678}`. It now answers only `GetWindowFactory`'s `{d98fd14a}`. The button then does
   nothing, which is correct: there is no share host here.
+
+### Optical size: Segoe UI Variable's Small and Display designs (2026-09-24)
+
+XAML passes an opsz axis value with every text format: 9 for 12 px text. dwrite ignored it for two
+reasons.
+
+1. `IDWriteFactory6::CreateTextFormat` turned the axis values into weight, stretch and style, and
+   then dropped them.
+2. The layout never looked at them.
+
+The font has three optical-size designs, as named instances: Small at opsz 8, Text at 10.5 (the
+default) and Display at 36, each at five weights.
+
+- The format now keeps its axis values.
+- `layout_apply_optical_size` switches each run's face to the named instance with the same weight
+  and the nearest opsz. It uses the factory's face cache and `create_fontface` directly, not
+  `IDWriteFactory::CreateFontFace`, which rightly insists on index 0 for a single-face file.
+- Windows interpolates the axis continuously. The nearest named design is what this font model
+  can do; at opsz 9 that is Small.
+
+`probe-text.exe` takes `family:weight:opsz` now. At 12 px the three designs measure 277.69
+(Small), 267.54 (Text) and 263.44 (Display).
+
+Found on the way: `layout_format_from_textformat` struct-copied the format, so the layout shared
+the format's `axis_values` array and both freed it. It went unnoticed only because no format had
+axis values until now. The array is duplicated.
+
+Calculator re-baselined: the only change is the 12 px title-bar caption "Calculator [Dev]"
+(87x11 px), now drawn in the Small design.
+
+### Solitaire's start-up flake is back: about 1 bad start in 6 (2026-09-24, open)
+
+The "60/60 clean" from 09-23 01:44 no longer holds. On 09-24, 29 runs gave 5 bad starts, of two
+kinds:
+
+- **Blank, 2 colours.** The app log stops at about 1.4 s, just after `PlayFab Logged in`. This is
+  the old never-ticked signature.
+- **Crash.** `Access violation reading 0x45` in `CoreMessaging.dll`, at
+  `DispatchItem::Activate+0xb2` (`+0x21fd2`), called from `TimeoutManager::OnTimerSignaled`. The
+  calling frame is inside our timer-ring code cave (`+0xd4b89`). Findings above calls that path
+  unsafe.
+
+Ruled out, by measurement:
+
+- Present pacing: with it switched off (temporarily), 1 of 10 runs was still bad.
+- The window factory's `QueryService` change: Solitaire asks only for `{d98fd14a}`, which is still
+  answered.
+- The prefix's CoreMessaging copy: it is byte-identical to the patched copy in `uwp-bin/win11`.
+
+About 30 commits have landed since the 60/60 measurement, so bisecting at 8+ runs a point is the
+next step. Judge any one Solitaire run with that rate in mind.

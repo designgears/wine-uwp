@@ -1,6 +1,7 @@
 // Render sample strings through Direct2D + DirectWrite into a PNG, one line per font family, to judge
 // Wine's text rendering the way XAML drives it (DrawTextLayout, grayscale antialiasing).
-// Usage: wine probe-text.exe <out.png> [size] [family...]
+// Usage: wine probe-text.exe <out.png> [size] [family[:weight[:opsz]]...]
+// With an opsz the format is made through IDWriteFactory6 with wght and opsz axis values, as XAML does.
 #include <windows.h>
 #include <d2d1_1.h>
 #include <dwrite_3.h>
@@ -36,10 +37,25 @@ int wmain(int argc, wchar_t **argv)
     for (int i = 0; i < family_count; i++)
     {
         IDWriteTextFormat *format; IDWriteTextLayout *layout;
-        wchar_t family[128]; int weight = 400;
+        wchar_t family[128]; int weight = 400; float opsz = 0;
         lstrcpynW(family, families[i], 128);
-        if (wchar_t *colon = wcschr(family, L':')) { *colon = 0; weight = _wtoi(colon + 1); }
-        if (FAILED(dw->CreateTextFormat(family, nullptr, (DWRITE_FONT_WEIGHT)weight, DWRITE_FONT_STYLE_NORMAL,
+        if (wchar_t *colon = wcschr(family, L':'))
+        {
+            *colon = 0; weight = _wtoi(colon + 1);
+            if (wchar_t *second = wcschr(colon + 1, L':')) opsz = (float)_wtof(second + 1);
+        }
+        if (opsz > 0)
+        {
+            IDWriteFactory6 *dw6; IDWriteTextFormat3 *format3;
+            DWRITE_FONT_AXIS_VALUE axes[2] = { { DWRITE_FONT_AXIS_TAG_WEIGHT, (float)weight },
+                                               { DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE, opsz } };
+            if (FAILED(dw->QueryInterface(IID_PPV_ARGS(&dw6)))) continue;
+            HRESULT fhr = dw6->CreateTextFormat(family, nullptr, axes, 2, size, L"en-us", &format3);
+            dw6->Release();
+            if (FAILED(fhr)) continue;
+            format = format3;
+        }
+        else if (FAILED(dw->CreateTextFormat(family, nullptr, (DWRITE_FONT_WEIGHT)weight, DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", &format))) continue;
         dw->CreateTextLayout(text, (UINT32)wcslen(text), format, (float)width, (float)line, &layout);
         rt->DrawTextLayout(D2D1::Point2F(6.0f, 4.0f + i * line), layout, brush);

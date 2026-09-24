@@ -546,6 +546,7 @@ struct dwrite_var_instance
     UINT16 subfamily_name_id;
     float weight, width, italic, slant;
     BOOL default_opsz;      /* the opsz coordinate is the axis default, or there is no opsz axis */
+    float opsz;             /* the opsz coordinate, or -1 with no opsz axis */
     BOOL is_default;        /* every coordinate is the axis default: the plain face already is this */
 };
 #define DWRITE_FACE_INDEX(index) ((index) & 0xffff)

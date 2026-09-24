@@ -852,6 +852,9 @@ static HRESULT layout_itemize(struct dwrite_textlayout *layout)
     return hr;
 }
 
+static void layout_apply_optical_size(const struct dwrite_textlayout *layout, const struct layout_range *range,
+        IDWriteFontFace **fontface);
+
 static HRESULT layout_map_run_characters(struct dwrite_textlayout *layout, struct layout_run *r,
         IDWriteFontFallback *fallback, struct layout_run **remaining)
 {
@@ -900,6 +903,7 @@ static HRESULT layout_map_run_characters(struct dwrite_textlayout *layout, struc
             WARN("Failed to create a font face, hr %#lx.\n", hr);
             return hr;
         }
+        layout_apply_optical_size(layout, range, &run->run.fontFace);
 
         run->run.fontEmSize = range->fontsize * scale;
 
@@ -928,6 +932,77 @@ static HRESULT layout_map_run_characters(struct dwrite_textlayout *layout, struc
     }
 
     return hr;
+}
+
+/* Optical size. A variable font's named instances at other optical sizes are not members of its
+ * family (Segoe UI Variable's "Small" and "Display" designs), so matching always yields the default
+ * size. When the range asks for an opsz (XAML passes one with every format: 9 for 12 px text), switch
+ * the run to the instance of the same weight whose optical size is nearest. Windows interpolates
+ * the axis continuously; the nearest named design is the closest this font data model gets. */
+static void layout_apply_optical_size(const struct dwrite_textlayout *layout, const struct layout_range *range,
+        IDWriteFontFace **fontface)
+{
+    struct dwrite_var_instance *instances = NULL;
+    struct file_stream_desc stream_desc;
+    IDWriteFontFileStream *stream = NULL;
+    IDWriteFontFile *file = NULL;
+    IDWriteFontFace *face;
+    struct list *cached_list;
+    unsigned int i, count, current, best = ~0u, index, target;
+    UINT32 files = 1;
+    float opsz = -1.0f, weight = 400.0f;
+
+    for (i = 0; i < range->axis_count; ++i)
+        if (range->axis_values[i].axisTag == DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE) opsz = range->axis_values[i].value;
+    if (opsz <= 0.0f) return;
+
+    if (FAILED(IDWriteFontFace_GetFiles(*fontface, &files, &file)) || !file) return;
+    if (FAILED(get_filestream_from_file(file, &stream))) goto done;
+    index = IDWriteFontFace_GetIndex(*fontface);
+    stream_desc.stream = stream;
+    stream_desc.face_type = IDWriteFontFace_GetType(*fontface);
+    stream_desc.face_index = index;
+    if (!(count = opentype_get_named_instances(&stream_desc, &instances))) goto done;
+
+    current = DWRITE_FACE_INSTANCE(index);
+    if (current && current <= count) weight = instances[current - 1].weight;
+    else for (i = 0; i < count; ++i) if (instances[i].is_default) weight = instances[i].weight;
+
+    for (i = 0; i < count; ++i)
+    {
+        if (instances[i].opsz < 0.0f || fabsf(instances[i].weight - weight) > 0.5f) continue;
+        if (best == ~0u || fabsf(opsz - instances[i].opsz) < fabsf(opsz - instances[best].opsz)) best = i;
+    }
+    if (best == ~0u) goto done;
+    target = instances[best].is_default ? DWRITE_FACE_INDEX(index) : DWRITE_FACE_INDEX(index) | ((best + 1) << 16);
+    if (target == index) goto done;
+
+    /* not IDWriteFactory::CreateFontFace, which wants index 0 for a single-face file: the instance
+     * rides in bits 16-31 of the index, as it does for faces made from the collection */
+    if (factory_get_cached_fontface(layout->factory, &file, target, IDWriteFontFace_GetSimulations(*fontface),
+            &cached_list, &IID_IDWriteFontFace, (void **)&face) != S_OK)
+    {
+        struct fontface_desc desc;
+        IDWriteFontFace5 *face5;
+
+        desc.factory = layout->factory;
+        desc.face_type = stream_desc.face_type;
+        desc.file = file;
+        desc.stream = stream;
+        desc.index = target;
+        desc.simulations = IDWriteFontFace_GetSimulations(*fontface);
+        desc.font_data = NULL;
+        if (FAILED(create_fontface(&desc, cached_list, &face5))) goto done;
+        face = (IDWriteFontFace *)face5;
+    }
+    TRACE("opsz %.2f: face index %#x -> %#x.\n", opsz, index, target);
+    IDWriteFontFace_Release(*fontface);
+    *fontface = face;
+
+done:
+    free(instances);
+    if (stream) IDWriteFontFileStream_Release(stream);
+    IDWriteFontFile_Release(file);
 }
 
 static HRESULT layout_run_get_last_resort_font(const struct dwrite_textlayout *layout, const struct layout_range *range,
@@ -5740,7 +5815,12 @@ static HRESULT layout_format_from_textformat(struct dwrite_textlayout *layout, I
 
         layout->format.locale = wcsdup(textformat->format.locale);
         layout->format.family_name = wcsdup(textformat->format.family_name);
-        if (!layout->format.locale || !layout->format.family_name)
+        /* the struct copy shares the format's axis array, and both free it */
+        layout->format.axis_values = NULL;
+        layout->format.axis_values_count = 0;
+        if (!layout->format.locale || !layout->format.family_name
+                || FAILED(format_set_font_axisvalues(&layout->format, textformat->format.axis_values,
+                        textformat->format.axis_values_count)))
         {
             free(layout->format.locale);
             free(layout->format.family_name);

@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     3c6990793be3298bb7a40995615489056773ed77
-                 edputil: new DLL for ext-ms-win-edputil-policy; wineuwp: answer only the window-factory service
+  wine HEAD:     d4cc196674c1e47db4de64ddaded2b93747db1e5
+                 dwrite: apply the opsz axis per run via named instances; layouts duplicate the format's axis values
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-24T07:08:30Z
+  captured:      2026-09-24T07:55:46Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
