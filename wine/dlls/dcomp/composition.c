@@ -2651,6 +2651,10 @@ struct drawing_surface
     ULONG generation;           /* bumped whenever the CPU copy is refreshed; painters key their caches on it */
     BOOL readback_queued;       /* in readback_pending, read back with the next frame's batch */
     BOOL opaque, back_opaque;   /* every pixel of cache (back_cache) has alpha 255 */
+    /* IDCompositionVirtualSurface view, for surfaces made by CreateVirtualSurface: slots 3-7 are the
+     * surface's, then 8 Resize and 9 Trim, which collide with the internal interface's slots on
+     * vtbl. Every other interface is answered by vtbl. */
+    const void **virtual_vtbl;
 };
 
 static struct drawing_surface **swapchain_surfaces;
@@ -3303,8 +3307,11 @@ static void *surface_brush_vtbl[COMP_OBJECT_SLOTS];
 static void *surface_brush2_vtbl[20];
 static ULONG surface_brush_layout_counter;
 
+static void *virtual_surface_vtbl[10];
 static struct drawing_surface *surface_from_iface( void *iface )
 {
+    if (iface && *(void ***)iface == (void **)virtual_surface_vtbl)
+        return CONTAINING_RECORD( iface, struct drawing_surface, virtual_vtbl );
     if (!iface || *(void ***)iface != (void **)surface_vtbl) return NULL;
     return CONTAINING_RECORD( iface, struct drawing_surface, vtbl );
 }
@@ -4063,11 +4070,98 @@ static HRESULT WINAPI surface_factory_CreateSurface( void *iface, UINT w, UINT h
     return create_drawing_surface( w, h, format, alpha, out );
 }
 
+
+static struct drawing_surface *surface_from_virtual( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct drawing_surface, virtual_vtbl );
+}
+static HRESULT WINAPI virtual_surface_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    static const GUID IID_IDCompositionVirtualSurface_local =
+        { 0xae471c51, 0x5f53, 0x4a24, { 0x8d, 0x3e, 0xd0, 0xc3, 0x9c, 0x30, 0xb3, 0xf0 } };
+    struct drawing_surface *surface = surface_from_virtual( iface );
+
+    if (IsEqualGUID( iid, &IID_IDCompositionVirtualSurface_local ))
+    {
+        InterlockedIncrement( &surface->ref );
+        *out = iface;
+        return S_OK;
+    }
+    return comp_object_QueryInterface( &surface->vtbl, iid, out );
+}
+static ULONG WINAPI virtual_surface_AddRef( void *iface )
+{
+    return comp_object_AddRef( &surface_from_virtual( iface )->vtbl );
+}
+static ULONG WINAPI virtual_surface_Release( void *iface )
+{
+    return surface_Release( &surface_from_virtual( iface )->vtbl );
+}
+static HRESULT WINAPI virtual_surface_BeginDraw( void *iface, const RECT *rect, REFIID iid, void **object, POINT *offset )
+{
+    return surface_BeginDraw( &surface_from_virtual( iface )->vtbl, rect, iid, object, offset );
+}
+static HRESULT WINAPI virtual_surface_EndDraw( void *iface )
+{
+    return surface_EndDraw( &surface_from_virtual( iface )->vtbl );
+}
+static HRESULT WINAPI virtual_surface_SuspendDraw( void *iface )
+{
+    return surface_SuspendDraw( &surface_from_virtual( iface )->vtbl );
+}
+static HRESULT WINAPI virtual_surface_ResumeDraw( void *iface )
+{
+    return surface_ResumeDraw( &surface_from_virtual( iface )->vtbl );
+}
+static HRESULT WINAPI virtual_surface_Scroll( void *iface, const RECT *scroll, const RECT *clip, int dx, int dy )
+{
+    FIXME( "surface %p, scroll by %d,%d not implemented.\n", surface_from_virtual( iface ), dx, dy );
+    return S_OK;
+}
+static HRESULT WINAPI virtual_surface_Resize( void *iface, UINT width, UINT height )
+{
+    return surface_Resize( &surface_from_virtual( iface )->vtbl, width, height );
+}
+/* The whole surface is kept; trimming only lets the real one release memory. */
+static HRESULT WINAPI virtual_surface_Trim( void *iface, const RECT *rects, UINT count )
+{
+    TRACE( "surface %p, %u rects.\n", surface_from_virtual( iface ), count );
+    return S_OK;
+}
+
+static HRESULT create_virtual_surface( UINT w, UINT h, UINT format, UINT alpha, void **out )
+{
+    struct drawing_surface *surface;
+    void *iface;
+    HRESULT hr;
+
+    if (FAILED(hr = create_drawing_surface( w, h, format, alpha, &iface ))) return hr;
+    surface = CONTAINING_RECORD( iface, struct drawing_surface, vtbl );
+    if (!virtual_surface_vtbl[0])
+    {
+        virtual_surface_vtbl[1] = virtual_surface_AddRef;
+        virtual_surface_vtbl[2] = virtual_surface_Release;
+        virtual_surface_vtbl[3] = virtual_surface_BeginDraw;
+        virtual_surface_vtbl[4] = virtual_surface_EndDraw;
+        virtual_surface_vtbl[5] = virtual_surface_SuspendDraw;
+        virtual_surface_vtbl[6] = virtual_surface_ResumeDraw;
+        virtual_surface_vtbl[7] = virtual_surface_Scroll;
+        virtual_surface_vtbl[8] = virtual_surface_Resize;
+        virtual_surface_vtbl[9] = virtual_surface_Trim;
+        InterlockedExchangePointer( &virtual_surface_vtbl[0], virtual_surface_QueryInterface );
+    }
+    surface->virtual_vtbl = (const void **)virtual_surface_vtbl;
+    surface->kind = "virtual surface";
+    *out = &surface->virtual_vtbl;
+    return S_OK;
+}
+
 static HRESULT WINAPI surface_factory_CreateVirtualSurface( void *iface, UINT w, UINT h,
                                                             UINT format, UINT alpha, void **out )
 {
     TRACE( "CreateVirtualSurface %ux%u fmt %u alpha %u.\n", w, h, format, alpha );
-    return create_comp_object_vtbl( "virtual surface", surface_vtbl, out );
+    if (!out) return E_POINTER;
+    return create_virtual_surface( w, h, format, alpha, out );
 }
 
 /* CSurfaceFactory slot 6: Flush */
@@ -5949,7 +6043,9 @@ static HRESULT WINAPI device_CreateVirtualSurface( void *iface, void *a, void *b
 {
     TRACE( "CreateVirtualSurface %ux%u fmt %u.\n", (unsigned)(uintptr_t)a, (unsigned)(uintptr_t)b,
            (unsigned)(uintptr_t)c );
-    return create_comp_object_vtbl( "virtual surface", surface_vtbl, out );
+    if (!out) return E_POINTER;
+    /* IDCompositionDevice::CreateVirtualSurface( width, height, format, alphaMode, out ) */
+    return create_virtual_surface( (UINT)(uintptr_t)a, (UINT)(uintptr_t)b, (UINT)(uintptr_t)c, (UINT)(uintptr_t)d, out );
 }
 DEVICE_CREATE1( CreateTranslateTransform )
 DEVICE_CREATE1( CreateScaleTransform )

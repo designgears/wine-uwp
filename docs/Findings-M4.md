@@ -8514,3 +8514,33 @@ Calculator is AE 0.
   through windows.storage. No surface of their size is ever created. Unexplained.
 - Seen once and not reproduced: a fault in `adapter_vk_copy_bo_address`'s memcpy during a texture
   Map on wined3d's CS thread. Shapr3D's crash handler then died on that thread.
+
+### Cloud sync works (2026-09-23)
+
+"Sync is offline" is gone from the editor title. With WinINet request bodies dumped (a temporary
+hook, not committed), one editor session showed the full upload: `POST
+sync.api.shapr3d.com/v2/projects/<id>/revisions`, PUTs of the project blob and both thumbnails to
+`shapr3d-sync-*-prod.s3-accelerate.amazonaws.com`, then `.../revisions/1/finalize`. The
+`RandomAccessStream` copy statics are the likely unblocker, since uploads copy through them.
+
+**The app's own log is in `LocalState/telemetry.db`** (SQLite, table `Records`, one JSON event
+per row, with source file, line and message) until it is posted to `telemetry.api.shapr3d.com/debug/`.
+Read it before theorising about Shapr3D. The `"internet_connection":"cellular"` field only means
+"not WiFi": `IsWlanConnectionProfile` is false, which is also true of wired ethernet.
+
+### Blank project tiles and swatches: what is ruled out
+
+- The tile is a 240x172 colour sprite (`ff1c1c1c`) plus an outline mask brush. No image sprite is
+  ever attached. No JPEG decoder is ever created, the thumbnail files are never opened (only a
+  directory listing touches them), and neither `GetFileFromApplicationUriAsync` nor any
+  WriteableBitmap/SoftwareBitmapSource is used. The app does not ask for the pictures, so this is
+  app-side state rather than a rendering failure. `projectStorage.db` holds thumbnail resource IDs
+  for 18 of 77 projects, and every `sync.db` thumbnail path is empty. The app may display only
+  thumbnails that sync has downloaded.
+- The Visualization swatches are the same: a 130x130 transparent sprite with nothing inside.
+- `CreateVirtualSurface` returned a recording object; it is now a real surface. The one Shapr3D
+  makes (256x256) is the acrylic noise, which XAML releases undrawn.
+- `CompositionLinearGradientBrush` is not drawn (control-border gradients, skipped as "neither a
+  colour nor a surface brush"). A fidelity gap, not a missing image.
+- The `adapter_vk_copy_bo_address` fault hit 2 of about 4 editor exits. With an ERR per copy it hit
+  0 of 7, so it is timing-dependent. Next step: log only when a mapped pointer is NULL.
