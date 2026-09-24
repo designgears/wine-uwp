@@ -31,6 +31,7 @@ struct media_player
     IMediaPlayer3 IMediaPlayer3_iface;
     IMediaPlayerSource2 IMediaPlayerSource2_iface;
     IMediaPlayer5 IMediaPlayer5_iface;
+    IClosable IClosable_iface;
     LONG ref;
 
     ISystemMediaTransportControls *controls;
@@ -249,6 +250,13 @@ static HRESULT WINAPI media_player_QueryInterface( IMediaPlayer *iface, REFIID i
     if (IsEqualGUID( iid, &IID_IMediaPlayer3 ))
     {
         *out = &impl->IMediaPlayer3_iface;
+        IInspectable_AddRef( *out );
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_IClosable ))
+    {
+        *out = &impl->IClosable_iface;
         IInspectable_AddRef( *out );
         return S_OK;
     }
@@ -2322,6 +2330,28 @@ static HRESULT WINAPI media_player5_RenderSubtitlesToSurfaceWithTargetRectangle(
     return S_OK;
 }
 
+DEFINE_IINSPECTABLE( media_player_closable, IClosable, struct media_player, IMediaPlayer_iface )
+
+/* .NET projects IClosable as IDisposable, so "using (var player = new MediaPlayer())" needs it.
+ * Close stops playback; the object itself goes when its last reference does. */
+static HRESULT WINAPI media_player_closable_Close( IClosable *iface )
+{
+    struct media_player *impl = impl_from_IClosable( iface );
+    TRACE( "iface %p.\n", iface );
+    return IMediaPlayer_Pause( &impl->IMediaPlayer_iface );
+}
+
+static const struct IClosableVtbl media_player_closable_vtbl =
+{
+    media_player_closable_QueryInterface,
+    media_player_closable_AddRef,
+    media_player_closable_Release,
+    media_player_closable_GetIids,
+    media_player_closable_GetRuntimeClassName,
+    media_player_closable_GetTrustLevel,
+    media_player_closable_Close,
+};
+
 static const struct IMediaPlayer5Vtbl media_player5_vtbl =
 {
     media_player5_QueryInterface,
@@ -2467,6 +2497,7 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
     impl->volume = 1.0;
     impl->rate = 1.0;
     impl->IMediaPlayer5_iface.lpVtbl = &media_player5_vtbl;
+    impl->IClosable_iface.lpVtbl = &media_player_closable_vtbl;
     impl->ref = 1;
 
     *instance = (IInspectable *)&impl->IMediaPlayer_iface;

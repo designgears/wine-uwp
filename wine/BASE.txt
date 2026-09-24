@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     e4116398a06eec1ca94a2cc09017cd059c6e77d0
-                 win32u, dcomp: do not blind-forward pointer input to a window dcomp routes
+  wine HEAD:     2254d0385d846298024f42be1f6f7f2f4e82d3e7
+                 windows.globalization: list numberformatting.c in the Makefile
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-24T00:43:11Z
+  captured:      2026-09-24T01:34:56Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

@@ -415,6 +415,7 @@ static ULONG WINAPI impl_type##_Release( iface_type *iface )                    
         /* guard against re-entry if inner releases an outer iface */                                               \
         InterlockedIncrement( &impl->ref );                                                                         \
         IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );                                                       \
+        if (impl->progress) progress_type##_Release( impl->progress );                                              \
         free( impl );                                                                                               \
     }                                                                                                               \
                                                                                                                     \
@@ -436,15 +437,24 @@ static HRESULT WINAPI impl_type##_GetTrustLevel( iface_type *iface, TrustLevel *
     FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );                                                \
     return E_NOTIMPL;                                                                                               \
 }                                                                                                                   \
+/* Progress is never reported, but registering for it has to succeed: .NET's AsTask(progress)  \
+ * throws on a failure here and abandons the operation while it is still running. */           \
 static HRESULT WINAPI impl_type##_put_Progress( iface_type *iface, progress_type *handler )                         \
 {                                                                                                                   \
-    FIXME( "iface %p, handler %p stub!\n", iface, handler );                                                        \
-    return E_NOTIMPL;                                                                                               \
+    struct impl_type *impl = impl_from_##iface_type( iface );                                                       \
+    TRACE( "iface %p, handler %p.\n", iface, handler );                                                             \
+    if (handler) progress_type##_AddRef( handler );                                                                 \
+    if (impl->progress) progress_type##_Release( impl->progress );                                                  \
+    impl->progress = handler;                                                                                       \
+    return S_OK;                                                                                                    \
 }                                                                                                                   \
 static HRESULT WINAPI impl_type##_get_Progress( iface_type *iface, progress_type **handler )                        \
 {                                                                                                                   \
-    FIXME( "iface %p, handler %p stub!\n", iface, handler );                                                        \
-    return E_NOTIMPL;                                                                                               \
+    struct impl_type *impl = impl_from_##iface_type( iface );                                                       \
+    TRACE( "iface %p, handler %p.\n", iface, handler );                                                             \
+    if (!handler) return E_POINTER;                                                                                 \
+    if ((*handler = impl->progress)) progress_type##_AddRef( *handler );                                            \
+    return S_OK;                                                                                                    \
 }                                                                                                                   \
 static HRESULT WINAPI impl_type##_put_Completed( iface_type *iface, completed_type *typed_handler )                 \
 {                                                                                                                   \
@@ -521,6 +531,7 @@ struct async_buffer_uint32
 {
     IAsyncOperationWithProgress_IBuffer_UINT32 IAsyncOperationWithProgress_IBuffer_UINT32_iface;
     IAsyncInfoImpl *IAsyncInfoImpl_inner;
+    IAsyncOperationProgressHandler_IBuffer_UINT32 *progress;
     LONG ref;
 };
 
@@ -533,6 +544,7 @@ struct async_uint32_uint32
 {
     IAsyncOperationWithProgress_UINT32_UINT32 IAsyncOperationWithProgress_UINT32_UINT32_iface;
     IAsyncInfoImpl *IAsyncInfoImpl_inner;
+    IAsyncOperationProgressHandler_UINT32_UINT32 *progress;
     LONG ref;
 };
 
@@ -540,6 +552,19 @@ DEFINE_IASYNCOPERATIONWITHPROGRESS( IAsyncOperationWithProgress_UINT32_UINT32, \
         IAsyncOperationProgressHandler_UINT32_UINT32, \
         IAsyncOperationWithProgressCompletedHandler_UINT32_UINT32, \
         "UInt32,UInt32", async_uint32_uint32, UINT32, VT_UI4, ulVal, async_operation_uint32_uint32_create )
+
+struct async_uint64_uint64
+{
+    IAsyncOperationWithProgress_UINT64_UINT64 IAsyncOperationWithProgress_UINT64_UINT64_iface;
+    IAsyncInfoImpl *IAsyncInfoImpl_inner;
+    IAsyncOperationProgressHandler_UINT64_UINT64 *progress;
+    LONG ref;
+};
+
+DEFINE_IASYNCOPERATIONWITHPROGRESS( IAsyncOperationWithProgress_UINT64_UINT64, \
+        IAsyncOperationProgressHandler_UINT64_UINT64, \
+        IAsyncOperationWithProgressCompletedHandler_UINT64_UINT64, \
+        "UInt64,UInt64", async_uint64_uint64, UINT64, VT_UI8, uhVal.QuadPart, async_operation_uint64_uint64_create )
 
 struct async_bool
 {

@@ -529,6 +529,18 @@ needs that). Both at once handed Shapr3D every toolbar click as a viewport press
 Sketch "pick a plane" by itself. dcomp sets `__wine_dcomp_input_sink` on its sink and the forwarder
 skips it. When input arrives that nothing you wrote posted, `WINEDEBUG=trace+msg` and grep `forwarding`.
 
+**`tools/make_makefiles` builds `SOURCES` from `git ls-files`.** A new `.c` file that is not yet
+`git add`ed is silently dropped from its `Makefile.in` and the link fails with an undefined
+reference. `git add` first, then `make_makefiles`, then `./config.status` in the build tree. Check
+`git status` afterwards: it also "fixed" a committed Makefile that had never listed
+`numberformatting.c`.
+
+**A NULL out-parameter with S_OK across apartments means a wrong IDL direction.** Windows.Graphics
+got a NULL `IWICMetadataQueryWriter` from a call that succeeded, because `wincodec.idl` lacked
+`[out]` on `IWICBitmapFrameEncode::GetMetadataQueryWriter`. The stub treated it as `[in]`, created
+the writer, never sent it back and freed it. `WINEDEBUG=trace+rpc` shows it:
+`stub_do_args param[0] ... IsIn` with no `IsOut`.
+
 **`.as<>()` vs `try_as<>()` is the whole difference, and you can tell which one threw.** C++/WinRT's
 `throw_hresult` is a switch on the HRESULT with one `call` + `int3` per value, so the **return
 address in the app's own crash callstack lands in the branch for the specific HRESULT**. For

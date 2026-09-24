@@ -4,14 +4,15 @@ IMPORTS = shlwapi advapi32 shell32 combase
 SOURCES = \
 	appdatapaths.c \
 	async.c \
-	fileio.c \
-	filestream.c \
 	async_private.idl \
 	classes.idl \
+	fileio.c \
 	fileproperties.c \
+	filestream.c \
 	main.c \
 	queryoptions.c \
 	queryoptions_private.idl \
 	storagefile.c \
 	storagefolder.c \
+	streamcopy.c \
 	streams.c

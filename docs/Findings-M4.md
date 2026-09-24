@@ -8493,3 +8493,19 @@ CoreIndependentInputSource window. That is the same window dcomp's sink targets 
 both traces). dcomp now marks its sink and the forwarder skips it. Toolbar tools and the Display
 Modes menu work (`docs/screenshots/shapr3d-display-modes.png`). Solitaire still plays and
 Calculator is AE 0.
+
+### HTTP bodies, thumbnails, MediaPlayer IClosable (2026-09-23)
+
+- `Windows.Storage.Streams.RandomAccessStream` (CopyAsync and friends) did not exist, so all 23
+  of Shapr.Native's HTTP body copies failed with 0x80040111. It is now in
+  `windows.storage/streamcopy.c`. Two traps on the way: a wait handler that answered QI for every
+  IID was called past its vtable by .NET, and `put_Progress` returning E_NOTIMPL made .NET dispose
+  the streams mid-copy (0x80131622).
+- Project thumbnails: `BitmapEncoder` crashed with an AV in
+  `CImagingHelper::RemoveFrameOrientationWithoutPhotoMetadataPolicy` on a NULL writer. The cause
+  was the missing `[out]` in `wincodec.idl` (see AGENTS.md). Thumbnails now save
+  (`docs/screenshots/shapr3d-thumbnail-saved.png`, the JPEG from `LocalState/storage/resources`).
+- **They still do not display**, and neither do the What's New images: the tiles are background
+  colour only (4 colours). XAML is not showing images from files or HTTP. Next.
+- Seen once and not reproduced: a fault in `adapter_vk_copy_bo_address`'s memcpy during a texture
+  Map on wined3d's CS thread. Shapr3D's crash handler then died on that thread.

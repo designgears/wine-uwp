@@ -56,6 +56,9 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
     if (!wcscmp( buffer, RuntimeClass_Windows_Storage_Streams_InMemoryRandomAccessStream ))
         IActivationFactory_QueryInterface( memory_stream_activation_factory, &IID_IActivationFactory, (void **)factory );
 
+    if (!wcscmp( buffer, RuntimeClass_Windows_Storage_Streams_RandomAccessStream ))
+        IActivationFactory_QueryInterface( random_access_stream_statics_factory, &IID_IActivationFactory, (void **)factory );
+
     if (*factory) return S_OK;
     return CLASS_E_CLASSNOTAVAILABLE;
 }
