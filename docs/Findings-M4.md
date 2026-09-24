@@ -8972,3 +8972,56 @@ Ruled out along the way, by measurement:
 - the 60/60-era dcomp, dxgi and wineuwp: 1 bad in 12;
 - a 250 ms UI-thread heartbeat timer: 6 of 10;
 - windows.storage's async handler registration: correct, and a trace showed no difference.
+
+## 2026-09-24: the Shapr3D UI stall was ntdll's WaitOnAddress table being corrupted
+
+The rarer Shapr3D flake left over from the CoMsgWait fix (about 3 in 12 runs: a half-loaded
+Visualization panel, a blank window, or an import that never returns) was **not** in the UI stack.
+Every failed soak log had lock-timeout reports that the successful runs lacked. Some were
+`peb_lock ... blocked by 03cc`; others were the loader lock held `in DllMain of ucrtbase.dll, reason
+3`, i.e. a thread exiting. No successful run had either.
+
+Finding the holder without a debugger: **`OpenThread` + `SuspendThread` + `GetThreadContext` on a
+thread of *another* Wine process works** (the server asks the target to report its own context), even
+though ptrace is locked down. `probes/probe-threads.cpp` lists a process's threads by Wine tid and
+description (`all` samples every thread's registers three times); `probes/probe-peek.cpp` reads its
+memory. The stalled process showed:
+
+- ten threads (01a0, 01c8 the dispatcher, 03cc the peb_lock holder, 03d4, 0420, wininet, ...) at
+  100% CPU, all in ntdll's `spin_lock`, called from `RtlWakeAddressSingle` or `RtlWaitOnAddress`,
+  all on `futex_queues[14]`, the bucket for address `0x7ffffe2300e8` - the process heap's critical
+  section;
+- every other thread in a syscall, and none inside the spin lock's critical region;
+- the bucket's list empty and consistent, and its lock word `0x00007f5dc329f770`. **That is a
+  stack pointer written by an 8-byte store**, not a lock someone forgot to release.
+
+The cause is upstream Wine code. The wakers did
+
+```c
+entry->addr = NULL;
+list_remove( &entry->entry );
+```
+
+and the waiter, once `NtWaitForAlertByThreadId` returns (timeout, or a stale alert left over from an
+earlier wake - both routine), tests `entry.addr` **without the lock** and returns if it is NULL. In
+between the two waker statements the waiter can return and reuse the stack its entry lives on, so
+`list_remove` reads links out of a live, different frame and writes through them. Spilling `rbx =
+&queue->lock` into the old entry's `prev` slot turns `prev->next = next` into exactly the store that
+was found. Heap-CS contention through that bucket runs at thousands of waits a second in Shapr3D,
+which is why it shows up there and not in smaller apps.
+
+Fix (`dlls/ntdll/sync.c`): both wakers unlink first and clear `addr` last with a full barrier, and
+the waiter reads it with `ReadPointerAcquire`.
+
+**That fix alone did not change the rate: 8 of 12**, and the failed runs still had lock timeouts
+(`peb_lock`, or `reason 3` in ucrtbase/rpcrt4). So the race is real but it was not the only cause.
+The next stop-on-failure run caught a **different** failure. The process vanished, and Sentry's
+minidump (`./minidump.py`) put the fault in `dcomp!raster_blend` (`composition.c:275`), reading
+unmapped memory through an `OP_BLEND`. The swap-chain readback worker `DeleteObject()`ed its back
+DIB whenever the swap chain changed size. But the UI thread may have emitted an `OP_BLEND` into that
+buffer while it was still the front, before swapping it out, and that frame can still be
+rasterizing. Every other cache DIB is retired with `retire_bitmap()` and freed after the frame; this
+one now is too. Crashpad suspends every thread while it writes an 80 MB dump, which may be
+why some crash runs show lock timeouts instead of a clean disappearance. Not proven.
+
+With both fixes: 14 of 15, and the one failure was at startup, with no log kept.

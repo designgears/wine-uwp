@@ -199,6 +199,7 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | What is the visual tree doing? | `WINEDEBUG=+dcomp`; `present_desktop_hwnd frame: N ops` - 0 ops means nothing to draw |
 | Why is an app stuck, when the stack dumper cannot say? | `WINE_UWP_PROFILE=<prefix> WINE_UWP_PROFILE_MS=10` - a sampling profiler already in `wineuwp`. Writes `<prefix>.<pid>` every 2 s: an `M` line per module then `S <tid> <rip> <count> <4 callers>`. It **found the waiting thread's loop when `WINE_UWP_DUMP_STACKS` returned nothing useful**, and it distinguishes *blocked* from *spinning*, which no single stack snapshot can |
 | What is every thread actually doing? | `WINE_UWP_DUMP_STACKS=<seconds>` - suspends and unwinds every thread, prints `STACK tid N frame M rip=`. Works on an *idle* app, not just a hung one. Resolve against `/proc/<pid>/maps` from the same run |
+| What is a thread of a *stuck* process doing, from outside, with no restart? | `wine $UWP_BIN/build-probes/probe-threads.exe <exe> all` - cross-process `SuspendThread` + `GetThreadContext` **works in Wine** although ptrace does not: it lists every thread by Wine tid and description with three register samples, so "blocked by 03cc" gets a rip. `probe-peek.exe <exe> <addr> <qwords>` reads the process's memory. Resolve rips against the `M` lines it prints and `llvm-symbolizer --obj=<build dll>` (image base from `llvm-objdump -p`). This found the corrupted `futex_queues` lock in one live process after days of flushed-log inference |
 | Method count of a private interface | parse the MIDL proxy/stub DLL, below |
 | A parameterised IID over `String`/`Object`/`Int32` | `./piid.py` does **not** know base types: `IVector<String>` silently hashes `String` as a type *name* and prints a wrong IID. Use `--signature` with `string`, `i4`, `cinterface(IInspectable)`: `pinterface({913337e9-11a1-4345-a3a2-4e7f956e222d};string)` gives `98b9acc1-...`, the known `IVector<String>` - check a control like that first |
 | Did this code path run, and with what registers, without ending the run? | `WINE_UWP_BP=windows.ui.xaml.dll+35dcd0,<module>+<rva>,...`: int3 breakpoints planted by `wineuwp` once each module loads. A vectored handler, which runs before the target's own handlers, logs `BP <module>+<rva> hit N tid rcx rdx r8 r9 rax ret=<module+off>`, single-steps over the breakpoint and re-arms it. `WINE_UWP_BP_MAX` caps the lines per breakpoint (default 20). **Use this before `ud2` inside XAML**: XAML swallowed `ud2` probes and gave contradictory negatives, while this showed the whole LoadedImageSurface chain in one run. The address must start an instruction |
@@ -745,6 +746,13 @@ starts with `struct comp_object`'s three fields and reuses its AddRef/Release. A
 landed on `kf_animation`'s `target[]` and made Release iterate 0x664f garbage entries - the fault
 report showed `rdx 007300660066004f`, `"Offs"` from `"Offset"`. Put new state in its own allocation.
 
+**Lock-timeout lines are noise at start-up and a verdict later on.** This file calls the
+`loader_section` retries "normal noise", and for the start-up burst they are. But a `peb_lock`
+timeout, or `blocked by <tid> (in DllMain of ..., reason 3)` (a thread *exiting*) after the app is
+up, appeared in **every** failed Shapr3D soak run and in no good one. I read past them for a whole
+session. `grep -ao "blocked by [0-9a-f]* ([^)]*)"` across all of a soak's logs, split by outcome, is
+a one-line discriminator. Then take the named tid's context with `probe-threads.exe`.
+
 **Do not blame the shared tree until you have dated proof, and do not declare an app broken
 without a screenshot.** Media Player rendered and navigated, then a later run failed to start. I
 wrote both of the following into this file, and both were wrong:
@@ -886,7 +894,7 @@ the fully-qualified name. `--grep` first, always.
   `export PATH="$WINE_BUILD:$PATH"` first, and check `which wine`. Our Wine redoes the update on its
   next start, which is what repairs it; the native byte-patched DLLs are not touched by either.
 
-- `winedbg` crashes on startup in this build, `gdb` cannot attach (`/proc/sys/kernel/yama/ptrace_scope`
+- `winedbg` crashes on startup in this build (but `probe-threads.exe` above gets any thread's context), `gdb` cannot attach (`/proc/sys/kernel/yama/ptrace_scope`
   is 1, and changing it is a system-wide setting - do not do it unasked), and `eu-stack` returns
   nothing useful for Wine threads. **Locate crashes by mapping the fault address from a `+loaddll`
   log with `addr2mod.py` and resolving it against the public PDB.**

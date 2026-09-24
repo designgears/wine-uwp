@@ -2805,7 +2805,10 @@ static void CALLBACK swapchain_readback_job( PTP_CALLBACK_INSTANCE instance, voi
     }
     if (surface->back_cache && (surface->back_w != desc.Width || surface->back_h != desc.Height))
     {
-        if (surface->back_dib) DeleteObject( surface->back_dib );
+        /* retired, not deleted: the UI thread may have swapped this buffer out of the front only
+         * after emitting an OP_BLEND into it, and that frame may still be rasterizing. Deleting it
+         * here crashed Shapr3D in raster_blend when the viewport changed size during an import. */
+        if (surface->back_dib) retire_bitmap( surface->back_dib );
         else free( surface->back_cache );
         surface->back_cache = NULL;
         surface->back_dib = NULL;
