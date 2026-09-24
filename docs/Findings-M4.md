@@ -8849,3 +8849,46 @@ Ruled out, by measurement:
 
 About 30 commits have landed since the 60/60 measurement, so bisecting at 8+ runs a point is the
 next step. Judge any one Solitaire run with that rate in mind.
+
+### Material swatches render (2026-09-24)
+
+Screenshots: `docs/screenshots/shapr3d-used-material-swatches.png` and
+`shapr3d-drone-materials.png`. The Used Materials list now shows shaded spheres in each
+material's colour (Clear Glass `#DFFFFA`, ABS `#FDB08A`), and so do the library swatches. Five
+separate things were wrong. They were found with a new tool, `WINE_UWP_BP` (breakpoints that log
+and let the run carry on). The `ud2` probes of the previous round had been swallowed inside XAML
+and contradicted each other.
+
+1. **XAML did decode the images.** Breakpoints showed the whole chain running:
+   `StartLoadFromUri` → `InitFromUri` → `GetImageDescription` → `OnImageViewUpdated` →
+   `StartFinalSizeDecoding` → `AllocateHardwareResources` → `ImageCache::GetImage` → frame decode
+   → `NotifyCallback`. Every step succeeded.
+2. **The surface brush dropped the `LoadedImageSurface`.** The app passes XAML's
+   `LoadedImageSurface` to `CreateSurfaceBrush`. That is a facade, not a dcomp surface, so the
+   brush held nothing. It now keeps the facade and resolves it through
+   `ICompositionSurfaceFacade::GetRealSurface` (`{e01622c8}`, slot 6) on each paint.
+3. **The effect was never evaluated.** The swatch brush is
+   `Blend(Overlay; Background = Flood, Foreground = the picture)`, fed through a mask brush whose
+   mask is the same picture. The mask path used the flood colour flat. `effect_brush_blend` now
+   recognises that recipe (the root is D2D1 Blend, one input is a Flood) and computes the separable
+   blend per pixel: multiply, screen, darken, lighten, overlay, hard light and difference.
+4. **The colour animation was dropped.** The live colour arrives as a key-frame animation on
+   `ColorEffect.Color`, and `StartAnimation` ignored it, so every swatch stayed at the flood's
+   initial red. A colour key-frame animation on an effect brush now settles at its last frame into
+   the brush's property set.
+5. **The uploads were lost, in two ways.**
+   - When `BeginDraw` hands out the texture itself, `EndDraw` never invalidated the read-back
+     cache. It now marks it stale (read again by the painter) and re-reads a still-empty upload for
+     up to 120 frames.
+   - XAML copies a **50x50 decode into the 40x40 slot** a virtual surface gives it. On Windows
+     that slot sits in a larger atlas, so the overhang is harmless; here wined3d rejected the whole
+     copy. d3d11's `CopySubresourceRegion` now clips an overhanging copy to the destination.
+
+A trap found on the way: XAML's acrylic has a `LoadedImageSurface` too, its 256x256 noise texture.
+Once facades resolved, acrylic painted as noise across the whole window. So `effect_brush_surface`
+uses a facade source only for the recognised blend recipe.
+
+**Calculator re-baselined (134 px, the "=" button's border only).** The cause was confirmed by
+toggling: with the `EndDraw` re-read disabled the result is AE 0 against the old baseline. XAML
+writes that border surface more than once, and the old read-back froze its first contents. The new
+image is the latest contents. Whether it matches Windows for that one border is not verified.

@@ -2696,6 +2696,8 @@ struct drawing_surface
     ID2D1DeviceContext *context;
     ID2D1Bitmap1 *bitmap;
     BOOL drawing;
+    BOOL texture_out;           /* BeginDraw handed the texture itself out; EndDraw invalidates the read-back */
+    unsigned int upload_retries; /* read-backs left to wait for a direct texture upload to land */
     /* CPU copy of the texture, refreshed after XAML draws into it. The painter reads every sprite's
      * surface every frame, and a staging copy plus Map per sprite per frame (each a wined3d
      * round trip) took seconds a frame once the Scientific keypad was up, starving input. */
@@ -3022,6 +3024,24 @@ static void surface_invalidate_cache( struct drawing_surface *surface )
     LeaveCriticalSection( &readback_cs );
 }
 
+/* XAML's image decoder writes a LoadedImageSurface's texture after EndDraw has returned, so the
+ * first read-back can find it still empty. Until pixels appear, read it again on later frames
+ * (bounded: a picture that really is transparent stops being re-read). */
+static void surface_check_upload( struct drawing_surface *surface, unsigned int bpp )
+{
+    size_t i, n;
+
+    if (!surface->upload_retries || !surface->cache) return;
+    n = (size_t)surface->cache_w * surface->cache_h;
+    for (i = 0; i < n; i++)
+        if (bpp == 4 ? surface->cache[i * 4 + 3] : surface->cache[i]) break;
+    if (i < n) { surface->upload_retries = 0; return; }
+    surface->upload_retries--;
+    /* stale, but not queued to the read-back worker: the painter re-reads it itself on the next frame,
+     * so the cache is never reallocated under a blend */
+    surface->cache_valid = FALSE;
+}
+
 static void surface_free_cache( struct drawing_surface *surface );
 static ULONG WINAPI surface_Release( void *iface )
 {
@@ -3255,6 +3275,7 @@ static HRESULT WINAPI surface_BeginDraw( void *iface, const RECT *update_rect, R
     {
         /* IDXGISurface / D3D11 texture callers (XAML image and atlas updates) write the texture directly. */
         TRACE( "handing out the surface texture as %s.\n", debugstr_guid( iid ) );
+        surface->texture_out = TRUE;
         return S_OK;
     }
     if (SUCCEEDED( hr ))
@@ -3279,6 +3300,17 @@ static HRESULT WINAPI surface_EndDraw( void *iface )
     HRESULT hr = S_OK;
 
     TRACE( "surface %p.\n", surface );
+    /* A caller that wrote the texture itself (XAML's image decoder uploading a LoadedImageSurface)
+     * changed the pixels too: a read-back taken before the upload would otherwise stay cached, and
+     * a swatch first painted while still empty stayed empty. */
+    if (surface->texture_out)
+    {
+        /* stale, re-read by the painter on its next frame: queueing it to the read-back worker made
+         * that read race the caller's own copy into the texture on the same immediate context */
+        surface->texture_out = FALSE;
+        surface->upload_retries = 120;
+        surface->cache_valid = FALSE;
+    }
     if (surface->drawing)
     {
         hr = ID2D1DeviceContext_EndDraw( surface->context, NULL, NULL );
@@ -3372,6 +3404,9 @@ struct surface_brush
     BYTE *cache_bits;
     unsigned int cache_w, cache_h;
     ULONG cache_source_gen, cache_layout_gen, cache_serial;
+    /* a surface that is not ours (XAML's LoadedImageSurface): resolved through
+     * ICompositionSurfaceFacade::GetRealSurface when it has one, which may be later than now */
+    IUnknown *facade;
 };
 
 static void *surface_brush_vtbl[COMP_OBJECT_SLOTS];
@@ -3387,12 +3422,37 @@ static struct drawing_surface *surface_from_iface( void *iface )
     return CONTAINING_RECORD( iface, struct drawing_surface, vtbl );
 }
 
+/* ICompositionSurfaceFacade {e01622c8-2332-55c7-8868-a7312c5c229d}: slot 6 GetRealSurface. XAML's
+ * LoadedImageSurface is a facade over the composition surface it decodes into; apps hand the facade
+ * to CreateSurfaceBrush, and the real surface only exists once XAML has allocated it. */
+static struct drawing_surface *surface_from_facade( IUnknown *facade )
+{
+    static const GUID IID_ICompositionSurfaceFacade_ =
+        { 0xe01622c8, 0x2332, 0x55c7, { 0x88, 0x68, 0xa7, 0x31, 0x2c, 0x5c, 0x22, 0x9d } };
+    typedef HRESULT (WINAPI *get_real_surface)( void *, IUnknown ** );
+    struct drawing_surface *surface = NULL;
+    IUnknown *iface = NULL, *real = NULL;
+    HRESULT hr;
+
+    if (!facade) return NULL;
+    if (FAILED(hr = IUnknown_QueryInterface( facade, &IID_ICompositionSurfaceFacade_, (void **)&iface ))) return NULL;
+    hr = ((get_real_surface *)*(void ***)iface)[6]( iface, &real );
+    IUnknown_Release( iface );
+    if (SUCCEEDED(hr) && real)
+    {
+        if ((surface = surface_from_iface( real ))) return surface;  /* keeps GetRealSurface's reference */
+        TRACE( "facade %p: real surface %p is not ours.\n", facade, real );
+        IUnknown_Release( real );
+    }
+    return NULL;
+}
+
 static HRESULT WINAPI surface_brush_get_Surface( void *iface, void **value )
 {
     struct surface_brush *brush = CONTAINING_RECORD( iface, struct surface_brush, vtbl );
 
     if (!value) return E_POINTER;
-    *value = brush->surface ? &brush->surface->vtbl : NULL;
+    *value = brush->facade ? (void *)brush->facade : brush->surface ? &brush->surface->vtbl : NULL;
     if (*value) IUnknown_AddRef( (IUnknown *)*value );
     return S_OK;
 }
@@ -3406,6 +3466,13 @@ static HRESULT WINAPI surface_brush_put_Surface( void *iface, void *value )
     TRACE( "brush %p surface %p (%s).\n", brush, value, surface ? "ours" : "foreign" );
     if (surface) IUnknown_AddRef( (IUnknown *)value );
     if (brush->surface) IUnknown_Release( (IUnknown *)&brush->surface->vtbl );
+    if (brush->facade) IUnknown_Release( brush->facade );
+    brush->facade = NULL;
+    if (!surface && value)
+    {
+        IUnknown_AddRef( (brush->facade = value) );
+        surface = surface_from_facade( brush->facade );
+    }
     brush->surface = surface;
     return S_OK;
 }
@@ -3771,6 +3838,11 @@ static HRESULT create_surface_brush( void *surface_iface, void **out )
     brush->transform.M11 = brush->transform.M22 = 1.0f;
     if ((brush->surface = surface_from_iface( surface_iface )))
         IUnknown_AddRef( (IUnknown *)surface_iface );
+    else if (surface_iface)
+    {
+        IUnknown_AddRef( (brush->facade = surface_iface) );
+        brush->surface = surface_from_facade( brush->facade );
+    }
 
     TRACE( "created SurfaceBrush %p over surface %p.\n", brush, brush->surface );
     *out = &brush->vtbl;
@@ -3787,6 +3859,18 @@ static struct drawing_surface *brush_surface( void *brush_iface )
     if (brush_iface && *(void ***)brush_iface != (void **)surface_brush_vtbl) return effect_brush_surface( brush_iface );
     if (!brush_iface) return NULL;
     brush = CONTAINING_RECORD( brush_iface, struct surface_brush, vtbl );
+    if (brush->facade)
+    {
+        /* asked every time: a LoadedImageSurface may replace its surface (a new decode size) */
+        struct drawing_surface *real = surface_from_facade( brush->facade );
+        if (real != brush->surface)
+        {
+            TRACE( "brush %p: facade %p resolved to surface %p (was %p).\n", brush, brush->facade, real, brush->surface );
+            if (brush->surface) IUnknown_Release( (IUnknown *)&brush->surface->vtbl );
+            brush->surface = real;
+        }
+        else if (real) IUnknown_Release( (IUnknown *)&real->vtbl );
+    }
     return brush->surface && (brush->surface->texture || brush->surface->swapchain) ? brush->surface : NULL;
 }
 
@@ -3913,6 +3997,7 @@ static void readback_batch_format( struct drawing_surface **list, unsigned int c
             surface->opaque = bpp == 4 && bits_opaque( surface->cache, placed[i].w, placed[i].h );
             surface->cache_valid = TRUE;
             surface->generation = InterlockedIncrement( &content_generation );
+            surface_check_upload( surface, bpp );
         }
         ID3D11DeviceContext_Unmap( context, (ID3D11Resource *)*atlas, 0 );
         perf.batched += n;
@@ -4025,6 +4110,7 @@ static const BYTE *surface_cached_pixels( struct drawing_surface *surface, D3D11
     surface->opaque = bpp == 4 && bits_opaque( surface->cache, desc->Width, desc->Height );
     surface->cache_valid = TRUE;
     surface->generation = InterlockedIncrement( &content_generation );
+    surface_check_upload( surface, bpp );
     if (TRACE_ON(dcomp))
     {
         size_t i, n = (size_t)desc->Width * desc->Height * bpp, nonzero = 0;
@@ -13987,7 +14073,146 @@ static struct effect_brush *effect_brush_from_any( void *brush_iface )
     return NULL;
 }
 
-static struct drawing_surface *effect_brush_surface( void *brush_iface )
+/* A Win2D BlendEffect of a flood colour and the brush's surface source, the recipe Shapr3D's material
+ * swatches use: Blend(Mode Overlay; Background = ColorSourceEffect, Foreground = the swatch picture),
+ * with the colour animated through the brush's "ColorEffect.Color" property. D2D's Blend takes the
+ * backdrop as input 0 and the source as input 1. */
+static const GUID CLSID_D2D1Blend_ = { 0x81c5b77b, 0x13f8, 0x4cdd, { 0xad, 0x20, 0xc8, 0x90, 0x54, 0x7a, 0xc6, 0x5d } };
+
+struct effect_blend
+{
+    UINT mode;          /* D2D1_BLEND_MODE */
+    BOOL flood_is_backdrop;
+    float flood[4];     /* straight RGBA, 0..1 */
+    struct drawing_surface *surface;
+};
+
+static BOOL flood_color_of( IUnknown *node, float rgba[4] )
+{
+    IGraphicsEffectD2D1Interop_ *interop;
+    IPropertyValue *value = NULL;
+    FLOAT *a = NULL;
+    UINT32 n = 0;
+    BOOL ret = FALSE;
+    GUID id;
+
+    if (!node || is_own_object( node )) return FALSE;
+    if (FAILED( IUnknown_QueryInterface( node, &IID_IGraphicsEffectD2D1Interop_, (void **)&interop ) )) return FALSE;
+    if (SUCCEEDED( interop->lpVtbl->GetEffectId( interop, &id ) ) && IsEqualGUID( &id, &CLSID_D2D1Flood_ ) &&
+        SUCCEEDED( interop->lpVtbl->GetProperty( interop, 0, &value ) ) && value)
+    {
+        if (SUCCEEDED( IPropertyValue_GetSingleArray( value, &n, &a ) ) && a && n >= 4)
+        {
+            memcpy( rgba, a, 4 * sizeof(float) );
+            ret = TRUE;
+        }
+        CoTaskMemFree( a );
+        IPropertyValue_Release( value );
+    }
+    interop->lpVtbl->Release( interop );
+    return ret;
+}
+
+static struct effect_brush *effect_brush_from_any( void *brush_iface );
+static struct drawing_surface *effect_brush_source_surface( void *brush_iface );
+static BOOL effect_brush_blend( void *brush_iface, struct effect_blend *blend )
+{
+    struct effect_brush *brush = effect_brush_from_any( brush_iface );
+    IGraphicsEffectD2D1Interop_ *interop;
+    IGraphicsEffectSource *sources[2] = { NULL, NULL };
+    IPropertyValue *value = NULL;
+    UINT count = 0, i;
+    BOOL ret = FALSE;
+    GUID id;
+
+    if (!brush || !brush->effect) return FALSE;
+    if (!(blend->surface = effect_brush_source_surface( brush_iface ))) return FALSE;
+    __TRY
+    {
+        if (SUCCEEDED( IUnknown_QueryInterface( (IUnknown *)brush->effect, &IID_IGraphicsEffectD2D1Interop_, (void **)&interop ) ))
+        {
+            if (SUCCEEDED( interop->lpVtbl->GetEffectId( interop, &id ) ) && IsEqualGUID( &id, &CLSID_D2D1Blend_ ) &&
+                SUCCEEDED( interop->lpVtbl->GetSourceCount( interop, &count ) ) && count == 2 &&
+                SUCCEEDED( interop->lpVtbl->GetProperty( interop, 0, &value ) ) && value &&
+                SUCCEEDED( IPropertyValue_GetUInt32( value, &blend->mode ) ))
+            {
+                for (i = 0; i < 2; i++) interop->lpVtbl->GetSource( interop, i, &sources[i] );
+                if (flood_color_of( (IUnknown *)sources[0], blend->flood )) blend->flood_is_backdrop = TRUE, ret = TRUE;
+                else if (flood_color_of( (IUnknown *)sources[1], blend->flood )) blend->flood_is_backdrop = FALSE, ret = TRUE;
+                for (i = 0; i < 2; i++) if (sources[i]) IGraphicsEffectSource_Release( sources[i] );
+            }
+            if (value) IPropertyValue_Release( value );
+            interop->lpVtbl->Release( interop );
+        }
+    }
+    __EXCEPT_ALL
+    {
+        WARN( "effect graph of brush %p faulted.\n", brush );
+        ret = FALSE;
+    }
+    __ENDTRY
+    if (ret && brush->properties)
+    {
+        /* the live colour: an animated "<effect name>.Color" in the brush's property set */
+        struct property_set *set = CONTAINING_RECORD( brush->properties, struct property_set, ICompositionPropertySet_iface );
+        for (i = 0; i < set->value_count; i++)
+        {
+            size_t len = wcslen( set->values[i].name );
+            if (set->values[i].type != PROP_COLOR || len < 6 || wcsicmp( set->values[i].name + len - 6, L".Color" )) continue;
+            blend->flood[0] = set->values[i].u.color.R / 255.0f;
+            blend->flood[1] = set->values[i].u.color.G / 255.0f;
+            blend->flood[2] = set->values[i].u.color.B / 255.0f;
+            blend->flood[3] = set->values[i].u.color.A / 255.0f;
+            break;
+        }
+    }
+    return ret;
+}
+
+/* One channel of a separable blend mode, W3C compositing: cb is the backdrop, cs the source. */
+static float blend_channel( UINT mode, float cb, float cs )
+{
+    switch (mode)
+    {
+    case 0: return cb * cs;                                           /* multiply */
+    case 1: return cb + cs - cb * cs;                                 /* screen */
+    case 2: return min( cb, cs );                                     /* darken */
+    case 3: return max( cb, cs );                                     /* lighten */
+    case 11: return cb <= 0.5f ? 2.0f * cb * cs : 1.0f - 2.0f * (1.0f - cb) * (1.0f - cs);  /* overlay */
+    case 13: return cs <= 0.5f ? 2.0f * cb * cs : 1.0f - 2.0f * (1.0f - cb) * (1.0f - cs);  /* hard light */
+    case 18: return fabsf( cb - cs );                                 /* difference */
+    default: return cs;
+    }
+}
+
+/* Premultiplied BGRA source pixel in, the blend of it with the flood out (premultiplied BGRA). */
+static void effect_blend_pixel( const struct effect_blend *blend, const BYTE *in, BYTE *out )
+{
+    float fa = blend->flood[3], sa = in[3] / 255.0f, ba, bs, oa, c[3];
+    const float *flood = blend->flood;
+    unsigned int k;
+
+    /* flood colour channels in R,G,B order; the picture's are B,G,R premultiplied */
+    for (k = 0; k < 3; k++)
+    {
+        float pic = sa > 0.0f ? in[2 - k] / 255.0f / sa : 0.0f;
+        float cb = blend->flood_is_backdrop ? flood[k] : pic;
+        float cs = blend->flood_is_backdrop ? pic : flood[k];
+        ba = blend->flood_is_backdrop ? fa : sa;
+        bs = blend->flood_is_backdrop ? sa : fa;
+        /* co = cs*as*(1-ab) + cb*ab*(1-as) + as*ab*B(cb,cs) */
+        c[k] = cs * bs * (1.0f - ba) + cb * ba * (1.0f - bs) + bs * ba * blend_channel( blend->mode, cb, cs );
+    }
+    ba = blend->flood_is_backdrop ? fa : sa;
+    bs = blend->flood_is_backdrop ? sa : fa;
+    oa = bs + ba - bs * ba;
+    out[0] = (BYTE)(min( c[2], 1.0f ) * 255.0f + 0.5f);
+    out[1] = (BYTE)(min( c[1], 1.0f ) * 255.0f + 0.5f);
+    out[2] = (BYTE)(min( c[0], 1.0f ) * 255.0f + 0.5f);
+    out[3] = (BYTE)(min( oa, 1.0f ) * 255.0f + 0.5f);
+}
+
+static struct drawing_surface *effect_brush_source_surface_( void *brush_iface, BOOL facades )
 {
     struct effect_brush *brush = effect_brush_from_any( brush_iface );
     struct drawing_surface *surface;
@@ -13995,8 +14220,29 @@ static struct drawing_surface *effect_brush_surface( void *brush_iface )
 
     if (!brush) return NULL;
     for (i = 0; i < brush->source_count; i++)
-        if (brush->sources[i] && (surface = brush_surface( brush->sources[i] ))) return surface;
+    {
+        IUnknown *source = brush->sources[i];
+        if (!source) continue;
+        if (!facades && *(void ***)source == (void **)surface_brush_vtbl &&
+            surface_brush_from( source )->facade) continue;
+        if ((surface = brush_surface( source ))) return surface;
+    }
     return NULL;
+}
+static struct drawing_surface *effect_brush_source_surface( void *brush_iface )
+{
+    return effect_brush_source_surface_( brush_iface, TRUE );
+}
+
+/* The picture an effect brush paints when it is drawn as a plain surface. Only the blend recipe above
+ * uses a LoadedImageSurface source: XAML's acrylic has one too (its noise texture), and painted as
+ * the picture it covered the whole window. */
+static struct drawing_surface *effect_brush_surface( void *brush_iface )
+{
+    struct effect_blend blend;
+
+    if (effect_brush_blend( brush_iface, &blend )) return blend.surface;
+    return effect_brush_source_surface_( brush_iface, FALSE );
 }
 
 
@@ -14251,6 +14497,7 @@ struct mask_brush
     BOOL cache_have_color;
     Color cache_color;
     FLOAT cache_grid[8];
+    FLOAT cache_blend[4];       /* the effect-blend flood colour the cache was made with */
     ULONG cache_serial;         /* content generation of cache_bits */
     ULONG cache_source_layout;  /* the source surface brush's layout_gen */
 };
@@ -15257,6 +15504,8 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
     ULONG layout = 0;
     struct gradient_brush *gradient = NULL;
     BYTE *gradient_bits = NULL;
+    struct effect_blend effect_blend = { 0 };
+    BOOL have_blend = FALSE;
     HDC mem;
 
     if (!brush) return FALSE;
@@ -15276,8 +15525,14 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
         struct nine_grid_brush *source_grid = nine_grid_from( brush->source );
         src = source_grid ? source_grid->source : brush->source;
 
-        have_color = src && brush_solid_color( (ICompositionBrush *)src, &color );
-        if (!have_color && src) source_surface = brush_surface( src );
+        if (src && effect_brush_blend( src, &effect_blend ))
+        {
+            have_blend = TRUE;
+            have_color = FALSE;
+            source_surface = effect_blend.surface;
+        }
+        else have_color = src && brush_solid_color( (ICompositionBrush *)src, &color );
+        if (!have_color && !source_surface && src) source_surface = brush_surface( src );
         if (!have_color && !source_surface) gradient = gradient_brush_from( src );
     }
     if (!have_color && !source_surface && !gradient)
@@ -15321,6 +15576,7 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
            brush->cache_source_surface == (source_surface ? (const void *)source_surface : (const void *)gradient) &&
            (!source_surface || brush->cache_source_gen == source_surface->generation) &&
            brush->cache_have_color == have_color && (!have_color || !memcmp( &brush->cache_color, &color, sizeof(color) )) &&
+           !memcmp( brush->cache_blend, effect_blend.flood, sizeof(brush->cache_blend) ) &&
            !memcmp( brush->cache_grid, grid_key, sizeof(grid_key) ) && brush->cache_source_layout == layout;
     if (!same)
     {
@@ -15364,6 +15620,12 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
                     /* source surfaces hold premultiplied BGRA */
                     const BYTE *in = mapped ? surface_sample( source, source_desc.Width, source_desc.Height, smap, px, py )
                                             : source + ((size_t)py * source_desc.Width + px) * 4;
+                    BYTE blended[4];
+                    if (have_blend)
+                    {
+                        effect_blend_pixel( &effect_blend, in, blended );
+                        in = blended;
+                    }
                     out[0] = in[0] * a / 255;
                     out[1] = in[1] * a / 255;
                     out[2] = in[2] * a / 255;
@@ -15376,14 +15638,20 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
         {
             unsigned int n = 0, i;
             for (i = 0; i < w * h; i++) if (((const BYTE *)brush->cache_bits)[i * 4 + 3]) n++;
-            TRACE( "mask brush %p: %ux%u composed, %u of %u pixels visible (mask gen %u).\n", brush, w, h, n, w * h,
-                   mask_surface->generation );
+            unsigned int m = 0;
+            for (i = 0; i < mask_desc.Width * mask_desc.Height; i++)
+                if (mask_desc.Format == DXGI_FORMAT_A8_UNORM ? mask[i] : mask[i * 4 + 3]) m++;
+            TRACE( "mask brush %p: %ux%u composed, %u of %u pixels visible (mask gen %u, %u mask pixels, blend %d colour %d "
+                   "surface %p gen %u flood %.2f %.2f %.2f %.2f).\n", brush, w, h, n, w * h, mask_surface->generation, m,
+                   have_blend, have_color, source_surface, source_surface ? source_surface->generation : 0,
+                   effect_blend.flood[0], effect_blend.flood[1], effect_blend.flood[2], effect_blend.flood[3] );
         }
         brush->cache_w = w; brush->cache_h = h;
         brush->cache_mask_surface = mask_surface; brush->cache_mask_gen = mask_surface->generation;
         brush->cache_source_surface = source_surface ? (const void *)source_surface : (const void *)gradient;
         brush->cache_source_gen = source_surface ? source_surface->generation : 0;
         brush->cache_have_color = have_color; brush->cache_color = color;
+        memcpy( brush->cache_blend, effect_blend.flood, sizeof(brush->cache_blend) );
         memcpy( brush->cache_grid, grid_key, sizeof(grid_key) );
         brush->cache_source_layout = layout;
         brush->cache_serial = InterlockedIncrement( &content_generation );
@@ -15994,6 +16262,29 @@ static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, voi
         {
             anim_bind( shape->bindings, &shape->binding_count, prop, kf );
             TRACE( "shape %p: %s bound to %p.\n", shape, debugstr_w( prop ), kf );
+        }
+        else if (!shape && !ctrl && kf && prop && kf->has_value && kf->value_kind == KF_COLOR &&
+                 effect_brush_from_any( view->owner ))
+        {
+            /* an effect brush's animated colour ("ColorEffect.Color"): settle at the last key frame,
+             * which is where the brush rests once the animation has run */
+            struct effect_brush *eb = effect_brush_from_any( view->owner );
+            ICompositionPropertySet *set = eb->properties;
+            HSTRING hname;
+
+            if (!set && SUCCEEDED( create_property_set( &set ) ) &&
+                InterlockedCompareExchangePointer( (void **)&eb->properties, set, NULL ))
+            {
+                ICompositionPropertySet_Release( set );
+                set = eb->properties;
+            }
+            if (set && SUCCEEDED( WindowsCreateString( prop, wcslen( prop ), &hname ) ))
+            {
+                ICompositionPropertySet_InsertColor( set, hname, kf->color );
+                WindowsDeleteString( hname );
+                TRACE( "effect brush %p: %s settles at %02x%02x%02x%02x.\n", eb, debugstr_w( prop ),
+                       kf->color.A, kf->color.R, kf->color.G, kf->color.B );
+            }
         }
         else if (!shape && !ctrl && kf && prop)
             TRACE( "owner %p (%s): %s key-frame animation not bound.\n", view->owner,

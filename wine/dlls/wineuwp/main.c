@@ -4882,6 +4882,139 @@ static LONG CALLBACK resume_exception_trace( EXCEPTION_POINTERS *info )
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* WINE_UWP_BP=module+rva[,module+rva...]: non-fatal code probes. Each address gets an int3; a vectored
+ * handler (which runs before any of the target's own handlers, so nothing can swallow it) logs the hit
+ * with its argument registers and return address, puts the original byte back, single-steps over it
+ * and re-arms it. Unlike a ud2 probe the run carries on, so one run answers several questions.
+ * WINE_UWP_BP_MAX caps the lines per breakpoint (default 20). Hits on other threads while one is being
+ * stepped over can be missed; counts are therefore lower bounds. */
+struct code_bp
+{
+    char module[64];
+    ULONG_PTR rva;
+    BYTE *addr;
+    BYTE orig;
+    LONG hits;
+};
+static struct code_bp code_bps[32];
+static unsigned int code_bp_count;
+static LONG code_bp_max = 20;
+static DWORD code_bp_step_tls = TLS_OUT_OF_INDEXES;
+
+static void code_bp_write( BYTE *addr, BYTE value )
+{
+    DWORD old;
+    if (!VirtualProtect( addr, 1, PAGE_EXECUTE_READWRITE, &old )) return;
+    *addr = value;
+    VirtualProtect( addr, 1, old, &old );
+    FlushInstructionCache( GetCurrentProcess(), addr, 1 );
+}
+
+static void code_bp_describe( ULONG_PTR addr, char *buf, size_t size )
+{
+    HMODULE mod;
+    WCHAR path[MAX_PATH], *name;
+
+    if (GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (const WCHAR *)addr, &mod ) && GetModuleFileNameW( mod, path, MAX_PATH ))
+    {
+        name = wcsrchr( path, '\\' );
+        snprintf( buf, size, "%ls+%#Ix", name ? name + 1 : path, addr - (ULONG_PTR)mod );
+    }
+    else snprintf( buf, size, "%#Ix", addr );
+}
+
+static LONG CALLBACK code_bp_handler( EXCEPTION_POINTERS *info )
+{
+    EXCEPTION_RECORD *rec = info->ExceptionRecord;
+    CONTEXT *ctx = info->ContextRecord;
+    unsigned int i;
+
+    if (rec->ExceptionCode == EXCEPTION_BREAKPOINT)
+    {
+        for (i = 0; i < code_bp_count; i++)
+        {
+            struct code_bp *bp = &code_bps[i];
+            char ret[128];
+            LONG n;
+
+            if (!bp->addr || (BYTE *)rec->ExceptionAddress != bp->addr) continue;
+            n = InterlockedIncrement( &bp->hits );
+            if (n <= code_bp_max)
+            {
+                code_bp_describe( *(ULONG_PTR *)ctx->Rsp, ret, sizeof(ret) );
+                ERR( "BP %s+%#Ix hit %ld tid %04lx rcx %Ix rdx %Ix r8 %Ix r9 %Ix rax %Ix ret %s\n", bp->module,
+                     bp->rva, n, GetCurrentThreadId(), ctx->Rcx, ctx->Rdx, ctx->R8, ctx->R9, ctx->Rax, ret );
+            }
+            code_bp_write( bp->addr, bp->orig );
+            ctx->Rip = (ULONG_PTR)bp->addr;
+            ctx->EFlags |= 0x100;   /* trap after the original instruction, then re-arm */
+            TlsSetValue( code_bp_step_tls, (void *)(ULONG_PTR)(i + 1) );
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    else if (rec->ExceptionCode == EXCEPTION_SINGLE_STEP && code_bp_step_tls != TLS_OUT_OF_INDEXES)
+    {
+        ULONG_PTR index = (ULONG_PTR)TlsGetValue( code_bp_step_tls );
+        if (index)
+        {
+            TlsSetValue( code_bp_step_tls, NULL );
+            code_bp_write( code_bps[index - 1].addr, 0xcc );
+            ctx->EFlags &= ~0x100;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* The target modules may load after us: poll until each is present, for up to two minutes. */
+static DWORD WINAPI code_bp_thread( void *arg )
+{
+    unsigned int armed = 0, i, tries;
+    const char *max = getenv( "WINE_UWP_BP_MAX" );
+
+    if (max) code_bp_max = atol( max );
+    for (tries = 0; tries < 2400 && armed < code_bp_count; tries++)
+    {
+        for (i = 0; i < code_bp_count; i++)
+        {
+            struct code_bp *bp = &code_bps[i];
+            HMODULE mod;
+
+            if (bp->addr || !(mod = GetModuleHandleA( bp->module ))) continue;
+            bp->addr = (BYTE *)mod + bp->rva;
+            bp->orig = *bp->addr;
+            code_bp_write( bp->addr, 0xcc );
+            ERR( "BP armed %s+%#Ix at %p (byte %02x)\n", bp->module, bp->rva, bp->addr, bp->orig );
+            armed++;
+        }
+        if (armed < code_bp_count) Sleep( 50 );
+    }
+    return 0;
+}
+
+static void maybe_start_code_bps(void)
+{
+    char env[1024], *p, *item;
+    HANDLE thread;
+
+    if (!GetEnvironmentVariableA( "WINE_UWP_BP", env, sizeof(env) )) return;
+    for (item = strtok_s( env, ",", &p ); item && code_bp_count < ARRAY_SIZE(code_bps); item = strtok_s( NULL, ",", &p ))
+    {
+        char *plus = strrchr( item, '+' );
+        struct code_bp *bp = &code_bps[code_bp_count];
+        if (!plus) continue;
+        *plus = 0;
+        lstrcpynA( bp->module, item, sizeof(bp->module) );
+        bp->rva = strtoull( plus + 1, NULL, 16 );
+        code_bp_count++;
+    }
+    if (!code_bp_count) return;
+    code_bp_step_tls = TlsAlloc();
+    AddVectoredExceptionHandler( 1, code_bp_handler );
+    if ((thread = CreateThread( NULL, 0, code_bp_thread, NULL, 0, NULL ))) CloseHandle( thread );
+}
+
 HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID iid, void **out)
 {
     static LONG resume_trace;
@@ -4896,7 +5029,11 @@ HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID iid, void **out)
     }
     /* also arm the stack dumper here: a run that never reaches ActivationHandled is exactly
      * the one worth dumping, and that hook fires too late to see it. */
-    if (!InterlockedExchange( &dumping, 1 )) maybe_start_stack_dumper();
+    if (!InterlockedExchange( &dumping, 1 ))
+    {
+        maybe_start_stack_dumper();
+        maybe_start_code_bps();
+    }
     TRACE("%s, %s, %p\n", debugstr_guid(clsid), debugstr_guid(iid), out);
     if (IsEqualGUID(clsid, &CLSID_ActivatableApplicationRegistrar))
         return IClassFactory_QueryInterface(&registrar_factory, iid, out);

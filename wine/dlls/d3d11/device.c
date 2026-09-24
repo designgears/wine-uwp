@@ -1334,6 +1334,48 @@ static void STDMETHODCALLTYPE d3d11_device_context_RSSetScissorRects(ID3D11Devic
     wined3d_device_context_set_scissor_rects(context->wined3d_context, rect_count, rects);
 }
 
+/* A copy whose source box overhangs the destination is invalid, and wined3d drops it whole. Clip it
+ * to the destination instead. XAML's LoadedImageSurface copies its 50x50 decode into the 40x40 slot
+ * a DirectComposition virtual surface hands out; on Windows that slot sits inside a larger atlas, so
+ * the overhang lands in slack nobody shows, and the visible result is the clipped copy. Only
+ * 2D textures are handled. Returns FALSE when nothing is left to copy. */
+static BOOL clip_copy_box(ID3D11Resource *dst_resource, UINT dst_subresource_idx, UINT dst_x, UINT dst_y,
+        ID3D11Resource *src_resource, UINT src_subresource_idx, const D3D11_BOX *src_box, struct wined3d_box *box,
+        BOOL *have_box)
+{
+    ID3D11Texture2D *dst, *src;
+    D3D11_TEXTURE2D_DESC dst_desc, src_desc;
+    UINT dst_w, dst_h, mip;
+
+    if (FAILED(ID3D11Resource_QueryInterface(dst_resource, &IID_ID3D11Texture2D, (void **)&dst)))
+        return TRUE;
+    ID3D11Texture2D_GetDesc(dst, &dst_desc);
+    ID3D11Texture2D_Release(dst);
+    mip = dst_desc.MipLevels ? dst_subresource_idx % dst_desc.MipLevels : 0;
+    dst_w = max(1, dst_desc.Width >> mip);
+    dst_h = max(1, dst_desc.Height >> mip);
+
+    if (!src_box)
+    {
+        if (FAILED(ID3D11Resource_QueryInterface(src_resource, &IID_ID3D11Texture2D, (void **)&src)))
+            return TRUE;
+        ID3D11Texture2D_GetDesc(src, &src_desc);
+        ID3D11Texture2D_Release(src);
+        mip = src_desc.MipLevels ? src_subresource_idx % src_desc.MipLevels : 0;
+        wined3d_box_set(box, 0, 0, max(1, src_desc.Width >> mip), max(1, src_desc.Height >> mip), 0, 1);
+    }
+    if (dst_x >= dst_w || dst_y >= dst_h)
+        return FALSE;
+    if (dst_x + (box->right - box->left) <= dst_w && dst_y + (box->bottom - box->top) <= dst_h)
+        return TRUE;
+    WARN("Clipping a %ux%u copy at %u,%u to a %ux%u destination.\n", box->right - box->left,
+            box->bottom - box->top, dst_x, dst_y, dst_w, dst_h);
+    box->right = min(box->right, box->left + (dst_w - dst_x));
+    box->bottom = min(box->bottom, box->top + (dst_h - dst_y));
+    *have_box = TRUE;
+    return TRUE;
+}
+
 static void STDMETHODCALLTYPE d3d11_device_context_CopySubresourceRegion(ID3D11DeviceContext4 *iface,
         ID3D11Resource *dst_resource, UINT dst_subresource_idx, UINT dst_x, UINT dst_y, UINT dst_z,
         ID3D11Resource *src_resource, UINT src_subresource_idx, const D3D11_BOX *src_box)
@@ -1341,6 +1383,7 @@ static void STDMETHODCALLTYPE d3d11_device_context_CopySubresourceRegion(ID3D11D
     struct d3d11_device_context *context = impl_from_ID3D11DeviceContext4(iface);
     struct wined3d_resource *wined3d_dst_resource, *wined3d_src_resource;
     struct wined3d_box wined3d_src_box;
+    BOOL have_box;
 
     TRACE("iface %p, dst_resource %p, dst_subresource_idx %u, dst_x %u, dst_y %u, dst_z %u, "
             "src_resource %p, src_subresource_idx %u, src_box %p.\n",
@@ -1353,11 +1396,15 @@ static void STDMETHODCALLTYPE d3d11_device_context_CopySubresourceRegion(ID3D11D
     if (src_box)
         wined3d_box_set(&wined3d_src_box, src_box->left, src_box->top,
                 src_box->right, src_box->bottom, src_box->front, src_box->back);
+    have_box = !!src_box;
+    if (!clip_copy_box(dst_resource, dst_subresource_idx, dst_x, dst_y, src_resource, src_subresource_idx,
+            src_box, &wined3d_src_box, &have_box))
+        return;
 
     wined3d_dst_resource = wined3d_resource_from_d3d11_resource(dst_resource);
     wined3d_src_resource = wined3d_resource_from_d3d11_resource(src_resource);
     wined3d_device_context_copy_sub_resource_region(context->wined3d_context, wined3d_dst_resource, dst_subresource_idx,
-            dst_x, dst_y, dst_z, wined3d_src_resource, src_subresource_idx, src_box ? &wined3d_src_box : NULL, 0);
+            dst_x, dst_y, dst_z, wined3d_src_resource, src_subresource_idx, have_box ? &wined3d_src_box : NULL, 0);
 }
 
 static void STDMETHODCALLTYPE d3d11_device_context_CopyResource(ID3D11DeviceContext4 *iface,
@@ -2742,6 +2789,7 @@ static void STDMETHODCALLTYPE d3d11_device_context_CopySubresourceRegion1(ID3D11
     struct d3d11_device_context *context = impl_from_ID3D11DeviceContext4(iface);
     struct wined3d_resource *wined3d_dst_resource, *wined3d_src_resource;
     struct wined3d_box wined3d_src_box;
+    BOOL have_box;
 
     TRACE("iface %p, dst_resource %p, dst_subresource_idx %u, dst_x %u, dst_y %u, dst_z %u, "
             "src_resource %p, src_subresource_idx %u, src_box %p, flags %#x.\n",
@@ -2754,11 +2802,15 @@ static void STDMETHODCALLTYPE d3d11_device_context_CopySubresourceRegion1(ID3D11
     if (src_box)
         wined3d_box_set(&wined3d_src_box, src_box->left, src_box->top,
                 src_box->right, src_box->bottom, src_box->front, src_box->back);
+    have_box = !!src_box;
+    if (!clip_copy_box(dst_resource, dst_subresource_idx, dst_x, dst_y, src_resource, src_subresource_idx,
+            src_box, &wined3d_src_box, &have_box))
+        return;
 
     wined3d_dst_resource = wined3d_resource_from_d3d11_resource(dst_resource);
     wined3d_src_resource = wined3d_resource_from_d3d11_resource(src_resource);
     wined3d_device_context_copy_sub_resource_region(context->wined3d_context, wined3d_dst_resource, dst_subresource_idx,
-            dst_x, dst_y, dst_z, wined3d_src_resource, src_subresource_idx, src_box ? &wined3d_src_box : NULL, flags);
+            dst_x, dst_y, dst_z, wined3d_src_resource, src_subresource_idx, have_box ? &wined3d_src_box : NULL, flags);
 }
 
 static void STDMETHODCALLTYPE d3d11_device_context_UpdateSubresource1(ID3D11DeviceContext4 *iface,

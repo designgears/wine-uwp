@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     d4cc196674c1e47db4de64ddaded2b93747db1e5
-                 dwrite: apply the opsz axis per run via named instances; layouts duplicate the format's axis values
+  wine HEAD:     6d1ca9f27a0520c64486a7e4dd03e823a558ff84
+                 Material swatches: LoadedImageSurface facades, blend effects, colour animations, direct-texture uploads; d3d11 clips overhanging copies; wineuwp WINE_UWP_BP
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-24T07:55:46Z
+  captured:      2026-09-24T09:46:01Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
