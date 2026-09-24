@@ -1973,9 +1973,6 @@ static HRESULT WINAPI dwritefactory6_CreateTextFormat(IDWriteFactory7 *iface, co
 
     *format = NULL;
 
-    if (axis_values)
-        FIXME("Axis values are ignored.\n");
-
     if (collection)
     {
         IDWriteFontCollection_AddRef(collection);
@@ -1986,8 +1983,45 @@ static HRESULT WINAPI dwritefactory6_CreateTextFormat(IDWriteFactory7 *iface, co
         return hr;
     }
 
-    hr = create_text_format(family_name, collection, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL, size, locale, &IID_IDWriteTextFormat3, (void **)format);
+    /* Faces are chosen by weight, stretch and style; a variable font's named instances are faces of
+     * their own (see fontset_builder_add_file). The optical size is left to the default instance. */
+    {
+        static const float stretches[] = { 50.0f, 62.5f, 75.0f, 87.5f, 100.0f, 112.5f, 125.0f, 150.0f, 200.0f };
+        DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL;
+        DWRITE_FONT_STRETCH stretch = DWRITE_FONT_STRETCH_NORMAL;
+        DWRITE_FONT_STYLE style = DWRITE_FONT_STYLE_NORMAL;
+        UINT32 i, j;
+
+        for (i = 0; axis_values && i < num_axis; ++i)
+        {
+            float value = axis_values[i].value;
+
+            switch (axis_values[i].axisTag)
+            {
+            case DWRITE_FONT_AXIS_TAG_WEIGHT:
+                weight = value < 1.0f ? 1 : value > 999.0f ? 999 : (DWRITE_FONT_WEIGHT)(value + 0.5f);
+                break;
+            case DWRITE_FONT_AXIS_TAG_WIDTH:
+                for (j = 0; j < ARRAY_SIZE(stretches); ++j)
+                {
+                    stretch = j + 1;
+                    if (j + 1 == ARRAY_SIZE(stretches) || value < (stretches[j] + stretches[j + 1]) / 2.0f) break;
+                }
+                break;
+            case DWRITE_FONT_AXIS_TAG_ITALIC:
+                if (value >= 0.5f) style = DWRITE_FONT_STYLE_ITALIC;
+                break;
+            case DWRITE_FONT_AXIS_TAG_SLANT:
+                if (value != 0.0f && style == DWRITE_FONT_STYLE_NORMAL) style = DWRITE_FONT_STYLE_OBLIQUE;
+                break;
+            default:
+                TRACE("Axis %s is not applied.\n", debugstr_fourcc(axis_values[i].axisTag));
+            }
+        }
+
+        hr = create_text_format(family_name, collection, weight, style, stretch, size, locale,
+                &IID_IDWriteTextFormat3, (void **)format);
+    }
     IDWriteFontCollection_Release(collection);
     return hr;
 }

@@ -161,7 +161,9 @@ static int fontface_get_glyph_advance(struct dwrite_fontface *fontface, float fo
 
 void dwrite_fontface_get_glyph_bbox(IDWriteFontFace *iface, struct dwrite_glyphbitmap *bitmap)
 {
-    struct cache_key key = { .size = bitmap->emsize, .glyph = bitmap->glyph, .mode = DWRITE_MEASURING_MODE_NATURAL };
+    /* one cache entry holds the box and the bitmap of a glyph for a rendering mode and subpixel step */
+    struct cache_key key = { .size = bitmap->emsize, .glyph = bitmap->glyph,
+                             .mode = (bitmap->mode << 2) | (bitmap->subpixel & 3) };
     struct dwrite_fontface *fontface = unsafe_impl_from_IDWriteFontFace(iface);
     struct get_glyph_bbox_params params;
     struct cache_entry *entry;
@@ -169,6 +171,8 @@ void dwrite_fontface_get_glyph_bbox(IDWriteFontFace *iface, struct dwrite_glyphb
     params.object = fontface->get_font_object(fontface);
     params.simulations = bitmap->simulations;
     params.glyph = bitmap->glyph;
+    params.mode = bitmap->mode;
+    params.subpixel = bitmap->subpixel & 3;
     params.emsize = bitmap->emsize;
     matrix_2x2_from_dwrite_matrix(&params.m, bitmap->m ? bitmap->m : &identity);
     key.m = params.m;
@@ -195,7 +199,8 @@ static unsigned int get_glyph_bitmap_pitch(DWRITE_RENDERING_MODE1 rendering_mode
 static HRESULT dwrite_fontface_get_glyph_bitmap(struct dwrite_fontface *fontface, DWRITE_RENDERING_MODE1 rendering_mode,
         unsigned int *is_1bpp, struct dwrite_glyphbitmap *bitmap)
 {
-    struct cache_key key = { .size = bitmap->emsize, .glyph = bitmap->glyph, .mode = rendering_mode };
+    struct cache_key key = { .size = bitmap->emsize, .glyph = bitmap->glyph,
+                             .mode = (bitmap->mode << 2) | (bitmap->subpixel & 3) };
     struct get_glyph_bitmap_params params;
     const RECT *bbox = &bitmap->bbox;
     unsigned int bitmap_size, _1bpp;
@@ -209,6 +214,7 @@ static HRESULT dwrite_fontface_get_glyph_bitmap(struct dwrite_fontface *fontface
     params.simulations = fontface->simulations;
     params.glyph = bitmap->glyph;
     params.mode = rendering_mode;
+    params.subpixel = bitmap->subpixel & 3;
     params.emsize = bitmap->emsize;
     params.bbox = bitmap->bbox;
     params.pitch = bitmap->pitch;
@@ -4404,6 +4410,36 @@ static HRESULT init_font_data(const struct fontface_desc *desc, DWRITE_FONT_FAMI
     opentype_get_font_metrics(&stream_desc, &data->metrics, NULL);
     opentype_get_font_facename(&stream_desc, props.lf.lfFaceName, &data->names);
 
+    if (DWRITE_FACE_INSTANCE(desc->index))
+    {
+        struct dwrite_var_instance *instances, *instance;
+        unsigned int count = opentype_get_named_instances(&stream_desc, &instances), k;
+        IDWriteLocalizedStrings *names;
+
+        if (DWRITE_FACE_INSTANCE(desc->index) > count)
+        {
+            free(instances);
+            release_font_data(data);
+            return E_INVALIDARG;
+        }
+        instance = &instances[DWRITE_FACE_INSTANCE(desc->index) - 1];
+        props.weight = instance->weight < 1.0f ? 1 : instance->weight > 999.0f ? 999 :
+                (DWRITE_FONT_WEIGHT)(instance->weight + 0.5f);
+        for (k = DWRITE_FONT_STRETCH_ULTRA_CONDENSED; k < DWRITE_FONT_STRETCH_ULTRA_EXPANDED; ++k)
+            if (instance->width < (width_axis_values[k] + width_axis_values[k + 1]) / 2.0f) break;
+        props.stretch = k;
+        if (instance->italic >= 0.5f) props.style = DWRITE_FONT_STYLE_ITALIC;
+        else if (instance->slant != 0.0f) props.style = DWRITE_FONT_STYLE_OBLIQUE;
+        props.lf.lfWeight = props.weight;
+        props.lf.lfItalic = props.style != DWRITE_FONT_STYLE_NORMAL;
+        if (SUCCEEDED(opentype_get_name_strings(&stream_desc, instance->subfamily_name_id, &names)))
+        {
+            if (data->names) IDWriteLocalizedStrings_Release(data->names);
+            data->names = names;
+        }
+        free(instances);
+    }
+
     if (FAILED(hr = opentype_get_font_familyname(&stream_desc, family_model, &data->family_names)))
     {
         WARN("Unable to get family name from the font file, hr %#lx.\n", hr);
@@ -4422,7 +4458,9 @@ static HRESULT init_font_data(const struct fontface_desc *desc, DWRITE_FONT_FAMI
     fontstrings_get_en_string(data->family_names, familyW, ARRAY_SIZE(familyW));
     fontstrings_get_en_string(data->names, faceW, ARRAY_SIZE(faceW));
 
-    if (family_model == DWRITE_FONT_FAMILY_MODEL_WEIGHT_STRETCH_STYLE
+    /* A variable font's named instances belong to the font's own family: the rules would turn
+     * "Semibold Text" into a separate "... Text" family that callers asking for the family never see. */
+    if (family_model == DWRITE_FONT_FAMILY_MODEL_WEIGHT_STRETCH_STYLE && !DWRITE_FACE_INSTANCE(desc->index)
             && font_apply_differentiation_rules(data, familyW, faceW))
     {
         set_en_localizedstring(data->family_names, familyW);
@@ -5882,6 +5920,35 @@ static ULONG WINAPI glyphrunanalysis_Release(IDWriteGlyphRunAnalysis *iface)
     return refcount;
 }
 
+/* Where a glyph of the run goes: a whole-pixel position plus, in the natural modes, the remaining
+ * horizontal fraction in quarter pixels, which the rasterizer applies to the outline. Placing every
+ * glyph at a truncated whole pixel moved each one by up to a pixel from its layout position. */
+static void glyphrunanalysis_place_glyph(const struct dwrite_glyphrunanalysis *analysis, UINT32 i,
+        struct dwrite_glyphbitmap *glyph_bitmap, POINT *pos)
+{
+    float x = analysis->origins[i].x, y = analysis->origins[i].y, fx;
+    BOOL natural = analysis->rendering_mode == DWRITE_RENDERING_MODE1_NATURAL
+            || analysis->rendering_mode == DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC
+            || analysis->rendering_mode == DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC_DOWNSAMPLED;
+
+    glyph_bitmap->mode = analysis->rendering_mode;
+    pos->y = (LONG)floorf(y + 0.5f);
+    if (!natural)
+    {
+        pos->x = (LONG)floorf(x + 0.5f);
+        glyph_bitmap->subpixel = 0;
+        return;
+    }
+    pos->x = (LONG)floorf(x);
+    fx = x - pos->x;
+    glyph_bitmap->subpixel = (unsigned int)(fx * 4.0f + 0.5f);
+    if (glyph_bitmap->subpixel == 4)
+    {
+        pos->x++;
+        glyph_bitmap->subpixel = 0;
+    }
+}
+
 static void glyphrunanalysis_get_texturebounds(struct dwrite_glyphrunanalysis *analysis, RECT *bounds)
 {
     struct dwrite_glyphbitmap glyph_bitmap;
@@ -5905,7 +5972,10 @@ static void glyphrunanalysis_get_texturebounds(struct dwrite_glyphrunanalysis *a
         RECT *bbox = &glyph_bitmap.bbox;
         UINT32 bitmap_size;
 
+        POINT pos;
+
         glyph_bitmap.glyph = analysis->run.glyphIndices[i];
+        glyphrunanalysis_place_glyph(analysis, i, &glyph_bitmap, &pos);
         dwrite_fontface_get_glyph_bbox(analysis->run.fontFace, &glyph_bitmap);
 
         bitmap_size = get_glyph_bitmap_pitch(analysis->rendering_mode, bbox->right - bbox->left) *
@@ -5913,7 +5983,7 @@ static void glyphrunanalysis_get_texturebounds(struct dwrite_glyphrunanalysis *a
         if (bitmap_size > analysis->max_glyph_bitmap_size)
             analysis->max_glyph_bitmap_size = bitmap_size;
 
-        OffsetRect(bbox, analysis->origins[i].x, analysis->origins[i].y);
+        OffsetRect(bbox, pos.x, pos.y);
         UnionRect(&analysis->bounds, &analysis->bounds, bbox);
     }
 
@@ -5989,8 +6059,10 @@ static HRESULT glyphrunanalysis_render(struct dwrite_glyphrunanalysis *analysis)
         BYTE *src = glyph_bitmap.buf, *dst;
         int x, y, width, height;
         unsigned int is_1bpp;
+        POINT pos;
 
         glyph_bitmap.glyph = analysis->run.glyphIndices[i];
+        glyphrunanalysis_place_glyph(analysis, i, &glyph_bitmap, &pos);
         dwrite_fontface_get_glyph_bbox(analysis->run.fontFace, &glyph_bitmap);
 
         if (IsRectEmpty(bbox))
@@ -6008,7 +6080,7 @@ static HRESULT glyphrunanalysis_render(struct dwrite_glyphrunanalysis *analysis)
             continue;
         }
 
-        OffsetRect(bbox, analysis->origins[i].x, analysis->origins[i].y);
+        OffsetRect(bbox, pos.x, pos.y);
 
         /* blit to analysis bitmap */
         dst = get_pixel_ptr(analysis->bitmap, analysis->texture_type, bbox, &analysis->bounds);
@@ -6038,7 +6110,7 @@ static HRESULT glyphrunanalysis_render(struct dwrite_glyphrunanalysis *analysis)
             if (analysis->texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1) {
                 for (y = 0; y < height; y++) {
                     for (x = 0; x < width; x++)
-                        dst[3*x] = dst[3*x+1] = dst[3*x+2] = src[x] | dst[3*x];
+                        dst[3*x] = dst[3*x+1] = dst[3*x+2] = max(src[x], dst[3*x]);
                     src += glyph_bitmap.pitch;
                     dst += (analysis->bounds.right - analysis->bounds.left) * 3;
                 }
@@ -6046,7 +6118,7 @@ static HRESULT glyphrunanalysis_render(struct dwrite_glyphrunanalysis *analysis)
             else {
                 for (y = 0; y < height; y++) {
                     for (x = 0; x < width; x++)
-                        dst[x] |= src[x];
+                        dst[x] = max(src[x], dst[x]);
                     src += glyph_bitmap.pitch;
                     dst += analysis->bounds.right - analysis->bounds.left;
                 }
@@ -8096,9 +8168,32 @@ static HRESULT fontset_builder_add_file(struct dwrite_fontset_builder *builder, 
 
     for (i = 0; i < face_count; ++i)
     {
+        struct dwrite_var_instance *instances;
+        struct file_stream_desc stream_desc;
+        IDWriteFontFileStream *stream;
+        unsigned int j, count;
+
         desc.face_index = i;
         if (FAILED(hr = fontset_builder_add_entry(builder, &desc)))
             break;
+
+        /* the named instances of a variable font at its default optical size, so that its weights
+         * are real faces rather than the default instance with a simulated bold */
+        if (FAILED(get_filestream_from_file(file, &stream))) continue;
+        stream_desc.stream = stream;
+        stream_desc.face_type = desc.face_type;
+        stream_desc.face_index = i;
+        count = opentype_get_named_instances(&stream_desc, &instances);
+        if (count) TRACE("face %u has %u named instances.\n", i, count);
+        for (j = 0; j < count && j < 0xfffe && SUCCEEDED(hr); ++j)
+        {
+            if (instances[j].is_default || !instances[j].default_opsz) continue;
+            desc.face_index = i | ((j + 1) << 16);
+            hr = fontset_builder_add_entry(builder, &desc);
+        }
+        free(instances);
+        IDWriteFontFileStream_Release(stream);
+        if (FAILED(hr)) break;
     }
 
     return hr;

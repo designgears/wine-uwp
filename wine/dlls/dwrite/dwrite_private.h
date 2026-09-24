@@ -537,6 +537,23 @@ extern HRESULT opentype_get_font_info_strings(const struct file_stream_desc *str
 extern HRESULT opentype_get_font_familyname(const struct file_stream_desc *desc, DWRITE_FONT_FAMILY_MODEL family_model,
         IDWriteLocalizedStrings **names);
 extern HRESULT opentype_get_font_facename(struct file_stream_desc*,WCHAR*,IDWriteLocalizedStrings**);
+
+/* A named instance of a variable font. Collections expose one font per instance at the default
+ * optical size, with the instance index in bits 16-31 of the face index (FreeType's convention,
+ * counted from 1); table reads use only the low 16 bits. */
+struct dwrite_var_instance
+{
+    UINT16 subfamily_name_id;
+    float weight, width, italic, slant;
+    BOOL default_opsz;      /* the opsz coordinate is the axis default, or there is no opsz axis */
+    BOOL is_default;        /* every coordinate is the axis default: the plain face already is this */
+};
+#define DWRITE_FACE_INDEX(index) ((index) & 0xffff)
+#define DWRITE_FACE_INSTANCE(index) ((index) >> 16)
+extern unsigned int opentype_get_named_instances(const struct file_stream_desc *stream_desc,
+        struct dwrite_var_instance **instances);
+extern HRESULT opentype_get_name_strings(const struct file_stream_desc *stream_desc, UINT16 name_id,
+        IDWriteLocalizedStrings **strings);
 extern void opentype_get_typographic_features(struct ot_gsubgpos_table *table, unsigned int script_index,
         unsigned int language_index, struct tag_array *tags);
 extern BOOL opentype_get_vdmx_size(const struct dwrite_fonttable *table, INT ppem, UINT16 *ascent,
@@ -595,6 +612,8 @@ struct dwrite_glyphbitmap
     DWORD simulations;
     float emsize;
     UINT16 glyph;
+    DWRITE_RENDERING_MODE1 mode;    /* 0 (default) keeps the hinted, whole-pixel rendering */
+    unsigned int subpixel;          /* horizontal offset in quarter pixels, 0-3 */
     INT pitch;
     RECT bbox;
     BYTE *buf;

@@ -265,3 +265,6 @@ dlls/windows.storage/streamcopy.c
 include/wincodec.idl
 dlls/windows.globalization/Makefile.in
 dlls/wined3d/texture.c
+dlls/dwrite/unixlib.h
+dlls/dwrite/freetype.c
+dlls/dwrite/opentype.c

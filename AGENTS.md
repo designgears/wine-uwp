@@ -148,7 +148,8 @@ capture. It was re-taken on 2026-09-23 when `IDWriteFontFamily2::GetMatchingFont
 XAML's text then takes its normal font path instead of an E_NOTIMPL fallback, which moves text by
 one pixel (3486 pixels differ). The change was confirmed to come from dwrite alone (the old dwrite
 gives AE 0), and the new rendering is identical across runs. Re-baseline only like that: attribute
-the difference to one change, look at it, and run twice. It used to live only in `/tmp`, and `/tmp` gets wiped: the baseline, every session log and
+the difference to one change, look at it, and run twice. Re-taken again the same day for dwrite's
+subpixel glyph positioning (771 pixels, antialiasing inside glyphs; layout identical). It used to live only in `/tmp`, and `/tmp` gets wiped: the baseline, every session log and
 **the Xvfb socket for `:98`** all vanished at once. Nothing starts `:98` automatically, so the first
 symptom was every app failing activation with `PrivateCreateCoreWindow failed, hr 0x80004005` -
 which looks like a Wine regression and is not. **If a run suddenly fails at activation, check
@@ -558,6 +559,13 @@ run) and disassemble just before the return address. XAML reports through a help
 `windows.ui.xaml+0x2f790`, called with the HRESULT, so the vtable call just before it is the refusing
 API. That found both `IDWriteFontFamily2::GetMatchingFonts` and dcomp's missing easing creators in
 one pass each.
+
+**Text quality lives in dwrite's glyph run analysis, not in the fonts.** XAML rasterizes text
+itself with `CreateGlyphRunAnalysis(NATURAL_SYMMETRIC, grayscale)`, not through D2D's text drawing.
+So a D2D `DrawTextLayout` probe can look fine while XAML text does not. `probes/probe-fonts.cpp`
+lists the system collection and a family's faces; `probes/probe-text.cpp` renders `Family:weight`
+lines through D2D. The Segoe fonts come from the host through fontconfig (`~/.local/share/fonts`
+here), not from the prefix's Fonts folder, which is empty.
 
 **`.as<>()` vs `try_as<>()` is the whole difference, and you can tell which one threw.** C++/WinRT's
 `throw_hresult` is a switch on the HRESULT with one `call` + `int3` per value, so the **return

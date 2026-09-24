@@ -8586,3 +8586,24 @@ the game in 2 of 3 runs. The other one died at 72 s with an access violation in
 `CoreMessaging.dll+0x27ed3` (one of the byte-patched DLLs), called from `windows.ui.dll`'s
 dispatcher. It was not seen in the previous 60+ runs, and this session cannot say whether this
 change makes it more likely. Watch for it.
+
+### Fonts: right files, wrong faces and wrong rasterization (2026-09-23)
+
+The fonts themselves were right. Segoe UI, Segoe UI Variable and Segoe Fluent Icons are the real
+files, found through fontconfig. Three things were wrong with how they were used
+(`docs/screenshots/shapr3d-text-before-after.png`):
+
+1. **Variable fonts had one face.** SegUIVar.ttf has 15 named instances (Light to Bold x
+   Small/Text/Display), and dwrite exposed only its default, Regular Text, plus a simulated bold.
+   The instances at the default optical size are now real faces of the same family, with the face
+   index carrying the instance in bits 16-31 as FreeType expects. The WWS differentiation rules had
+   to be skipped for them, or they became a separate "Segoe UI Variable Text" family.
+2. **`CreateTextFormat`'s axis values were ignored**, weight included. XAML passes wght, wdth,
+   ital, slnt and opsz for every format. opsz is still not applied: 12 px text is opsz 9, between
+   the Small and Text designs, and gets Text.
+3. **Glyphs were snapped and hinted.** `glyphrunanalysis_render` placed each glyph at its origin
+   truncated to a whole pixel and FreeType hinted it fully. That is what made "Visualization" and
+   "Items" look unevenly spaced. The natural modes now use quarter-pixel positions and light hinting.
+
+Regression: Calculator re-baselined (771 px of antialiasing, identical across runs), Feedback Hub
+852 colours / 0 fail-fasts, Media Player 2246, Solitaire game reached.
