@@ -8757,3 +8757,25 @@ Two refusals had killed the process on the first keystroke, one after the other:
 Driving this with `xdotool type` at its default 12 ms per key loses the key after the one that
 opens the dimension field ("50" arrives as "5"). At 250 ms per key every digit arrives. A person
 types slower than 12 ms per key, so this is recorded rather than chased.
+
+### Fillet, undo/redo, tool search, reopening, Screenshot -> Capture (2026-09-24)
+
+A tour of the editor for fatal refusals. Nothing new was fatal. What was tested:
+
+- Ctrl+Z and Ctrl+Y.
+- Ctrl+F search: "fillet" lists four Chamfer/Fillet commands.
+- Chamfer/Fillet with a typed 2 mm radius (`docs/screenshots/shapr3d-fillet.png`).
+- Leaving the editor. Recents shows live thumbnails
+  (`docs/screenshots/shapr3d-recents-live-thumbnails.png`).
+- Reopening the project with a double-click on its tile; a single click only selects it.
+- Screenshot -> Capture.
+
+The capture saves through `FileSavePicker`. The shim now turns the app's `FileTypeChoices`
+(JPEG `.jpeg`/`.jpg`, PNG `.png`) into the dialog's type list
+(`docs/screenshots/shapr3d-save-dialog-types.png`). It reads them by iterating the PropertySet
+behind the wrapper. The first extension becomes the default when the app sets none. The app sets
+no suggested name, so the name field starts empty. The saved file is a 1280x752 JPEG of the
+viewport (`docs/screenshots/shapr3d-capture-output.png`).
+
+The prefix's `Documents`, `Desktop` and `Pictures` are symlinks to the user's home folders. The
+dialogs start in Documents, so test output goes to `C:\users\Public\`.

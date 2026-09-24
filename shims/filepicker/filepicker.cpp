@@ -195,16 +195,28 @@ static bool open_file_dialog(const WCHAR *patterns, WCHAR *path, DWORD size)
     return false;
 }
 
-static bool save_file_dialog(const WCHAR *suggested, const WCHAR *default_ext, WCHAR *path, DWORD size)
+/* FileTypeChoices -> an OPENFILENAME filter, one entry per choice ("PNG (*.png)"), in the app's
+ * order, then all files. Returns FALSE if there are none. first_ext gets the first extension. */
+static BOOL choices_filter(IUnknown *map, WCHAR *filter, size_t size, WCHAR *first_ext, size_t ext_size);
+
+static bool save_file_dialog(const WCHAR *suggested, const WCHAR *default_ext, IUnknown *choices,
+                             WCHAR *path, DWORD size)
 {
-    WCHAR filter[512], patterns[128] = L"";
+    WCHAR filter[1024], patterns[128] = L"", choice_ext[32] = L"";
     const WCHAR *ext = default_ext && *default_ext ? default_ext : suggested ? wcsrchr(suggested, '.') : nullptr;
     OPENFILENAMEW ofn = { sizeof(ofn) };
 
-    append_pattern(patterns, ARRAYSIZE(patterns), ext);
-    build_filter(filter, ARRAYSIZE(filter), patterns);
+    if (choices && choices_filter(choices, filter, ARRAYSIZE(filter), choice_ext, ARRAYSIZE(choice_ext)))
+    {
+        if (!ext || !*ext) ext = choice_ext;
+    }
+    else
+    {
+        append_pattern(patterns, ARRAYSIZE(patterns), ext);
+        build_filter(filter, ARRAYSIZE(filter), patterns);
+    }
     lstrcpynW(path, suggested ? suggested : L"", size);
-    if (ext && *ext && !(wcslen(path) >= wcslen(ext) && !_wcsicmp(path + wcslen(path) - wcslen(ext), ext)))
+    if (path[0] && ext && *ext && !(wcslen(path) >= wcslen(ext) && !_wcsicmp(path + wcslen(path) - wcslen(ext), ext)))
         wcsncat(path, ext, size - wcslen(path) - 1);
     ofn.hwndOwner = GetActiveWindow();
     ofn.lpstrFilter = filter;
@@ -892,6 +904,81 @@ static HRESULT make_choices(IUnknown **out)
     return S_OK;
 }
 
+/* IIterable<IKeyValuePair<String, Object>>, which Wine's PropertySet answers */
+DEF_IID(IID_IIterable_KVP_String_Object_, 0xfe2f3d47,0x5d47,0x5499, 0x83,0x74,0x43,0x0c,0x7c,0xda,0x02,0x04);
+DEF_IID(IID_IVector_String_,              0x98b9acc1,0x4b56,0x532e, 0xac,0x73,0x03,0xd5,0x29,0x1c,0xca,0x90);
+
+static BOOL choices_filter(IUnknown *map, WCHAR *filter, size_t size, WCHAR *first_ext, size_t ext_size)
+{
+    typedef HRESULT (WINAPI *get_obj)(void *, IUnknown **);
+    typedef HRESULT (WINAPI *get_bool)(void *, boolean *);
+    typedef HRESULT (WINAPI *get_str)(void *, HSTRING *);
+    typedef HRESULT (WINAPI *get_u32)(void *, UINT32 *);
+    typedef HRESULT (WINAPI *get_at)(void *, UINT32, HSTRING *);
+    IUnknown *iterable = nullptr, *it = nullptr;
+    boolean has = FALSE;
+    size_t n = 0;
+    BOOL any = FALSE;
+    auto put = [&](const WCHAR *str) {
+        size_t len = wcslen(str);
+        if (n + len + 2 >= size) return;
+        memcpy(filter + n, str, len * sizeof(WCHAR));
+        n += len;
+    };
+    auto end = [&]() { if (n + 1 < size) filter[n++] = 0; };
+
+    first_ext[0] = 0;
+    if (FAILED(map->QueryInterface(IID_IIterable_KVP_String_Object_, (void **)&iterable))) return FALSE;
+    if (FAILED(((get_obj *)(*(void ***)iterable))[6](iterable, &it)) || !it) { iterable->Release(); return FALSE; }
+    iterable->Release();
+    ((get_bool *)(*(void ***)it))[7](it, &has);
+    while (has)
+    {
+        IUnknown *pair = nullptr, *value = nullptr, *vector = nullptr;
+        HSTRING key = nullptr;
+        UINT32 count = 0, i;
+        WCHAR patterns[256] = L"";
+
+        if (SUCCEEDED(((get_obj *)(*(void ***)it))[6](it, &pair)) && pair)
+        {
+            ((get_str *)(*(void ***)pair))[6](pair, &key);
+            if (SUCCEEDED(((get_obj *)(*(void ***)pair))[7](pair, &value)) && value &&
+                SUCCEEDED(value->QueryInterface(IID_IVector_String_, (void **)&vector)))
+            {
+                ((get_u32 *)(*(void ***)vector))[7](vector, &count);
+                for (i = 0; i < count; i++)
+                {
+                    HSTRING ext = nullptr;
+                    if (FAILED(((get_at *)(*(void ***)vector))[6](vector, i, &ext))) continue;
+                    const WCHAR *e = WindowsGetStringRawBuffer(ext, nullptr);
+                    append_pattern(patterns, ARRAYSIZE(patterns), e);
+                    if (!first_ext[0] && e && *e == '.') lstrcpynW(first_ext, e, ext_size);
+                    WindowsDeleteString(ext);
+                }
+                vector->Release();
+            }
+            if (patterns[0])
+            {
+                const WCHAR *name = WindowsGetStringRawBuffer(key, nullptr);
+                put(name && *name ? name : patterns); put(L" ("); put(patterns); put(L")"); end();
+                put(patterns); end();
+                any = TRUE;
+                trace("file type choice %ls: %ls", name, patterns);
+            }
+            if (value) value->Release();
+            WindowsDeleteString(key);
+            pair->Release();
+        }
+        has = FALSE;
+        if (FAILED(((get_bool *)(*(void ***)it))[8](it, &has))) break;
+    }
+    it->Release();
+    if (!any) return FALSE;
+    put(L"All files (*.*)"); end(); put(L"*.*"); end();
+    if (n < size) filter[n] = 0;
+    return TRUE;
+}
+
 struct save_picker
 {
     const void **vtbl;
@@ -952,6 +1039,7 @@ static HRESULT WINAPI sp_GetRuntimeClassName(void *, HSTRING *name)
         if (FAILED(hr)) return hr;                                                                 \
         WindowsDeleteString(impl->field);                                                          \
         impl->field = copy;                                                                        \
+        trace("FileSavePicker " #name " = %ls", WindowsGetStringRawBuffer(v, nullptr));            \
         return S_OK;                                                                               \
     }
 SAVE_STRING(SettingsIdentifier, settings_id)
@@ -1003,6 +1091,7 @@ static HRESULT WINAPI sp_PickSaveFileAsync(void *iface, IUnknown **operation)
         !(dialogs_enabled() &&
           save_file_dialog(impl->file_name ? WindowsGetStringRawBuffer(impl->file_name, nullptr) : nullptr,
                            impl->default_ext ? WindowsGetStringRawBuffer(impl->default_ext, nullptr) : nullptr,
+                           impl->choices ? ((choices *)impl->choices)->inner : nullptr,
                            path, ARRAYSIZE(path))))
     {
         trace("PickSaveFileAsync (suggested %ls): nothing picked; reporting a cancelled pick",
