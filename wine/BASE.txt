@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     2e8d408415a506d7eff8e4386d4f067617f1b80d
-                 dxgi: lock the composition swap chain's presented copies
+  wine HEAD:     5c58a1f9ec269ee1c61119eb9283a7f0b8e58837
+                 windows.storage: implement StorageFile copy and move
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-24T02:58:13Z
+  captured:      2026-09-24T03:44:50Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

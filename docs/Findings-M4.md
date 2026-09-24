@@ -8549,3 +8549,23 @@ Read it before theorising about Shapr3D. The `"internet_connection":"cellular"` 
   guard never fired, so the fix is unproven. Grep for `marked current in system memory` when it recurs.
   The root cause of the stale flag is still unknown. Separately fixed on the way: dxgi's composition
   swap chain now locks `presented[]` against dcomp's readback worker.
+
+### STL export works; three refusals fixed (2026-09-23)
+
+File > Export to > STL produces `Made with Shapr3D`, 12 triangles, 14 x 10 x 21.4 mm, which is the
+extruded rectangle. Found by following the ignored FailFasts and managed exceptions of one export click:
+
+1. `IDWriteFontFamily2::GetMatchingFonts` (axis values) was E_NOTIMPL. XAML's TextBox font lookup
+   stowed it on every run of text. Implemented by mapping wght/wdth/ital/slnt onto the weight,
+   stretch and style matcher. Side effect: text moves by 1 px, so the Calculator baseline was
+   re-taken (see AGENTS.md).
+2. `{509eab63}` is `CompositorCommon::DCPrivate`. Its easing creators (quartic storyboard easings
+   use CreatePowerEasingFunction, slot 9) were refused by the probe. The old `probe_slot_8`
+   "harmless notification" hack for Calculator was `CreateExponentialEasingFunction` returning S_OK
+   with its out-parameter unwritten.
+3. `StorageFile.MoveAndReplaceAsync` (and the whole copy/move family) was E_NOTIMPL. The exporter
+   writes a temp file and moves it onto the picked one.
+
+The save picker shim needs `WINE_UWP_PICKER_SAVE_FILE`; without it the pick is reported as
+cancelled, which looks exactly like "export does nothing". The export-format promo dialog shows only
+the first time.

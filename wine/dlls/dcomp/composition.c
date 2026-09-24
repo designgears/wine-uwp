@@ -982,6 +982,76 @@ static const void *probe_vtbl[PROBE_SLOTS] =
     probe_slot_36, probe_slot_37, probe_slot_38, probe_slot_39,
 };
 
+/* ICompositorPrivate5 {509eab63} is CompositorCommon::DCPrivate (dcomp.pdb), an IUnknown-based
+ * interface: 3 CreateBackEasingFunction, 4 CreateBounceEasingFunction, 5 CreateCircleEasingFunction,
+ * 6 CreateCompositionSurfaceForDCompositionSurface, 7 CreateElasticEasingFunction,
+ * 8 CreateExponentialEasingFunction, 9 CreatePowerEasingFunction,
+ * 10 CreateSharedVisualReferenceController, 11 OpenSharedInteractionFromHandle,
+ * 12 OpenSharedManipulationTransformFromHandle, 13 CreateSineEasingFunction, 14 OpenSharedLightFromHandle,
+ * 15 SetMaximumExpressionLength. XAML turns storyboard easings (quartic, quintic, sine, ...) into
+ * these; refusing them stowed an E_NOTIMPL per animation and dropped the animation. The easing is
+ * returned as a recording object, since key frames are not interpolated with easing here. */
+static HRESULT create_comp_object( const char *kind, void **out );
+static HRESULT create_easing( const char *kind, int mode, void **out )
+{
+    TRACE( "%s mode %d.\n", kind, mode );
+    if (!out) return E_POINTER;
+    return create_comp_object( kind, out );
+}
+static HRESULT WINAPI dcprivate_CreateBackEasingFunction( void *iface, int mode, float amplitude, void **out )
+{
+    return create_easing( "BackEasingFunction", mode, out );
+}
+static HRESULT WINAPI dcprivate_CreateBounceEasingFunction( void *iface, int mode, int bounces, float bounciness, void **out )
+{
+    return create_easing( "BounceEasingFunction", mode, out );
+}
+static HRESULT WINAPI dcprivate_CreateCircleEasingFunction( void *iface, int mode, void **out )
+{
+    return create_easing( "CircleEasingFunction", mode, out );
+}
+static HRESULT WINAPI dcprivate_CreateElasticEasingFunction( void *iface, int mode, int oscillations, float springiness, void **out )
+{
+    return create_easing( "ElasticEasingFunction", mode, out );
+}
+static HRESULT WINAPI dcprivate_CreateExponentialEasingFunction( void *iface, int mode, float exponent, void **out )
+{
+    return create_easing( "ExponentialEasingFunction", mode, out );
+}
+static HRESULT WINAPI dcprivate_CreatePowerEasingFunction( void *iface, int mode, float power, void **out )
+{
+    return create_easing( "PowerEasingFunction", mode, out );
+}
+static HRESULT WINAPI dcprivate_CreateSineEasingFunction( void *iface, int mode, void **out )
+{
+    return create_easing( "SineEasingFunction", mode, out );
+}
+static HRESULT WINAPI dcprivate_SetMaximumExpressionLength( void *iface, UINT length )
+{
+    TRACE( "length %u.\n", length );
+    return S_OK;
+}
+
+static const void *dcprivate_vtbl[PROBE_SLOTS];
+
+static const void **dcprivate_get_vtbl(void)
+{
+    if (!dcprivate_vtbl[0])
+    {
+        memcpy( (void *)&dcprivate_vtbl[1], &probe_vtbl[1], sizeof(probe_vtbl) - sizeof(probe_vtbl[0]) );
+        dcprivate_vtbl[3] = dcprivate_CreateBackEasingFunction;
+        dcprivate_vtbl[4] = dcprivate_CreateBounceEasingFunction;
+        dcprivate_vtbl[5] = dcprivate_CreateCircleEasingFunction;
+        dcprivate_vtbl[7] = dcprivate_CreateElasticEasingFunction;
+        dcprivate_vtbl[8] = dcprivate_CreateExponentialEasingFunction;
+        dcprivate_vtbl[9] = dcprivate_CreatePowerEasingFunction;
+        dcprivate_vtbl[13] = dcprivate_CreateSineEasingFunction;
+        dcprivate_vtbl[15] = dcprivate_SetMaximumExpressionLength;
+        InterlockedExchangePointer( (void **)&dcprivate_vtbl[0], (void *)probe_vtbl[0] );
+    }
+    return dcprivate_vtbl;
+}
+
 /* Probes are cached per interface so a caller that QIs twice gets the same pointer, which COM
  * identity rules require. */
 static const GUID IID_ICompositorInteropFactory_private =
@@ -6596,7 +6666,7 @@ static HRESULT get_probe( struct compositor *owner, REFIID iid, void **out )
         if (probes[i]->owner == owner && IsEqualGUID( &probes[i]->iid, iid )) probe = probes[i];
     if (!probe && probe_count < MAX_PROBES && (probe = calloc( 1, sizeof(*probe) )))
     {
-        probe->vtbl = probe_vtbl;
+        probe->vtbl = IsEqualGUID( iid, &IID_ICompositorPrivate5 ) ? dcprivate_get_vtbl() : probe_vtbl;
         probe->iid = *iid;
         probe->owner = owner;
         probes[probe_count++] = probe;

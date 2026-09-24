@@ -3094,9 +3094,48 @@ static HRESULT WINAPI dwritefontfamily1_GetFontFaceReference(IDWriteFontFamily2 
 static HRESULT WINAPI dwritefontfamily2_GetMatchingFonts(IDWriteFontFamily2 *iface,
         DWRITE_FONT_AXIS_VALUE const *axis_values, UINT32 num_values, IDWriteFontList2 **fontlist)
 {
-    FIXME("%p, %p, %u, %p.\n", iface, axis_values, num_values, fontlist);
+    static const float stretches[] = { 50.0f, 62.5f, 75.0f, 87.5f, 100.0f, 112.5f, 125.0f, 150.0f, 200.0f };
+    DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL;
+    DWRITE_FONT_STRETCH stretch = DWRITE_FONT_STRETCH_NORMAL;
+    DWRITE_FONT_STYLE style = DWRITE_FONT_STYLE_NORMAL;
+    unsigned int i, j;
 
-    return E_NOTIMPL;
+    TRACE("%p, %p, %u, %p.\n", iface, axis_values, num_values, fontlist);
+
+    if (!fontlist) return E_POINTER;
+    *fontlist = NULL;
+    if (num_values && !axis_values) return E_INVALIDARG;
+
+    /* Families here are made of static faces, so the axis values select among them the way the
+     * weight/stretch/style arguments of IDWriteFontFamily::GetMatchingFonts do. */
+    for (i = 0; i < num_values; ++i)
+    {
+        float value = axis_values[i].value;
+
+        switch (axis_values[i].axisTag)
+        {
+        case DWRITE_FONT_AXIS_TAG_WEIGHT:
+            weight = value < 1.0f ? 1 : value > 1000.0f ? 1000 : (DWRITE_FONT_WEIGHT)(value + 0.5f);
+            break;
+        case DWRITE_FONT_AXIS_TAG_WIDTH:
+            for (j = 0; j < ARRAY_SIZE(stretches); ++j)
+            {
+                stretch = j + 1;
+                if (j + 1 == ARRAY_SIZE(stretches) || value < (stretches[j] + stretches[j + 1]) / 2.0f) break;
+            }
+            break;
+        case DWRITE_FONT_AXIS_TAG_ITALIC:
+            if (value >= 0.5f) style = DWRITE_FONT_STYLE_ITALIC;
+            break;
+        case DWRITE_FONT_AXIS_TAG_SLANT:
+            if (value != 0.0f && style == DWRITE_FONT_STYLE_NORMAL) style = DWRITE_FONT_STYLE_OBLIQUE;
+            break;
+        default:
+            WARN("Ignoring axis %s.\n", debugstr_fourcc(axis_values[i].axisTag));
+        }
+    }
+
+    return dwritefontfamily_GetMatchingFonts(iface, weight, stretch, style, (IDWriteFontList **)fontlist);
 }
 
 static HRESULT WINAPI dwritefontfamily2_GetFontSet(IDWriteFontFamily2 *iface, IDWriteFontSet1 **fontset)

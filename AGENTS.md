@@ -144,7 +144,11 @@ Every change to Wine or the host gets checked against apps that already work, *b
 a result:
 
 **The baseline lives in the repo, at `docs/baselines/calc-regress.png`** - a 1600x1000 *root*
-capture. It used to live only in `/tmp`, and `/tmp` gets wiped: the baseline, every session log and
+capture. It was re-taken on 2026-09-23 when `IDWriteFontFamily2::GetMatchingFonts` was implemented:
+XAML's text then takes its normal font path instead of an E_NOTIMPL fallback, which moves text by
+one pixel (3486 pixels differ). The change was confirmed to come from dwrite alone (the old dwrite
+gives AE 0), and the new rendering is identical across runs. Re-baseline only like that: attribute
+the difference to one change, look at it, and run twice. It used to live only in `/tmp`, and `/tmp` gets wiped: the baseline, every session log and
 **the Xvfb socket for `:98`** all vanished at once. Nothing starts `:98` automatically, so the first
 symptom was every app failing activation with `PrivateCreateCoreWindow failed, hr 0x80004005` -
 which looks like a Wine regression and is not. **If a run suddenly fails at activation, check
@@ -547,6 +551,14 @@ the writer, never sent it back and freed it. `WINEDEBUG=trace+rpc` shows it:
 `magick -size WxH -depth 8 bgra:f.raw f.png` ended a "decode is broken" theory in one run. The
 pictures were there, and the bug was in how the brush was painted.
 
+**Ignored FailFasts are where the unimplemented APIs are.** `RoFailFastWithErrorContextInternal2
+hosted UWP, ignoring FailFast` follows a `dump_stowed_exception` whose `frame[N]` lines are raw
+addresses. Resolve the first few against the module's PDB `.syms` (with the base from a `+loaddll`
+run) and disassemble just before the return address. XAML reports through a helper at
+`windows.ui.xaml+0x2f790`, called with the HRESULT, so the vtable call just before it is the refusing
+API. That found both `IDWriteFontFamily2::GetMatchingFonts` and dcomp's missing easing creators in
+one pass each.
+
 **`.as<>()` vs `try_as<>()` is the whole difference, and you can tell which one threw.** C++/WinRT's
 `throw_hresult` is a switch on the HRESULT with one `call` + `int3` per value, so the **return
 address in the app's own crash callstack lands in the branch for the specific HRESULT**. For
@@ -864,7 +876,7 @@ the fully-qualified name. `--grep` first, always.
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
 | Solitaire | **Playable on the unpatched `Solitaire.exe`** (`docs/screenshots/solitaire-unpatched-menu-game.png`): main menu -> Klondike -> game, and clicks move cards. No exe byte patch is needed any more: `wineuwp` delivers `CoreWindow.VisibilityChanged`. The Sign In Error popup shows on top of the menu; Cancel is at about (813,549). The old ~1-in-10 blank window is fixed (60/60 clean) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
-| Shapr3D | **Models, and cloud sync works** (`docs/screenshots/shapr3d-extruded-body.png`): sketch -> extrude -> Visualization, toolbar and menus, and the project uploads its revision and thumbnails (the "Sync is offline" title is gone). Signs in once (Log In -> `./browser-callback.sh shapr3d`, a human solves the reCAPTCHA, run with `WINE_UWP_LAUNCHER=log`) and stays signed in. Downloaded images show. **Open:** project tiles and material swatches stay blank because the app never attaches an image to them (cause unknown), and an intermittent fault in `adapter_vk_copy_bo_address` when leaving the editor that per-copy logging hides. Findings-M4 |
+| Shapr3D | **Models, syncs and exports** (`docs/screenshots/shapr3d-extruded-body.png`): sketch -> extrude -> Visualization, toolbar and menus, cloud upload of revisions and thumbnails, and **File > Export to > STL writes a correct file** (with `WINE_UWP_PICKER_SAVE_FILE=Z:\path\out.stl`; the save picker shim has no UI). Signs in once (Log In -> `./browser-callback.sh shapr3d`, a human solves the reCAPTCHA, run with `WINE_UWP_LAUNCHER=log`) and stays signed in. Downloaded images show. **Open:** project tiles and material swatches stay blank because the app never attaches an image to them (cause unknown), and an intermittent fault when leaving the editor (guarded; see Findings-M4) |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
 them. **Testing that, and making them the default if it holds, is a standing job** - they change the

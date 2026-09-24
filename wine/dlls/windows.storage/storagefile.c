@@ -262,52 +262,193 @@ static HRESULT WINAPI storage_file_OpenTransactedWriteAsync( IStorageFile *iface
     return E_NOTIMPL;
 }
 
-static HRESULT WINAPI storage_file_CopyOverloadDefaultNameAndOptions( IStorageFile *iface, IStorageFolder *folder, IAsyncOperation_StorageFile **operation )
+/* Copy and move. The work is packed into one path parameter, "<op><option>|<source>|<target>", op
+ * being C or M and the target either a file path or "<folder>\<name>". Shapr3D's exporter writes to a
+ * temporary file and moves it onto the file the save picker returned. */
+static HRESULT item_path( IUnknown *item, WCHAR *buffer, SIZE_T size )
 {
-    FIXME( "iface %p, folder %p, operation %p stub!\n", iface, folder, operation );
-    return E_NOTIMPL;
+    IStorageItem *storage_item;
+    HSTRING path;
+    HRESULT hr;
+
+    if (!item) return E_INVALIDARG;
+    if (FAILED(hr = IUnknown_QueryInterface( item, &IID_IStorageItem, (void **)&storage_item ))) return hr;
+    hr = IStorageItem_get_Path( storage_item, &path );
+    IStorageItem_Release( storage_item );
+    if (FAILED(hr)) return hr;
+    if (WindowsGetStringLen( path ) >= size) hr = HRESULT_FROM_WIN32( ERROR_FILENAME_EXCED_RANGE );
+    else lstrcpyW( buffer, WindowsGetStringRawBuffer( path, NULL ) );
+    WindowsDeleteString( path );
+    return hr;
 }
 
-static HRESULT WINAPI storage_file_CopyOverloadDefaultOptions( IStorageFile *iface, IStorageFolder *folder, HSTRING name, IAsyncOperation_StorageFile **operation )
+/* "name (2).ext", "name (3).ext", ... for NameCollisionOption_GenerateUniqueName */
+static BOOL unique_target( WCHAR *target, SIZE_T size )
 {
-    FIXME( "iface %p, folder %p, name %s, operation %p stub!\n", iface, folder, debugstr_hstring( name ), operation );
-    return E_NOTIMPL;
+    WCHAR base[MAX_PATH], *dot, *slash;
+    unsigned int i;
+
+    if (GetFileAttributesW( target ) == INVALID_FILE_ATTRIBUTES) return TRUE;
+    lstrcpynW( base, target, ARRAY_SIZE(base) );
+    slash = wcsrchr( base, '\\' );
+    if ((dot = wcsrchr( base, '.' )) && (!slash || dot > slash)) *dot++ = 0;
+    else dot = NULL;
+    for (i = 2; i < 1000; i++)
+    {
+        swprintf( target, size, dot ? L"%s (%u).%s" : L"%s (%u)", base, i, dot );
+        if (GetFileAttributesW( target ) == INVALID_FILE_ATTRIBUTES) return TRUE;
+    }
+    return FALSE;
+}
+
+static HRESULT transfer_file( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+{
+    const WCHAR *spec = storage_path_param_buffer( param ), *source, *sep;
+    WCHAR source_path[MAX_PATH], target[MAX_PATH];
+    NameCollisionOption option = spec[1] - '0';
+    BOOL move = spec[0] == 'M', ok;
+    IStorageFile *file;
+    HRESULT hr;
+
+    if (!called_async) return STATUS_PENDING;
+
+    source = spec + 3;
+    if (!(sep = wcschr( source, '|' )) || sep - source >= MAX_PATH) return E_INVALIDARG;
+    memcpy( source_path, source, (sep - source) * sizeof(WCHAR) );
+    source_path[sep - source] = 0;
+    lstrcpynW( target, sep + 1, ARRAY_SIZE(target) );
+
+    if (option == NameCollisionOption_GenerateUniqueName && !unique_target( target, ARRAY_SIZE(target) ))
+        return HRESULT_FROM_WIN32( ERROR_ALREADY_EXISTS );
+    if (option == NameCollisionOption_FailIfExists && GetFileAttributesW( target ) != INVALID_FILE_ATTRIBUTES)
+        return HRESULT_FROM_WIN32( ERROR_ALREADY_EXISTS );
+
+    TRACE( "%s %s -> %s.\n", move ? "moving" : "copying", debugstr_w( source_path ), debugstr_w( target ) );
+    if (move) ok = MoveFileExW( source_path, target, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED );
+    else ok = CopyFileW( source_path, target, FALSE );
+    if (!ok) return HRESULT_FROM_WIN32( GetLastError() );
+
+    if (move) return S_OK;
+    if (FAILED(hr = storage_file_create( target, &file ))) return hr;
+    result->vt = VT_UNKNOWN;
+    result->punkVal = (IUnknown *)file;
+    return S_OK;
+}
+
+static HRESULT transfer_param( struct storage_file *impl, WCHAR op, NameCollisionOption option, const WCHAR *target,
+                               IUnknown **param )
+{
+    WCHAR *spec;
+    SIZE_T len = 4 + wcslen( impl->path ) + wcslen( target );
+    HRESULT hr;
+
+    if (!(spec = malloc( (len + 1) * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
+    swprintf( spec, len + 1, L"%c%c|%s|%s", op, '0' + option, impl->path, target );
+    hr = storage_path_param_create( spec, param );
+    free( spec );
+    return hr;
+}
+
+static HRESULT folder_target( IStorageFolder *folder, HSTRING name, const WCHAR *default_name, WCHAR *target, SIZE_T size )
+{
+    const WCHAR *leaf = name && WindowsGetStringLen( name ) ? WindowsGetStringRawBuffer( name, NULL ) : default_name;
+    HRESULT hr;
+
+    if (FAILED(hr = item_path( (IUnknown *)folder, target, size ))) return hr;
+    if (wcslen( target ) + 1 + wcslen( leaf ) >= size) return HRESULT_FROM_WIN32( ERROR_FILENAME_EXCED_RANGE );
+    if (target[0] && target[wcslen( target ) - 1] != '\\') wcscat( target, L"\\" );
+    wcscat( target, leaf );
+    return S_OK;
+}
+
+static const WCHAR *file_leaf( const struct storage_file *impl )
+{
+    const WCHAR *leaf = wcsrchr( impl->path, '\\' );
+    return leaf ? leaf + 1 : impl->path;
 }
 
 static HRESULT WINAPI storage_file_CopyOverload( IStorageFile *iface, IStorageFolder *folder, HSTRING name, NameCollisionOption option, IAsyncOperation_StorageFile **operation )
 {
-    FIXME( "iface %p, folder %p, name %s, option %d, operation %p stub!\n", iface, folder, debugstr_hstring( name ), (int)option, operation );
-    return E_NOTIMPL;
+    struct storage_file *impl = impl_from_IStorageFile( iface );
+    WCHAR target[MAX_PATH];
+    IUnknown *param;
+    HRESULT hr;
+
+    TRACE( "iface %p, folder %p, name %s, option %d, operation %p.\n", iface, folder, debugstr_hstring( name ), (int)option, operation );
+
+    if (!operation) return E_POINTER;
+    *operation = NULL;
+    if (FAILED(hr = folder_target( folder, name, file_leaf( impl ), target, ARRAY_SIZE(target) ))) return hr;
+    if (FAILED(hr = transfer_param( impl, 'C', option, target, &param ))) return hr;
+    hr = async_operation_storage_file_create( (IUnknown *)iface, param, transfer_file, operation );
+    IUnknown_Release( param );
+    return hr;
+}
+
+static HRESULT WINAPI storage_file_CopyOverloadDefaultNameAndOptions( IStorageFile *iface, IStorageFolder *folder, IAsyncOperation_StorageFile **operation )
+{
+    return storage_file_CopyOverload( iface, folder, NULL, NameCollisionOption_FailIfExists, operation );
+}
+
+static HRESULT WINAPI storage_file_CopyOverloadDefaultOptions( IStorageFile *iface, IStorageFolder *folder, HSTRING name, IAsyncOperation_StorageFile **operation )
+{
+    return storage_file_CopyOverload( iface, folder, name, NameCollisionOption_FailIfExists, operation );
+}
+
+static HRESULT replace_file( IStorageFile *iface, IStorageFile *file, WCHAR op, IAsyncAction **operation )
+{
+    struct storage_file *impl = impl_from_IStorageFile( iface );
+    WCHAR target[MAX_PATH];
+    IUnknown *param;
+    HRESULT hr;
+
+    if (!operation) return E_POINTER;
+    *operation = NULL;
+    if (FAILED(hr = item_path( (IUnknown *)file, target, ARRAY_SIZE(target) ))) return hr;
+    if (FAILED(hr = transfer_param( impl, op, NameCollisionOption_ReplaceExisting, target, &param ))) return hr;
+    hr = async_action_create( (IUnknown *)iface, param, transfer_file, operation );
+    IUnknown_Release( param );
+    return hr;
 }
 
 static HRESULT WINAPI storage_file_CopyAndReplaceAsync( IStorageFile *iface, IStorageFile *file, IAsyncAction **operation )
 {
-    FIXME( "iface %p, file %p, operation %p stub!\n", iface, file, operation );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI storage_file_MoveOverloadDefaultNameAndOptions( IStorageFile *iface, IStorageFolder *folder, IAsyncAction **operation )
-{
-    FIXME( "iface %p, folder %p, operation %p stub!\n", iface, folder, operation );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI storage_file_MoveOverloadDefaultOptions( IStorageFile *iface, IStorageFolder *folder, HSTRING name, IAsyncAction **operation )
-{
-    FIXME( "iface %p, folder %p, name %s, operation %p stub!\n", iface, folder, debugstr_hstring( name ), operation );
-    return E_NOTIMPL;
+    TRACE( "iface %p, file %p, operation %p.\n", iface, file, operation );
+    return replace_file( iface, file, 'C', operation );
 }
 
 static HRESULT WINAPI storage_file_MoveOverload( IStorageFile *iface, IStorageFolder *folder, HSTRING name, NameCollisionOption option, IAsyncAction **operation )
 {
-    FIXME( "iface %p, folder %p, name %s, option %d, operation %p stub!\n", iface, folder, debugstr_hstring( name ), (int)option, operation );
-    return E_NOTIMPL;
+    struct storage_file *impl = impl_from_IStorageFile( iface );
+    WCHAR target[MAX_PATH];
+    IUnknown *param;
+    HRESULT hr;
+
+    TRACE( "iface %p, folder %p, name %s, option %d, operation %p.\n", iface, folder, debugstr_hstring( name ), (int)option, operation );
+
+    if (!operation) return E_POINTER;
+    *operation = NULL;
+    if (FAILED(hr = folder_target( folder, name, file_leaf( impl ), target, ARRAY_SIZE(target) ))) return hr;
+    if (FAILED(hr = transfer_param( impl, 'M', option, target, &param ))) return hr;
+    hr = async_action_create( (IUnknown *)iface, param, transfer_file, operation );
+    IUnknown_Release( param );
+    return hr;
+}
+
+static HRESULT WINAPI storage_file_MoveOverloadDefaultNameAndOptions( IStorageFile *iface, IStorageFolder *folder, IAsyncAction **operation )
+{
+    return storage_file_MoveOverload( iface, folder, NULL, NameCollisionOption_FailIfExists, operation );
+}
+
+static HRESULT WINAPI storage_file_MoveOverloadDefaultOptions( IStorageFile *iface, IStorageFolder *folder, HSTRING name, IAsyncAction **operation )
+{
+    return storage_file_MoveOverload( iface, folder, name, NameCollisionOption_FailIfExists, operation );
 }
 
 static HRESULT WINAPI storage_file_MoveAndReplaceAsync( IStorageFile *iface, IStorageFile *file, IAsyncAction **operation )
 {
-    FIXME( "iface %p, file %p, operation %p stub!\n", iface, file, operation );
-    return E_NOTIMPL;
+    TRACE( "iface %p, file %p, operation %p.\n", iface, file, operation );
+    return replace_file( iface, file, 'M', operation );
 }
 
 static const struct IStorageFileVtbl storage_file_vtbl =
