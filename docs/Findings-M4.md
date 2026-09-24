@@ -9063,3 +9063,29 @@ every soak before today). Regressions unchanged: Calculator AE 0, Feedback Hub 8
 fail-fasts, Media Player 2250, Solitaire 0 bad in 3. No `not an out-pointer` ERR fired in any of
 the 30 runs, so which call passed the garbage register is still unknown. The guard stays.
 `docs/screenshots/shapr3d-import-soak-30of30.png` is the last run's window.
+
+### Leaving the editor: surfaces destroyed under the painter (2026-09-24)
+
+The "intermittent fault when leaving the editor" in AGENTS' Current state reproduced on the first
+try. `/tmp/leavesoak.sh` starts the app, then three times opens a new project and presses the back
+arrow. **The process died leaving in 6 of 10 runs.** Sentry's dump: a write to `0x70780` in
+ucrtbase's `sse2_memmove`, called from `surface_cached_pixels` (the row copy into `surface->cache`)
+under `paint_mask_brush`. So `cache` was NULL by the time of the copy, although the same function
+had just allocated it.
+
+The painter reaches surfaces through the visual tree and brushes **without holding references**.
+XAML tears the editor's visuals down on its own thread, and two paths there invalidated a surface
+mid-frame:
+
+- `surface_Release` destroyed the surface outright (cache first, then the struct);
+- `surface_Resize` freed the cache outright.
+
+Fixes:
+
+- A surface whose last reference goes while a frame is in progress (present_cs held elsewhere, or by
+  this thread, mid-frame) is queued and destroyed by the painter after the frame. That is the same
+  idea as `retire_bitmap`.
+- `Resize` only marks the cache stale. `surface_cached_pixels` reallocates it anyway when the
+  texture's size no longer matches.
+
+**Result: 10 of 10 runs, 30 leaves, no death** (4 of 10 with the previous build, same script).

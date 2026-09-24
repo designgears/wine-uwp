@@ -624,6 +624,48 @@ static CRITICAL_SECTION present_cs = { &present_cs_debug, -1, 0, 0, 0, 0 };
 static LONG present_pending;
 static HWND present_request_hwnd;
 
+/* surfaces whose last reference went while a frame was in progress, destroyed after it */
+struct drawing_surface;
+static void surface_destroy( struct drawing_surface *surface );
+static struct drawing_surface **deferred_surfaces;
+static unsigned int deferred_surface_count, deferred_surface_capacity;
+
+static void defer_surface_destroy( struct drawing_surface *surface )
+{
+    EnterCriticalSection( &retired_cs );
+    if (deferred_surface_count == deferred_surface_capacity)
+    {
+        unsigned int capacity = max( 16, deferred_surface_capacity * 2 );
+        struct drawing_surface **grown = realloc( deferred_surfaces, capacity * sizeof(*grown) );
+        if (!grown)
+        {
+            LeaveCriticalSection( &retired_cs );
+            WARN( "leaking surface %p.\n", surface );
+            return;
+        }
+        deferred_surfaces = grown;
+        deferred_surface_capacity = capacity;
+    }
+    deferred_surfaces[deferred_surface_count++] = surface;
+    LeaveCriticalSection( &retired_cs );
+}
+
+/* called holding present_cs, outside any frame */
+static void destroy_deferred_surfaces( void )
+{
+    struct drawing_surface **list;
+    unsigned int i, count;
+
+    EnterCriticalSection( &retired_cs );
+    list = deferred_surfaces;
+    count = deferred_surface_count;
+    deferred_surfaces = NULL;
+    deferred_surface_count = deferred_surface_capacity = 0;
+    LeaveCriticalSection( &retired_cs );
+    for (i = 0; i < count; i++) surface_destroy( list[i] );
+    free( list );
+}
+
 static void present_desktop_hwnd_locked( HWND hwnd );
 static void present_desktop_hwnd( HWND hwnd )
 {
@@ -633,6 +675,8 @@ static void present_desktop_hwnd( HWND hwnd )
     {
         if (!TryEnterCriticalSection( &present_cs )) return;   /* the painter will see the request */
         if (InterlockedExchange( &present_pending, 0 )) present_desktop_hwnd_locked( present_request_hwnd );
+        /* only the outermost frame: a nested present must not destroy what the outer one is painting */
+        if (present_cs.RecursionCount == 1) destroy_deferred_surfaces();
         LeaveCriticalSection( &present_cs );
         /* a request that arrived while we held the lock found it taken and returned */
         if (!InterlockedCompareExchange( &present_pending, 0, 0 )) return;
@@ -3113,6 +3157,21 @@ static ULONG WINAPI surface_Release( void *iface )
     for (i = 0; i < readback_pending_count; i++)
         if (readback_pending[i] == surface) readback_pending[i] = readback_pending[--readback_pending_count];
     LeaveCriticalSection( &readback_cs );
+    /* The painter reaches surfaces through the visual tree and brushes without holding references, so
+     * one released on another thread mid-frame was destroyed under it: leaving Shapr3D's editor tore
+     * down a mask brush's surface while paint_mask_brush was copying into its cache (a memcpy to
+     * NULL + offset). Destroy it now only if no frame is in progress, else after the frame. */
+    if (present_cs.OwningThread == ULongToHandle( GetCurrentThreadId() ) || !TryEnterCriticalSection( &present_cs ))
+    {
+        defer_surface_destroy( surface );
+        return 0;
+    }
+    surface_destroy( surface );
+    LeaveCriticalSection( &present_cs );
+    return 0;
+}
+static void surface_destroy( struct drawing_surface *surface )
+{
     TRACE( "surface %p freed.\n", surface );
     surface_free_cache( surface );
     if (surface->staging) ID3D11Texture2D_Release( surface->staging );
@@ -3120,7 +3179,6 @@ static ULONG WINAPI surface_Release( void *iface )
     if (surface->context) ID2D1DeviceContext_Release( surface->context );
     if (surface->texture) ID3D11Texture2D_Release( surface->texture );
     free( surface );
-    return 0;
 }
 static void surface_free_cache( struct drawing_surface *surface )
 {
@@ -3411,7 +3469,9 @@ static HRESULT WINAPI surface_Resize( void *iface, UINT width, UINT height )
     TRACE( "surface %p %ux%u -> %ux%u.\n", surface, surface->width, surface->height, width, height );
     if (surface->drawing) return 0x88980801; /* DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED */
     if (surface->width == width && surface->height == height) return S_OK;
-    surface_free_cache( surface );
+    /* Stale, not freed: the painter may be reading the cache on another thread right now, and
+     * surface_cached_pixels() reallocates it anyway once the texture's size no longer matches. */
+    surface->cache_valid = FALSE;
     /* Drop the old target; the next BeginDraw creates one at the new size. */
     if (surface->context) ID2D1DeviceContext_SetTarget( surface->context, NULL );
     if (surface->bitmap)

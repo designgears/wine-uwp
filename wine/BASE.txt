@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     16ea2acda73832318c4a4ea1ff4fd101ef6576ee
-                 dcomp: Serialize present_desktop_hwnd between threads
+  wine HEAD:     7da280ebdf6a2e830bb02b911c73731821add92d
+                 dcomp: Destroy surfaces released mid-frame after the frame; Resize only invalidates the cache
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-24T20:22:31Z
+  captured:      2026-09-24T22:35:54Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
