@@ -579,8 +579,13 @@ one pass each.
 itself with `CreateGlyphRunAnalysis(NATURAL_SYMMETRIC, grayscale)`, not through D2D's text drawing.
 So a D2D `DrawTextLayout` probe can look fine while XAML text does not. `probes/probe-fonts.cpp`
 lists the system collection and a family's faces; `probes/probe-text.cpp` renders `Family:weight`
-lines through D2D. The Segoe fonts come from the host through fontconfig (`~/.local/share/fonts`
-here), not from the prefix's Fonts folder, which is empty.
+lines through D2D. The fonts are Windows' own: all 348 files of a Windows installation's `Windows\Fonts`, copied
+into `$UWP_BIN/win11/Windows/Fonts` and installed into the prefix's `C:\windows\Fonts` by
+`install-overrides.sh`. win32u registers them under their bare file names, and dwrite opens them
+from there (`trace+dwrite` shows `C:\windows\fonts\SegUIVar.ttf`). The host's fontconfig fonts
+(`~/.local/share/fonts`) are still loaded too, but a face present in both comes from the Windows
+directory. The Windows partition is `/dev/nvme0n1p2`; mount it read-only at `/mnt/win` to refresh
+the copy.
 
 **`.as<>()` vs `try_as<>()` is the whole difference, and you can tell which one threw.** C++/WinRT's
 `throw_hresult` is a switch on the HRESULT with one `call` + `int3` per value, so the **return
