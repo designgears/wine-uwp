@@ -8651,3 +8651,11 @@ blocked. Present now waits for the next refresh for sync interval >= 1. That giv
 60 frames a second, and the process used 3.9 s of CPU over a 10 s orbit where it used 23.5 s. At
 idle both builds sit near 1%: the engine renders only while something moves. The frame-latency
 waitable object is still signalled on every present; with Present blocking, that is enough.
+
+### Unexplained: an execute fault at startup, 1 start in 11 (2026-09-23)
+
+One Shapr3D start died on an NX fault that `comp_object_nx_veh` logged but could not soft-return:
+rip `dcomp+0xae4` (inside the image header), rax `0x3F0000003F000000` (two floats 0.5), the object's
+vtable pointer landing 0x52c0 into `expr_animation_vtbl`'s neighbourhood, and the return address in
+another module. The next 10 starts were clean. It is not tied to the gradient work: none of that code
+runs at that point of startup. Watch for `comp_object_nx_veh NX at` with a rip that is not near null.
