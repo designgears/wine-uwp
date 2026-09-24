@@ -21,6 +21,8 @@
 #include <winstring.h>
 #include <activation.h>
 #include <eventtoken.h>
+#include <commdlg.h>
+#include <shlobj.h>
 #include <cstdio>
 #include <cstdlib>
 
@@ -93,6 +95,143 @@ static IUnknown *storage_file_from_path(const WCHAR *path)
 
     trace("picked %ls -> %p", path, file);
     return file;
+}
+
+
+/* ---------------------------------------------------------------- the dialogs
+ *
+ * With nothing staged through the environment, the pickers show Wine's common file dialogs, so an
+ * app driven by a person can open and save files. The dialog is modal on the calling (UI) thread,
+ * which pumps messages while it is up. WINE_UWP_PICKER_NODIALOG=1 restores the cancelled pick that
+ * scripted runs rely on. */
+static bool dialogs_enabled()
+{
+    return !getenv("WINE_UWP_PICKER_NODIALOG");
+}
+
+/* "*.stl;*.obj" from a list of ".stl" style extensions; "*" means everything */
+static void append_pattern(WCHAR *patterns, size_t size, const WCHAR *ext)
+{
+    if (!ext || !*ext) return;
+    if (patterns[0]) wcsncat(patterns, L";", size - wcslen(patterns) - 1);
+    if (!wcscmp(ext, L"*")) { wcsncat(patterns, L"*.*", size - wcslen(patterns) - 1); return; }
+    wcsncat(patterns, L"*", size - wcslen(patterns) - 1);
+    wcsncat(patterns, ext, size - wcslen(patterns) - 1);
+}
+
+/* A double-NUL-terminated OPENFILENAME filter: the given patterns, then all files. */
+static void build_filter(WCHAR *filter, size_t size, const WCHAR *patterns)
+{
+    size_t n = 0;
+    auto put = [&](const WCHAR *str) {
+        size_t len = wcslen(str) + 1;
+        if (n + len + 1 >= size) return;
+        memcpy(filter + n, str, len * sizeof(WCHAR));
+        n += len;
+    };
+    if (patterns[0] && wcscmp(patterns, L"*.*"))
+    {
+        put(patterns);
+        put(patterns);
+    }
+    put(L"All files (*.*)");
+    put(L"*.*");
+    filter[n] = 0;
+}
+
+static IUnknown *storage_folder_from_path(const WCHAR *path)
+{
+    static const WCHAR *cls = L"Windows.Storage.StorageFolder";
+    static const GUID IID_IStorageFolderStatics_ =
+        {0x08f327ff, 0x85d5, 0x48b9, {0xae, 0xe9, 0x28, 0x51, 0x1e, 0x33, 0x9f, 0x9f}};
+    IUnknown *statics = nullptr, *op = nullptr, *folder = nullptr;
+    HSTRING name = nullptr, hpath = nullptr;
+    HRESULT hr;
+
+    if (FAILED(WindowsCreateString(cls, lstrlenW(cls), &name))) return nullptr;
+    hr = RoGetActivationFactory(name, IID_IStorageFolderStatics_, (void **)&statics);
+    WindowsDeleteString(name);
+    if (FAILED(hr)) { trace("StorageFolder statics: %#lx", hr); return nullptr; }
+    if (SUCCEEDED(WindowsCreateString(path, lstrlenW(path), &hpath)))
+    {
+        /* IStorageFolderStatics slot 6 is GetFolderFromPathAsync. */
+        typedef HRESULT (WINAPI *from_path)(void *, HSTRING, IUnknown **);
+        hr = ((from_path *)(*(void ***)statics))[6](statics, hpath, &op);
+        WindowsDeleteString(hpath);
+    }
+    statics->Release();
+    if (FAILED(hr) || !op) { trace("GetFolderFromPathAsync(%ls): %#lx", path, hr); return nullptr; }
+    typedef HRESULT (WINAPI *get_results)(IUnknown *, IUnknown **);
+    hr = ((get_results *)(*(void ***)op))[8](op, &folder);
+    op->Release();
+    if (FAILED(hr)) { trace("folder GetResults: %#lx", hr); return nullptr; }
+    trace("picked folder %ls -> %p", path, folder);
+    return folder;
+}
+
+/* The dialogs start in Documents, not in the process's current directory (the package). */
+static const WCHAR *initial_dir()
+{
+    static WCHAR dir[MAX_PATH];
+    if (!dir[0] && FAILED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, dir))) dir[0] = 0;
+    return dir[0] ? dir : nullptr;
+}
+
+static bool open_file_dialog(const WCHAR *patterns, WCHAR *path, DWORD size)
+{
+    WCHAR filter[512];
+    OPENFILENAMEW ofn = { sizeof(ofn) };
+
+    build_filter(filter, ARRAYSIZE(filter), patterns);
+    path[0] = 0;
+    ofn.hwndOwner = GetActiveWindow();
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = size;
+    ofn.lpstrInitialDir = initial_dir();
+    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
+    if (GetOpenFileNameW(&ofn)) { trace("open dialog -> %ls", path); return true; }
+    trace("open dialog cancelled (%#lx)", CommDlgExtendedError());
+    return false;
+}
+
+static bool save_file_dialog(const WCHAR *suggested, const WCHAR *default_ext, WCHAR *path, DWORD size)
+{
+    WCHAR filter[512], patterns[128] = L"";
+    const WCHAR *ext = default_ext && *default_ext ? default_ext : suggested ? wcsrchr(suggested, '.') : nullptr;
+    OPENFILENAMEW ofn = { sizeof(ofn) };
+
+    append_pattern(patterns, ARRAYSIZE(patterns), ext);
+    build_filter(filter, ARRAYSIZE(filter), patterns);
+    lstrcpynW(path, suggested ? suggested : L"", size);
+    if (ext && *ext && !(wcslen(path) >= wcslen(ext) && !_wcsicmp(path + wcslen(path) - wcslen(ext), ext)))
+        wcsncat(path, ext, size - wcslen(path) - 1);
+    ofn.hwndOwner = GetActiveWindow();
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = size;
+    ofn.lpstrDefExt = ext && *ext == '.' ? ext + 1 : nullptr;
+    ofn.lpstrInitialDir = initial_dir();
+    ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
+    if (GetSaveFileNameW(&ofn)) { trace("save dialog -> %ls", path); return true; }
+    trace("save dialog cancelled (%#lx)", CommDlgExtendedError());
+    return false;
+}
+
+static bool folder_dialog(WCHAR *path)
+{
+    BROWSEINFOW info = {};
+    LPITEMIDLIST pidl;
+    bool ok;
+
+    info.hwndOwner = GetActiveWindow();
+    info.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (!(pidl = SHBrowseForFolderW(&info))) return false;
+    ok = SHGetPathFromIDListW(pidl, path);
+    CoTaskMemFree(pidl);
+    trace("folder dialog -> %ls", ok ? path : L"(none)");
+    return ok;
 }
 
 /* ---------------------------------------------------------------- IAsyncOperation<StorageFile> */
@@ -309,6 +448,27 @@ static bool matches_filter(picker *impl, const WCHAR *path)
     return ok;
 }
 
+static HRESULT WINAPI picker_get_FileTypeFilter(void *iface, IUnknown **value);
+static void picker_patterns(picker *impl, WCHAR *patterns, size_t size)
+{
+    IUnknown *filter = nullptr;
+    UINT32 count = 0;
+
+    patterns[0] = 0;
+    if (FAILED(picker_get_FileTypeFilter(impl, &filter)) || !filter) return;
+    typedef HRESULT (WINAPI *get_size)(IUnknown *, UINT32 *);
+    typedef HRESULT (WINAPI *get_at)(IUnknown *, UINT32, HSTRING *);
+    if (SUCCEEDED(((get_size *)(*(void ***)filter))[7](filter, &count)))
+        for (UINT32 i = 0; i < count; i++)
+        {
+            HSTRING entry = nullptr;
+            if (FAILED(((get_at *)(*(void ***)filter))[6](filter, i, &entry))) continue;
+            append_pattern(patterns, size, WindowsGetStringRawBuffer(entry, nullptr));
+            WindowsDeleteString(entry);
+        }
+    filter->Release();
+}
+
 static HRESULT make_async_file(IUnknown *file, IUnknown **out)
 {
     async_file *impl;
@@ -334,17 +494,28 @@ static HRESULT WINAPI picker_PickSingleFileAsync(void *iface, IUnknown **operati
      * pick, which callers handle (it is what closing the dialog does). */
     if (impl->folder)
     {
-        HRESULT hr = make_async_file(nullptr, operation);
-        trace("PickSingleFolderAsync: reporting a cancelled pick");
+        IUnknown *folder = nullptr;
+        HRESULT hr;
+        if (dialogs_enabled() && folder_dialog(path)) folder = storage_folder_from_path(path);
+        else trace("PickSingleFolderAsync: reporting a cancelled pick");
+        hr = make_async_file(folder, operation);
         if (SUCCEEDED(hr)) ((async_file *)*operation)->folder = true;
         return hr;
     }
 
     if (!GetEnvironmentVariableW(L"WINE_UWP_PICKER_FILE", path, ARRAYSIZE(path)))
     {
-        /* No file staged: report a cancelled pick, which is what a user closing the dialog does. */
-        trace("WINE_UWP_PICKER_FILE is not set; reporting a cancelled pick");
-        return make_async_file(nullptr, operation);
+        WCHAR patterns[256];
+        picker_patterns(impl, patterns, ARRAYSIZE(patterns));
+        if (!dialogs_enabled() || !open_file_dialog(patterns, path, ARRAYSIZE(path)))
+        {
+            /* a cancelled pick, which is what a user closing the dialog does */
+            trace("no file picked; reporting a cancelled pick");
+            return make_async_file(nullptr, operation);
+        }
+        file = storage_file_from_path(path);
+        trace("PickSingleFileAsync -> %ls (%p)", path, file);
+        return make_async_file(file, operation);
     }
     if (!matches_filter(impl, path))
         return make_async_file(nullptr, operation);
@@ -595,11 +766,22 @@ static HRESULT WINAPI picker_PickMultipleFilesAsync(void *iface, IUnknown **oper
     view->vtbl_iterable = fileiterable_vtbl;
     view->ref = 1;
 
-    /* An empty list is a cancelled pick, which is what closing the dialog does. */
-    if (GetEnvironmentVariableW(L"WINE_UWP_PICKER_FILE", path, ARRAYSIZE(path)) && matches_filter(impl, path))
-        view->file = storage_file_from_path(path);
+    /* An empty list is a cancelled pick, which is what closing the dialog does. One file only:
+     * the view holds a single entry. */
+    if (GetEnvironmentVariableW(L"WINE_UWP_PICKER_FILE", path, ARRAYSIZE(path)))
+    {
+        if (matches_filter(impl, path)) view->file = storage_file_from_path(path);
+    }
     else
-        trace("PickMultipleFilesAsync: nothing staged or filtered out; empty selection");
+    {
+        WCHAR patterns[256];
+        picker_patterns(impl, patterns, ARRAYSIZE(patterns));
+        if (dialogs_enabled() && open_file_dialog(patterns, path, ARRAYSIZE(path)))
+            view->file = storage_file_from_path(path);
+        else
+            path[0] = 0;
+    }
+    if (!view->file) trace("PickMultipleFilesAsync: nothing picked; empty selection");
 
     if (!(async = (async_files *)calloc(1, sizeof(*async)))) { fv_Release(view); return E_OUTOFMEMORY; }
     async->vtbl = asyncfiles_vtbl;
@@ -817,9 +999,13 @@ static HRESULT WINAPI sp_PickSaveFileAsync(void *iface, IUnknown **operation)
 
     if (!operation) return E_POINTER;
     *operation = nullptr;
-    if (!GetEnvironmentVariableW(L"WINE_UWP_PICKER_SAVE_FILE", path, ARRAYSIZE(path)))
+    if (!GetEnvironmentVariableW(L"WINE_UWP_PICKER_SAVE_FILE", path, ARRAYSIZE(path)) &&
+        !(dialogs_enabled() &&
+          save_file_dialog(impl->file_name ? WindowsGetStringRawBuffer(impl->file_name, nullptr) : nullptr,
+                           impl->default_ext ? WindowsGetStringRawBuffer(impl->default_ext, nullptr) : nullptr,
+                           path, ARRAYSIZE(path))))
     {
-        trace("PickSaveFileAsync (suggested %ls): WINE_UWP_PICKER_SAVE_FILE is not set; reporting a cancelled pick",
+        trace("PickSaveFileAsync (suggested %ls): nothing picked; reporting a cancelled pick",
               impl->file_name ? WindowsGetStringRawBuffer(impl->file_name, nullptr) : L"");
         return make_async_file(nullptr, operation);
     }

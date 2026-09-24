@@ -8630,3 +8630,15 @@ reporting a cancel because `WINE_UWP_PICKER_SAVE_FILE` was not set.
 
 Also: `CoBeginProcessEvents`/`CoEndProcessEvents` logged a FIXME per dispatcher wait, 220,756 lines
 in one session. They now report once.
+
+### Real file dialogs in the picker shim (2026-09-23)
+
+`shims/filepicker` answered every pick without a staged path with a cancel, so on a real desktop
+exports and imports did nothing. The open, multiple-file, folder and save pickers now show Wine's
+GetOpenFileName / GetSaveFileName / SHBrowseForFolder, modal on the calling UI thread, starting in
+Documents. The open filter comes from the picker's FileTypeFilter, the save filter from
+DefaultFileExtension or the suggested name. The environment overrides still win, and
+`WINE_UWP_PICKER_NODIALOG=1` restores the old behaviour. Verified round trip: File > Export to > STL
+through the Save As dialog, then File > Import File... through the Open dialog, gives "dlg-body.stl"
+in Items (`docs/screenshots/filepicker-save-dialog.png`, `filepicker-open-dialog.png`,
+`shapr3d-import-stl.png`).
