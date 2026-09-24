@@ -9047,3 +9047,19 @@ Fix: `is_out_pointer()` and `is_writable_pointer()` refuse any address inside a 
 (the `"Wine builtin DLL"` signature after the DOS header). Nothing legitimately hands dcomp an
 out-pointer in Wine's own static data. Both partner creators now require `is_out_pointer(out)`, and
 say so with an `ERR` that names the caller, so the soak shows which call passes the garbage.
+
+**The remaining crash: two threads painting at once.** With those fixes in, the next stop-on-failure
+run was a crash again, `raster_blend` reading unmapped memory. Every cache DIB is already retired, so
+a stale pointer could only survive if `free_retired_bitmaps()` ran while another frame was still
+rasterizing. `present_desktop_hwnd()` had no lock at all. It is reached from Commit on whichever
+thread commits and from a thread timer, and Shapr3D has two UI threads. The two paint lists, the back
+buffer and the retired list are all shared. It is serialized now with a *try*-lock and a pending
+flag. A thread that finds a frame in progress leaves a request, and the painter paints again before
+it leaves. A blocking lock could deadlock: painting calls `ShowWindow`/`GetDC`, which send to the
+window's thread.
+
+**Result: Shapr3D start -> Visualization -> import Drone, 30 of 30** (it had been 7-9 of 10-12 in
+every soak before today). Regressions unchanged: Calculator AE 0, Feedback Hub 896 colours and 0
+fail-fasts, Media Player 2250, Solitaire 0 bad in 3. No `not an out-pointer` ERR fired in any of
+the 30 runs, so which call passed the garbage register is still unknown. The guard stays.
+`docs/screenshots/shapr3d-import-soak-30of30.png` is the last run's window.

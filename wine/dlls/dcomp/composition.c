@@ -607,7 +607,39 @@ static void CALLBACK paint_timer_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD t
     if (last_desktop_hwnd) present_desktop_hwnd( last_desktop_hwnd );
 }
 
+/* present_desktop_hwnd() is reached from Commit on whichever thread commits and from a thread timer,
+ * and Shapr3D has two UI threads. The frame state is shared - the two paint lists, the back buffer,
+ * the retired bitmaps - so two painters at once let one free cache DIBs the other's OP_BLENDs were
+ * still reading (a raster_blend fault on unmapped memory, one Shapr3D import in ~15). Painting also
+ * sends messages to the window's thread (ShowWindow, GetDC), so a blocking lock could deadlock two UI
+ * threads; a thread that finds a frame in progress leaves a request for the painter instead. */
+static CRITICAL_SECTION present_cs;
+static CRITICAL_SECTION_DEBUG present_cs_debug =
+{
+    0, 0, &present_cs,
+    { &present_cs_debug.ProcessLocksList, &present_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": present_cs") }
+};
+static CRITICAL_SECTION present_cs = { &present_cs_debug, -1, 0, 0, 0, 0 };
+static LONG present_pending;
+static HWND present_request_hwnd;
+
+static void present_desktop_hwnd_locked( HWND hwnd );
 static void present_desktop_hwnd( HWND hwnd )
+{
+    present_request_hwnd = hwnd;
+    InterlockedExchange( &present_pending, 1 );
+    for (;;)
+    {
+        if (!TryEnterCriticalSection( &present_cs )) return;   /* the painter will see the request */
+        if (InterlockedExchange( &present_pending, 0 )) present_desktop_hwnd_locked( present_request_hwnd );
+        LeaveCriticalSection( &present_cs );
+        /* a request that arrived while we held the lock found it taken and returned */
+        if (!InterlockedCompareExchange( &present_pending, 0, 0 )) return;
+    }
+}
+
+static void present_desktop_hwnd_locked( HWND hwnd )
 {
     HDC hdc;
     RECT rc;
