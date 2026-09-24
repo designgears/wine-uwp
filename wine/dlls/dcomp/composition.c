@@ -3551,7 +3551,27 @@ static struct drawing_surface *surface_from_facade( IUnknown *facade )
     IUnknown *iface = NULL, *real = NULL;
     HRESULT hr;
 
+    /* ILoadedImageSurface: slot 6 get_DecodedPhysicalSize (then DecodedSize, NaturalSize, add_LoadCompleted,
+     * by the LoadedImageSurface vtable windows.ui.xaml.pdb names). Asking a LoadedImageSurface for its real
+     * surface before it has decoded sends XAML down DCompSurface::CreateWithNoHardware, which hands us a NULL
+     * DComp surface and fail-fasts on the answer - 13 ignored FailFasts per Shapr3D import. Wait for it. */
+    static const GUID IID_ILoadedImageSurface_ =
+        { 0x050c8313, 0x6737, 0x45ba, { 0x85, 0x31, 0x33, 0x09, 0x4f, 0xeb, 0xef, 0x55 } };
+    typedef HRESULT (WINAPI *get_size)( void *, Size * );
+
     if (!facade) return NULL;
+    if (SUCCEEDED(IUnknown_QueryInterface( facade, &IID_ILoadedImageSurface_, (void **)&iface )))
+    {
+        Size decoded = { 0 };
+        hr = ((get_size *)*(void ***)iface)[6]( iface, &decoded );
+        IUnknown_Release( iface );
+        iface = NULL;
+        if (FAILED(hr) || decoded.Width <= 0.0f || decoded.Height <= 0.0f)
+        {
+            TRACE( "facade %p: not decoded yet (hr %#lx, %gx%g).\n", facade, hr, decoded.Width, decoded.Height );
+            return NULL;
+        }
+    }
     if (FAILED(hr = IUnknown_QueryInterface( facade, &IID_ICompositionSurfaceFacade_, (void **)&iface ))) return NULL;
     hr = ((get_real_surface *)*(void ***)iface)[6]( iface, &real );
     IUnknown_Release( iface );

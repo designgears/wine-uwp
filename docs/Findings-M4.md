@@ -9089,3 +9089,30 @@ Fixes:
   texture's size no longer matches.
 
 **Result: 10 of 10 runs, 30 leaves, no death** (4 of 10 with the previous build, same script).
+
+### The 13 ignored FailFasts per import were our own facade resolution (2026-09-24)
+
+A healthy import run logged 13 `RoFailFastWithErrorContextInternal2 ... ignoring FailFast 0x80070057`.
+On Windows a FailFast ends the process, so each of these marks something we answer differently.
+Resolving the stowed frames against a live process's module list (`probe-threads.exe`'s `M` lines)
+gave `LoadedImageSurface::GetRealSurface -> CLoadedImageSurface::GetCompositionSurface ->
+ImageSurfaceWrapper::AllocateHWTextureWithNoHardware -> DCompSurface::CreateWithNoHardware`, called
+from **our** `surface_from_facade` under `create_surface_brush`.
+
+A `WINE_UWP_BP` on the failing call (`windows.ui.xaml+0x4da3a8`) showed its target is our
+`ICompositorPrivate5` slot 6, `CreateCompositionSurfaceForDCompositionSurface`. The call passes a
+NULL DComp surface, and we answer E_INVALIDARG. So asking a `LoadedImageSurface` for its real
+surface before it has decoded sends XAML down its no-hardware path. dcomp did that at brush
+creation.
+
+Fix: `surface_from_facade` first asks `ILoadedImageSurface` (`{050c8313}`) for
+`DecodedPhysicalSize`. That is slot 6: the vtable found by searching `.rdata` for a pointer to the
+PDB-named `get_DecodedPhysicalSize` lists DecodedSize, NaturalSize and add_LoadCompleted after it. It
+calls `GetRealSurface` only once that size is non-zero. `brush_surface` re-resolves on every paint
+anyway. **FailFasts per import: 13 -> 0**, and the swatches and decals still show
+(`docs/screenshots/shapr3d-visualization-no-failfast.png`).
+
+Also named, and harmless: the 65 `Failed to create ifstub` per run are XAML putting the app's
+`WindowSizeChangedEventHandler` (`{5c21c742}`) and `WindowActivatedEventHandler` (`{18026348}`)
+into the GIT (`CGITCookie::Create`). There is no proxy registered for either, on Windows too. The
+editor still relays out correctly when the window is resized with `probe-resize.exe`.
