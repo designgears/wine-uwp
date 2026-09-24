@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     f67fbfee275c03ee019621f711ac1af38c8875f3
-                 ntdll: Unlink a WaitOnAddress entry before clearing its address; dcomp: retire a resized swap-chain back buffer
+  wine HEAD:     d1b8ffccb43753eada65db977ff6f9267e95c2ea
+                 dcomp: Never treat Wine's own static data as an out-pointer
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-24T19:18:42Z
+  captured:      2026-09-24T19:46:21Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

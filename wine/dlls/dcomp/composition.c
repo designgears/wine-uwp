@@ -1839,6 +1839,22 @@ static HRESULT comp_map_for_owner( IUnknown *owner, void **out )
 /* Many island-site / partner slots are Create* or getters. Returning S_OK without filling a real
  * out-pointer fail-fasts; treating float/handle args as out-pointers AVs. Only fill when a looks
  * like an aligned pointer to a NULL slot. */
+/* Inside a Wine builtin's image, i.e. in Wine's own static data. Nothing hands dcomp an out-pointer
+ * there, but a leftover register can hold one: after a WaitOnAddress wake, rdx still points at the
+ * futex bucket's lock, which is a writable zero word - exactly what an empty out-pointer looks like.
+ * Writing a recording object there stuck ntdll's process-heap bucket and wedged Shapr3D. */
+static BOOL in_builtin_image( const void *p )
+{
+    static const char builtin_signature[] = "Wine builtin DLL";
+    void *base;
+    const IMAGE_DOS_HEADER *dos;
+
+    if (!RtlPcToFileHeader( (void *)p, &base ) || !base) return FALSE;
+    dos = base;
+    return dos->e_lfanew >= sizeof(*dos) + sizeof(builtin_signature) &&
+           !memcmp( dos + 1, builtin_signature, sizeof(builtin_signature) );
+}
+
 static BOOL is_out_pointer( void *a )
 {
     void *value;
@@ -1864,6 +1880,7 @@ static BOOL is_out_pointer( void *a )
     if (!VirtualQuery( a, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT) return FALSE;
     if (!(mbi.Protect & readable) || (mbi.Protect & PAGE_GUARD)) return FALSE;
     if ((ULONG_PTR)a + sizeof(void *) > (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize) return FALSE;
+    if (mbi.Type == MEM_IMAGE && in_builtin_image( a )) return FALSE;
     value = *(void **)a;
     return !value;
 }
@@ -2578,7 +2595,7 @@ static BOOL is_writable_pointer( void *p )
     if (!v || (v & 3) || v < 0x10000 || (v >> 47)) return FALSE;
     if (!VirtualQuery( p, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT || !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
         return FALSE;
-    return TRUE;
+    return !(mbi.Type == MEM_IMAGE && in_builtin_image( p ));
 }
 static HRESULT WINAPI comp_object_GetIids( void *iface, ULONG *count, IID **iids )
 {
@@ -2669,7 +2686,12 @@ static HRESULT WINAPI expression_animation_CreateAnimatorPartner( void *iface, v
                                                                    void *context, void **out )
 {
     TRACE( "iface %p, source %p, context %p, out %p.\n", iface, source, context, out );
-    if (!out) return E_POINTER;
+    if (!is_out_pointer( out ))
+    {
+        ERR( "iface %p, source %p, context %p: out %p is not an out-pointer, from %p.\n", iface, source,
+             context, out, __builtin_return_address( 0 ) );
+        return E_POINTER;
+    }
     return create_comp_object( "ExpressionAnimatorPartner", out );
 }
 
@@ -8939,7 +8961,12 @@ static HRESULT WINAPI propset_partner_CreateAnimatorPartner( void *iface, void *
                 break;
             }
     }
-    if (!out) return E_POINTER;
+    if (!is_out_pointer( out ))
+    {
+        ERR( "set %p, source %p, context %p: out %p is not an out-pointer, from %p.\n", set, source, context,
+             out, __builtin_return_address( 0 ) );
+        return E_POINTER;
+    }
     return create_comp_object( "ExpressionAnimatorPartner", out );
 }
 static HRESULT create_propset_partner( struct property_set *set, void **out )

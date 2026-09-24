@@ -9025,3 +9025,25 @@ one now is too. Crashpad suspends every thread while it writes an 80 MB dump, wh
 why some crash runs show lock timeouts instead of a clean disappearance. Not proven.
 
 With both fixes: 14 of 15, and the one failure was at startup, with no log kept.
+
+**The next live stall showed what actually writes the lock.** Same bucket, same seven spinners, and
+the lock word was `0x7f105cdcce80` again. But that address is in **no** thread's stack: the stack
+ranges now come from each TEB via `probe-threads`. Reading it with `probe-peek` found a heap block
+whose first two words are `dcomp!comp_object_vtbl` and a pointer to the string
+`"ExpressionAnimatorPartner"`. So **dcomp wrote one of its own recording objects into ntdll's
+futex bucket**. The WaitOnAddress race above is still a real race, but it was not this.
+
+Two dcomp paths write an object through a pointer they never validated:
+
+- `is_out_pointer()`, used by the catch-all default slot, accepts any committed, writable word that
+  holds zero. An **unlocked** futex bucket lock is exactly that. After `RtlWaitOnAddress` or
+  `RtlWakeAddress*` returns, `rdx` still holds `&futex_queues[i].lock`. The stalled threads'
+  registers show it, and so does every earlier capture. So a caller that passes fewer arguments
+  than the slot reads hands dcomp that address in a register.
+- Both `CreateAnimatorPartner`s (on an expression animation, and on a property set's `{83112a11}`)
+  wrote `*out` whenever it was non-NULL.
+
+Fix: `is_out_pointer()` and `is_writable_pointer()` refuse any address inside a Wine builtin's image
+(the `"Wine builtin DLL"` signature after the DOS header). Nothing legitimately hands dcomp an
+out-pointer in Wine's own static data. Both partner creators now require `is_out_pointer(out)`, and
+say so with an `ERR` that names the caller, so the soak shows which call passes the garbage.
