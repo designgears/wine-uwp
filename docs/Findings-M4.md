@@ -8705,3 +8705,36 @@ image was known but lost.
 
 Still blank: the Visualization material swatches (`ms-appx:///Assets/Images/Visualization/Thumbnails/*.png`).
 XAML does open those files, so they are lost after the decode, not before.
+
+### Material swatches: where the trail stands (2026-09-24, unresolved)
+
+The Visualization swatches are drawn by `MaterialThumbnail`. It is a `XamlCompositionBrushBase` that
+combines two things:
+
+- a `LoadedImageSurface` holding `ms-appx:///Assets/Images/Visualization/Thumbnails/<name>.png`
+  (260x260 RGBA);
+- a Win2D `BlendEffect` with a `ColorSourceEffect` for the tint, fed through
+  `CompositionEffectSourceParameter`.
+
+The activation-factory FIXMEs name every one of these classes.
+
+What is established:
+
+- XAML opens each PNG and reads **only its header**, on the UI thread: `CreateDecoderFromStream`,
+  `GetFrame` 260x260, then release. That happens 13 times.
+- There is never a full decode, and no 260x260 composition surface is ever created. In the same
+  run, 48x48 icons decode fully on worker threads.
+- `ud2` probes, restored and `cmp`ed within the same command:
+  - `LoadedImageSurfaceFactory::StartLoadFromUriWithSizeImpl` (`+0x35d960`) fires on the
+    Visualization click and not before it.
+  - `CLoadedImageSurface::InitFromUri` (`+0x35dcd0`) fires.
+  - Its non-closed path (`+0x35dcf5`) fires, and so does the return point of the resource
+    manager's URI combine (`+0x35f5a9`).
+  - `StartFinalSizeDecoding` (`+0x196e4c`) and `OnImageViewUpdated` (`+0x1953b0`) do not fire.
+- The probe results after `+0x35f5a9` contradict each other. `GetImageProvider`'s return point
+  and both of `InitFromUri`'s outcome paths are silent, although the header reads show that the
+  image cache ran. Some of these faults are being swallowed. Treat negatives there as unknown.
+
+The "No models yet? Try a sample" dialog in an empty project is **modal and only accepts a
+choice**. Clicks outside it do nothing, so the editor looks frozen when it is not. Pick Drone to
+get a populated Visualization scene.
