@@ -406,6 +406,13 @@ faulted about one run in seven. "It is not a `dcomp_visual`, so it must be a `st
 same error in the other direction. **Check the vtbl** - `dcv_from_any`, `visual_from_interop`,
 `comp_shape_from_any` and `path_geometry_from_any` all do now.
 
+**The same catch-all hands out `IClosable` as the primary vtable, and `Close()` is slot 6.** On a
+typed object with a getter in slot 6, that getter writes through Close's missing argument. It
+happened with the radial gradient brush: WinUI closed it, `get_EllipseCenter` wrote 0.5,0.5
+through rdx, and the editor crashed on every open. Any new typed object needs a real IClosable
+view (`dcv_closable_vtbl`, `visual_closable_vtbl` and `gradient_closable_vtbl` are the patterns).
+To find which IID a caller got, log the IID and `__builtin_return_address(0)` in that object's QI.
+
 **`addr2mod.py` cannot see Wine builtins, and will misattribute confidently.** `+loaddll` traces
 only `native` modules (a full Media Player run: 23 `Loaded ... : native`, zero `builtin`), and
 `addr2mod` returns the highest base below the target - so every address above the last native DLL

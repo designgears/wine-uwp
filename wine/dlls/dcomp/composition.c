@@ -14674,6 +14674,7 @@ struct gradient_brush
     LONG ref;
     const void **grad_vtbl;     /* ICompositionGradientBrush */
     const void **grad2_vtbl;    /* ICompositionGradientBrush2 */
+    const void **closable_vtbl; /* Windows.Foundation.IClosable */
     struct stop_collection *stops;
     Vector2 start, end, anchor, center, offset, scale;
     float rotation;             /* radians */
@@ -14692,6 +14693,7 @@ static void *gradient_brush_vtbl[COMP_OBJECT_SLOTS];
 static void *gradient_radial_vtbl[COMP_OBJECT_SLOTS];
 static void *gradient_grad_vtbl[25];
 static void *gradient_grad2_vtbl[8];
+static void *gradient_closable_vtbl[7];
 
 static struct gradient_brush *gradient_brush_from( void *iface )
 {
@@ -14743,6 +14745,14 @@ static HRESULT WINAPI gradient_brush_QueryInterface( void *iface, REFIID iid, vo
     {
         InterlockedIncrement( &impl->ref );
         *out = &impl->grad2_vtbl;
+        return S_OK;
+    }
+    /* WinUI closes the brushes it drops; the catch-all below would hand it the primary vtable, whose slot 6
+     * is a getter (get_EllipseCenter on a radial brush) that writes through Close's missing argument. */
+    if (IsEqualGUID( iid, &IID_IClosable ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = &impl->closable_vtbl;
         return S_OK;
     }
     return comp_object_QueryInterface( iface, iid, out );
@@ -14879,6 +14889,27 @@ static ULONG WINAPI gradient_grad2_Release( void *iface )
 {
     return gradient_brush_Release( &gradient_from_grad2( iface )->vtbl );
 }
+static struct gradient_brush *gradient_from_closable( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct gradient_brush, closable_vtbl );
+}
+static HRESULT WINAPI gradient_closable_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return gradient_brush_QueryInterface( &gradient_from_closable( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI gradient_closable_AddRef( void *iface )
+{
+    return InterlockedIncrement( &gradient_from_closable( iface )->ref );
+}
+static ULONG WINAPI gradient_closable_Release( void *iface )
+{
+    return gradient_brush_Release( &gradient_from_closable( iface )->vtbl );
+}
+static HRESULT WINAPI gradient_closable_Close( void *iface )
+{
+    TRACE( "gradient brush %p.\n", gradient_from_closable( iface ) );
+    return S_OK;
+}
 static HRESULT WINAPI gradient_grad2_get_MappingMode( void *iface, INT32 *value )
 {
     if (!value) return E_POINTER;
@@ -14954,6 +14985,13 @@ static HRESULT create_gradient_brush( BOOL radial, void **out )
         gradient_grad2_vtbl[5] = gradient_view_GetTrustLevel;
         gradient_grad2_vtbl[6] = gradient_grad2_get_MappingMode;
         gradient_grad2_vtbl[7] = gradient_grad2_put_MappingMode;
+        gradient_closable_vtbl[0] = gradient_closable_QueryInterface;
+        gradient_closable_vtbl[1] = gradient_closable_AddRef;
+        gradient_closable_vtbl[2] = gradient_closable_Release;
+        gradient_closable_vtbl[3] = gradient_view_GetIids;
+        gradient_closable_vtbl[4] = gradient_view_GetRuntimeClassName;
+        gradient_closable_vtbl[5] = gradient_view_GetTrustLevel;
+        gradient_closable_vtbl[6] = gradient_closable_Close;
 
         memcpy( gradient_radial_vtbl, gradient_brush_vtbl, sizeof(gradient_radial_vtbl) );
         gradient_radial_vtbl[0] = gradient_brush_QueryInterface;
@@ -14976,6 +15014,7 @@ static HRESULT create_gradient_brush( BOOL radial, void **out )
     brush->vtbl = (const void **)(radial ? gradient_radial_vtbl : gradient_brush_vtbl);
     brush->grad_vtbl = (const void **)gradient_grad_vtbl;
     brush->grad2_vtbl = (const void **)gradient_grad2_vtbl;
+    brush->closable_vtbl = (const void **)gradient_closable_vtbl;
     brush->kind = radial ? "RadialGradientBrush" : "LinearGradientBrush";
     brush->radial = radial;
     brush->ellipse_center.X = brush->ellipse_center.Y = 0.5f;   /* documented defaults, relative */

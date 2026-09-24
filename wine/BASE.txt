@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     8ce6ce58faeeb958ec2454864724a2c4ae15c97e
-                 dcomp: implement CompositionRadialGradientBrush
+  wine HEAD:     7b57ef533d60645c7b91c02e93e64475cc586ad4
+                 dcomp: IClosable view on gradient brushes
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-24T05:25:35Z
+  captured:      2026-09-24T05:46:02Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

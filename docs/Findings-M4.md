@@ -8652,10 +8652,23 @@ blocked. Present now waits for the next refresh for sync interval >= 1. That giv
 idle both builds sit near 1%: the engine renders only while something moves. The frame-latency
 waitable object is still signalled on every present; with Present blocking, that is enough.
 
-### Unexplained: an execute fault at startup, 1 start in 11 (2026-09-23)
+### Explained: the "startup" execute fault was the radial gradient brush (2026-09-23)
 
-One Shapr3D start died on an NX fault that `comp_object_nx_veh` logged but could not soft-return:
-rip `dcomp+0xae4` (inside the image header), rax `0x3F0000003F000000` (two floats 0.5), the object's
-vtable pointer landing 0x52c0 into `expr_animation_vtbl`'s neighbourhood, and the return address in
-another module. The next 10 starts were clean. It is not tied to the gradient work: none of that code
-runs at that point of startup. Watch for `comp_object_nx_veh NX at` with a rip that is not near null.
+One Shapr3D start died on an NX fault at `dcomp+0xae4` with rax `0x3F0000003F000000` (two floats
+0.5). This entry first said the fault was "not tied to the gradient work". **That was wrong.** It
+was the radial gradient commit (0051e37), and after that commit it crashed on every editor open:
+3 opens out of 3, against 0 out of 3 on the previous dcomp. The 0.5,0.5 value is the radial brush's
+default `EllipseCenter`.
+
+Tracing QueryInterface calls on the radial brush found the caller. WinUI 2 asks the brush for
+`IClosable` `{30d5a829}` and calls `Close()`, which is slot 6. The catch-all QI answered with the
+primary vtable, whose slot 6 on a radial brush is `get_EllipseCenter`. That getter wrote 0.5,0.5
+through whatever garbage was in rdx.
+
+Linear brushes had the same latent bug; their slot 6 is also a getter. The fix is a real IClosable
+view on both brush kinds (`gradient_closable_vtbl`). After it, the editor opened 3 times out of 3
+and every regression passed.
+
+The general rule, again: **the catch-all QI is a loaded gun for any object whose slot 6 is not
+harmless.** IClosable is the IID most likely to be asked for, because XAML and WinUI close what
+they drop.
