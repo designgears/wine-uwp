@@ -9283,6 +9283,23 @@ committing thread has a batch open from its first change to its commit (`xaml_ba
 from any other thread waits for it (at most 50 ms, for changes made outside a frame). 0 flickers in
 5 opens after. Changes the painter itself makes (transform-parent bookkeeping) do not open a batch.
 
+The History row's "..." menu showed a second form of the same tear: XAML takes a finished
+transition's subtree down right after one commit and rebuilds it in the *next* frame, and a repaint
+timer on the same thread painted in between. So an open batch holds every paint except the commit's
+own, on any thread.
+
+Two mistakes in the gate, both caught by Media Player and worth knowing:
+- **The repaint entry points opened batches themselves.** `__wine_dcomp_repaint_window(_rect)`, the
+  swap chain callbacks and the manipulation tracker call `scene_changed()` on the UI thread; that
+  opened a batch, and their own present then waited 50 ms for a commit that never came. Media Player
+  deferred 1,166 paints in a minute, and the repaint/notify loop kept XAML committing 3,641 times
+  where it now commits 22. Those callers use `scene_dirty()` (a new generation, no batch).
+- **The retry is a WM_PAINT**, which a window that was never shown does not get, and two UI threads
+  committing in turn can each find the other's batch open indefinitely. Media Player came up as a
+  blank white window in 3 of ~16 starts (0 of 8 on the old dcomp, 0 of 8 with the gate switched off).
+  Now the first frame is never held, and no paint is held more than 50 ms in a row. 0 blank in 8+.
+
+
 Measured with raw `xwd` frames after `mousedown; sleep 0.02; mouseup`: the File menu is complete
 32-85 ms after the press (first open slowest), was 270-300 ms
 (`docs/screenshots/shapr3d-file-menu-50ms.png` is the frame at 50 ms). Orbiting the viewport still
@@ -9303,3 +9320,12 @@ The occasional 2242 instead of 2250 is the white rounded keyboard-focus rectangl
 "Open file(s)" being absent (the only differing pixels, `+759+456` 151x32). It came up in 2 of 7
 runs of today's build; the old build gave 2250 in its one run, and 2242 predates these changes. Not
 chased further.
+
+### Regression runs polled, not slept (2026-09-25)
+
+`./regress.sh [calc] [fh] [mp] [sol]` replaces the fixed 55-80 s sleeps with a check once a second:
+Calculator AE 0 against the baseline, Feedback Hub and Media Player a colour count stable for three
+samples, Solitaire its own `NewState 'Sgi::FEState'` log line. The whole suite takes under 2 minutes
+(was ~7). The Solitaire check is **stricter** than the old soak's "at least 1000 colours at 80 s",
+which the splash artwork (151k colours) passes: one run in about 15 stalls in the bootflow at ~1.5 s,
+on the old dcomp as well as the new.

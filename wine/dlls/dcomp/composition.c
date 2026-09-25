@@ -69,6 +69,7 @@ WINE_DECLARE_DEBUG_CHANNEL(dcompperf);
 WINE_DECLARE_DEBUG_CHANNEL(dcompanim);
 WINE_DECLARE_DEBUG_CHANNEL(dcompops);
 WINE_DECLARE_DEBUG_CHANNEL(dcomptree);
+WINE_DECLARE_DEBUG_CHANNEL(dcompgate);
 
 /* WINEDEBUG=+dcompperf: a one-line summary per second of what the presenter did, cheap enough to leave
  * on while measuring (the +dcomp trace itself costs more than the painting). */
@@ -113,8 +114,8 @@ static ULONGLONG scene_change_tick;
  * UI thread's commits (Shapr3D has two) and from the swap chain and repaint timers, so a paint could show half
  * a batch: when a menu's open transition ends XAML takes its subtree down and rebuilds it, and the other
  * thread's commit painted in between - the menu vanished for a frame. A batch is open on a committing thread
- * from its first change to its commit; paints from any other thread wait for it (present_desktop_hwnd), for at
- * most XAML_BATCH_WAIT ms in case the changes were made outside a frame and no commit follows. */
+ * from its first change to its commit, and every paint but the commit's own waits for it (present_desktop_hwnd),
+ * for at most XAML_BATCH_WAIT ms in case the changes were made outside a frame and no commit follows. */
 #define XAML_BATCH_WAIT 50
 static struct xaml_batch { DWORD thread; LONG open; ULONGLONG start; } xaml_batches[4];
 static CRITICAL_SECTION present_cs;
@@ -134,19 +135,30 @@ static void scene_changed( void )
         {
             xaml_batches[i].start = scene_change_tick;
             xaml_batches[i].open = TRUE;
+            TRACE_(dcompgate)( "batch opens\n" );
         }
         break;
     }
 }
-/* how long a paint from this thread should still wait for another thread's batch, 0 for none */
+/* A change that is not XAML's (a repaint request, a swap chain frame, input moving a manipulation): paint it,
+ * but do not open a batch - the repaint entry points run on the UI thread, and opening one there made every
+ * WM_PAINT repaint wait out XAML_BATCH_WAIT for a commit that was never coming. */
+static void scene_dirty( void )
+{
+    InterlockedIncrement( &scene_generation );
+    scene_change_tick = GetTickCount64();
+}
+/* how long a paint should still wait for an open batch, 0 for none. The committing thread's own paints
+ * wait too: XAML takes a finished transition's subtree down after one commit and rebuilds it in the next
+ * frame, and a repaint timer firing on that thread in between showed the context menu missing. */
 static DWORD xaml_batch_wait( void )
 {
-    DWORD tid = GetCurrentThreadId(), wait = 0;
+    DWORD wait = 0;
     ULONGLONG now = GetTickCount64();
     unsigned int i;
 
     for (i = 0; i < ARRAY_SIZE(xaml_batches) && xaml_batches[i].thread; i++)
-        if (xaml_batches[i].thread != tid && xaml_batches[i].open && now - xaml_batches[i].start < XAML_BATCH_WAIT)
+        if (xaml_batches[i].open && now - xaml_batches[i].start < XAML_BATCH_WAIT)
             wait = max( wait, XAML_BATCH_WAIT - (DWORD)(now - xaml_batches[i].start) );
     return wait;
 }
@@ -161,6 +173,7 @@ static void xaml_batch_commit( void )
         if (xaml_batches[i].thread == tid) break;
     }
     if (i < ARRAY_SIZE(xaml_batches)) xaml_batches[i].open = FALSE;
+    TRACE_(dcompgate)( "commit\n" );
 }
 static IVisual *last_desktop_root;
 static void present_dcomp_visuals( HDC hdc );
@@ -846,14 +859,26 @@ static void present_desktop_hwnd_locked( HWND hwnd );
 static void request_repaint( DWORD delay );
 static void present_desktop_hwnd( HWND hwnd )
 {
+    static ULONGLONG deferred_since;
+    ULONGLONG now = GetTickCount64();
     DWORD wait;
 
-    /* another thread's batch is half done: its commit paints, or a repaint once the wait runs out */
-    if ((wait = xaml_batch_wait()))
+    /* A batch is half done: its commit paints, or a repaint once the wait runs out. Not before the first
+     * frame (the repaint is a WM_PAINT, which a window that was never shown does not get), and not for
+     * longer than XAML_BATCH_WAIT in a row: two UI threads committing in turn can each find the other's
+     * batch open every time. */
+    if (back_bmp && (wait = xaml_batch_wait()))
     {
-        request_repaint( wait );
-        return;
+        if (!deferred_since) deferred_since = now;
+        if (now - deferred_since < XAML_BATCH_WAIT)
+        {
+            TRACE_(dcompgate)( "deferred, wait %lu, since %I64u\n", wait, now - deferred_since );
+            request_repaint( min( wait, XAML_BATCH_WAIT - (DWORD)(now - deferred_since) ) );
+            return;
+        }
     }
+    if (deferred_since) TRACE_(dcompgate)( "painting after %I64u ms deferred\n", now - deferred_since );
+    deferred_since = 0;
     present_request_hwnd = hwnd;
     InterlockedExchange( &present_pending, 1 );
     for (;;)
@@ -955,6 +980,7 @@ static void present_desktop_hwnd_locked( HWND hwnd )
         paint_xf.quarter = 0; paint_xf.active = FALSE;
         readback_batch();
         TRACE_(dcompops)( "paint, scene generation %ld\n", generation );
+        TRACE_(dcompgate)( "paint, scene generation %ld\n", generation );
         present_dcomp_visuals( mem );
         if (timing) QueryPerformanceCounter( &t1 );
 
@@ -1036,7 +1062,7 @@ void WINAPI __wine_dcomp_repaint_window( HWND hwnd )
     TRACE( "hwnd %p.\n", hwnd );
     if (!hwnd) hwnd = last_desktop_hwnd;
     if (!hwnd) return;
-    scene_changed();
+    scene_dirty();
     last_paint_tick = 0;
     GetClientRect( hwnd, &paint_forced );
     present_desktop_hwnd( hwnd );
@@ -1051,7 +1077,7 @@ void WINAPI __wine_dcomp_repaint_window_rect( HWND hwnd, const RECT *rect )
     if (!hwnd) return;
     if (rect) UnionRect( &paint_forced, &paint_forced, rect );
     else GetClientRect( hwnd, &paint_forced );
-    scene_changed();    /* an unchanged scene would not paint at all */
+    scene_dirty();    /* an unchanged scene would not paint at all */
     last_paint_tick = 0;
     present_desktop_hwnd( hwnd );
 }
@@ -3142,7 +3168,7 @@ static void CALLBACK swapchain_readback_job( PTP_CALLBACK_INSTANCE instance, voi
     InterlockedExchange( &surface->readback_busy, 0 );
     if (ok)
     {
-        scene_changed();
+        scene_dirty();
         /* the UI thread paints it; wineuwp's WM_PAINT handler repaints from dcomp */
         if (surface->notified && last_desktop_hwnd)
         {
@@ -13760,7 +13786,7 @@ static void CALLBACK swapchain_timer_proc( HWND hwnd, UINT msg, UINT_PTR id, DWO
 {
     if (swapchain_surfaces_dirty() && last_desktop_hwnd)
     {
-        scene_changed();
+        scene_dirty();
         present_desktop_hwnd( last_desktop_hwnd );
     }
 }
@@ -17877,7 +17903,7 @@ static void tracker_notify( struct interactions_object *tracker, INT32 request )
     const void **owner_vtbl;
 
     tracker_sync_properties( tracker );
-    scene_changed();
+    scene_dirty();
     if (!tracker->owner || tracker->in_callback) return;
     owner_vtbl = *(const void ***)tracker->owner;
     tracker->in_callback = TRUE;

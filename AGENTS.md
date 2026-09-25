@@ -161,6 +161,10 @@ which looks like a Wine regression and is not. **If a run suddenly fails at acti
 `DISPLAY=:98 xdpyinfo` first**, and restart the display with
 `Xvfb :98 -screen 0 1600x1000x24 -nolisten tcp &`.
 
+**Run it with `TESTDISPLAY=:97 ./regress.sh`** (or name apps: `./regress.sh calc mp`). It polls each
+app once a second and moves on when it passes, so the suite takes under 2 minutes. Do not go back to
+fixed sleeps; the apps are up in 3-6 s. What it checks, by hand:
+
 ```
 # Calculator must stay identical to the saved baseline
 DISPLAY=:98 UWP_TIMEOUT=80 UWP_LOG=/tmp/c.log ./run.sh &  sleep 55
@@ -441,9 +445,11 @@ Freeing directly is what killed Shapr3D when leaving the editor.
 
 **Tree changes land live here; on Windows they land at Commit.** Shapr3D has two XAML UI threads, and
 one's commit painted while the other was halfway through rebuilding a menu's subtree - the menu
-vanished for a frame. Paints from other threads now wait for an open batch (`xaml_batches` in
-`dcomp/composition.c`). Anything new that paints outside a commit has to go through
-`present_desktop_hwnd` to get that.
+vanished for a frame. Paints other than a commit's own now wait for an open batch (`xaml_batches` in
+`dcomp/composition.c`, at most 50 ms). Anything new that paints outside a commit has to go through
+`present_desktop_hwnd` to get that, and **anything of ours that bumps the scene from a UI thread must
+use `scene_dirty()`, not `scene_changed()`**: the latter opens a batch, and a repaint that opens one
+waits for itself (Media Player started blank white 3 times in 16 before that was found).
 
 **An `IDCompositionVisual` slot we answer with a no-op can move things, not just decorate them.**
 `SetTransformParent` (slot 9, and `SetTransformParent2` at slot 50) was `dcv_ok`. XAML uses it to
