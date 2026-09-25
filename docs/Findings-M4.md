@@ -9224,7 +9224,7 @@ The rows now show ">" and the hovered button shows it
 (`docs/screenshots/shapr3d-history-chevrons.png`). An expanded row has no chevron: XAML removes that
 visual from the tree, so that is the app's design, not a missing draw.
 
-### Menus open ~270 ms late: narrowed, not fixed (2026-09-24)
+### Menus open ~270 ms late: narrowed, not fixed (2026-09-24) - fixed 09-25, see below
 
 File/Edit menus appear about 270-300 ms after the click; hover and row expand respond in 12-26 ms.
 Measured by clicking with `xdotool mousedown; sleep 0.02; mouseup` and grabbing raw `xwd` frames
@@ -9234,7 +9234,8 @@ measured with it reads ~105 ms. Findings:
 - XAML opens the popup 11 ms after the click (`WINE_UWP_BP` on `ShowAtCore`, `FlyoutBase::Open`,
   `MenuFlyout::OnOpening`, `CPopup::Open`). It creates the entrance animation at +18 ms and ticks
   every 16 ms throughout.
-- The menu's visual tree is only **built** at about +220 ms. The UI thread is idle meanwhile
+- ~~The menu's visual tree is only **built** at about +220 ms.~~ **Wrong** (09-25): it is built at
+  +22 ms and painted ~1e29 pixels below the window; see the fix below. The UI thread is idle meanwhile
   (sampling profile: 1823 of 2000 samples in `CoMsgWaitInProcessEvents`).
 - During that window XAML repeatedly asks for a frame through
   `UIThreadScheduler::RequestAdditionalFrame(delay, reason 2)` from
@@ -9250,3 +9251,55 @@ frames), clips (the RectangleClip is ignored entirely), and opacity expressions.
 `"PS.POpacity * PS.TTOpacity"` is now evaluated anyway; it was silently skipped before.
 `WINEDEBUG=+dcompops` logs every emitted paint op, every commit, and every visual skipped as
 hidden or transparent.
+
+### Menus open in ~40 ms: a popup backdrop call landed in SetOffsetY (2026-09-25)
+
+The ~270 ms menu delay above was **not** XAML waiting. The menu's visuals were built at +22 ms, in
+the tree, and painted every frame - at y = 1.5e29. `WINEDEBUG=+dcomptree` (new: every visit with
+position and clip, every create/insert/remove) showed one interop visual on the menu's chain with
+`offset_y 7.50188e+28`. A `WARN` on absurd offsets named the caller,
+`windows.ui.xaml+0x46f1ec` = `CPopup::ApplyHostBackdropTreatment`: it queries the popup's visual for
+`{01dc794b-4ff5-4491-9942-b9e7b8893be4}` and calls slot 6 with a brush, with no check of the QI.
+
+That IID is in no winmd. It is in `VisualCommon`'s `s_InterfaceParts` table in Windows' `dcomp.dll`
+(next to IVisual..IVisual4), and the vtable `??_7Partner@VisualCommon@...` names it
+**IVisualPartner** (IUnknown-based): 3 GetOrCreateNonDefaultPointerEventRouter,
+4 RemovePointerEventRouter, **5 SetTransformParent(IVisual)**, **6 SetWindowBackgroundTreatment(brush)**,
+7 SetInteraction, 8 SetSharedManipulationTransform, 9 GetPointerEventRouter. The interop visual's
+catch-all QI handed out the IDCompositionVisual vtable, whose slot 6 is `SetOffsetY(float)`: the brush
+pointer's register state became the menu's y offset. The open transition hides this on Windows' side
+too: when it ends XAML rebuilds the popup's comp nodes (fresh visuals, no backdrop call), which is
+why the menu appeared at ~250 ms. `dcv_partner_vtbl` now answers it (the backdrop is not drawn).
+
+How the interface was found, reusable for any private IID: the QI table entries are `{GUID, offset}`
+pairs under `?s_InterfaceParts@<Class>@...` in the PDB publics; a search for the GUID bytes in
+`dcomp.dll` lands in one, and the class's `Partner`/`Private` vtables in the `.syms` name the slots.
+
+**Then a one-frame flicker at the end of the transition.** XAML's UI thread (01c8) takes the
+redirected menu subtree down and rebuilds it (~40 removes, ~40 creates), and Shapr3D's *other* UI
+thread (01a0) committed in the middle and painted the half-built tree; the menu vanished for 15-20 ms
+in 4 opens out of 4. Tree changes land live here, while Windows applies a batch at Commit. Now each
+committing thread has a batch open from its first change to its commit (`xaml_batches`), and a paint
+from any other thread waits for it (at most 50 ms, for changes made outside a frame). 0 flickers in
+5 opens after. Changes the painter itself makes (transform-parent bookkeeping) do not open a batch.
+
+Measured with raw `xwd` frames after `mousedown; sleep 0.02; mouseup`: the File menu is complete
+32-85 ms after the press (first open slowest), was 270-300 ms
+(`docs/screenshots/shapr3d-file-menu-50ms.png` is the frame at 50 ms). Orbiting the viewport still
+paints 60 frames a second (`+dcompperf`, 4.4 s CPU over a 10 s orbit).
+
+### Expanded History rows lost their chevron: Scale(-1,-1) (2026-09-25)
+
+The expanded chevron is an AnimatedIcon whose glyph sprites carry **Scale(-1,-1)** - a half turn
+written as a scale. `paint_public_visual` multiplied the size by it, got -10x-12, and drew nothing.
+A both-negative scale is now painted as a quarter-turn 2 about the visual's origin with positive sizes,
+through the same `paint_enter_rotation` the collapsed chevrons use
+(`docs/screenshots/shapr3d-history-expanded-chevron.png`: collapsed, expanded, collapsed again). A
+single negative axis (a mirror) is still not drawn.
+
+### Media Player's 2242 colours is a missing focus rectangle
+
+The occasional 2242 instead of 2250 is the white rounded keyboard-focus rectangle around
+"Open file(s)" being absent (the only differing pixels, `+759+456` 151x32). It came up in 2 of 7
+runs of today's build; the old build gave 2250 in its one run, and 2242 predates these changes. Not
+chased further.

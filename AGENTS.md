@@ -201,6 +201,7 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | How many real `CoreApplicationView`s exist, on which threads? | `WINE_UWP_REPORT_VIEWS=1` (read-only census) |
 | Is it rendering more than it should? | `WINEDEBUG=+dcompperf`: one line a second with presents, readbacks and painted frames. More presents than the refresh rate means the app is not being paced |
 | Which paint ops did a frame emit, and what did the painter skip? | `WINEDEBUG=+dcompops`: every emitted op with dest, clip, alpha and quarter turns, every `Commit`, and every visual skipped as hidden or transparent. Far lighter than `+dcomp`, which filled a 16 GB `/tmp` in one menu-open trace |
+| Is this visual in the tree at all, and where is it painted? | `WINEDEBUG=+timestamp,+dcomptree`: every visual create, insert and remove, and every painter visit with position, clip, offset/transform fields and scale. `./dcomptree.py <log> <visual> [time]` rebuilds the ancestor chain from it and prints each ancestor's last painted position. It found a menu that was built, in the tree and painted every frame - at y = 1.5e29. `WARN`s `is not a coordinate` (`warn+dcomp`) name the caller of any absurd offset |
 | How long does the app take to react to a click? | press and release by hand, `xdotool mousedown 1; sleep 0.02; xdotool mouseup 1`, and grab raw `xwd -id` frames in a loop (2 ms each; compare afterwards). **`xdotool click` waits ~100 ms before the press**, so every latency measured with it reads ~105 ms |
 | What is the visual tree doing? | `WINEDEBUG=+dcomp`; `present_desktop_hwnd frame: N ops` - 0 ops means nothing to draw |
 | Why is an app stuck, when the stack dumper cannot say? | `WINE_UWP_PROFILE=<prefix> WINE_UWP_PROFILE_MS=10` - a sampling profiler already in `wineuwp`. Writes `<prefix>.<pid>` every 2 s: an `M` line per module then `S <tid> <rip> <count> <4 callers>`. It **found the waiting thread's loop when `WINE_UWP_DUMP_STACKS` returned nothing useful**, and it distinguishes *blocked* from *spinning*, which no single stack snapshot can |
@@ -300,7 +301,10 @@ For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
    name even when the metadata does not.
 2. Find which DLLs contain the IID bytes. A **proxy/stub** DLL gives the exact method count: find a
    pointer to the IID (that is `CInterfaceStubHeader::piid`), read `DispatchTableCount` at +0x10.
-3. Best of all: find the **shipping implementation's vtable** and let its PDB name every slot. That
+3. Best of all: find the **shipping implementation's vtable** and let its PDB name every slot. For
+   a WRL class the GUID bytes sit in a `{GUID, offset}` table under `?s_InterfaceParts@<Class>@...`
+   in the `.syms`: that names the class, and its `Partner`/`Private` vtables in the same `.syms`
+   name the slots. That is how XAML's `{01dc794b}` turned out to be `IVisualPartner` in minutes. That
    is how `{9d47a108}`'s 13 methods were recovered - the 19-entry `MediaPlayerImpl` vtable in
    `Windows.Media.Playback.MediaPlayer.dll`. Do this before writing a single stub.
 4. Failing all that, implement the interface with one traced thunk per slot and let the app tell you
@@ -435,6 +439,12 @@ paint-visible state must defer to the painter: cache DIBs through `retire_bitmap
 through `defer_surface_destroy()`. Only the painter frees them, under `present_cs`, after the frame.
 Freeing directly is what killed Shapr3D when leaving the editor.
 
+**Tree changes land live here; on Windows they land at Commit.** Shapr3D has two XAML UI threads, and
+one's commit painted while the other was halfway through rebuilding a menu's subtree - the menu
+vanished for a frame. Paints from other threads now wait for an open batch (`xaml_batches` in
+`dcomp/composition.c`). Anything new that paints outside a commit has to go through
+`present_desktop_hwnd` to get that.
+
 **An `IDCompositionVisual` slot we answer with a no-op can move things, not just decorate them.**
 `SetTransformParent` (slot 9, and `SetTransformParent2` at slot 50) was `dcv_ok`. XAML uses it to
 place a popup's visual in the space of the element it is attached to. Ignoring it drew every
@@ -442,6 +452,13 @@ ComboBox dropdown relative to the window origin instead: a Settings dropdown ope
 instead of over its box at (836,338). Before calling a slot "harmless", name it from the shipping
 vtable: Windows' `dcomp.dll` + `dcomp.pdb`, `InteropVisual::Api`, found by searching `.rdata` for
 the PDB-named `SetVisible`.
+
+**The catch-all is also how a private interface's call turns into garbage state.** XAML's
+`CPopup::ApplyHostBackdropTreatment` queries every popup's visual for `IVisualPartner` `{01dc794b}`
+and calls slot 6, `SetWindowBackgroundTreatment(brush)`, without checking the QI. The catch-all
+answered with the IDCompositionVisual vtable, whose slot 6 is `SetOffsetY(float)`, so every menu was
+built on time and painted ~1e29 pixels down until its open transition ended: the "270 ms menu lag".
+When something is in the tree but invisible, look for an absurd number before a missing call.
 
 **The same catch-all hands out `IClosable` as the primary vtable, and `Close()` is slot 6.** On a
 typed object with a getter in slot 6, that getter writes through Close's missing argument. It
@@ -585,6 +602,10 @@ bitmap target the way Win2D does, not straight into its WIC target.
 needs that). Both at once handed Shapr3D every toolbar click as a viewport press - which also made
 Sketch "pick a plane" by itself. dcomp sets `__wine_dcomp_input_sink` on its sink and the forwarder
 skips it. When input arrives that nothing you wrote posted, `WINEDEBUG=trace+msg` and grep `forwarding`.
+
+**`make dlls/dcomp` in the build tree does nothing** - it names the directory, which is up to date.
+Build one DLL with `make -j16 dlls/dcomp/all`, and check the DLL's timestamp before trusting a run:
+three runs this session tested a build that had never been made.
 
 **`tools/make_makefiles` builds `SOURCES` from `git ls-files`.** A new `.c` file that is not yet
 `git add`ed is silently dropped from its `Makefile.in` and the link fails with an undefined
@@ -942,17 +963,17 @@ the fully-qualified name. `--grep` first, always.
 - The unhandled-error text an app reports is often a *consequence*. `Delegate to an instance method
   cannot have null 'this'` was the second exception; the first, further up, was the real one.
 
-## Current state (2026-09-23)
+## Current state (2026-09-25)
 
 | App | State |
 | --- | --- |
 | Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0). **Depends on hand-patched `CoreMessaging.dll` and `Windows.UI.dll`** - see the byte-patch rule above |
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
-| Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15 |
+| Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15. Regression capture: 2250 colours; the occasional 2242 is the keyboard focus rectangle missing from Open file(s) |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
 | Solitaire | **Playable on the unpatched `Solitaire.exe`** (`docs/screenshots/solitaire-unpatched-menu-game.png`): main menu -> Klondike -> game, and clicks move cards. No exe byte patch is needed any more: `wineuwp` delivers `CoreWindow.VisibilityChanged`. The Sign In Error popup shows on top of the menu; Cancel is at about (813,549). The blank-window start-up flake (about 1 in 6 through 09-24) is gone again, 0/20, after two fixes to combase's `CoMsgWaitInProcessEvents` (Findings-M4, 2026-09-24). Shapr3D's rarer UI stall is fixed too (Findings-M4: a dcomp object written into ntdll's futex bucket, and unserialised painting) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
-| Shapr3D | **Models, syncs and exports** (`docs/screenshots/shapr3d-extruded-body.png`): sketch -> extrude -> Visualization, toolbar and menus, cloud upload of revisions and thumbnails, **File > Export to > STL** and **Drawings -> Create Drawing -> Export drawing (PDF)** both write correct files (`docs/screenshots/shapr3d-drawing-pdf.png`). The file pickers show Wine's common Open/Save/folder dialogs (starting in Documents). For scripted runs, `WINE_UWP_PICKER_FILE` / `WINE_UWP_PICKER_SAVE_FILE` still bypass them, and `WINE_UWP_PICKER_NODIALOG=1` makes an unstaged pick report a cancel. On `:98` the dialog is its own top-level window ("Open" / "Save As"), captured with `xwd -id`. Type into it with plain `xdotool type` after a click, not `--window`. The colon needs `xdotool key colon`, and Ctrl+A does not select the combo box text. Signs in once (Log In -> `./browser-callback.sh shapr3d`, a human solves the reCAPTCHA, run with `WINE_UWP_LAUNCHER=log`) and stays signed in. Project thumbnails and material swatches show (`docs/screenshots/shapr3d-project-thumbnails.png`, `shapr3d-used-material-swatches.png`). The save dialog offers the app's `FileTypeChoices` (Screenshot -> Capture: JPEG, PNG; `docs/screenshots/shapr3d-capture-output.png`). **The prefix's `Documents`, `Desktop` and `Pictures` are symlinks to the user's real home folders**, which is where the dialogs start - save test output to `C:\users\Public\` instead. Share -> copy link puts the project URL on the clipboard (`docs/screenshots/shapr3d-share-copy-link.png`); the share-sheet button does nothing (there is no share host). Typed dimensions work while sketching (`docs/screenshots/shapr3d-dimension-entry.png`); drive them with `xdotool type --delay 250`, because at the default 12 ms the key after the one that opens the field is lost. Start -> Visualization -> import Drone passes **30/30** (`docs/screenshots/shapr3d-import-soak-30of30.png`); it was about 3 in 4 before 09-24. Leaving the editor no longer kills it: 30 leaves in 10 runs, against 6 deaths in 10 runs before (`docs/screenshots/shapr3d-home-after-leaving.png`). |
+| Shapr3D | **Models, syncs and exports** (`docs/screenshots/shapr3d-extruded-body.png`): sketch -> extrude -> Visualization, toolbar and menus, cloud upload of revisions and thumbnails, **File > Export to > STL** and **Drawings -> Create Drawing -> Export drawing (PDF)** both write correct files (`docs/screenshots/shapr3d-drawing-pdf.png`). The file pickers show Wine's common Open/Save/folder dialogs (starting in Documents). For scripted runs, `WINE_UWP_PICKER_FILE` / `WINE_UWP_PICKER_SAVE_FILE` still bypass them, and `WINE_UWP_PICKER_NODIALOG=1` makes an unstaged pick report a cancel. On `:98` the dialog is its own top-level window ("Open" / "Save As"), captured with `xwd -id`. Type into it with plain `xdotool type` after a click, not `--window`. The colon needs `xdotool key colon`, and Ctrl+A does not select the combo box text. Signs in once (Log In -> `./browser-callback.sh shapr3d`, a human solves the reCAPTCHA, run with `WINE_UWP_LAUNCHER=log`) and stays signed in. Project thumbnails and material swatches show (`docs/screenshots/shapr3d-project-thumbnails.png`, `shapr3d-used-material-swatches.png`). The save dialog offers the app's `FileTypeChoices` (Screenshot -> Capture: JPEG, PNG; `docs/screenshots/shapr3d-capture-output.png`). **The prefix's `Documents`, `Desktop` and `Pictures` are symlinks to the user's real home folders**, which is where the dialogs start - save test output to `C:\users\Public\` instead. Share -> copy link puts the project URL on the clipboard (`docs/screenshots/shapr3d-share-copy-link.png`); the share-sheet button does nothing (there is no share host). Typed dimensions work while sketching (`docs/screenshots/shapr3d-dimension-entry.png`); drive them with `xdotool type --delay 250`, because at the default 12 ms the key after the one that opens the field is lost. Start -> Visualization -> import Drone passes **30/30** (`docs/screenshots/shapr3d-import-soak-30of30.png`); it was about 3 in 4 before 09-24. Leaving the editor no longer kills it: 30 leaves in 10 runs, against 6 deaths in 10 runs before (`docs/screenshots/shapr3d-home-after-leaving.png`). Menus are complete 32-85 ms after the press (were ~280 ms; `docs/screenshots/shapr3d-file-menu-50ms.png`), and expanded History rows show their chevron. |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
 them. **Testing that, and making them the default if it holds, is a standing job** - they change the

@@ -68,6 +68,7 @@ WINE_DECLARE_DEBUG_CHANNEL(dcompperf);
 /* WINEDEBUG=+dcompanim: every animation started on visuals and property sets, and what it resolved to */
 WINE_DECLARE_DEBUG_CHANNEL(dcompanim);
 WINE_DECLARE_DEBUG_CHANNEL(dcompops);
+WINE_DECLARE_DEBUG_CHANNEL(dcomptree);
 
 /* WINEDEBUG=+dcompperf: a one-line summary per second of what the presenter did, cheap enough to leave
  * on while measuring (the +dcomp trace itself costs more than the painting). */
@@ -107,10 +108,59 @@ static HWND last_desktop_hwnd;
  * animations and expressions move without any call). XAML commits ~60 times a second regardless. */
 static LONG scene_generation;
 static ULONGLONG scene_change_tick;
+/* XAML builds each frame's changes on its UI thread and ends them with CommitMainDevice, which Windows
+ * applies atomically. Here changes land in the tree as they are made, and paints also start from the other
+ * UI thread's commits (Shapr3D has two) and from the swap chain and repaint timers, so a paint could show half
+ * a batch: when a menu's open transition ends XAML takes its subtree down and rebuilds it, and the other
+ * thread's commit painted in between - the menu vanished for a frame. A batch is open on a committing thread
+ * from its first change to its commit; paints from any other thread wait for it (present_desktop_hwnd), for at
+ * most XAML_BATCH_WAIT ms in case the changes were made outside a frame and no commit follows. */
+#define XAML_BATCH_WAIT 50
+static struct xaml_batch { DWORD thread; LONG open; ULONGLONG start; } xaml_batches[4];
+static CRITICAL_SECTION present_cs;
 static void scene_changed( void )
 {
+    DWORD tid = GetCurrentThreadId();
+    unsigned int i;
+
     InterlockedIncrement( &scene_generation );
     scene_change_tick = GetTickCount64();
+    /* the painter's own bookkeeping is not a batch */
+    if (HandleToULong( present_cs.OwningThread ) == tid) return;
+    for (i = 0; i < ARRAY_SIZE(xaml_batches) && xaml_batches[i].thread; i++)
+    {
+        if (xaml_batches[i].thread != tid) continue;
+        if (!xaml_batches[i].open)
+        {
+            xaml_batches[i].start = scene_change_tick;
+            xaml_batches[i].open = TRUE;
+        }
+        break;
+    }
+}
+/* how long a paint from this thread should still wait for another thread's batch, 0 for none */
+static DWORD xaml_batch_wait( void )
+{
+    DWORD tid = GetCurrentThreadId(), wait = 0;
+    ULONGLONG now = GetTickCount64();
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(xaml_batches) && xaml_batches[i].thread; i++)
+        if (xaml_batches[i].thread != tid && xaml_batches[i].open && now - xaml_batches[i].start < XAML_BATCH_WAIT)
+            wait = max( wait, XAML_BATCH_WAIT - (DWORD)(now - xaml_batches[i].start) );
+    return wait;
+}
+static void xaml_batch_commit( void )
+{
+    DWORD tid = GetCurrentThreadId();
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(xaml_batches); i++)
+    {
+        if (!xaml_batches[i].thread && !InterlockedCompareExchange( (LONG *)&xaml_batches[i].thread, tid, 0 )) break;
+        if (xaml_batches[i].thread == tid) break;
+    }
+    if (i < ARRAY_SIZE(xaml_batches)) xaml_batches[i].open = FALSE;
 }
 static IVisual *last_desktop_root;
 static void present_dcomp_visuals( HDC hdc );
@@ -793,8 +843,17 @@ static void destroy_deferred_surfaces( void )
 }
 
 static void present_desktop_hwnd_locked( HWND hwnd );
+static void request_repaint( DWORD delay );
 static void present_desktop_hwnd( HWND hwnd )
 {
+    DWORD wait;
+
+    /* another thread's batch is half done: its commit paints, or a repaint once the wait runs out */
+    if ((wait = xaml_batch_wait()))
+    {
+        request_repaint( wait );
+        return;
+    }
     present_request_hwnd = hwnd;
     InterlockedExchange( &present_pending, 1 );
     for (;;)
@@ -895,6 +954,7 @@ static void present_desktop_hwnd_locked( HWND hwnd )
         paint_xf.m11 = paint_xf.m22 = 1.0f; paint_xf.m12 = paint_xf.m21 = paint_xf.dx = paint_xf.dy = 0.0f;
         paint_xf.quarter = 0; paint_xf.active = FALSE;
         readback_batch();
+        TRACE_(dcompops)( "paint, scene generation %ld\n", generation );
         present_dcomp_visuals( mem );
         if (timing) QueryPerformanceCounter( &t1 );
 
@@ -4891,6 +4951,7 @@ struct dcomp_visual
     const void **ivisual_vtbl;   /* Windows.UI.Composition.IVisual view, see dcv_ivisual_vtbl */
     const void **object2_vtbl;   /* ICompositionObject2 view, see dcv_object2_vtbl */
     const void **closable_vtbl;  /* Windows.Foundation.IClosable view, see dcv_closable_vtbl */
+    const void **partner_vtbl;   /* IVisualPartner view, see dcv_partner_vtbl */
     HSTRING comment;
     BOOL hidden;                 /* IVisual::put_IsVisible(FALSE) */
     IUnknown *clip_object;       /* IVisual::put_Clip, kept for get_Clip, not applied */
@@ -4957,6 +5018,9 @@ static const GUID IID_ILayerVisual_local =
 static const GUID IID_ICompositionObject2_local =
     { 0xef874ea1, 0x5cff, 0x4b68, { 0x9e, 0x30, 0xa1, 0x51, 0x9d, 0x08, 0xba, 0x03 } };
 
+/* IVisualPartner, see dcv_partner_vtbl */
+static const GUID IID_IVisualPartner_local =
+    { 0x01dc794b, 0x4ff5, 0x4491, { 0x99, 0x42, 0xb9, 0xe7, 0xb8, 0x89, 0x3b, 0xe4 } };
 static HRESULT WINAPI dcv_QueryInterface( void *iface, REFIID iid, void **out )
 {
     static const GUID IID_visual = { 0x4d93059d, 0x097b, 0x4651, { 0x9a, 0x60, 0xf0, 0xf2, 0x51, 0x16, 0xe2, 0xf3 } };
@@ -5023,10 +5087,22 @@ static HRESULT WINAPI dcv_QueryInterface( void *iface, REFIID iid, void **out )
         *out = &v->closable_vtbl;
         return S_OK;
     }
+    /* IVisualPartner {01dc794b}: the catch-all handed out the IDCompositionVisual vtable, and CPopup's
+     * SetWindowBackgroundTreatment(brush) (slot 6) became SetOffsetY(float) with a pointer in the argument
+     * register. Every flyout and menu then sat ~1e29 pixels down until its open transition ended. */
+    if (IsEqualGUID( iid, &IID_IVisualPartner_local ))
+    {
+        struct dcomp_visual *v = dcomp_visual_from( iface );
+
+        InterlockedIncrement( &v->ref );
+        *out = &v->partner_vtbl;
+        return S_OK;
+    }
     /* Accept any other IID: the old recording stub did this, and rejecting partner IIDs
      * (e.g. {92179cc0}) fail-fasts with E_NOINTERFACE from CalculatorApp. */
     (void)IID_visual; (void)IID_visual2; (void)IID_partner_a; (void)IID_partner_b;
     (void)IID_partner_c; (void)IID_visual_dbg;
+    TRACE_(dcomptree)( "catch-all %s from %p\n", debugstr_guid( iid ), __builtin_return_address( 0 ) );
     InterlockedIncrement( &dcomp_visual_from( iface )->ref );
     *out = iface;
     return S_OK;
@@ -5316,6 +5392,7 @@ static HRESULT WINAPI dcv_SetOffsetY( void *iface, float y )
     scene_changed();
     dcomp_visual_from( iface )->offset_y = y;
     TRACE( "%p y %f.\n", iface, y );
+    if (fabsf( y ) > 1e7f) WARN( "%p SetOffsetY %g from %p is not a coordinate\n", iface, y, __builtin_return_address( 0 ) );
     return S_OK;
 }
 static HRESULT WINAPI dcv_SetWidth( void *iface, float w )
@@ -5450,6 +5527,7 @@ static BOOL dcv_resolve_child( struct dcomp_visual *v, void *child, struct dcomp
         return TRUE;
     }
     TRACE( "child %p uses foreign visual vtbl %p.\n", child, *(const void ***)child );
+    TRACE_(dcomptree)( "owner %p: foreign child %p (vtbl %p) dropped\n", v, child, *(const void ***)child );
     return FALSE;
 }
 
@@ -5469,6 +5547,8 @@ static HRESULT WINAPI dcv_AddVisual( void *iface, void *child, BOOL insert_above
     ref_index = dcv_child_index( v, reference );
     if (ref_index >= 0) index = insert_above ? ref_index + 1 : ref_index;
     else index = insert_above ? 0 : v->child_count;
+    TRACE_(dcomptree)( "add %s %p to %p at %u of %u\n", dcv ? "dcomp" : "public", dcv ? (void *)dcv : pub, v, index,
+                      v->child_count );
     dcv_insert_child( v, dcv, pub, index );
     return S_OK;
 }
@@ -5493,6 +5573,7 @@ static HRESULT WINAPI dcv_RemoveVisual( void *iface, void *child )
         i = dcv_child_index( v, interop );
         IUnknown_Release( (IUnknown *)interop );
     }
+    TRACE_(dcomptree)( "remove %p from %p (index %d)\n", child, v, i );
     if (i >= 0) dcv_release_child_at( v, i );
     else TRACE( "%p: child %p is not here.\n", v, child );
     return S_OK;
@@ -5577,6 +5658,7 @@ static HRESULT WINAPI dcvc_Remove( void *iface, void *child, void *reference, vo
     unsigned int i;
 
     TRACE( "owner %p child %p.\n", owner, child );
+    TRACE_(dcomptree)( "dcomp %p remove %p\n", owner, child );
     (void)reference; (void)unused;
     if (!child) return E_INVALIDARG;
     {
@@ -5635,6 +5717,8 @@ static HRESULT dcvc_insert( void *iface, void *child, void *sibling, int where, 
     TRACE( "owner %p %s child %p sibling %p.\n", owner, how, child, sibling );
     if (!child) return E_INVALIDARG;
     if (!dcv_resolve_child( owner, child, &dcv, &pub )) return S_OK;
+    TRACE_(dcomptree)( "dcomp %p %s %s %p (sibling %p), %u children\n", owner, how, dcv ? "dcomp" : "public",
+                      dcv ? (void *)dcv : pub, sibling, owner->child_count );
     sib = dcv_child_index( owner, sibling );
     switch (where)
     {
@@ -6072,6 +6156,63 @@ static const void *dcv_closable_vtbl[] =
     dcv_closable_Close,
 };
 
+/* IVisualPartner {01dc794b-4ff5-4491-9942-b9e7b8893be4}, an IUnknown. Slots from VisualCommon::Partner in
+ * dcomp.pdb: 3 GetOrCreateNonDefaultPointerEventRouter, 4 RemovePointerEventRouter, 5 SetTransformParent(IVisual),
+ * 6 SetWindowBackgroundTreatment(ICompositionBrush), 7 SetInteraction, 8 SetSharedManipulationTransform,
+ * 9 GetPointerEventRouter. XAML's popups use 6 for their host backdrop. */
+static struct dcomp_visual *dcomp_visual_from_partner( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct dcomp_visual, partner_vtbl );
+}
+static HRESULT WINAPI dcv_partner_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return dcv_QueryInterface( &dcomp_visual_from_partner( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI dcv_partner_AddRef( void *iface )
+{
+    return dcv_AddRef( &dcomp_visual_from_partner( iface )->vtbl );
+}
+static ULONG WINAPI dcv_partner_Release( void *iface )
+{
+    return dcv_Release( &dcomp_visual_from_partner( iface )->vtbl );
+}
+static HRESULT WINAPI dcv_partner_get_router( void *iface, void **router )
+{
+    TRACE( "visual %p.\n", dcomp_visual_from_partner( iface ) );
+    if (!router) return E_POINTER;
+    *router = NULL;
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI dcv_partner_RemovePointerEventRouter( void *iface )
+{
+    return S_OK;
+}
+static HRESULT WINAPI dcv_SetTransformParent( void *iface, IUnknown *parent );
+static HRESULT WINAPI dcv_partner_SetTransformParent( void *iface, IUnknown *parent )
+{
+    TRACE_(dcomptree)( "partner SetTransformParent %p -> %p\n", dcomp_visual_from_partner( iface ), parent );
+    return dcv_SetTransformParent( &dcomp_visual_from_partner( iface )->vtbl, parent );
+}
+/* The host backdrop is the desktop behind the window, which is not available here; the popup draws its own
+ * fill above it. */
+static HRESULT WINAPI dcv_partner_SetWindowBackgroundTreatment( void *iface, IUnknown *brush )
+{
+    TRACE( "visual %p brush %p: not drawn.\n", dcomp_visual_from_partner( iface ), brush );
+    return S_OK;
+}
+static HRESULT WINAPI dcv_partner_set_object( void *iface, IUnknown *object )
+{
+    TRACE( "visual %p object %p: ignored.\n", dcomp_visual_from_partner( iface ), object );
+    return S_OK;
+}
+static const void *dcv_partner_vtbl[] =
+{
+    dcv_partner_QueryInterface, dcv_partner_AddRef, dcv_partner_Release,
+    dcv_partner_get_router, dcv_partner_RemovePointerEventRouter, dcv_partner_SetTransformParent,
+    dcv_partner_SetWindowBackgroundTreatment, dcv_partner_set_object, dcv_partner_set_object,
+    dcv_partner_get_router,
+};
+
 /* Windows.UI.Composition.IVisual view of an interop visual. Slots 6-38 in IDL order: AnchorPoint,
  * BackfaceVisibility, BorderMode, CenterPoint, Clip (14/15), CompositeMode, IsVisible (18/19), Offset (20/21),
  * Opacity (22/23), Orientation, Parent (26), RotationAngle, RotationAngleInDegrees, RotationAxis, Scale,
@@ -6189,6 +6330,8 @@ static HRESULT WINAPI dcv_ivisual_put_Offset( void *iface, Vector3 value )
     struct dcomp_visual *v = impl_from_dcv_ivisual( iface );
 
     TRACE( "%p offset %g,%g,%g.\n", v, value.X, value.Y, value.Z );
+    if (fabsf( value.Y ) > 1e7f || fabsf( value.X ) > 1e7f)
+        WARN( "%p put_Offset %g,%g from %p is not a coordinate\n", v, value.X, value.Y, __builtin_return_address( 0 ) );
     v->offset_x = value.X;
     v->offset_y = value.Y;
     return S_OK;
@@ -6490,6 +6633,9 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
     perf.visits++;
     TRACE( "visit dcomp %p size %gx%g at %g,%g children %u content %p opacity %g\n", v, w, h, x, y,
            v->child_count, v->content, v->opacity );
+    TRACE_(dcomptree)( "visit dcomp %p size %gx%g at %g,%g clip %s children %u (offset %g transform %g m42 %g expr %s)\n", v, w, h, x, y,
+                      wine_dbgstr_rect( &paint_clip ), v->child_count, v->offset_y, v->transform_y, v->transform4.M42,
+                      v->transform_expr ? debugstr_w( v->transform_expr->expression ) : "none" );
     /* the content root: XAML offsets it by the title bar row and it covers the rest of the window */
     if (v->offset_y > 0.5f && v->width >= back_w - 1.0f && v->offset_y + v->height >= back_h - 1.0f &&
         v->height > back_h / 2.0f)
@@ -6585,6 +6731,7 @@ static HRESULT WINAPI device_CreateVisual( void *iface, void **out )
     }
     TRACE( "CreateVisual.\n" );
     if (!(v = calloc( 1, sizeof(*v) ))) return E_OUTOFMEMORY;
+    TRACE_(dcomptree)( "create dcomp %p\n", v );
     v->vtbl = dcomp_visual_vtbl;
     v->ref = 1;
     v->opacity = 1.0f;
@@ -6592,6 +6739,7 @@ static HRESULT WINAPI device_CreateVisual( void *iface, void **out )
     v->ivisual_vtbl = dcv_ivisual_vtbl;
     v->object2_vtbl = dcv_object2_vtbl;
     v->closable_vtbl = dcv_closable_vtbl;
+    v->partner_vtbl = dcv_partner_vtbl;
     v->scale3.X = v->scale3.Y = v->scale3.Z = 1.0f;
     v->rotation_axis.Z = 1.0f;
     v->orientation.W = 1.0f;
@@ -6880,6 +7028,8 @@ static HRESULT WINAPI anim_instance_AddTimeEvent( void *iface, double seconds, v
     HRESULT hr = S_OK;
 
     TRACE( "instance %p, seconds %f, callback %p, context %p.\n", iface, seconds, callback, context );
+    TRACE_(dcompops)( "instance %p time event at %f s (instance time now %f)\n", iface, seconds,
+                      anim_instance_now( iface ) );
     if (!callback) return E_INVALIDARG;
     EnterCriticalSection( &anim_instances_cs );
     if (inst->event_count < ARRAY_SIZE(inst->events))
@@ -6954,6 +7104,7 @@ static void fire_animation_time_events( void )
     for (i = 0; i < count; i++)
     {
         TRACE( "firing time event %p(%p).\n", due[i].callback, due[i].context );
+        TRACE_(dcompops)( "firing time event %p(%p)\n", due[i].callback, due[i].context );
         due[i].callback( due[i].context );
     }
     if (pending || count) notify_partner_dirty();
@@ -7031,7 +7182,9 @@ static const GUID IID_IDCompositionDevicePartner_local =
 static HRESULT WINAPI device_slot_69( void *iface )
 {
     TRACE( "interop device CommitMainDevice (slot 69).\n" );
+    TRACE_(dcompops)( "commit main device, scene generation %ld\n", scene_generation );
     perf.commits++;
+    xaml_batch_commit();
     fire_animation_time_events();
     if (last_desktop_hwnd) present_desktop_hwnd( last_desktop_hwnd );
     /* Telling XAML the composition is dirty after every commit keeps it scheduling frames forever.
@@ -7787,6 +7940,7 @@ static HRESULT collection_insert_at( struct visual_collection *impl, IVisual *ch
     }
     if (index > impl->count) index = impl->count;
     TRACE( "owner %p %s child %p at %u of %u.\n", impl->owner, how, child, index, impl->count );
+    TRACE_(dcomptree)( "public %p %s child %p at %u of %u\n", impl->owner, how, child, index, impl->count );
     /* A visual has one parent. XAML moves its text sprites under the DirectManipulation content
      * container without our seeing a Remove for the old parent, and a child painted from both
      * parents shows up twice (the result digits at the top left of Calculator's window). */
@@ -8310,7 +8464,9 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
     float height = impl->size.Y * csy + impl->relative_size.Y * parent_height;
     unsigned int i;
     int saved = 0;
-    RECT saved_clip = paint_clip;
+    RECT saved_clip = paint_clip, turn_saved_clip, turn_saved_outer;
+    struct paint_xform turn_saved_xf;
+    BOOL turned = FALSE;
 
     /* Composition sizes default to 0 and a sprite of size 0 draws nothing; filling the parent instead put
      * XAML's black window-background sprite (size 0, inserted below the content, which is later inserted at
@@ -8322,11 +8478,28 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
            impl->relative_size.X, impl->relative_size.Y, impl->visible, impl->opacity, impl->collection.count );
     /* IsVisible = false hides the whole subtree (XAML collapses e.g. the NavigationView back button's
      * AnimatedIcon this way); so does zero opacity. */
+    TRACE_(dcomptree)( "visit public %p size %gx%g at %g,%g clip %s children %u (scale %g,%g parent scale %g,%g)\n", impl,
+                       width, height, x, y, wine_dbgstr_rect( &paint_clip ), impl->collection.count, impl->scale.X, impl->scale.Y,
+                       sx, sy );
     if (!impl->visible || impl->opacity <= 0.01f)
     {
         TRACE_(dcompops)( "public %p %s, size %gx%g, %u children\n", impl, impl->visible ? "transparent" : "hidden",
                           width, height, impl->collection.count );
         return;
+    }
+    /* Scale(-1,-1) is a half turn about the visual's origin (AnimatedIcon's expanded chevron): the sizes came out
+     * negative and nothing was drawn. Draw it turned, with positive sizes, around that origin. */
+    if (csx < 0.0f && csy < 0.0f)
+    {
+        turn_saved_xf = paint_xf;
+        turn_saved_outer = paint_rot_clip;
+        turn_saved_clip = paint_clip;
+        paint_enter_rotation( 2, x, y );
+        csx = -csx;
+        csy = -csy;
+        width = impl->size.X * csx + impl->relative_size.X * parent_width;
+        height = impl->size.Y * csy + impl->relative_size.Y * parent_height;
+        turned = TRUE;
     }
     if (!xaml_island_container && impl->kind != VISUAL_SPRITE) xaml_island_container = impl;
     saved = apply_inset_clip( hdc, impl->clip, x, y, width, height );
@@ -8445,6 +8618,12 @@ children:
         }
     }
     if (saved) paint_clip = saved_clip;
+    if (turned)
+    {
+        paint_xf = turn_saved_xf;
+        paint_rot_clip = turn_saved_outer;
+        paint_clip = turn_saved_clip;
+    }
 }
 
 static const GUID IID_IShapeVisual_local = {0xf2bd13c3,0xba7e,0x4b0f,{0x91,0x26,0xff,0xb7,0x53,0x6b,0x81,0x76}};
