@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     1dd873537c2071e19607c0016891c8680c3868b4
-                 dcomp: Resolve a LoadedImageSurface facade only once it has decoded
+  wine HEAD:     718c2d76a694625bd021288ae53ffb748e097721
+                 directmanipulation: Send the wheel to the viewport XAML marks with SetContact(MOUSEFOCUS)
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-24T22:59:21Z
+  captured:      2026-09-25T02:08:31Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

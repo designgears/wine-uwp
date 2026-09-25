@@ -9116,3 +9116,28 @@ Also named, and harmless: the 65 `Failed to create ifstub` per run are XAML putt
 `WindowSizeChangedEventHandler` (`{5c21c742}`) and `WindowActivatedEventHandler` (`{18026348}`)
 into the GIT (`CGITCookie::Create`). There is no proxy registered for either, on Windows too. The
 editor still relays out correctly when the window is resized with `probe-resize.exe`.
+
+### Mouse wheel in Settings and History: DirectManipulation ignored XAML's contact (2026-09-24)
+
+The wheel scrolled the Recents page and zoomed the 3D viewport, but did nothing in the Settings
+dialog (Input section) or the editor's History panel. The viewport is not involved: it gets the wheel
+through dcomp's input sink. The XAML ScrollViewers go through our `directmanipulation.dll`.
+
+`WINEDEBUG=+manipulation` (the channel is `manipulation`, not `directmanipulation`) showed two
+things:
+
+- **Every viewport rect is `(0,0)`-based**, in the element's own space: `(0,0)-(599,500)` for the
+  Settings content, `(0,0)-(1039,703)` for Recents. Our wheel handler hit-tested those as window
+  client coordinates. That only ever worked for viewports big enough to cover the cursor from the
+  window's origin, such as Recents.
+- **XAML says which viewport it means.** It hit-tests the wheel itself and brackets `ProcessInput`
+  with `SetContact(DIRECTMANIPULATION_MOUSEFOCUS = 0xfffffffd)` and `ReleaseContact` on the viewport
+  under the cursor. Our `SetContact` ignored it.
+
+Fix: `SetContact`/`ReleaseContact(MOUSEFOCUS)` mark the viewport, and the wheel goes to the marked
+one. The geometric search is kept only for when no viewport is marked. Settings -> Input now scrolls
+to "Display keyboard presses" (`docs/screenshots/shapr3d-settings-wheel-scroll.png`). History
+scrolls up through Face Offset 17 / Chamfer 24 (`docs/screenshots/shapr3d-history-wheel-scroll.png`).
+
+Not done: when the marked viewport cannot scroll in that direction, Windows chains the wheel to the
+parent; we drop it.

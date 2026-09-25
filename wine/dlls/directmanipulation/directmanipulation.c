@@ -727,6 +727,7 @@ struct directviewport
     DIRECTMANIPULATION_INPUT_MODE input_mode;
     DIRECTMANIPULATION_INPUT_MODE update_mode;
     float transform[6];
+    BOOL mouse_focus;   /* XAML set DIRECTMANIPULATION_MOUSEFOCUS on it: the wheel belongs to this viewport */
 
     struct viewport_handler handlers[16];
     unsigned int handler_count;
@@ -993,10 +994,17 @@ static HRESULT WINAPI viewport_Disable(IDirectManipulationViewport2 *iface)
     return S_OK;
 }
 
+/* DIRECTMANIPULATION_MOUSEFOCUS from directmanipulation.h, which our IDL does not define */
+#define DM_MOUSEFOCUS 0xfffffffd
+
+/* XAML hit-tests a wheel event itself, then brackets ProcessInput with SetContact(MOUSEFOCUS) and
+ * ReleaseContact on the ScrollViewer's viewport under the cursor. That is the only reliable way to
+ * know which viewport it means: their rects are all (0,0)-based, in each element's own space. */
 static HRESULT WINAPI viewport_SetContact(IDirectManipulationViewport2 *iface, UINT32 id)
 {
     struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
-    TRACE("%p, %u: no manipulation engine, contact ignored\n", This, id);
+    TRACE("%p, %u\n", This, id);
+    if (id == DM_MOUSEFOCUS) This->mouse_focus = TRUE;
     return S_OK;
 }
 
@@ -1004,6 +1012,7 @@ static HRESULT WINAPI viewport_ReleaseContact(IDirectManipulationViewport2 *ifac
 {
     struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
     TRACE("%p, %u\n", This, id);
+    if (id == DM_MOUSEFOCUS) This->mouse_focus = FALSE;
     return S_OK;
 }
 
@@ -1011,6 +1020,7 @@ static HRESULT WINAPI viewport_ReleaseAllContacts(IDirectManipulationViewport2 *
 {
     struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
     TRACE("%p\n", This);
+    This->mouse_focus = FALSE;
     return S_OK;
 }
 
@@ -1470,16 +1480,19 @@ static BOOL manager_process_wheel(struct directmanipulation *This, const MSG *ms
     float vw, vh, cw, ch, min_x, min_y, x, y;
     RECT vp;
     unsigned int i;
+    BOOL have_focus = FALSE;
 
     if (msg->message == WM_POINTERWHEEL || msg->message == WM_POINTERHWHEEL) horizontal = msg->message == WM_POINTERHWHEEL;
     if (!delta) return FALSE;
     ScreenToClient(This->window ? This->window : msg->hwnd, &pt);
+    for (i = 0; i < viewport_count; i++) if (viewports[i]->mouse_focus) have_focus = TRUE;
 
     for (i = 0; i < viewport_count; i++)
     {
         struct directviewport *v = viewports[i];
         if (v->status != DIRECTMANIPULATION_READY || !v->primary) continue;
-        if (!PtInRect(&v->rect, pt)) continue;
+        /* the viewport XAML named with SetContact(MOUSEFOCUS) wins outright */
+        if (!v->mouse_focus && (have_focus || !PtInRect(&v->rect, pt))) continue;
         if (!(v->active_configuration & (horizontal ? DIRECTMANIPULATION_CONFIGURATION_TRANSLATION_X
                                                     : DIRECTMANIPULATION_CONFIGURATION_TRANSLATION_Y))) continue;
         vw = (float)(v->rect.right - v->rect.left);
@@ -1487,7 +1500,12 @@ static BOOL manager_process_wheel(struct directmanipulation *This, const MSG *ms
         cw = (float)(v->primary->rect.right - v->primary->rect.left) * v->primary->transform[0];
         ch = (float)(v->primary->rect.bottom - v->primary->rect.top) * v->primary->transform[3];
         if (horizontal ? cw <= vw + 0.5f : ch <= vh + 0.5f) continue;   /* nothing to scroll */
-        /* the innermost viewport wins */
+        if (v->mouse_focus)
+        {
+            best = v;
+            break;
+        }
+        /* otherwise the innermost viewport wins */
         if (!best || (v->rect.right - v->rect.left) * (v->rect.bottom - v->rect.top) <
                      (best->rect.right - best->rect.left) * (best->rect.bottom - best->rect.top))
             best = v;
