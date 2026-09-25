@@ -9397,3 +9397,14 @@ real frames instead of a stack scan) and writes `T tid name` lines; `./profsym.p
 anything else by `.pdata` function), and `BUSY=1` drops samples parked in a blocking call. Sampling
 at 3 ms with ~80 threads crashed Shapr3D once (a fault in `Shapr.Native` and then CoreMessaging);
 5 ms has been fine.
+
+### The Fusion 360 XDamage present-wait patch does not apply to Shapr3D (2026-09-25)
+
+`../Autodesk-Fusion-360-on-Linux/files/setup/data/wine-present-wait-damage.patch` makes
+`X11DRV_client_surface_present` wait for an XDamage event on the Vulkan/GL child window before copying
+it to the visible window, so the copy is not one frame old. That code runs only for a *client surface*,
+which win32u creates for `vkQueuePresentKHR` to a window. Shapr3D's viewport presents through our DXGI
+composition swap chain (`dlls/dxgi/compswapchain.c`) into plain D3D11 textures, and dcomp reads those
+back and blits them itself. A drone-opening run with `+x11drv` (2,140 trace lines) logged no
+`Created ... for client window` at all. The equivalent concern here, copying a frame that is not the
+one presented, is handled by the swap chain's per-present snapshot and the readback's event query.
