@@ -175,8 +175,12 @@ static HRESULT WINAPI settings_map_Insert( IMap_HSTRING_IInspectable *iface, HST
     struct settings *impl = impl_from_IMap_HSTRING_IInspectable( iface );
     HRESULT hr;
 
+    IInspectable *copy;
+
     TRACE( "key %s, value %p.\n", debugstr_hstring( key ), value );
-    hr = IMap_HSTRING_IInspectable_Insert( impl->inner_map, key, value, replaced );
+    if (FAILED(hr = copy_setting_value( value, &copy ))) return hr;
+    hr = IMap_HSTRING_IInspectable_Insert( impl->inner_map, key, copy, replaced );
+    if (copy) IInspectable_Release( copy );
     if (SUCCEEDED(hr) && impl->container) settings_changed();
     return hr;
 }

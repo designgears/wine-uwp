@@ -5030,6 +5030,25 @@ static DWORD WINAPI code_bp_thread( void *arg )
     return 0;
 }
 
+/* WINE_UWP_TEST_CRASH=<seconds>: fault on a thread of our own, which the app's runtime has never seen,
+ * after that long. It stands in for a crash on a graphics worker when testing an app's crash reporter. */
+static DWORD WINAPI test_crash_thread( void *arg )
+{
+    Sleep( (DWORD)(ULONG_PTR)arg * 1000 );
+    ERR( "WINE_UWP_TEST_CRASH: faulting now\n" );
+    *(volatile int *)(ULONG_PTR)0x10 = 1;
+    return 0;
+}
+
+static void maybe_start_test_crash(void)
+{
+    const char *seconds = getenv( "WINE_UWP_TEST_CRASH" );
+    HANDLE thread;
+    if (!seconds || atoi( seconds ) <= 0) return;
+    if ((thread = CreateThread( NULL, 0, test_crash_thread, (void *)(ULONG_PTR)atoi( seconds ), 0, NULL )))
+        CloseHandle( thread );
+}
+
 static void maybe_start_code_bps(void)
 {
     char env[1024], *p, *item;
@@ -5081,6 +5100,7 @@ HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID iid, void **out)
     {
         maybe_start_stack_dumper();
         maybe_start_code_bps();
+        maybe_start_test_crash();
     }
     TRACE("%s, %s, %p\n", debugstr_guid(clsid), debugstr_guid(iid), out);
     if (IsEqualGUID(clsid, &CLSID_ActivatableApplicationRegistrar))

@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     5715b8a16d1feaa598f7d1f5d9c3af11eb653374
-                 dcomp: Implement SetTransformParent; wineuwp: memory dumps in WINE_UWP_BP
+  wine HEAD:     5dd19b340709b2170a587f142ae33a3caf5e93be
+                 applicationdata: Copy settings values on insert; ntdll: use-after-free check under warn+heap; wineuwp: WINE_UWP_TEST_CRASH
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-25T03:03:28Z
+  captured:      2026-09-25T04:37:41Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

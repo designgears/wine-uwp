@@ -47,6 +47,7 @@ extern HRESULT settings_create( IPropertySet *inner, IPropertySet **out );
 extern IActivationFactory *composite_value_factory;
 /* called after a container's values change; persists the settings (applicationdata.c) */
 extern void settings_changed( void );
+extern HRESULT copy_setting_value( IInspectable *value, IInspectable **out );
 
 #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
     static inline impl_type *impl_from( iface_type *iface )                                        \

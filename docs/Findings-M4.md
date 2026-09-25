@@ -9173,3 +9173,33 @@ has `malloc` returning an address inside dcomp's image, past the end of `.bss`, 
 `CreateVertexShader` bytecode copy. That is heap corruption from an earlier write. Twelve rounds of
 expand/collapse plus wheel scrolling did not reproduce it. `minidump.py` now prints the faulting
 context from the exception stream, not the crash handler's.
+
+### A heap corruption that crashes Shapr3D on the user's desktop, and its crash reporter (2026-09-24)
+
+On the user's `:0`, clicking `drone.shapr` in the Items pane crashed Shapr3D twice. Neither crash
+reproduces on Xvfb, including at the same 3440x1440 size and on the same RTX 5090.
+
+- **Crash 1** (Sentry dump): `malloc` for a vertex shader's bytecode copy returned
+  `dcomp.dll+0x14ab40`, the page padding after dcomp's `.bss`.
+- **Crash 2** (the fail-fast unwind in the log): `RtlAllocateHeap -> heap_allocate_block_lfh ->
+  mark_block_tail` faulted on the wined3d command-stream thread, under `vkd3d_shader_scan`.
+
+Both are a corrupted low-fragmentation-heap group. Its first qword is its free-list link, and it had
+been overwritten with a pointer into dcomp's static data, so an earlier write through a stale pointer
+is the cause. That write is not found yet. Ruled out by reading the code: every `vtbl` assignment in
+dcomp (all constructors), its one static list (`anim_instances`, unlinked under its lock before
+`free`), and the `RowPitch` copies in dcomp and dxgi (tight rows written, `RowPitch` read).
+
+**The crash reporter died too, and that part was ours.** Sentry's handler inserts a flag into
+`LocalSettings`. Our `ApplicationDataContainer` then re-serialized every stored value by calling into
+the objects the app had inserted, which for .NET are managed CCWs. On the crashing graphics thread
+that ended in `mrt100`, so no dump was written. Values are now copied through the persistence format
+at `Insert`, as Windows does. `WINE_UWP_TEST_CRASH=<s>` (a fault on a thread of `wineuwp`'s) gives a
+correct Sentry dump with both the old and the new code, so the exact failure did not reproduce here.
+
+**A use-after-free detector** for the next occurrence: under `WINEDEBUG=warn+heap`, ntdll now keeps
+16384 freed blocks filled, with the LFH off. A block leaving that ring is checked, and a write after
+free is reported as
+`block X (size S) written after free at +off: value value; freed from f0 f1 f2 f3`.
+`probes/probe-uaf.cpp` is the control; it is caught at `+0x18` with the right value and free site.
+The value written usually names the writer: a vtable or a static in the module that wrote it.

@@ -1472,6 +1472,43 @@ static void load_root( IApplicationDataContainer *root, ApplicationDataLocality 
     free( data );
 }
 
+/* A value stored into a settings map is copied, as on Windows: the container never calls back into the
+ * caller's object. Keeping the caller's IPropertyValue made every later save call into it - for a .NET
+ * app that is a managed CCW - and Shapr3D's crash handler, saving a flag from a graphics thread in the
+ * middle of a crash, died inside mrt100 there instead of writing its report. The copy goes through the
+ * persistence format itself, so what is kept is exactly what would be saved and reloaded. */
+HRESULT copy_setting_value( IInspectable *value, IInspectable **out )
+{
+    static const WCHAR property_value[] = L"Windows.Foundation.PropertyValue";
+    IPropertyValueStatics *statics;
+    struct buffer buf = { 0 };
+    struct reader r = { 0 };
+    HSTRING_HEADER header;
+    HSTRING name;
+    HRESULT hr;
+
+    *out = NULL;
+    /* our own composite values keep their object: their own inserts are copied the same way */
+    if (!value || is_composite( value ) || !put_value( &buf, value ) || buf.failed)
+    {
+        free( buf.data );
+        if ((*out = value)) IInspectable_AddRef( value );
+        return S_OK;
+    }
+    if (FAILED(hr = WindowsCreateStringReference( property_value, ARRAY_SIZE(property_value) - 1, &header, &name )) ||
+        FAILED(hr = RoGetActivationFactory( name, &IID_IPropertyValueStatics, (void **)&statics )))
+    {
+        free( buf.data );
+        return hr;
+    }
+    r.data = buf.data;
+    r.size = buf.size;
+    hr = get_value( &r, statics, out );
+    IPropertyValueStatics_Release( statics );
+    free( buf.data );
+    return hr;
+}
+
 /* The root containers are process-wide, like the folders: every ApplicationData.Current hands back
  * the same LocalSettings, so what one caller writes another reads. Their Name is empty on Windows. */
 static HRESULT get_root_container( IApplicationDataContainer **root, ApplicationDataLocality locality,
