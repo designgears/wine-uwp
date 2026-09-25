@@ -59,7 +59,11 @@ that were ours; the Calculator tree is no longer involved.
     ```
 
   Then `Read` the PNG, describe what is actually on it, and embed it in the reply.
-- **Run on Xvfb `:98`, never the user's `:0`.** `DISPLAY=:98 ./run.sh`.
+- **Run on Xvfb `:98`, never the user's `:0`.** `DISPLAY=:98 ./run.sh`. **Check that `:98` is yours before
+  trusting a capture**: another program took it over on 09-24 with a full-screen window, and every
+  Shapr3D capture came back black (1 colour) while the app was fine. `xdotool search --onlyvisible
+  --name .` plus `xdotool getwindowpid` names the owner; leave it alone and start your own
+  (`Xvfb :97 ...`). The /tmp test scripts take `TESTDISPLAY`.
 - **The Wine tree (`~/src/wine`) is ours, all of it.** It is simply a checkout that lives outside
   this repo. Edit anything in it, then `./sync-wine.sh --from-tree` and commit the result here.
   Earlier revisions of this file claimed the tree was "shared with another session" and listed
@@ -202,7 +206,7 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | What is a thread of a *stuck* process doing, from outside, with no restart? | `wine $UWP_BIN/build-probes/probe-threads.exe <exe> all` - cross-process `SuspendThread` + `GetThreadContext` **works in Wine** although ptrace does not: it lists every thread by Wine tid and description with three register samples, so "blocked by 03cc" gets a rip. `probe-peek.exe <exe> <addr> <qwords>` reads the process's memory. Resolve rips against the `M` lines it prints and `llvm-symbolizer --obj=<build dll>` (image base from `llvm-objdump -p`). This found the corrupted `futex_queues` lock in one live process after days of flushed-log inference |
 | Method count of a private interface | parse the MIDL proxy/stub DLL, below |
 | A parameterised IID over `String`/`Object`/`Int32` | `./piid.py` does **not** know base types: `IVector<String>` silently hashes `String` as a type *name* and prints a wrong IID. Use `--signature` with `string`, `i4`, `cinterface(IInspectable)`: `pinterface({913337e9-11a1-4345-a3a2-4e7f956e222d};string)` gives `98b9acc1-...`, the known `IVector<String>` - check a control like that first |
-| Did this code path run, and with what registers, without ending the run? | `WINE_UWP_BP=windows.ui.xaml.dll+35dcd0,<module>+<rva>,...`: int3 breakpoints planted by `wineuwp` once each module loads. A vectored handler, which runs before the target's own handlers, logs `BP <module>+<rva> hit N tid rcx rdx r8 r9 rax ret=<module+off>`, single-steps over the breakpoint and re-arms it. `WINE_UWP_BP_MAX` caps the lines per breakpoint (default 20). **Use this before `ud2` inside XAML**: XAML swallowed `ud2` probes and gave contradictory negatives, while this showed the whole LoadedImageSurface chain in one run. The address must start an instruction |
+| Did this code path run, and with what registers, without ending the run? | `WINE_UWP_BP=windows.ui.xaml.dll+35dcd0,<module>+<rva>,...`: int3 breakpoints planted by `wineuwp` once each module loads. A vectored handler, which runs before the target's own handlers, logs `BP <module>+<rva> hit N tid rcx rdx r8 r9 rax ret=<module+off>`, single-steps over the breakpoint and re-arms it. `WINE_UWP_BP_MAX` caps the lines per breakpoint (default 20). **Use this before `ud2` inside XAML**: XAML swallowed `ud2` probes and gave contradictory negatives, while this showed the whole LoadedImageSurface chain in one run. The address must start an instruction. **Append `@reg+off:n` to also dump `n` dwords at that address as hex and float** (`windows.ui.xaml.dll+449e26@rbp-60:4` printed XAML's visible-bounds `Rect` straight after the call that filled it); registers: rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r12-r15. That is how a value computed *inside* a Microsoft function gets read without a trampoline |
 | Did this code path run, without ending the run? | `./tramp.py <exe> <rva> <nbytes> 'MSG' [cave] [--applog]` - a jmp to a code cave that logs and jumps back, so one run answers several questions. It appends its own RWX `.tramp` section, refuses a displacement that splits an instruction, and relocates displaced rip-relative operands |
 | What is the value of a register or field at that point? | `./tramp.py ... --val=rcx` / `--val=[rcx+0x30]` / `--val=[[rcx+0x30]+0x14c]` - formats it as hex through `OutputDebugStringA`; read it with `WINEDEBUG=warn+seh` |
 | Where is this class's vtable, with no symbols? | `./rtti.py <exe> '<name substring>'` - walks the MSVC type descriptors and prints the vtable and its slots |
@@ -426,6 +430,14 @@ by raw pointer, while XAML releases and resizes them on its own thread. So anyth
 paint-visible state must defer to the painter: cache DIBs through `retire_bitmap()`, surfaces
 through `defer_surface_destroy()`. Only the painter frees them, under `present_cs`, after the frame.
 Freeing directly is what killed Shapr3D when leaving the editor.
+
+**An `IDCompositionVisual` slot we answer with a no-op can move things, not just decorate them.**
+`SetTransformParent` (slot 9, and `SetTransformParent2` at slot 50) was `dcv_ok`. XAML uses it to
+place a popup's visual in the space of the element it is attached to. Ignoring it drew every
+ComboBox dropdown relative to the window origin instead: a Settings dropdown opened at (382,9)
+instead of over its box at (836,338). Before calling a slot "harmless", name it from the shipping
+vtable: Windows' `dcomp.dll` + `dcomp.pdb`, `InteropVisual::Api`, found by searching `.rdata` for
+the PDB-named `SetVisible`.
 
 **The same catch-all hands out `IClosable` as the primary vtable, and `Close()` is slot 6.** On a
 typed object with a getter in slot 6, that getter writes through Close's missing argument. It

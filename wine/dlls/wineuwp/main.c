@@ -4895,6 +4895,10 @@ struct code_bp
     BYTE *addr;
     BYTE orig;
     LONG hits;
+    /* optional "@reg+off:count": also dump count dwords at reg+off, as hex and as floats */
+    char dump_reg[8];
+    LONG_PTR dump_off;
+    unsigned int dump_count;
 };
 static struct code_bp code_bps[32];
 static unsigned int code_bp_count;
@@ -4924,6 +4928,38 @@ static void code_bp_describe( ULONG_PTR addr, char *buf, size_t size )
     else snprintf( buf, size, "%#Ix", addr );
 }
 
+static void code_bp_dump( const struct code_bp *bp, const CONTEXT *ctx )
+{
+    static const struct { const char *name; size_t offset; } regs[] =
+    {
+        { "rax", offsetof(CONTEXT, Rax) }, { "rbx", offsetof(CONTEXT, Rbx) }, { "rcx", offsetof(CONTEXT, Rcx) },
+        { "rdx", offsetof(CONTEXT, Rdx) }, { "rsi", offsetof(CONTEXT, Rsi) }, { "rdi", offsetof(CONTEXT, Rdi) },
+        { "rbp", offsetof(CONTEXT, Rbp) }, { "rsp", offsetof(CONTEXT, Rsp) }, { "r8", offsetof(CONTEXT, R8) },
+        { "r9", offsetof(CONTEXT, R9) }, { "r12", offsetof(CONTEXT, R12) }, { "r13", offsetof(CONTEXT, R13) },
+        { "r14", offsetof(CONTEXT, R14) }, { "r15", offsetof(CONTEXT, R15) },
+    };
+    const DWORD *mem;
+    unsigned int i;
+    char line[1024];
+    int len = 0;
+
+    for (i = 0; i < ARRAY_SIZE(regs); i++) if (!strcmp( regs[i].name, bp->dump_reg )) break;
+    if (i == ARRAY_SIZE(regs)) return;
+    mem = (const DWORD *)(*(const ULONG_PTR *)((const BYTE *)ctx + regs[i].offset) + bp->dump_off);
+    __TRY
+    {
+        for (i = 0; i < bp->dump_count && len < sizeof(line) - 40; i++)
+        {
+            float f;
+            memcpy( &f, &mem[i], sizeof(f) );
+            len += snprintf( line + len, sizeof(line) - len, " %08lx(%g)", mem[i], f );
+        }
+    }
+    __EXCEPT_ALL { len += snprintf( line + len, sizeof(line) - len, " <fault>" ); }
+    __ENDTRY
+    ERR( "BP %s+%#Ix  [%s%+Id]:%s\n", bp->module, bp->rva, bp->dump_reg, bp->dump_off, line );
+}
+
 static LONG CALLBACK code_bp_handler( EXCEPTION_POINTERS *info )
 {
     EXCEPTION_RECORD *rec = info->ExceptionRecord;
@@ -4945,6 +4981,7 @@ static LONG CALLBACK code_bp_handler( EXCEPTION_POINTERS *info )
                 code_bp_describe( *(ULONG_PTR *)ctx->Rsp, ret, sizeof(ret) );
                 ERR( "BP %s+%#Ix hit %ld tid %04lx rcx %Ix rdx %Ix r8 %Ix r9 %Ix rax %Ix ret %s\n", bp->module,
                      bp->rva, n, GetCurrentThreadId(), ctx->Rcx, ctx->Rdx, ctx->R8, ctx->R9, ctx->Rax, ret );
+                if (bp->dump_count) code_bp_dump( bp, ctx );
             }
             code_bp_write( bp->addr, bp->orig );
             ctx->Rip = (ULONG_PTR)bp->addr;
@@ -5001,8 +5038,19 @@ static void maybe_start_code_bps(void)
     if (!GetEnvironmentVariableA( "WINE_UWP_BP", env, sizeof(env) )) return;
     for (item = strtok_s( env, ",", &p ); item && code_bp_count < ARRAY_SIZE(code_bps); item = strtok_s( NULL, ",", &p ))
     {
-        char *plus = strrchr( item, '+' );
+        char *at = strchr( item, '@' ), *plus;
         struct code_bp *bp = &code_bps[code_bp_count];
+        if (at)
+        {
+            char *colon = strchr( at, ':' ), *off;
+            *at++ = 0;
+            if (colon) { *colon = 0; bp->dump_count = min( atoi( colon + 1 ), 64 ); }
+            else bp->dump_count = 4;
+            off = strpbrk( at, "+-" );
+            if (off) bp->dump_off = strtoll( off, NULL, 16 );
+            lstrcpynA( bp->dump_reg, at, off ? min( off - at + 1, sizeof(bp->dump_reg) ) : sizeof(bp->dump_reg) );
+        }
+        plus = strrchr( item, '+' );
         if (!plus) continue;
         *plus = 0;
         lstrcpynA( bp->module, item, sizeof(bp->module) );

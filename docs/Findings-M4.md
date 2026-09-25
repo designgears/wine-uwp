@@ -9141,3 +9141,35 @@ scrolls up through Face Offset 17 / Chamfer 24 (`docs/screenshots/shapr3d-histor
 
 Not done: when the marked viewport cannot scroll in that direction, Windows chains the wheel to the
 parent; we drop it.
+
+### ComboBox dropdowns opened at the window's corner: SetTransformParent was a no-op (2026-09-24)
+
+Every dropdown opened in the wrong place. In the editor's left pane it was about 55 px too high; in
+Settings it was hundreds of pixels up and left, drawn over the title bar. The dropdown is a
+windowless XAML popup, drawn inside the CoreWindow, so this was not a window-placement bug.
+
+Measured with `WINE_UWP_BP` (plus the new `@reg+off:n` memory dump) inside
+`ComboBox::ArrangePopup`:
+
+- `IsDropDownOpen` true after `OnOpen`;
+- `GetVisibleBoundsInternal` returns `(0,0,1280,800)`, correct;
+- `TransformComboBoxToVisual` puts the combo at `(836,338)`, correct.
+
+So XAML's arithmetic was fine. The rest came from `+dcomp`: the popup's visual got
+`put_TransformMatrix(translate 382,9)`. That value is **relative to a transform parent**, set with
+`IDCompositionVisual::SetTransformParent` (slot 9), and our table had that slot as a no-op. The slot
+names come from Windows' own `dcomp.dll` vtable for `InteropVisual::Api`, resolved through
+`dcomp.pdb`: 9 `SetTransformParent`, 43 `SetTransparentForInput`, 47 `EnablePixelSnapping`,
+50/51 `SetTransformParent2`.
+
+Fix: `SetTransformParent` records a weak link. A registry clears it when either visual is freed. The
+painter draws such a visual from the space its transform parent last handed its own children, and
+repaints when that space moves (the parent may paint later in the same frame).
+`docs/screenshots/shapr3d-dropdown-placed.png` shows the Settings dropdown over its box with the
+selected item aligned, as on Windows.
+
+A crash the user hit while expanding something in the left pane is **not** explained. Sentry's dump
+has `malloc` returning an address inside dcomp's image, past the end of `.bss`, for a
+`CreateVertexShader` bytecode copy. That is heap corruption from an earlier write. Twelve rounds of
+expand/collapse plus wheel scrolling did not reproduce it. `minidump.py` now prints the faulting
+context from the exception stream, not the crash handler's.

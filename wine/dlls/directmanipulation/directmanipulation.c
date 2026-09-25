@@ -39,7 +39,7 @@ struct directmanipulation
 };
 
 /* Every live viewport, so that ProcessInput can find the one under a wheel event. */
-static struct directviewport *viewports[64];
+static struct directviewport *viewports[512];   /* past this a viewport is not tracked and gets no wheel */
 static unsigned int viewport_count;
 
 struct directupdatemanager

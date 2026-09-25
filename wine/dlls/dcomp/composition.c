@@ -1422,6 +1422,7 @@ struct expr_animation
     struct propset_value *params;   /* Set*Parameter values, referenced by bare name in the expression */
     unsigned int param_count;
     ICompositionPropertySet *properties; /* Properties: XAML binds it as "PS" and inserts X, Y, CenterX ... */
+    BOOL warned_eval;                   /* expr_evaluate_matrix has reported failing on it */
 };
 struct expr_animation;
 static BOOL expr_evaluate_matrix( struct expr_animation *expr, ICompositionPropertySet *local,
@@ -4770,6 +4771,12 @@ struct dcomp_visual
     FLOAT rotation;
     Matrix4x4 transform4;
     ICompositionPropertySet *properties;
+    /* SetTransformParent: position relative to that visual's space instead of the tree parent's. Weak:
+     * transform_parent_links clears it when either end is destroyed. */
+    struct dcomp_visual *transform_parent;
+    /* the origin and scale this visual last handed its children, for visuals using it as transform parent */
+    float local_x, local_y, local_sx, local_sy;
+    BOOL has_local;
 };
 
 static HRESULT create_property_set( ICompositionPropertySet **out );
@@ -4899,6 +4906,61 @@ static ULONG WINAPI dcv_AddRef( void *iface )
 {
     return InterlockedIncrement( &dcomp_visual_from( iface )->ref );
 }
+/* Visuals with a transform parent. Short: XAML sets one on popups and a few hand-off visuals. */
+static CRITICAL_SECTION transform_parent_cs;
+static CRITICAL_SECTION_DEBUG transform_parent_cs_debug =
+{
+    0, 0, &transform_parent_cs,
+    { &transform_parent_cs_debug.ProcessLocksList, &transform_parent_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": transform_parent_cs") }
+};
+static CRITICAL_SECTION transform_parent_cs = { &transform_parent_cs_debug, -1, 0, 0, 0, 0 };
+static struct dcomp_visual **transform_parent_links;
+static unsigned int transform_parent_link_count, transform_parent_link_capacity;
+
+static void transform_parent_set( struct dcomp_visual *v, struct dcomp_visual *parent )
+{
+    unsigned int i;
+
+    EnterCriticalSection( &transform_parent_cs );
+    for (i = 0; i < transform_parent_link_count; i++) if (transform_parent_links[i] == v) break;
+    if (parent && i == transform_parent_link_count)
+    {
+        if (i == transform_parent_link_capacity)
+        {
+            unsigned int capacity = max( 16, transform_parent_link_capacity * 2 );
+            struct dcomp_visual **grown = realloc( transform_parent_links, capacity * sizeof(*grown) );
+            if (!grown) { LeaveCriticalSection( &transform_parent_cs ); return; }
+            transform_parent_links = grown;
+            transform_parent_link_capacity = capacity;
+        }
+        transform_parent_links[transform_parent_link_count++] = v;
+    }
+    else if (!parent && i < transform_parent_link_count)
+        transform_parent_links[i] = transform_parent_links[--transform_parent_link_count];
+    v->transform_parent = parent;
+    LeaveCriticalSection( &transform_parent_cs );
+}
+
+static void transform_parent_unlink( struct dcomp_visual *v )
+{
+    unsigned int i;
+
+    EnterCriticalSection( &transform_parent_cs );
+    for (i = 0; i < transform_parent_link_count; )
+    {
+        struct dcomp_visual *child = transform_parent_links[i];
+        if (child == v)
+        {
+            transform_parent_links[i] = transform_parent_links[--transform_parent_link_count];
+            continue;
+        }
+        if (child->transform_parent == v) child->transform_parent = NULL;
+        i++;
+    }
+    LeaveCriticalSection( &transform_parent_cs );
+}
+
 static ULONG WINAPI dcv_Release( void *iface )
 {
     struct dcomp_visual *v = dcomp_visual_from( iface );
@@ -4906,6 +4968,7 @@ static ULONG WINAPI dcv_Release( void *iface )
     if (!ref)
     {
         unsigned i;
+        transform_parent_unlink( v );
         if (v->content) IUnknown_Release( v->content );
         if (v->manip) comp_object_Release( &v->manip->vtbl );
         if (v->clip_object) IUnknown_Release( v->clip_object );
@@ -6125,6 +6188,21 @@ static const void *dcv_ivisual_vtbl[] =
 
 /* Like dcv_ok, but shows the first three arguments: XAML calls slots 43, 47 and 50 on every interop
  * visual each frame and the values tell what they are. */
+static HRESULT WINAPI dcv_SetTransformParent( void *iface, IUnknown *parent )
+{
+    struct dcomp_visual *v = CONTAINING_RECORD( iface, struct dcomp_visual, vtbl );
+    struct dcomp_visual *pdcv = parent ? dcv_from_any( parent ) : NULL;
+    struct visual *ppub = parent && !pdcv ? visual_from_interop( parent ) : NULL;
+    TRACE( "visual %p transform parent %p (dcv %p pub %p)\n", v, parent, pdcv, ppub );
+    if (pdcv == v) pdcv = NULL;
+    if (pdcv != v->transform_parent)
+    {
+        transform_parent_set( v, pdcv );
+        scene_changed();
+    }
+    if (ppub) FIXME( "transform parent %p is a public visual, ignored\n", ppub );
+    return S_OK;
+}
 static HRESULT WINAPI dcv_ok_args( void *iface, void *a, void *b, void *c )
 {
     TRACE( "%p slot? a %p b %p c %p.\n", iface, a, b, c );
@@ -6135,7 +6213,7 @@ static const void *dcomp_visual_vtbl[] =
     /* 0-2 */ dcv_QueryInterface, dcv_AddRef, dcv_Release,
     /* 3-4 */ dcv_ok /*SetOffsetX anim*/, dcv_SetOffsetX,
     /* 5-6 */ dcv_ok /*SetOffsetY anim*/, dcv_SetOffsetY,
-    /* 7-9 */ dcv_ok /*SetTransform object*/, dcv_SetTransformMatrix, dcv_ok /*SetTransformParent*/,
+    /* 7-9 */ dcv_ok /*SetTransform object*/, dcv_SetTransformMatrix, dcv_SetTransformParent,
     /* 10 */ dcv_ok, /* SetEffect */
     /* 11-12 */ dcv_ok, dcv_ok, /* SetBitmapInterpolationMode, SetBorderMode */
     /* 13-14 */ dcv_ok /*SetClip object*/, dcv_SetClipRect,
@@ -6157,7 +6235,7 @@ static const void *dcomp_visual_vtbl[] =
     /* 42-44 */ dcv_ok, dcv_ok_args, dcv_ok, /* Interaction / Transparent / RasterScale */
     /* 45 */ dcv_GetVisualCollection,
     /* 46 */ dcv_RealClose,
-    /* 47-51 */ dcv_ok_args, dcv_ok, dcv_ok, dcv_ok_args, dcv_ok,
+    /* 47-51 */ dcv_ok_args, dcv_ok, dcv_ok, dcv_SetTransformParent /* SetTransformParent2(IDCompositionVisual *) */, dcv_ok,
 };
 
 /* sx, sy: the scale the ancestors apply (SetTransform matrices, XAML's Viewbox and RenderTransform scale go
@@ -6167,14 +6245,25 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
     RECT rc;
     HBRUSH brush;
     unsigned i;
-    float x = ox + (v->offset_x + v->transform_x + v->transform4.M41) * sx;
-    float y = oy + (v->offset_y + v->transform_y + v->transform4.M42) * sy;
-    /* the SetTransform matrix and XAML's IVisual TransformMatrix (an identity M11/M22 of 0 means unset) */
-    float csx = sx * (v->scale_x != 0.0f ? v->scale_x : 1.0f) * (v->transform4.M11 != 0.0f ? v->transform4.M11 : 1.0f);
-    float csy = sy * (v->scale_y != 0.0f ? v->scale_y : 1.0f) * (v->transform4.M22 != 0.0f ? v->transform4.M22 : 1.0f);
-    float w = v->width * csx, h = v->height * csy;
+    float x, y, csx, csy, w, h;
     int saved = 0;
     RECT saved_clip;
+
+    /* SetTransformParent: this visual lives in its transform parent's space, not in the tree parent's. The
+     * parent may paint later in the frame; its last recorded space is used, and a change repaints. */
+    if (v->transform_parent && v->transform_parent->has_local)
+    {
+        ox = v->transform_parent->local_x;
+        oy = v->transform_parent->local_y;
+        sx = v->transform_parent->local_sx;
+        sy = v->transform_parent->local_sy;
+    }
+    x = ox + (v->offset_x + v->transform_x + v->transform4.M41) * sx;
+    y = oy + (v->offset_y + v->transform_y + v->transform4.M42) * sy;
+    /* the SetTransform matrix and XAML's IVisual TransformMatrix (an identity M11/M22 of 0 means unset) */
+    csx = sx * (v->scale_x != 0.0f ? v->scale_x : 1.0f) * (v->transform4.M11 != 0.0f ? v->transform4.M11 : 1.0f);
+    csy = sy * (v->scale_y != 0.0f ? v->scale_y : 1.0f) * (v->transform4.M22 != 0.0f ? v->transform4.M22 : 1.0f);
+    w = v->width * csx, h = v->height * csy;
 
     if (v->hidden) return;
     if (v->opacity_expr)
@@ -6190,6 +6279,9 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
         if (expr_evaluate_matrix( v->transform_expr, v->properties,
                                   v->manip && v->manip->has_matrix ? &v->manip->matrix : NULL, &m ))
         {
+            if (TRACE_ON(dcompanim) && wcsstr( v->transform_expr->expression, L"prependVisual" ))
+                TRACE_(dcompanim)( "visual %p offset %g,%g %s -> %g %g %g %g %g %g\n", v, v->offset_x, v->offset_y,
+                                   debugstr_w( v->transform_expr->expression ), m._11, m._12, m._21, m._22, m._31, m._32 );
             /* axis-aligned only: the painter positions and stretches, it does not rotate */
             x += m._31 * sx;
             y += m._32 * sy;
@@ -6210,6 +6302,23 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
         y += v->manip->matrix._32 * sy;
     }
 
+    if (!v->has_local || v->local_x != x || v->local_y != y || v->local_sx != csx || v->local_sy != csy)
+    {
+        BOOL moved = v->has_local;
+        v->local_x = x; v->local_y = y; v->local_sx = csx; v->local_sy = csy;
+        v->has_local = TRUE;
+        if (transform_parent_link_count)
+        {
+            unsigned int k;
+            /* a visual placed relative to this one may already have been painted this frame */
+            EnterCriticalSection( &transform_parent_cs );
+            for (k = 0; k < transform_parent_link_count; k++)
+                if (transform_parent_links[k]->transform_parent == v) break;
+            if (k < transform_parent_link_count) scene_changed();
+            LeaveCriticalSection( &transform_parent_cs );
+        }
+        (void)moved;
+    }
     perf.visits++;
     TRACE( "visit dcomp %p size %gx%g at %g,%g children %u content %p opacity %g\n", v, w, h, x, y,
            v->child_count, v->content, v->opacity );
@@ -11578,6 +11687,7 @@ static BOOL expr_evaluate_matrix( struct expr_animation *expr, ICompositionPrope
                                   const D2D_MATRIX_3X2_F *dmanip, D2D_MATRIX_3X2_F *result )
 {
     struct expr_ctx c;
+    BOOL ok;
 
     if (!expr) return FALSE;
     c.expr = expr;
@@ -11585,9 +11695,15 @@ static BOOL expr_evaluate_matrix( struct expr_animation *expr, ICompositionPrope
     c.dmanip = dmanip;
     c.p = expr->expression;
     c.depth = 0;
-    if (!expr_matrix_product( &c, result )) return FALSE;
-    expr_skip_space( &c );
-    return !*c.p;
+    ok = expr_matrix_product( &c, result );
+    if (ok) expr_skip_space( &c );
+    ok = ok && !*c.p;
+    if (!ok && !expr->warned_eval)
+    {
+        expr->warned_eval = TRUE;
+        WARN( "cannot evaluate %s: stopped at %s\n", debugstr_w( expr->expression ), debugstr_w( c.p ) );
+    }
+    return ok;
 }
 
 static struct property_set *propset_from_object( IUnknown *object )

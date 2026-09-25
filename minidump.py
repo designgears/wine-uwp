@@ -27,6 +27,15 @@ sz,r=streams[6]; tid=struct.unpack_from('<I',d,r)[0]
 code,flags,rec,addr,np_=struct.unpack_from('<IIQQI',d,r+8)
 info=struct.unpack_from('<15Q',d,r+8+32)[:np_]
 print(f"thread {tid:#x} code {code:#x} addr {addr:#x} = {where(addr)}", [hex(x) for x in info])
+# the context at the fault, from the exception stream (the thread list's context is where the
+# crash handler was when it wrote the dump, which for Sentry is inside its own handler)
+exc_ctx_sz,exc_ctx_rva=struct.unpack_from('<II',d,r+8+152)
+exc_regs=None
+if exc_ctx_sz >= 0x100:
+    names=['rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi','r8','r9','r10','r11','r12','r13','r14','r15']
+    exc_regs=dict(zip(names,struct.unpack_from('<16Q',d,exc_ctx_rva+0x78)))
+    exc_regs['rip']=struct.unpack_from('<Q',d,exc_ctx_rva+0xf8)[0]
+    print('fault rip',where(exc_regs['rip']),' '.join(f"{k} {v:#x}" for k,v in exc_regs.items() if k!='rip'))
 # thread context rsp & scan stack for return addresses into modules
 # ---- stack scan of the faulting thread
 sz,r=streams[3]; nthreads=struct.unpack_from('<I',d,r)[0]
@@ -51,6 +60,7 @@ for i in range(nthreads):
     stk_start,stk_sz,stk_rva=struct.unpack_from('<QII',d,o+24)
     ctx_sz,ctx_rva=struct.unpack_from('<II',d,o+40)
     rsp=struct.unpack_from('<Q',d,ctx_rva+0x98)[0]; rip=struct.unpack_from('<Q',d,ctx_rva+0xf8)[0]
+    if exc_regs and stk_start <= exc_regs['rsp'] < stk_start+stk_sz: rsp,rip=exc_regs['rsp'],exc_regs['rip']
     print('rip',where(rip),'rsp',hex(rsp))
     n=0
     for a in range(rsp, min(rsp+0x3000, stk_start+stk_sz), 8):
