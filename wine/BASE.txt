@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     640fce0d178b204fa6161b6beb2a26fbda5164a0
-                 dcomp: hold every paint but the commit's for an open XAML batch; scene_dirty for our own repaints; dcompgate channel
+  wine HEAD:     7187747da70e8714b1da17040bf7480e4b67aa5c
+                 dcomp: paint swap chain frames off the UI thread, walk_lock guards frees against the walk; dxgi: one vblank grid; readback waits on an event query; profiler unwinds and names threads
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-25T09:02:20Z
+  captured:      2026-09-25T11:04:13Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

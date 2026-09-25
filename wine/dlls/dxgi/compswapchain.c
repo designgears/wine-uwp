@@ -51,7 +51,7 @@ struct comp_swapchain
     ID3D11Texture2D *presented[2];
     SRWLOCK presented_lock;     /* dcomp's readback worker takes presented[] while the app may resize */
     LONG present_count;
-    LONGLONG next_vblank;       /* QueryPerformanceCounter time the next synced present may return */
+    LONGLONG vblank_slot;       /* the refresh (see dxgi_vblank_period) of the last synced present */
     DXGI_MATRIX_3X2_F transform;
     DXGI_RGBA background;
     DXGI_MODE_ROTATION rotation;
@@ -227,16 +227,15 @@ static HRESULT STDMETHODCALLTYPE comp_swapchain_GetDevice(IDXGISwapChain4 *iface
     return IUnknown_QueryInterface(swapchain->device, riid, device);
 }
 
-/* A synced present returns at the display's refresh, as the compositor's does on Windows: with no
- * wait the Shapr3D engine presented 3,700 frames a second with sync interval 1, all of them wasted
- * work, and the compositor read back and painted 560 of them. */
-static void comp_swapchain_wait_vblank(struct comp_swapchain *swapchain, UINT sync_interval)
+/* One vblank grid for the process: refresh k happens at QPC time k * period. IDXGIOutput::WaitForVBlank and
+ * synced presents both keep to it; they used to keep separate clocks (a plain 16 ms sleep, and a schedule
+ * started at the first present), and Shapr3D's render loop, which waits for the vblank and then presents
+ * with sync interval 1, paid for two refreshes a frame. */
+LONGLONG dxgi_vblank_period(void)
 {
     static LONGLONG period_ticks;
-    LARGE_INTEGER now, freq;
-    LONGLONG period;
+    LARGE_INTEGER freq;
 
-    QueryPerformanceFrequency(&freq);
     if (!period_ticks)
     {
         DEVMODEW mode = { .dmSize = sizeof(mode) };
@@ -244,21 +243,44 @@ static void comp_swapchain_wait_vblank(struct comp_swapchain *swapchain, UINT sy
         if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1
                 && mode.dmDisplayFrequency < 1000)
             hz = mode.dmDisplayFrequency;
+        QueryPerformanceFrequency(&freq);
         period_ticks = freq.QuadPart / hz;
-        TRACE("pacing synced presents at %lu Hz.\n", hz);
+        TRACE("vblank grid at %lu Hz.\n", hz);
     }
-    period = period_ticks * sync_interval;
+    return period_ticks;
+}
+
+void dxgi_wait_until(LONGLONG target)
+{
+    LARGE_INTEGER now, freq;
+
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    if (target <= now.QuadPart) return;
+    if ((target - now.QuadPart) * 1000 / freq.QuadPart > 1)
+        Sleep((target - now.QuadPart) * 1000 / freq.QuadPart - 1);
+    while (QueryPerformanceCounter(&now), now.QuadPart < target) Sleep(0);
+}
+
+/* A synced present shows at most one frame per refresh, as the compositor's does on Windows: with no wait
+ * the Shapr3D engine presented 3,700 frames a second with sync interval 1, all of them wasted work, and the
+ * compositor read back and painted 560 of them. It blocks only when this refresh already has a frame (a
+ * flip-model present blocks only on a full queue), so a loop that waited for the vblank itself runs at the
+ * refresh rate. */
+static void comp_swapchain_wait_vblank(struct comp_swapchain *swapchain, UINT sync_interval)
+{
+    LONGLONG period = dxgi_vblank_period();
+    LARGE_INTEGER now;
+    LONGLONG slot;
 
     QueryPerformanceCounter(&now);
-    if (swapchain->next_vblank > now.QuadPart)
+    slot = now.QuadPart / period;
+    if (swapchain->vblank_slot && slot < swapchain->vblank_slot + sync_interval)
     {
-        LONGLONG ms = (swapchain->next_vblank - now.QuadPart) * 1000 / freq.QuadPart;
-        if (ms > 0) Sleep(ms);
-        while (QueryPerformanceCounter(&now), now.QuadPart < swapchain->next_vblank) Sleep(0);
+        slot = swapchain->vblank_slot + sync_interval;
+        dxgi_wait_until(slot * period);
     }
-    /* keep the schedule, but do not bank time when the app ran late */
-    if (swapchain->next_vblank + period < now.QuadPart) swapchain->next_vblank = now.QuadPart;
-    swapchain->next_vblank += period;
+    swapchain->vblank_slot = slot;
 }
 
 static HRESULT comp_swapchain_present(struct comp_swapchain *swapchain, UINT sync_interval, UINT flags)

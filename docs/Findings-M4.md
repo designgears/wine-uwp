@@ -9329,3 +9329,71 @@ samples, Solitaire its own `NewState 'Sgi::FEState'` log line. The whole suite t
 (was ~7). The Solitaire check is **stricter** than the old soak's "at least 1000 colours at 80 s",
 which the splash artwork (151k colours) passes: one run in about 15 stalls in the bootflow at ~1.5 s,
 on the old dcomp as well as the new.
+
+### Extrude drags: the UI thread was painting the viewport (2026-09-25)
+
+Reported: orbiting is smooth, extruding is "painfully slow". Measured on the drone (Offset Face on the
+brown block, a 2 s drag), with the window at the user's size - a 3440x1440 Xvfb (`:96`) and
+`probe-resize.exe 3440 1400 Shapr3D`. At 1280x800 the problem is mostly invisible.
+
+- **Per-thread CPU is the first measurement to take.** `/proc/<pid>/task/*/stat` before and after an
+  interaction (the threads carry Wine's names: `KernelRunLoop`, `ApplicationView`, `Render thread`):
+  at 3440x1366 the XAML UI thread used 1.95 s of CPU in a 2 s drag, the kernel 0.8 s. At 1280x800 the
+  UI thread used 0.9 s. `/proc/<pid>/task/<tid>/schedstat` sampled every 5 ms gives a per-thread
+  timeline at 10 ms resolution (`/tmp/schedtl.py`, `schedview.py` in the session).
+- **Almost none of it was XAML.** `WINE_UWP_PROFILE` on the UI thread: `raster_blend`, `raster_fill`,
+  `memmove`, `BitBlt` - our painter, repainting all 4.7 M pixels for each of the swap chain's 60
+  frames a second (~5 ms paint + ~1 ms blit per frame). The readback job ran on a pool thread but woke
+  the UI thread with a one-pixel `InvalidateRect`, so every frame was painted in its `WM_PAINT`.
+  Orbiting needs no UI thread and stayed smooth; anything that goes through the app's UI thread queued
+  behind 60 full-window paints a second.
+- **Fix: paint where the frame comes from.** The readback job and the deferred-repaint timer call
+  `present_desktop_hwnd` themselves; the UI thread keeps only XAML's commits. That made the tree walk
+  concurrent with XAML's changes, so the walk and the batch gate now share `walk_lock` (an SRW lock:
+  the painter holds it exclusively for the ~1 ms walk and checks for open batches under it; a XAML
+  thread takes it shared when it opens a batch). `ShowWindow` is skipped for a visible window, so a
+  painter thread never sends to the UI thread. UI thread in the same drag: **1.95 s -> 0.28 s** of CPU;
+  the final result appears ~0.3 s after release instead of 1.1-1.9 s.
+- **The render loop waited for two vblanks a frame.** Shapr3D calls `IDXGIOutput::WaitForVBlank`
+  (Wine: a plain `Sleep(16)`) and then `Present(1)`, which our composition swap chain paced to its own
+  schedule. Both now keep one grid (`dxgi_vblank_period`, `dxgi_wait_until`): WaitForVBlank returns at
+  the next grid point and a synced present blocks only if this refresh already has a frame.
+- **The readback held the app's device context lock through the GPU wait.** It copies and maps on the
+  app's own immediate context, and `Map` waited for the whole frame with the lock held; the render
+  thread's profile showed it blocked in `wined3d_device_context_lock < d3d11_device_context_Map`. It now
+  ends an event query after the copy and polls it (`GetData`, `DONOTFLUSH`, `Sleep(1)`) before mapping.
+- **`WINEDEBUG=warn+heap` more than doubles modelling time.** The same drag: kernel CPU 1.83 s against
+  0.79 s, and the result 1.36 s after release against 0.3 s. It disables the LFH and fills every free.
+  The session left running for the user had it on (it was hunting the heap corruption); do not leave
+  it on for someone who is using the app.
+
+**Not changed: the preview rate.** The face still updates every ~130-150 ms on the drone (~90 ms at
+1280x800; a plain rectangle updates every frame). Each update is ~60 ms of kernel work followed by
+~80 ms in which no thread is busy: the kernel waits in its task queue (`Shapr.Native!fn_225b700`), the
+UI thread in its message wait, the render thread mostly in present pacing while it takes in the new
+geometry over several frames. The rate did not change when the kernel was made 2.3x slower
+(`warn+heap`), nor with the vblank and readback fixes. No Windows baseline to compare against.
+
+**Painting beside the app's threads needed a guard on frees.** The first navigation soak (open a
+project, drag, undo, back to Home, four times per start) died in 1 of 3 starts, leaving the editor:
+the painter, on the readback thread, read a public visual's children array that XAML had just freed
+(`paint_public_visual`, rax `0xffffff00ffffff`; Sentry's dump, symbolized with `llvm-symbolizer`). The
+batch gate only covers changes made on committing threads between their first change and commit, and
+`Release` goes through no gate at all. Now every `free`/`realloc` in `composition.c` is
+`guarded_free`/`guarded_realloc`: it takes `walk_lock` shared (the walk holds it exclusively, ~1-2 ms),
+once per thread (a TLS depth), and not at all on the painter's own thread during its walk. Lists that
+are read only under their own critical section keep the plain `(realloc)()`, and
+`dcomp_target_SetRoot` releases the old root outside `dcomp_visual_cs` - a free that waits for the walk
+must not hold a lock the walk takes. After: 4 of 4 starts, 16 cycles, no death.
+
+Media Player's 2242 (the focus rectangle missing) became the usual result with painting off the UI
+thread. A full repaint (an `xmessage` over the button, then gone) leaves it at 2242, so the rectangle
+is not in the scene: it is XAML's choice of whether to show keyboard focus at start-up, which the
+timing moves. Both counts pass.
+
+Profiler improvements made on the way: `WINE_UWP_PROFILE` now unwinds with `RtlVirtualUnwind` (8
+real frames instead of a stack scan) and writes `T tid name` lines; `./profsym.py` symbolizes a dump
+(Windows DLLs from the PDB `.syms`, Wine builtins with `llvm-symbolizer` at their *linked* base,
+anything else by `.pdata` function), and `BUSY=1` drops samples parked in a blocking call. Sampling
+at 3 ms with ~80 threads crashed Shapr3D once (a fault in `Shapr.Native` and then CoreMessaging);
+5 ms has been fine.

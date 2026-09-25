@@ -4691,9 +4691,11 @@ static IClassFactory psm_broker_factory = { &psmfactory_vtbl };
  * seconds <prefix>.<pid> is rewritten with the module list and the counts. Threads blocked in a system call
  * report the call's user-mode caller. */
 #define PROFILE_BUCKETS 65536
-#define PROFILE_CALLERS 4
+#define PROFILE_CALLERS 8
 static struct { DWORD64 rip, caller[PROFILE_CALLERS]; DWORD tid; DWORD count; } profile_buckets[PROFILE_BUCKETS];
 
+static struct { DWORD tid; WCHAR name[48]; } profile_names[256];
+static unsigned int profile_name_count;
 static struct { DWORD64 start, end; } profile_images[512];
 static unsigned int profile_image_count;
 
@@ -4741,6 +4743,40 @@ static void profile_callers( DWORD64 rsp, DWORD64 *out )
     __ENDTRY
 }
 
+/* The real callers, by unwinding with the images' unwind data while the thread is suspended; FALSE when the
+ * first frame cannot be unwound (then the stack scan above guesses). */
+static BOOL profile_unwind( const CONTEXT *start, DWORD64 *out )
+{
+    CONTEXT ctx = *start;
+    unsigned int n = 0;
+    BOOL ok = FALSE;
+
+    __TRY
+    {
+        while (n < PROFILE_CALLERS)
+        {
+            DWORD64 base, frame;
+            void *data;
+            RUNTIME_FUNCTION *fn = RtlLookupFunctionEntry( ctx.Rip, &base, NULL );
+
+            if (fn) RtlVirtualUnwind( UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &data, &frame, NULL );
+            else if (!n)
+            {
+                /* a leaf without unwind data: its return address is on top of the stack */
+                ctx.Rip = *(DWORD64 *)(ULONG_PTR)ctx.Rsp;
+                ctx.Rsp += 8;
+            }
+            else break;
+            if (!ctx.Rip || ctx.Rip < 0x10000) break;
+            out[n++] = ctx.Rip;
+        }
+        ok = n > 0;
+    }
+    __EXCEPT_ALL { ok = n > 0; }
+    __ENDTRY
+    return ok;
+}
+
 static void profile_write( const char *path )
 {
     HANDLE snap = CreateToolhelp32Snapshot( TH32CS_SNAPMODULE, 0 );
@@ -4755,11 +4791,16 @@ static void profile_write( const char *path )
         while (Module32NextW( snap, &me ));
     }
     if (snap != INVALID_HANDLE_VALUE) CloseHandle( snap );
+    for (i = 0; i < profile_name_count; i++)
+        fprintf( f, "T %lx %ls\n", profile_names[i].tid, profile_names[i].name );
     for (i = 0; i < PROFILE_BUCKETS; i++)
         if (profile_buckets[i].count)
-            fprintf( f, "S %lx %I64x %lu %I64x %I64x %I64x %I64x\n", profile_buckets[i].tid, profile_buckets[i].rip,
-                     profile_buckets[i].count, profile_buckets[i].caller[0], profile_buckets[i].caller[1],
-                     profile_buckets[i].caller[2], profile_buckets[i].caller[3] );
+        {
+            unsigned int k;
+            fprintf( f, "S %lx %I64x %lu", profile_buckets[i].tid, profile_buckets[i].rip, profile_buckets[i].count );
+            for (k = 0; k < PROFILE_CALLERS; k++) fprintf( f, " %I64x", profile_buckets[i].caller[k] );
+            fputc( '\n', f );
+        }
     fclose( f );
 }
 
@@ -4789,8 +4830,23 @@ static DWORD WINAPI profile_thread( void *arg )
                 {
                     if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == self || count == ARRAY_SIZE(threads))
                         continue;
-                    if ((threads[count].handle = OpenThread( THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID )))
+                    if ((threads[count].handle = OpenThread( THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                                             THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID )))
+                    {
+                        WCHAR *desc = NULL;
+                        unsigned int n;
                         threads[count++].tid = te.th32ThreadID;
+                        /* thread names for the dump, so a tid can be told from the app's own naming */
+                        for (n = 0; n < profile_name_count; n++) if (profile_names[n].tid == te.th32ThreadID) break;
+                        if (n == profile_name_count && n < ARRAY_SIZE(profile_names) &&
+                            SUCCEEDED( GetThreadDescription( threads[count - 1].handle, &desc ) ) && desc && desc[0])
+                        {
+                            profile_names[n].tid = te.th32ThreadID;
+                            lstrcpynW( profile_names[n].name, desc, ARRAY_SIZE(profile_names[n].name) );
+                            profile_name_count++;
+                        }
+                        LocalFree( desc );
+                    }
                 } while (Thread32Next( snap, &te ));
             }
             if (snap != INVALID_HANDLE_VALUE) CloseHandle( snap );
@@ -4801,11 +4857,11 @@ static DWORD WINAPI profile_thread( void *arg )
             DWORD64 rip = 0, caller[PROFILE_CALLERS] = { 0 };
             unsigned int slot, probe, k;
             if (SuspendThread( threads[i].handle ) == (DWORD)-1) continue;
-            ctx.ContextFlags = CONTEXT_CONTROL;
+            ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
             if (GetThreadContext( threads[i].handle, &ctx ))
             {
                 rip = ctx.Rip;
-                profile_callers( ctx.Rsp, caller );
+                if (!profile_unwind( &ctx, caller )) profile_callers( ctx.Rsp, caller );
             }
             ResumeThread( threads[i].handle );
             if (!rip) continue;

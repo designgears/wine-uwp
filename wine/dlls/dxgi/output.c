@@ -363,30 +363,17 @@ static HRESULT STDMETHODCALLTYPE dxgi_output_FindClosestMatchingMode(IDXGIOutput
 
 static HRESULT STDMETHODCALLTYPE dxgi_output_WaitForVBlank(IDXGIOutput6 *iface)
 {
-    struct dxgi_output *output = impl_from_IDXGIOutput6(iface);
-    enum wined3d_display_rotation rotation;
-    struct wined3d_display_mode mode;
-    unsigned int interval = 16;
-    HRESULT hr;
+    LONGLONG period = dxgi_vblank_period();
+    LARGE_INTEGER now;
 
-    static BOOL once;
+    TRACE("iface %p.\n", iface);
 
-    if (!once++)
-        FIXME("iface %p semi-stub, waiting one refresh interval.\n", iface);
-    else
-        TRACE("iface %p.\n", iface);
-
-    /* There is no vblank to wait for here, but returning an error is worse than waiting
-     * roughly one refresh interval: a caller that drives a render loop from this (XAML's
-     * CompositorScheduler does, through RefreshRateInfo::WaitForRefreshInterval) treats the
-     * failure as a lost device. */
-    wined3d_mutex_lock();
-    hr = wined3d_output_get_display_mode(output->wined3d_output, &mode, &rotation);
-    wined3d_mutex_unlock();
-    if (SUCCEEDED(hr) && mode.refresh_rate)
-        interval = 1000 / mode.refresh_rate;
-
-    Sleep(interval);
+    /* There is no vblank to wait for here, but returning an error is worse than waiting for the next
+     * refresh of the grid synced presents keep to: a caller that drives a render loop from this (XAML's
+     * CompositorScheduler does, through RefreshRateInfo::WaitForRefreshInterval) treats the failure as a
+     * lost device. */
+    QueryPerformanceCounter(&now);
+    dxgi_wait_until((now.QuadPart / period + 1) * period);
     return S_OK;
 }
 

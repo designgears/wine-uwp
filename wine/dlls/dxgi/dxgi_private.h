@@ -220,4 +220,7 @@ HRESULT dxgi_resource_init(struct dxgi_resource *resource, IDXGIDevice *device,
         IUnknown *outer, BOOL needs_surface, struct wined3d_resource *wined3d_resource,
         IDXGIResource1 *parent_resource, unsigned int subresource_index);
 
+LONGLONG dxgi_vblank_period(void);
+void dxgi_wait_until(LONGLONG target);
+
 #endif /* __WINE_DXGI_PRIVATE_H */

@@ -71,6 +71,65 @@ WINE_DECLARE_DEBUG_CHANNEL(dcompops);
 WINE_DECLARE_DEBUG_CHANNEL(dcomptree);
 WINE_DECLARE_DEBUG_CHANNEL(dcompgate);
 
+/* The painter walks visuals, collections, brushes and expressions by raw pointer, and since swap chain frames
+ * are painted on the readback thread that walk runs beside the app's threads, which change and release the
+ * same objects - leaving the editor freed a visual's children array under a walk (a raster fault reading
+ * 0xffffff00ffffff). walk_lock is held exclusively for the walk; every free and realloc in this file takes it
+ * shared first, so memory the walk may be reading is never returned while it runs. A thread's nested frees
+ * take it once (a depth in TLS), and the painter's own frees inside the walk do not take it at all. Lists
+ * that are only read under their own critical section use the plain functions, (free)() and (realloc)(). */
+static SRWLOCK walk_lock = SRWLOCK_INIT;
+static DWORD walk_owner;
+static DWORD walk_tls = TLS_OUT_OF_INDEXES;
+
+static void walk_guard_enter( void )
+{
+    DWORD tid = GetCurrentThreadId(), error;
+    ULONG_PTR depth;
+
+    if (walk_owner == tid) return;
+    error = GetLastError();
+    if (walk_tls == TLS_OUT_OF_INDEXES)
+    {
+        DWORD index = TlsAlloc();
+        if (InterlockedCompareExchange( (LONG *)&walk_tls, index, TLS_OUT_OF_INDEXES ) != TLS_OUT_OF_INDEXES) TlsFree( index );
+    }
+    depth = (ULONG_PTR)TlsGetValue( walk_tls );
+    if (!depth) AcquireSRWLockShared( &walk_lock );
+    TlsSetValue( walk_tls, (void *)(depth + 1) );
+    SetLastError( error );
+}
+static void walk_guard_leave( void )
+{
+    DWORD error;
+    ULONG_PTR depth;
+
+    if (walk_owner == GetCurrentThreadId()) return;
+    error = GetLastError();
+    depth = (ULONG_PTR)TlsGetValue( walk_tls );
+    if (depth == 1) ReleaseSRWLockShared( &walk_lock );
+    TlsSetValue( walk_tls, (void *)(depth - 1) );
+    SetLastError( error );
+}
+static void guarded_free( void *ptr )
+{
+    if (!ptr) return;
+    walk_guard_enter();
+    (free)( ptr );
+    walk_guard_leave();
+}
+static void *guarded_realloc( void *ptr, size_t size )
+{
+    void *ret;
+    if (!ptr) return (realloc)( ptr, size );
+    walk_guard_enter();
+    ret = (realloc)( ptr, size );
+    walk_guard_leave();
+    return ret;
+}
+#define free(p) guarded_free(p)
+#define realloc(p, n) guarded_realloc(p, n)
+
 /* WINEDEBUG=+dcompperf: a one-line summary per second of what the presenter did, cheap enough to leave
  * on while measuring (the +dcomp trace itself costs more than the painting). */
 static struct
@@ -118,6 +177,10 @@ static ULONGLONG scene_change_tick;
  * for at most XAML_BATCH_WAIT ms in case the changes were made outside a frame and no commit follows. */
 #define XAML_BATCH_WAIT 50
 static struct xaml_batch { DWORD thread; LONG open; ULONGLONG start; } xaml_batches[4];
+/* Held exclusively by the painter while it walks the tree and checks for open batches, and shared by a XAML
+ * thread while it opens one: so a batch either opens before a walk (which then waits for its commit) or after
+ * it. Painting runs on the swap chain's readback thread and on a repaint timer, not only on the UI thread. */
+/* walk_lock itself is defined at the top of the file, with the free/realloc guard */
 static CRITICAL_SECTION present_cs;
 static void scene_changed( void )
 {
@@ -133,8 +196,10 @@ static void scene_changed( void )
         if (xaml_batches[i].thread != tid) continue;
         if (!xaml_batches[i].open)
         {
+            walk_guard_enter();
             xaml_batches[i].start = scene_change_tick;
             xaml_batches[i].open = TRUE;
+            walk_guard_leave();
             TRACE_(dcompgate)( "batch opens\n" );
         }
         break;
@@ -276,7 +341,7 @@ static void retire_bitmap( HBITMAP bmp )
     if (retired_count == retired_capacity)
     {
         unsigned int capacity = max( 16, retired_capacity * 2 );
-        HBITMAP *grown = realloc( retired_bitmaps, capacity * sizeof(*grown) );
+        HBITMAP *grown = (realloc)( retired_bitmaps, capacity * sizeof(*grown) );
         if (!grown)
         {
             LeaveCriticalSection( &retired_cs );
@@ -778,21 +843,25 @@ static double readback_ms;   /* readback time accumulated over a frame (TRACE_ON
 /* Ask for a frame in delay ms, from any thread. A paint deferred with SetTimer( NULL, ... ) used to be
  * lost whenever the thread that asked - a commit on some worker - never pumped messages again; and a
  * surface whose read-back came up empty (XAML's D2D drawing not yet executed) waited for the next unrelated
- * commit. The wake is the one-pixel
- * invalidation wineuwp's WM_PAINT turns into __wine_dcomp_repaint_window_rect on the window's thread. */
+ * commit. The timer paints itself. */
 static LONG repaint_pending;
+static void scene_dirty( void );
 static void CALLBACK repaint_timer_proc( void *arg, BOOLEAN fired )
 {
-    static const RECT wake = { 0, 0, 1, 1 };
     InterlockedExchange( &repaint_pending, 0 );
-    if (last_desktop_hwnd) InvalidateRect( last_desktop_hwnd, &wake, FALSE );
+    if (!last_desktop_hwnd) return;
+    /* painted here, on a pool thread: a WM_PAINT for the window's thread queued every deferred frame (and at
+     * 60 a second, every swap chain frame) behind the app's own work on the UI thread */
+    scene_dirty();
+    last_paint_tick = 0;
+    present_desktop_hwnd( last_desktop_hwnd );
 }
 static void request_repaint( DWORD delay )
 {
     HANDLE timer;
     if (!last_desktop_hwnd || InterlockedCompareExchange( &repaint_pending, 1, 0 )) return;
     if (!CreateTimerQueueTimer( &timer, NULL, repaint_timer_proc, NULL, max( delay, 1 ), 0,
-                                WT_EXECUTEONLYONCE | WT_EXECUTEINTIMERTHREAD ))
+                                WT_EXECUTEONLYONCE | WT_EXECUTELONGFUNCTION ))
         InterlockedExchange( &repaint_pending, 0 );
 }
 
@@ -825,7 +894,7 @@ static void defer_surface_destroy( struct drawing_surface *surface )
     if (deferred_surface_count == deferred_surface_capacity)
     {
         unsigned int capacity = max( 16, deferred_surface_capacity * 2 );
-        struct drawing_surface **grown = realloc( deferred_surfaces, capacity * sizeof(*grown) );
+        struct drawing_surface **grown = (realloc)( deferred_surfaces, capacity * sizeof(*grown) );
         if (!grown)
         {
             LeaveCriticalSection( &retired_cs );
@@ -859,26 +928,6 @@ static void present_desktop_hwnd_locked( HWND hwnd );
 static void request_repaint( DWORD delay );
 static void present_desktop_hwnd( HWND hwnd )
 {
-    static ULONGLONG deferred_since;
-    ULONGLONG now = GetTickCount64();
-    DWORD wait;
-
-    /* A batch is half done: its commit paints, or a repaint once the wait runs out. Not before the first
-     * frame (the repaint is a WM_PAINT, which a window that was never shown does not get), and not for
-     * longer than XAML_BATCH_WAIT in a row: two UI threads committing in turn can each find the other's
-     * batch open every time. */
-    if (back_bmp && (wait = xaml_batch_wait()))
-    {
-        if (!deferred_since) deferred_since = now;
-        if (now - deferred_since < XAML_BATCH_WAIT)
-        {
-            TRACE_(dcompgate)( "deferred, wait %lu, since %I64u\n", wait, now - deferred_since );
-            request_repaint( min( wait, XAML_BATCH_WAIT - (DWORD)(now - deferred_since) ) );
-            return;
-        }
-    }
-    if (deferred_since) TRACE_(dcompgate)( "painting after %I64u ms deferred\n", now - deferred_since );
-    deferred_since = 0;
     present_request_hwnd = hwnd;
     InterlockedExchange( &present_pending, 1 );
     for (;;)
@@ -925,7 +974,8 @@ static void present_desktop_hwnd_locked( HWND hwnd )
     }
     last_paint_tick = now;
     painted_generation = generation;
-    ShowWindow( hwnd, SW_SHOW );
+    /* painting runs on other threads too; ShowWindow would send to the window's thread every frame */
+    if (!IsWindowVisible( hwnd )) ShowWindow( hwnd, SW_SHOW );
     if (!GetClientRect( hwnd, &rc )) return;
     if (!(hdc = GetDC( hwnd ))) return;
     /* Paint the frame off-screen and copy it in one go: drawing straight into the window, backdrop
@@ -979,9 +1029,39 @@ static void present_desktop_hwnd_locked( HWND hwnd )
         paint_xf.m11 = paint_xf.m22 = 1.0f; paint_xf.m12 = paint_xf.m21 = paint_xf.dx = paint_xf.dy = 0.0f;
         paint_xf.quarter = 0; paint_xf.active = FALSE;
         readback_batch();
+        /* A batch is half done: its commit paints, or a repaint once the wait runs out. Not before the first
+         * frame, and not for longer than XAML_BATCH_WAIT in a row: two UI threads committing in turn can each
+         * find the other's batch open every time. Checked under walk_lock, which the walk keeps. */
+        AcquireSRWLockExclusive( &walk_lock );
+        walk_owner = GetCurrentThreadId();
+        {
+            static ULONGLONG deferred_since;
+            ULONGLONG gate_now = GetTickCount64();
+            DWORD wait;
+
+            if (paint_have_previous && (wait = xaml_batch_wait()))
+            {
+                if (!deferred_since) deferred_since = gate_now;
+                if (gate_now - deferred_since < XAML_BATCH_WAIT)
+                {
+                    walk_owner = 0;
+                    ReleaseSRWLockExclusive( &walk_lock );
+                    TRACE_(dcompgate)( "deferred, wait %lu, since %I64u\n", wait, gate_now - deferred_since );
+                    paint_current ^= 1;         /* the last frame's list stays the previous one */
+                    painted_generation = -1;    /* and this scene still needs painting */
+                    ReleaseDC( hwnd, hdc );
+                    request_repaint( min( wait, XAML_BATCH_WAIT - (DWORD)(gate_now - deferred_since) ) );
+                    return;
+                }
+            }
+            if (deferred_since) TRACE_(dcompgate)( "painting after %I64u ms deferred\n", gate_now - deferred_since );
+            deferred_since = 0;
+        }
         TRACE_(dcompops)( "paint, scene generation %ld\n", generation );
         TRACE_(dcompgate)( "paint, scene generation %ld\n", generation );
         present_dcomp_visuals( mem );
+        walk_owner = 0;
+        ReleaseSRWLockExclusive( &walk_lock );
         if (timing) QueryPerformanceCounter( &t1 );
 
         n_old = previous->count;
@@ -3030,6 +3110,7 @@ struct drawing_surface
     HBITMAP back_dib;
     UINT back_w, back_h;
     ID3D11Texture2D *worker_staging;
+    ID3D11Query *worker_query;  /* event after the staging copy: Map only once it has completed */
     LONG readback_busy;         /* a job is queued or running */
     UINT readback_target;       /* present count the queued job reads */
     UINT readback_count;        /* present count of the finished back_cache */
@@ -3135,6 +3216,29 @@ static void CALLBACK swapchain_readback_job( PTP_CALLBACK_INSTANCE instance, voi
     {
         ID3D11Device_GetImmediateContext( device, &context );
         ID3D11DeviceContext_CopyResource( context, (ID3D11Resource *)surface->worker_staging, (ID3D11Resource *)texture );
+        /* This is the app's own immediate context, and Map waits for the GPU to finish the frame and the copy while
+         * holding the context's lock: Shapr3D's render thread sat blocked on that lock for 4-13 ms, 60 times a
+         * second at 3440x1366. Wait on an event query instead, polled without the lock, and map a finished copy. */
+        if (!surface->worker_query)
+        {
+            D3D11_QUERY_DESC query_desc = { D3D11_QUERY_EVENT, 0 };
+            if (FAILED( ID3D11Device_CreateQuery( device, &query_desc, &surface->worker_query ) )) surface->worker_query = NULL;
+        }
+        if (surface->worker_query)
+        {
+            BOOL done = FALSE;
+            unsigned int tries;
+            ID3D11DeviceContext_End( context, (ID3D11Asynchronous *)surface->worker_query );
+            ID3D11DeviceContext_Flush( context );
+            for (tries = 0; tries < 200; tries++)
+            {
+                HRESULT qhr = ID3D11DeviceContext_GetData( context, (ID3D11Asynchronous *)surface->worker_query, &done, sizeof(done),
+                                                           D3D11_ASYNC_GETDATA_DONOTFLUSH );
+                if (qhr == S_OK && done) break;
+                if (FAILED( qhr )) break;
+                Sleep( 1 );
+            }
+        }
         if (SUCCEEDED( ID3D11DeviceContext_Map( context, (ID3D11Resource *)surface->worker_staging, 0, D3D11_MAP_READ, 0, &map ) ))
         {
             for (row = 0; row < desc.Height; row++)
@@ -3169,12 +3273,10 @@ static void CALLBACK swapchain_readback_job( PTP_CALLBACK_INSTANCE instance, voi
     if (ok)
     {
         scene_dirty();
-        /* the UI thread paints it; wineuwp's WM_PAINT handler repaints from dcomp */
-        if (surface->notified && last_desktop_hwnd)
-        {
-            static const RECT wake = { 0, 0, 1, 1 };
-            InvalidateRect( last_desktop_hwnd, &wake, FALSE );
-        }
+        /* Painted here rather than through a WM_PAINT on the UI thread: at 60 frames a second a full-window paint
+         * there took most of Shapr3D's UI thread (at 3440x1366), and an extrude drag, which needs it, updated
+         * 5-7 times a second while orbiting, which does not, stayed smooth. */
+        if (surface->notified && last_desktop_hwnd) present_desktop_hwnd( last_desktop_hwnd );
     }
 }
 
@@ -5160,7 +5262,7 @@ static void transform_parent_set( struct dcomp_visual *v, struct dcomp_visual *p
         if (i == transform_parent_link_capacity)
         {
             unsigned int capacity = max( 16, transform_parent_link_capacity * 2 );
-            struct dcomp_visual **grown = realloc( transform_parent_links, capacity * sizeof(*grown) );
+            struct dcomp_visual **grown = (realloc)( transform_parent_links, capacity * sizeof(*grown) );
             if (!grown) { LeaveCriticalSection( &transform_parent_cs ); return; }
             transform_parent_links = grown;
             transform_parent_link_capacity = capacity;
@@ -6833,11 +6935,15 @@ static HRESULT WINAPI dcomp_target_SetRoot( void *iface, void *visual )
 
     if (visual && *(const void ***)visual == dcomp_visual_vtbl) root = dcomp_visual_from( visual );
     TRACE( "target %p root %p (%s).\n", iface, visual, root ? "interop visual" : visual ? "foreign" : "none" );
+    struct dcomp_visual *old;
+
     EnterCriticalSection( &dcomp_visual_cs );
     if (root) dcv_AddRef( visual );
-    if (dcomp_target_root) dcv_Release( &dcomp_target_root->vtbl );
+    old = dcomp_target_root;
     dcomp_target_root = root;
     LeaveCriticalSection( &dcomp_visual_cs );
+    /* outside the lock the walk takes: a release may wait for the walk (walk_guard_enter) */
+    if (old) dcv_Release( &old->vtbl );
     return S_OK;
 }
 
@@ -13822,7 +13928,7 @@ static HRESULT create_swapchain_surface( IUnknown *swapchain, void **result )
     surface->swapchain = chain;
     surface->presented = ~0u;
     EnterCriticalSection( &swapchain_cs );
-    if ((swapchain_surfaces = realloc( swapchain_surfaces, (swapchain_surface_count + 1) * sizeof(*swapchain_surfaces) )))
+    if ((swapchain_surfaces = (realloc)( swapchain_surfaces, (swapchain_surface_count + 1) * sizeof(*swapchain_surfaces) )))
         swapchain_surfaces[swapchain_surface_count++] = surface;
     LeaveCriticalSection( &swapchain_cs );
     /* the app presents on its own schedule; XAML commits nothing for that. Wine's composition swap chains

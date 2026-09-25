@@ -208,6 +208,9 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | Is this visual in the tree at all, and where is it painted? | `WINEDEBUG=+timestamp,+dcomptree`: every visual create, insert and remove, and every painter visit with position, clip, offset/transform fields and scale. `./dcomptree.py <log> <visual> [time]` rebuilds the ancestor chain from it and prints each ancestor's last painted position. It found a menu that was built, in the tree and painted every frame - at y = 1.5e29. `WARN`s `is not a coordinate` (`warn+dcomp`) name the caller of any absurd offset |
 | How long does the app take to react to a click? | press and release by hand, `xdotool mousedown 1; sleep 0.02; xdotool mouseup 1`, and grab raw `xwd -id` frames in a loop (2 ms each; compare afterwards). **`xdotool click` waits ~100 ms before the press**, so every latency measured with it reads ~105 ms |
 | What is the visual tree doing? | `WINEDEBUG=+dcomp`; `present_desktop_hwnd frame: N ops` - 0 ops means nothing to draw |
+| Which thread is spending the CPU in an interaction? | `/proc/<pid>/task/*/stat` (utime+stime) before and after; Wine names the Linux threads (`KernelRunLoop`, `ApplicationView`, `Render thread`, `wine_threadpool`). For *when*: `./schedtl.py <pid> <s> <out>` samples every thread's `schedstat` every 5 ms, `./schedview.py <out> [t0 t1 N]` prints a 10 ms-per-character busy strip per thread. That showed Shapr3D's UI thread saturated by our painting, and the kernel's compute/wait rhythm |
+| Symbolize a `WINE_UWP_PROFILE` dump | `$UWP_BIN/venv/bin/python profsym.py <dump>` (threads by name), `profsym.py <dump> <tid> [N]` (top leaves with real 8-frame unwound callers; `DEPTH=n`), `BUSY=1` to drop samples parked in waits. Profile at 5 ms: 3 ms with ~80 threads crashed Shapr3D once |
+| Reproduce at the user's window size | the user's screen is 3440x1440: `Xvfb :96 -screen 0 3440x1440x24`, then `wine $UWP_BIN/build-probes/probe-resize.exe 3440 1400 Shapr3D`. Per-frame painting costs scale with it, and a 1280x800 run hid a UI thread at 100% |
 | Why is an app stuck, when the stack dumper cannot say? | `WINE_UWP_PROFILE=<prefix> WINE_UWP_PROFILE_MS=10` - a sampling profiler already in `wineuwp`. Writes `<prefix>.<pid>` every 2 s: an `M` line per module then `S <tid> <rip> <count> <4 callers>`. It **found the waiting thread's loop when `WINE_UWP_DUMP_STACKS` returned nothing useful**, and it distinguishes *blocked* from *spinning*, which no single stack snapshot can |
 | What is every thread actually doing? | `WINE_UWP_DUMP_STACKS=<seconds>` - suspends and unwinds every thread, prints `STACK tid N frame M rip=`. Works on an *idle* app, not just a hung one. Resolve against `/proc/<pid>/maps` from the same run |
 | What is a thread of a *stuck* process doing, from outside, with no restart? | `wine $UWP_BIN/build-probes/probe-threads.exe <exe> all` - cross-process `SuspendThread` + `GetThreadContext` **works in Wine** although ptrace does not: it lists every thread by Wine tid and description with three register samples, so "blocked by 03cc" gets a rip. `probe-peek.exe <exe> <addr> <qwords>` reads the process's memory. Resolve rips against the `M` lines it prints and `llvm-symbolizer --obj=<build dll>` (image base from `llvm-objdump -p`). This found the corrupted `futex_queues` lock in one live process after days of flushed-log inference |
@@ -442,6 +445,19 @@ by raw pointer, while XAML releases and resizes them on its own thread. So anyth
 paint-visible state must defer to the painter: cache DIBs through `retire_bitmap()`, surfaces
 through `defer_surface_destroy()`. Only the painter frees them, under `present_cs`, after the frame.
 Freeing directly is what killed Shapr3D when leaving the editor.
+
+**Do not leave `WINEDEBUG=warn+heap` on in a session the user works in.** It turns off the LFH and
+fills and checks every free: Shapr3D's modelling took 2.3x the CPU, and the user reported extrusion as
+"painfully slow" in exactly such a session.
+
+**Painting must not run on the UI thread per swap chain frame.** At the user's 3440x1366 a full-window
+paint is ~6 ms; the swap chain presents 60 times a second, and while those paints ran in the UI thread's
+`WM_PAINT` Shapr3D's UI thread had no time left for the app (a 2 s extrude drag: 1.95 s of UI-thread
+CPU, nearly all of it `raster_*`/`BitBlt`). The readback job and the repaint timer paint on their own
+threads. That walk now runs beside the app's threads, so **every `free`/`realloc` in `composition.c`
+waits out a walk in progress** (`guarded_free`, macro'd over `free`); a free that holds a lock the walk
+also takes (`dcomp_visual_cs`) deadlocks, so release outside those. Plain `(free)()`/`(realloc)()` only
+for lists read under their own lock.
 
 **Tree changes land live here; on Windows they land at Commit.** Shapr3D has two XAML UI threads, and
 one's commit painted while the other was halfway through rebuilding a menu's subtree - the menu
