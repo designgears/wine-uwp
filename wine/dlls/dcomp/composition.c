@@ -67,6 +67,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
 WINE_DECLARE_DEBUG_CHANNEL(dcompperf);
 /* WINEDEBUG=+dcompanim: every animation started on visuals and property sets, and what it resolved to */
 WINE_DECLARE_DEBUG_CHANNEL(dcompanim);
+WINE_DECLARE_DEBUG_CHANNEL(dcompops);
 
 /* WINEDEBUG=+dcompperf: a one-line summary per second of what the presenter did, cheap enough to leave
  * on while measuring (the +dcomp trace itself costs more than the painting). */
@@ -172,6 +173,7 @@ struct paint_op
     ULONG gen;              /* its content generation */
     BOOL opaque;            /* covers every pixel of dest with alpha 255 */
     BOOL swapchain;         /* OP_STRETCH of a swap chain's content: input there goes to its input sink */
+    BYTE quarter;           /* OP_BLEND: the source is drawn turned this many quarter turns clockwise */
 };
 struct paint_list
 {
@@ -235,11 +237,86 @@ static void free_retired_bitmaps( void )
     LeaveCriticalSection( &retired_cs );
 }
 
-static void paint_emit( const struct paint_op *op )
+/* Quarter-turn rotations (XAML's RenderTransform of a chevron, 0 1 -1 0) apply to a whole subtree. The painter
+ * still works in unrotated window coordinates; paint_emit maps each op through paint_xf, row-vector like
+ * DComp's matrices (p' = p * M + d), and ancestors' clips outside the rotation stay in paint_rot_clip. */
+struct paint_xform { float m11, m12, m21, m22, dx, dy; int quarter; BOOL active; };
+static struct paint_xform paint_xf = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0, FALSE };
+static RECT paint_rot_clip;
+
+static void xf_point( const struct paint_xform *xf, float x, float y, float *ox, float *oy )
+{
+    *ox = x * xf->m11 + y * xf->m21 + xf->dx;
+    *oy = x * xf->m12 + y * xf->m22 + xf->dy;
+}
+
+static RECT xf_rect( const struct paint_xform *xf, const RECT *r )
+{
+    float x0, y0, x1, y1;
+    RECT out;
+    xf_point( xf, r->left, r->top, &x0, &y0 );
+    xf_point( xf, r->right, r->bottom, &x1, &y1 );
+    out.left = floorf( min( x0, x1 ) + 0.5f ); out.right = floorf( max( x0, x1 ) + 0.5f );
+    out.top = floorf( min( y0, y1 ) + 0.5f ); out.bottom = floorf( max( y0, y1 ) + 0.5f );
+    return out;
+}
+
+/* The quarter turns of a matrix's linear part, or -1 when it is not a (uniformly scaled) quarter turn. */
+static int matrix_quarter( float m11, float m12, float m21, float m22 )
+{
+    float s = sqrtf( m11 * m11 + m12 * m12 );
+    if (s < 1e-6f || fabsf( m11 - m22 ) > 1e-3f * s || fabsf( m12 + m21 ) > 1e-3f * s) return -1;
+    m11 /= s; m12 /= s;
+    if (fabsf( m11 - 1.0f ) < 1e-3f && fabsf( m12 ) < 1e-3f) return 0;
+    if (fabsf( m12 - 1.0f ) < 1e-3f && fabsf( m11 ) < 1e-3f) return 1;
+    if (fabsf( m11 + 1.0f ) < 1e-3f && fabsf( m12 ) < 1e-3f) return 2;
+    if (fabsf( m12 + 1.0f ) < 1e-3f && fabsf( m11 ) < 1e-3f) return 3;
+    return -1;
+}
+
+/* Enter a subtree turned q quarter turns about (px, py); the caller restores paint_xf, paint_rot_clip and
+ * paint_clip when leaving it. */
+static void paint_enter_rotation( int q, float px, float py )
+{
+    static const float cs[4][2] = { { 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 } };
+    struct paint_xform local, old = paint_xf;
+    RECT outer = old.active ? xf_rect( &old, &paint_clip ) : paint_clip;
+
+    if (old.active) IntersectRect( &outer, &outer, &paint_rot_clip );
+    local.m11 = cs[q][0]; local.m12 = cs[q][1]; local.m21 = -cs[q][1]; local.m22 = cs[q][0];
+    local.dx = px - (px * local.m11 + py * local.m21);
+    local.dy = py - (px * local.m12 + py * local.m22);
+    paint_xf.m11 = local.m11 * old.m11 + local.m12 * old.m21;
+    paint_xf.m12 = local.m11 * old.m12 + local.m12 * old.m22;
+    paint_xf.m21 = local.m21 * old.m11 + local.m22 * old.m21;
+    paint_xf.m22 = local.m21 * old.m12 + local.m22 * old.m22;
+    paint_xf.dx = local.dx * old.m11 + local.dy * old.m21 + old.dx;
+    paint_xf.dy = local.dx * old.m12 + local.dy * old.m22 + old.dy;
+    paint_xf.quarter = (old.quarter + q) & 3;
+    paint_xf.active = TRUE;
+    paint_rot_clip = outer;
+    SetRect( &paint_clip, -0x100000, -0x100000, 0x100000, 0x100000 );
+}
+
+static void paint_emit( const struct paint_op *in )
 {
     struct paint_list *list = &paint_lists[paint_current];
+    struct paint_op xop;
+    const struct paint_op *op = in;
     RECT covered;
 
+    if (paint_xf.active)
+    {
+        xop = *in;
+        xop.dest = xf_rect( &paint_xf, &in->dest );
+        xop.clip = xf_rect( &paint_xf, &in->clip );
+        IntersectRect( &xop.clip, &xop.clip, &paint_rot_clip );
+        xop.quarter = (in->quarter + paint_xf.quarter) & 3;
+        op = &xop;
+    }
+    if (TRACE_ON(dcompops))
+        TRACE_(dcompops)( "op %d dest %s clip %s alpha %u quarter %u\n", op->kind, wine_dbgstr_rect( &op->dest ),
+                          wine_dbgstr_rect( &op->clip ), op->alpha, op->quarter );
     if (paint_rect_empty( &op->dest ) || !IntersectRect( &covered, &op->dest, &op->clip )) return;
     if (list->count == list->capacity)
     {
@@ -250,6 +327,39 @@ static void paint_emit( const struct paint_op *op )
         list->capacity = capacity;
     }
     list->ops[list->count++] = *op;
+}
+
+/* An OP_BLEND whose source is turned op->quarter quarter turns clockwise into op->dest. */
+static void raster_blend_turned( BYTE *target, int target_w, const struct paint_op *op, const RECT *clip )
+{
+    int dw = op->dest.right - op->dest.left, dh = op->dest.bottom - op->dest.top, px, py;
+
+    for (py = clip->top; py < clip->bottom; py++)
+    {
+        BYTE *out = target + (size_t)py * target_w * 4 + (size_t)clip->left * 4;
+        for (px = clip->left; px < clip->right; px++, out += 4)
+        {
+            int dx = px - op->dest.left, dy = py - op->dest.top, sx, sy;
+            const BYTE *in;
+            unsigned int a, inv;
+
+            switch (op->quarter)
+            {
+            case 1:  sx = dy;          sy = dw - 1 - dx; break;
+            case 2:  sx = dw - 1 - dx; sy = dh - 1 - dy; break;
+            default: sx = dh - 1 - dy; sy = dx;          break;
+            }
+            if (sx < 0 || sy < 0 || sx >= op->src_w || sy >= op->src_h) continue;
+            in = op->bits + ((size_t)sy * op->src_w + sx) * 4;
+            a = DIV255( in[3] * op->alpha );
+            if (!a) continue;
+            inv = 255 - a;
+            out[0] = DIV255( in[0] * op->alpha ) + DIV255( out[0] * inv );
+            out[1] = DIV255( in[1] * op->alpha ) + DIV255( out[1] * inv );
+            out[2] = DIV255( in[2] * op->alpha ) + DIV255( out[2] * inv );
+            out[3] = 255;
+        }
+    }
 }
 
 /* Blend premultiplied BGRA bits (stride src_stride) placed at x,y onto the back buffer within clip. */
@@ -422,7 +532,8 @@ static BOOL paint_op_equal( const struct paint_op *a, const struct paint_op *b )
 {
     return a->kind == b->kind && EqualRect( &a->dest, &b->dest ) && EqualRect( &a->clip, &b->clip ) &&
            a->alpha == b->alpha && a->key == b->key && a->gen == b->gen && a->bits == b->bits && a->bmp == b->bmp &&
-           a->src_w == b->src_w && a->src_h == b->src_h && a->opaque == b->opaque && !memcmp( &a->color, &b->color, sizeof(a->color) );
+           a->src_w == b->src_w && a->src_h == b->src_h && a->opaque == b->opaque && a->quarter == b->quarter &&
+           !memcmp( &a->color, &b->color, sizeof(a->color) );
 }
 
 #define PAINT_DAMAGE_RECTS 16
@@ -507,7 +618,8 @@ static void raster_ops( HDC dc, BYTE *target, int target_w, const struct paint_l
             raster_fill( target, target_w, &r, op->color, op->alpha );
             break;
         case OP_BLEND:
-            raster_blend( target, target_w, op->dest.left, op->dest.top, op->bits, op->src_w * 4, &r, op->alpha, op->opaque );
+            if (op->quarter) raster_blend_turned( target, target_w, op, &r );
+            else raster_blend( target, target_w, op->dest.left, op->dest.top, op->bits, op->src_w * 4, &r, op->alpha, op->opaque );
             break;
         case OP_HIT:
             break;
@@ -599,12 +711,26 @@ static void verify_damage( HDC dc, const struct paint_list *list )
 }
 static ULONGLONG last_paint_tick;
 static double readback_ms;   /* readback time accumulated over a frame (TRACE_ON only) */
-static BOOL paint_timer_armed;
-static void CALLBACK paint_timer_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD time )
+
+/* Ask for a frame in delay ms, from any thread. A paint deferred with SetTimer( NULL, ... ) used to be
+ * lost whenever the thread that asked - a commit on some worker - never pumped messages again; and a
+ * surface whose read-back came up empty (XAML's D2D drawing not yet executed) waited for the next unrelated
+ * commit. The wake is the one-pixel
+ * invalidation wineuwp's WM_PAINT turns into __wine_dcomp_repaint_window_rect on the window's thread. */
+static LONG repaint_pending;
+static void CALLBACK repaint_timer_proc( void *arg, BOOLEAN fired )
 {
-    KillTimer( hwnd, id );
-    paint_timer_armed = FALSE;
-    if (last_desktop_hwnd) present_desktop_hwnd( last_desktop_hwnd );
+    static const RECT wake = { 0, 0, 1, 1 };
+    InterlockedExchange( &repaint_pending, 0 );
+    if (last_desktop_hwnd) InvalidateRect( last_desktop_hwnd, &wake, FALSE );
+}
+static void request_repaint( DWORD delay )
+{
+    HANDLE timer;
+    if (!last_desktop_hwnd || InterlockedCompareExchange( &repaint_pending, 1, 0 )) return;
+    if (!CreateTimerQueueTimer( &timer, NULL, repaint_timer_proc, NULL, max( delay, 1 ), 0,
+                                WT_EXECUTEONLYONCE | WT_EXECUTEINTIMERTHREAD ))
+        InterlockedExchange( &repaint_pending, 0 );
 }
 
 /* present_desktop_hwnd() is reached from Commit on whichever thread commits and from a thread timer,
@@ -710,8 +836,7 @@ static void present_desktop_hwnd_locked( HWND hwnd )
     if (last_paint_tick && now - last_paint_tick < 15)
     {
         perf.deferred++;
-        if (!paint_timer_armed && SetTimer( NULL, 0, 16 - (UINT)(now - last_paint_tick), paint_timer_proc ))
-            paint_timer_armed = TRUE;
+        request_repaint( 16 - (UINT)(now - last_paint_tick) );
         return;
     }
     last_paint_tick = now;
@@ -767,6 +892,8 @@ static void present_desktop_hwnd_locked( HWND hwnd )
         previous = &paint_lists[!paint_current];
         list->count = 0;
         paint_clip = bounds;
+        paint_xf.m11 = paint_xf.m22 = 1.0f; paint_xf.m12 = paint_xf.m21 = paint_xf.dx = paint_xf.dy = 0.0f;
+        paint_xf.quarter = 0; paint_xf.active = FALSE;
         readback_batch();
         present_dcomp_visuals( mem );
         if (timing) QueryPerformanceCounter( &t1 );
@@ -1430,6 +1557,7 @@ static BOOL expr_evaluate_matrix( struct expr_animation *expr, ICompositionPrope
 static struct expr_animation *expr_animation_from_any( void *animation );
 static struct matrix_transform *manip_matrix_from_animation( void *animation );
 static struct propset_value *expr_resolve_value( void *animation, enum propset_type type );
+static BOOL expr_evaluate_scalar_product( struct expr_animation *expr, float *out );
 static const char *debugstr_animation( void *animation );
 static BOOL expr_resolve_colorrgb( void *animation, Color *color );
 static HRESULT create_matrix_transform( void **out );
@@ -4713,6 +4841,7 @@ static ULONG WINAPI device_Release( void *iface );
 static HRESULT WINAPI device_Commit( void *iface )
 {
     TRACE( "Commit.\n" );
+    TRACE_(dcompops)( "commit\n" );
     if (last_desktop_hwnd) present_desktop_hwnd( last_desktop_hwnd );
     return S_OK;
 }
@@ -6246,8 +6375,9 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
     HBRUSH brush;
     unsigned i;
     float x, y, csx, csy, w, h;
-    int saved = 0;
-    RECT saved_clip;
+    int saved = 0, quarter = -1;
+    RECT saved_clip, rot_saved_clip, rot_saved_outer;
+    struct paint_xform rot_saved_xf;
 
     /* SetTransformParent: this visual lives in its transform parent's space, not in the tree parent's. The
      * parent may paint later in the frame; its last recorded space is used, and a change repaints. */
@@ -6260,19 +6390,44 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
     }
     x = ox + (v->offset_x + v->transform_x + v->transform4.M41) * sx;
     y = oy + (v->offset_y + v->transform_y + v->transform4.M42) * sy;
-    /* the SetTransform matrix and XAML's IVisual TransformMatrix (an identity M11/M22 of 0 means unset) */
-    csx = sx * (v->scale_x != 0.0f ? v->scale_x : 1.0f) * (v->transform4.M11 != 0.0f ? v->transform4.M11 : 1.0f);
-    csy = sy * (v->scale_y != 0.0f ? v->scale_y : 1.0f) * (v->transform4.M22 != 0.0f ? v->transform4.M22 : 1.0f);
+    /* a quarter-turn TransformMatrix (XAML's RotateTransform of a chevron): scale by its magnitude, turn the
+     * subtree below */
+    if (v->transform4.M12 != 0.0f || v->transform4.M21 != 0.0f || v->transform4.M11 < 0.0f || v->transform4.M22 < 0.0f)
+        quarter = matrix_quarter( v->transform4.M11, v->transform4.M12, v->transform4.M21, v->transform4.M22 );
+    if (quarter > 0)
+    {
+        float mag = sqrtf( v->transform4.M11 * v->transform4.M11 + v->transform4.M12 * v->transform4.M12 );
+        csx = sx * (v->scale_x != 0.0f ? v->scale_x : 1.0f) * mag;
+        csy = sy * (v->scale_y != 0.0f ? v->scale_y : 1.0f) * mag;
+    }
+    else
+    {
+        /* the SetTransform matrix and XAML's IVisual TransformMatrix (an identity M11/M22 of 0 means unset) */
+        csx = sx * (v->scale_x != 0.0f ? v->scale_x : 1.0f) * (v->transform4.M11 != 0.0f ? v->transform4.M11 : 1.0f);
+        csy = sy * (v->scale_y != 0.0f ? v->scale_y : 1.0f) * (v->transform4.M22 != 0.0f ? v->transform4.M22 : 1.0f);
+    }
     w = v->width * csx, h = v->height * csy;
 
-    if (v->hidden) return;
+    if (v->hidden)
+    {
+        TRACE_(dcompops)( "dcomp %p hidden, size %gx%g at %g,%g, %u children\n", v, w, h, x, y, v->child_count );
+        return;
+    }
     if (v->opacity_expr)
     {
         struct propset_value *value = expr_resolve_value( &v->opacity_expr->vtbl, PROP_SCALAR );
+        float opacity;
         if (value) v->opacity = value->u.scalar;
+        else if (expr_evaluate_scalar_product( v->opacity_expr, &opacity )) v->opacity = opacity;
     }
     /* a transparent visual hides its subtree */
-    if (v->opacity <= 0.01f) return;
+    if (v->opacity <= 0.01f)
+    {
+        TRACE_(dcompops)( "dcomp %p transparent (%g%s%s), size %gx%g at %g,%g, %u children\n", v, v->opacity,
+                          v->opacity_expr ? ", expression " : "",
+                          v->opacity_expr ? debugstr_w( v->opacity_expr->expression ) : "", w, h, x, y, v->child_count );
+        return;
+    }
     if (v->transform_expr)
     {
         D2D_MATRIX_3X2_F m;
@@ -6282,11 +6437,24 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
             if (TRACE_ON(dcompanim) && wcsstr( v->transform_expr->expression, L"prependVisual" ))
                 TRACE_(dcompanim)( "visual %p offset %g,%g %s -> %g %g %g %g %g %g\n", v, v->offset_x, v->offset_y,
                                    debugstr_w( v->transform_expr->expression ), m._11, m._12, m._21, m._22, m._31, m._32 );
-            /* axis-aligned only: the painter positions and stretches, it does not rotate */
+            int q = (m._12 != 0.0f || m._21 != 0.0f || m._11 < 0.0f || m._22 < 0.0f) ?
+                    matrix_quarter( m._11, m._12, m._21, m._22 ) : 0;
             x += m._31 * sx;
             y += m._32 * sy;
-            csx *= m._11;
-            csy *= m._22;
+            if (q > 0)
+            {
+                float mag = sqrtf( m._11 * m._11 + m._12 * m._12 );
+                csx *= mag;
+                csy *= mag;
+                if (quarter <= 0) quarter = q;
+                else quarter = (quarter + q) & 3;
+            }
+            else
+            {
+                /* other angles are not drawn turned: the painter positions and stretches */
+                csx *= m._11;
+                csy *= m._22;
+            }
             w = v->width * csx;
             h = v->height * csy;
         }
@@ -6330,6 +6498,13 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
         xaml_content_branch = paint_branch;
     }
 
+    if (quarter > 0)
+    {
+        rot_saved_xf = paint_xf;
+        rot_saved_outer = paint_rot_clip;
+        rot_saved_clip = paint_clip;
+        paint_enter_rotation( quarter, x, y );
+    }
     saved_clip = paint_clip;
     if (v->has_clip)
     {
@@ -6360,6 +6535,12 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
         else if (v->children[i].dcv) paint_dcomp_visual( hdc, v->children[i].dcv, x, y, csx, csy );
     }
     if (saved) paint_clip = saved_clip;
+    if (quarter > 0)
+    {
+        paint_xf = rot_saved_xf;
+        paint_rot_clip = rot_saved_outer;
+        paint_clip = rot_saved_clip;
+    }
 }
 
 static void present_dcomp_visuals( HDC hdc )
@@ -8141,7 +8322,12 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
            impl->relative_size.X, impl->relative_size.Y, impl->visible, impl->opacity, impl->collection.count );
     /* IsVisible = false hides the whole subtree (XAML collapses e.g. the NavigationView back button's
      * AnimatedIcon this way); so does zero opacity. */
-    if (!impl->visible || impl->opacity <= 0.01f) return;
+    if (!impl->visible || impl->opacity <= 0.01f)
+    {
+        TRACE_(dcompops)( "public %p %s, size %gx%g, %u children\n", impl, impl->visible ? "transparent" : "hidden",
+                          width, height, impl->collection.count );
+        return;
+    }
     if (!xaml_island_container && impl->kind != VISUAL_SPRITE) xaml_island_container = impl;
     saved = apply_inset_clip( hdc, impl->clip, x, y, width, height );
     if (impl->kind != VISUAL_SPRITE && (width < 0.5f || height < 0.5f))
@@ -11791,6 +11977,24 @@ static const char *debugstr_animation( void *animation )
     case KF_BOOLEAN: return wine_dbg_sprintf( "key frames %p (%u keys) -> %d", kf, kf->key_count, kf->flag );
     default: return wine_dbg_sprintf( "key frames %p (%u keys, colour)", kf, kf->key_count );
     }
+}
+
+/* A scalar expression: a product of numbers and scalar properties. XAML binds a popup's Opacity to
+ * "PS.POpacity * PS.TTOpacity" (its own opacity times the transition's); expr_resolve_value only knows a
+ * single "Ref.Prop", so the product was never read and the visual kept whatever static opacity it had. */
+static BOOL expr_evaluate_scalar_product( struct expr_animation *expr, float *out )
+{
+    struct expr_ctx c = { expr, NULL, NULL, expr->expression, 0 };
+    float term;
+
+    if (!expr_scalar( &c, out )) return FALSE;
+    while (expr_accept( &c, L"*" ))
+    {
+        if (!expr_scalar( &c, &term )) return FALSE;
+        *out *= term;
+    }
+    expr_skip_space( &c );
+    return !*c.p;
 }
 
 static struct propset_value *expr_resolve_value( void *animation, enum propset_type type )

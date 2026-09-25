@@ -9203,3 +9203,50 @@ free is reported as
 `block X (size S) written after free at +off: value value; freed from f0 f1 f2 f3`.
 `probes/probe-uaf.cpp` is the control; it is caught at `+0x18` with the right value and free site.
 The value written usually names the writer: a vtable or a static in the module that wrote it.
+
+### History chevrons: quarter-turn rotations were drawn unrotated (2026-09-24)
+
+The History panel's row chevrons pointed up ("^"), and hovering one showed an empty button. A trace
+of every rotated visual found them. Each is a 10x12 dcomp visual with the static `TransformMatrix`
+`(0 1 -1 0)`, a 90° RenderTransform of the base glyph. The painter kept only `M11`/`M22` (treating 0
+as "unset"), so the glyph was drawn unturned.
+
+The painter now supports quarter turns for whole subtrees:
+
+- `paint_xf` is an affine map (row-vector, as DComp's matrices are) plus a quarter-turn count.
+  `paint_enter_rotation()` composes a turn about the visual's origin. `paint_emit()` maps each op's
+  rectangle and clip through it, and intersects with `paint_rot_clip`, the ancestors' clip in
+  window space.
+- `raster_blend_turned()` samples OP_BLEND sources turned 1, 2 or 3 quarters.
+- Static and expression-bound matrices are both handled. Other angles are still drawn unturned.
+
+The rows now show ">" and the hovered button shows it
+(`docs/screenshots/shapr3d-history-chevrons.png`). An expanded row has no chevron: XAML removes that
+visual from the tree, so that is the app's design, not a missing draw.
+
+### Menus open ~270 ms late: narrowed, not fixed (2026-09-24)
+
+File/Edit menus appear about 270-300 ms after the click; hover and row expand respond in 12-26 ms.
+Measured by clicking with `xdotool mousedown; sleep 0.02; mouseup` and grabbing raw `xwd` frames
+(2 ms each). **`xdotool click` adds ~100 ms of its own before the press**, so every click latency
+measured with it reads ~105 ms. Findings:
+
+- XAML opens the popup 11 ms after the click (`WINE_UWP_BP` on `ShowAtCore`, `FlyoutBase::Open`,
+  `MenuFlyout::OnOpening`, `CPopup::Open`). It creates the entrance animation at +18 ms and ticks
+  every 16 ms throughout.
+- The menu's visual tree is only **built** at about +220 ms. The UI thread is idle meanwhile
+  (sampling profile: 1823 of 2000 samples in `CoMsgWaitInProcessEvents`).
+- During that window XAML repeatedly asks for a frame through
+  `UIThreadScheduler::RequestAdditionalFrame(delay, reason 2)` from
+  `CParallelTimeline::UpdateAnimation`, with the delay counting down from ~200 ms. A XAML-side
+  storyboard is running, and the content appears when it ends. On Windows the menu is visible from
+  the first frame, so some property or condition we supply keeps XAML from rendering the content
+  early. Not found yet.
+
+Ruled out: lost deferred paints (`present_desktop_hwnd` deferred with `SetTimer(NULL, ...)` on a
+thread that may never pump messages - now a timer-queue timer that invalidates the window, kept as a
+robustness fix), empty surface read-backs, damage computation (`WINE_DCOMP_VERIFY_DAMAGE`: 0 bad
+frames), clips (the RectangleClip is ignored entirely), and opacity expressions.
+`"PS.POpacity * PS.TTOpacity"` is now evaluated anyway; it was silently skipped before.
+`WINEDEBUG=+dcompops` logs every emitted paint op, every commit, and every visual skipped as
+hidden or transparent.
