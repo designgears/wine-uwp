@@ -40,6 +40,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(msg);
 WINE_DECLARE_DEBUG_CHANNEL(key);
 WINE_DECLARE_DEBUG_CHANNEL(relay);
+WINE_DECLARE_DEBUG_CHANNEL(ptrdisp);
 
 #define QS_DRIVER       0x80000000
 #define QS_HARDWARE     0x40000000
@@ -3648,6 +3649,9 @@ BOOL WINAPI NtUserPeekMessage( MSG *msg_out, HWND hwnd, UINT first, UINT last, U
         return FALSE;
     }
     *msg_out = msg;
+    if (msg.message >= WM_POINTERUPDATE && msg.message <= WM_POINTERUP)
+        TRACE_(ptrdisp)( "peeked %#x for %p flags %#x, posted at %u (now %u)\n", msg.message, msg.hwnd, flags,
+                         (unsigned)msg.time, (unsigned)NtGetTickCount() );
     return TRUE;
 }
 
@@ -3684,6 +3688,9 @@ BOOL WINAPI NtUserGetMessage( MSG *msg, HWND hwnd, UINT first, UINT last )
     if (ret < 0) return -1;
 
     check_for_driver_events();
+    if (msg->message >= WM_POINTERUPDATE && msg->message <= WM_POINTERUP)
+        TRACE_(ptrdisp)( "got %#x for %p, posted at %u (now %u)\n", msg->message, msg->hwnd,
+                         (unsigned)msg->time, (unsigned)NtGetTickCount() );
 
     return msg->message != WM_QUIT;
 }
@@ -4082,6 +4089,9 @@ LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
     struct win_proc_params params;
     LRESULT retval = 0;
 
+    if (msg->message >= WM_POINTERUPDATE && msg->message <= WM_POINTERUP)
+        TRACE_(ptrdisp)( "%#x to %p, posted at %u (now %u)\n", msg->message, msg->hwnd, (unsigned)msg->time,
+                                 (unsigned)NtGetTickCount() );
     /* Process timer messages */
     if (msg->lParam && msg->message == WM_TIMER)
     {

@@ -9408,3 +9408,29 @@ composition swap chain (`dlls/dxgi/compswapchain.c`) into plain D3D11 textures, 
 back and blits them itself. A drone-opening run with `+x11drv` (2,140 trace lines) logged no
 `Created ... for client window` at all. The equivalent concern here, copying a frame that is not the
 one presented, is handled by the swap chain's per-present snapshot and the readback's event query.
+
+### The "130-150 ms preview" was my input, not the app (2026-09-25)
+
+The entry above says the drone's face-offset preview refreshes every ~130-150 ms and that nothing in
+Wine explains the idle gap. **The rate was an artifact of the test input.** `xdotool` moves every
+30-100 ms; a real mouse reports every few ms. Measured with timestamps on both sides (new trace
+channels: `dcompinput` for each pointer message routed to the input sink, `ptrdisp` for each
+`WM_POINTER*` a thread retrieves):
+
+- Input reaches the app promptly: routed within ~1 ms of the X event, peeked by the render thread
+  within one frame.
+- The app's rule: a move starts a preview computation only if none is running; moves during a
+  computation are dropped, and a finished computation does not catch up to the latest position. So
+  with sparse moves most of the cycle is waiting for the next move. Bursts of 8 ms moves separated by
+  pauses gave one computation per burst, started on its first move.
+- With continuous input (a move every ~8 ms, `/tmp/smoothdrag.sh`) at 3440x1366 the kernel starts a
+  preview every 67-84 ms (median 78 ms, ~13 a second), in whole frames of the render loop. It is busy
+  ~60% of each cycle.
+- The kernel thread's busy time is 88% Parasolid (`PSKERNEL`) and Shapr3D's native code; Wine is ~11%
+  (heap allocation, a little CRT). Parasolid's `PSthread*` workers barely run.
+- Readback off entirely (an experiment switch): no change. Frame pacing at 90, 120, 144 or 175 Hz: no
+  change (one 175 Hz run looked twice as slow; the repeat did not).
+
+What made extruding "painfully slow" on the user's desktop was what the previous entries fixed: the UI
+thread painting every swap chain frame at 3440 wide, and `warn+heap`. The rest is Parasolid's compute
+time. Wine's share could be cut a little with a faster heap; not attempted.

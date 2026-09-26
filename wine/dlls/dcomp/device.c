@@ -31,6 +31,7 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
+WINE_DECLARE_DEBUG_CHANNEL(dcompinput);
 
 extern void dcomp_install_fault_logger(void);
 
@@ -777,6 +778,8 @@ static LRESULT CALLBACK input_sink_hook_proc( int code, WPARAM wparam, LPARAM lp
             TRACE( "routing %#x at %s (screen %s, panel at %s) as %#x to input sink %p\n", msg->message,
                    wine_dbgstr_point( &pt ), wine_dbgstr_point( &screen ), wine_dbgstr_point( &panel ),
                    pointer_message, input_sink_target );
+            TRACE_(dcompinput)( "%#x -> %#x at %ld,%ld, message time %lu\n", msg->message, pointer_message,
+                                screen.x, screen.y, msg->time );
             PostMessageW( input_sink_target, pointer_message, pointer_wparam, pos );
             msg->message = WM_NULL;
         }
