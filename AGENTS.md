@@ -1019,6 +1019,11 @@ the fully-qualified name. `--grep` first, always.
   before trusting a run.
 - Wine's builtins win by module name. Pointing an `ActivatableClassId` at a native DLL is not enough;
   it also needs a `=n` override and the file in the prefix.
+- **`xdotool` was removed from the system on 2026-09-25** (a `pacman -Rns` clean-up), and every
+  `/tmp` test script drives the apps with it. Without it, find a window with
+  `DISPLAY=:0 xprop -root _NET_CLIENT_LIST` plus `xprop -id <w> WM_NAME`, and capture with `xwd -id`.
+  Reinstalling is the user's call (it needs sudo). A `2>/dev/null` on an `xdotool search` hides the
+  "command not found" and looks like "no such window".
 - Wine's `GetObject( dib, sizeof(DIBSECTION) )` reports `dsBmih.biHeight` **positive** for a top-down DIB,
   so it cannot tell you the row order. Every DIB `dcomp/composition.c` creates is top-down.
 - The unhandled-error text an app reports is often a *consequence*. `Delegate to an instance method
