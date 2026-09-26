@@ -9586,3 +9586,30 @@ windows.ui.xaml (26100.8972 syms):
 So a fresh, uncached page scrolled to its selected row, as the app asks. Expected to be the same on Windows;
 not compared with a Windows machine. Useful break points for next time: `ChangeViewInternal` `+0x406ac8`,
 `BringIntoViewportInternal` `+0x405ba4@rdx+0:4` (the target rect as floats), `Frame::NavigateImpl` `+0x31e7ac`.
+
+### Selecting a folder drew the toolbar at the origin; Settings pages overlapped (2026-09-26)
+
+Reported on the user's 3440x1440 desktop: selecting `drone.shapr` in Items flickered, with "a bunch of text
+in the top left" and the left pane collapsing for a moment; switching Settings sections showed mangled text
+for a moment. Both reproduced on `:96` at 3440x1400 with `WINE_UWP_TEST_HZ=175`; neither shows at 1280.
+
+**The half-built toolbar.** Selecting the folder selects every body, and the floating toolbar is rebuilt
+(Search/Sketch/... becomes Deselect All/Move/Rotate/Scale/...). `+dcomptree` showed ~40 public visuals
+painted at the window's origin plus only their own offsets for ~50 ms: their dcomp parent
+(`dcvc_insert` at .992) got its layout position (`m42 1235`) at .063, 70 ms later on the same UI thread,
+and the structural-batch gate (`XAML_BATCH_WAIT`) gave up after 50 ms. `XAML_BATCH_WAIT` is 250 ms now.
+Only batches that insert or remove visuals are held, so the orbit is not: 8 deferrals over 50 ms in a whole
+run, none during the orbit. Measured with `/tmp/selglitch.sh` (4 selections, counting transient visuals
+painted near the origin): 50 ms gate - 97 visuals in 6 frames; 250 ms - none. After:
+`docs/screenshots/shapr3d-select-folder-3440.png`.
+
+**Settings: opacity was never inherited.** The sections cross-fade through XAML's theme-transition target:
+the page's dcomp visual has `Opacity <- "PS.POpacity * PS.TTOpacity"`, and `TTOpacity` runs 1 -> 0 over
+0.1 s on the old page and 0 -> 1 over 0.333 s on the new one (live key frames, progress confirmed per
+tick). But `paint_dcomp_visual` used a visual's opacity only to skip it below 0.01, and
+`paint_public_visual` only for the visual's own fill; children were always drawn at full alpha. So the old
+page stayed at full strength over the new one until it was removed ~60 ms later. `paint_opacity` now carries
+the product of the ancestors' opacities and `paint_emit` scales every op's alpha by it (and clears
+`opaque`). Result: `docs/screenshots/shapr3d-settings-crossfade.png`, a clean cross-fade done in ~150 ms.
+Regression suite unchanged (Calculator AE 0). Orbit at 3440/60 Hz with and without the change: 55-57 vs
+54-61 frames shown, paint 5.3-6.5 vs 4.0-4.2 ms - within run-to-run noise.

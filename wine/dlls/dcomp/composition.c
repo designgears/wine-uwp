@@ -174,8 +174,11 @@ static ULONGLONG scene_change_tick;
  * a batch: when a menu's open transition ends XAML takes its subtree down and rebuilds it, and the other
  * thread's commit painted in between - the menu vanished for a frame. A batch is open on a committing thread
  * from its first change to its commit, and every paint but the commit's own waits for it (present_desktop_hwnd),
- * for at most XAML_BATCH_WAIT ms in case the changes were made outside a frame and no commit follows. */
-#define XAML_BATCH_WAIT 50
+ * for at most XAML_BATCH_WAIT ms in case the changes were made outside a frame and no commit follows. That was
+ * 50 ms, and at 3440 wide XAML takes 70 ms and more to build a frame that rebuilds a toolbar (selecting the
+ * drone's folder in Shapr3D): the paint that slipped in drew its new buttons at the window's origin, with the
+ * position still unset. Only batches that insert or remove visuals are waited for, so the orbit is unaffected. */
+#define XAML_BATCH_WAIT 250
 static struct xaml_batch { DWORD thread; LONG open; LONG structural; ULONGLONG start; } xaml_batches[4];
 /* Held exclusively by the painter while it walks the tree and checks for open batches, and shared by a XAML
  * thread while it opens one: so a batch either opens before a walk (which then waits for its commit) or after
@@ -392,6 +395,10 @@ static void free_retired_bitmaps( void )
  * DComp's matrices (p' = p * M + d), and ancestors' clips outside the rotation stay in paint_rot_clip. */
 struct paint_xform { float m11, m12, m21, m22, dx, dy; int quarter; BOOL active; };
 static struct paint_xform paint_xf = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0, FALSE };
+/* The product of the opacities of the visuals being painted: a visual's Opacity applies to its whole subtree, as
+ * on Windows. Only a visual's own fill used to get it, so a fading page (Settings' sections cross-fade through
+ * their TransitionTarget opacity) stayed at full strength over the next one until it was removed. */
+static float paint_opacity = 1.0f;
 static RECT paint_rot_clip;
 
 static void xf_point( const struct paint_xform *xf, float x, float y, float *ox, float *oy )
@@ -544,6 +551,12 @@ static void paint_emit( const struct paint_op *in )
         xop = *in;
         xop.affine = FALSE;   /* ops are often built on the stack field by field */
         op = &xop;
+    }
+    if (paint_opacity < 0.999f)
+    {
+        if (op != &xop) { xop = *op; op = &xop; }
+        xop.alpha = (BYTE)(xop.alpha * paint_opacity + 0.5f);
+        xop.opaque = FALSE;
     }
     if (TRACE_ON(dcompops))
         TRACE_(dcompops)( "op %d dest %s clip %s alpha %u quarter %u%s\n", op->kind, wine_dbgstr_rect( &op->dest ),
@@ -1264,6 +1277,7 @@ static void present_desktop_hwnd_locked( HWND hwnd )
         paint_clip = bounds;
         paint_xf.m11 = paint_xf.m22 = 1.0f; paint_xf.m12 = paint_xf.m21 = paint_xf.dx = paint_xf.dy = 0.0f;
         paint_xf.quarter = 0; paint_xf.active = FALSE;
+        paint_opacity = 1.0f;
         readback_batch();
         /* A batch is half done: its commit paints, or a repaint once the wait runs out. Not before the first
          * frame, and not for longer than XAML_BATCH_WAIT in a row: two UI threads committing in turn can each
@@ -6949,6 +6963,7 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
     RECT saved_clip, rot_saved_clip, rot_saved_outer;
     struct paint_xform rot_saved_xf;
     BOOL turned = FALSE, have_expr = FALSE;
+    float saved_opacity;
     float rot_c = 1.0f, rot_s = 0.0f;   /* the subtree's rotation, any angle */
     float t11 = 0.0f, t12 = 0.0f, t21 = 0.0f, t22 = 0.0f, t41 = 0.0f, t42 = 0.0f;   /* the static TransformMatrix */
     D2D_MATRIX_3X2_F em;
@@ -7118,6 +7133,8 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
     /* Content set through IDCompositionVisual::SetContent is a surface XAML drew into
      * (DCompVisual::SetContentInternal); paint the texture itself. It carries its own size, and
      * these visuals often have none. */
+    saved_opacity = paint_opacity;
+    if (v->opacity < 1.0f) paint_opacity *= v->opacity;
     if (v->opacity > 0.01f && surface_from_iface( v->content ) &&
         blit_surface_scaled( hdc, surface_from_iface( v->content ), (int)x, (int)y, csx, csy ))
     {
@@ -7133,6 +7150,7 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
         if (v->children[i].pub) paint_public_visual( hdc, v->children[i].pub, x, y, w, h, csx, csy );
         else if (v->children[i].dcv) paint_dcomp_visual( hdc, v->children[i].dcv, x, y, csx, csy );
     }
+    paint_opacity = saved_opacity;
     if (saved) paint_clip = saved_clip;
     if (turned)
     {
@@ -8948,6 +8966,7 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
     RECT saved_clip = paint_clip, turn_saved_clip, turn_saved_outer;
     struct paint_xform turn_saved_xf;
     BOOL turned = FALSE;
+    float saved_opacity = paint_opacity;
 
     /* Composition sizes default to 0 and a sprite of size 0 draws nothing; filling the parent instead put
      * XAML's black window-background sprite (size 0, inserted below the content, which is later inserted at
@@ -8971,6 +8990,8 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
                           width, height, impl->collection.count );
         return;
     }
+    /* this visual's opacity applies to everything below, its own fill included (paint_emit) */
+    paint_opacity *= min( impl->opacity, 1.0f );
     /* Scale(-1,-1) is a half turn about the visual's origin (AnimatedIcon's expanded chevron): the sizes came out
      * negative and nothing was drawn. Draw it turned, with positive sizes, around that origin. */
     if (csx < 0.0f && csy < 0.0f)
@@ -9005,7 +9026,7 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
         /* A sprite whose brush is a surface carries real drawn content; paint that instead of
          * guessing a colour. */
         if (surface && paint_mapped_surface( hdc, impl->brush, surface, (int)x, (int)y, (int)width, (int)height,
-                                             impl->opacity ))
+                                             1.0f ))
         {
             TRACE( "painted public sprite %p from mapped surface %p at %d,%d.\n", impl, surface, (int)x, (int)y );
             goto children;
@@ -9016,12 +9037,12 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
                    (int)x, (int)y );
             goto children;
         }
-        if (paint_mask_brush( hdc, impl->brush, (int)x, (int)y, (int)width, (int)height, impl->opacity ))
+        if (paint_mask_brush( hdc, impl->brush, (int)x, (int)y, (int)width, (int)height, 1.0f ))
         {
             TRACE( "painted public sprite %p with mask brush at %d,%d.\n", impl, (int)x, (int)y );
             goto children;
         }
-        if (paint_gradient_sprite( hdc, impl->brush, (int)x, (int)y, (int)width, (int)height, impl->opacity ))
+        if (paint_gradient_sprite( hdc, impl->brush, (int)x, (int)y, (int)width, (int)height, 1.0f ))
         {
             TRACE( "painted public sprite %p with gradient brush at %d,%d.\n", impl, (int)x, (int)y );
             goto children;
@@ -9047,7 +9068,7 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
         }
         SetRect( &rect, (int)x, (int)y, (int)(x + width), (int)(y + height) );
         soft_fill( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, c,
-                   (BYTE)(impl->opacity * 255.0f + 0.5f) );
+                   255 );
         (void)brush; (void)col;
         TRACE( "painted public sprite %p %gx%g at %d,%d color %02x%02x%02x%02x.\n",
                impl, width, height, (int)x, (int)y, c.A, c.R, c.G, c.B );
@@ -9101,6 +9122,7 @@ children:
             IUnknown_Release( (IUnknown *)child );
         }
     }
+    paint_opacity = saved_opacity;
     if (saved) paint_clip = saved_clip;
     if (turned)
     {
@@ -10117,6 +10139,8 @@ static void live_anims_tick( void )
     {
         BOOL more = live_anim_progress( &live_anims[i], &progress );
         live_anim_apply( &live_anims[i], progress );
+        TRACE_(dcompanim)( "live %p %s progress %g%s\n", live_anims[i].set, debugstr_w( live_anims[i].name ), progress,
+                           more ? "" : " (done)" );
         if (!more && n < ARRAY_SIZE(done))
         {
             done[n++] = live_anims[i];
