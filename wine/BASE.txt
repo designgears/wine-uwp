@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     3e59c19da9e8882f10fdf14035b24bcdd6b0ea40
-                 dcomp: Run key-frame animations live, with easing, rotations and clip transforms.
+  wine HEAD:     1f1ccc4974b15582320d1733a1d7a7cb6484eb58
+                 dxgi, dcomp: WINE_UWP_TEST_HZ paces as a display of that refresh rate.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-26T03:17:28Z
+  captured:      2026-09-26T04:31:22Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

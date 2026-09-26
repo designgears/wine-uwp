@@ -243,6 +243,9 @@ LONGLONG dxgi_vblank_period(void)
         if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1
                 && mode.dmDisplayFrequency < 1000)
             hz = mode.dmDisplayFrequency;
+        /* WINE_UWP_TEST_HZ: pace as a display of that rate would (Xvfb reports 60; the user's runs at 175) */
+        if (getenv("WINE_UWP_TEST_HZ") && atoi(getenv("WINE_UWP_TEST_HZ")) > 1)
+            hz = atoi(getenv("WINE_UWP_TEST_HZ"));
         QueryPerformanceFrequency(&freq);
         period_ticks = freq.QuadPart / hz;
         TRACE("vblank grid at %lu Hz.\n", hz);

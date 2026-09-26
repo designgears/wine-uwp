@@ -9547,3 +9547,42 @@ Also seen once in ~12 starts, before any interaction: Sentry caught an access vi
 `CoreMessaging.dll+0x2733e` (`Object::ReleaseNotFrozen` on a pointer to a vtable), from
 `BufferHeapBlock::~BufferHeapBlock` under XAML's message dispatch - the same function as the timer-drain
 crashes above. It did not repeat.
+
+### The wheel leak reproduces only at the user's refresh rate; the History "lost" position is the app's (2026-09-26)
+
+**Wheel over a panel reaching the viewport: fixed by the completed-list hit test, and now measured.** It
+never reproduced on Xvfb because Xvfb reports 60 Hz. The user's display runs at 175 Hz, where the painter
+rebuilds its paint list almost continuously while anything moves, and the old hit test read that half-built
+list (the viewport's swap chain op is emitted before the panels drawn over it). New switch
+`WINE_UWP_TEST_HZ=<hz>` makes dcomp's paint interval and dxgi's vblank grid pace as a display of that rate.
+At 3440x1400, 175 Hz, 150 wheel notches over History while it scrolls (`/tmp/wheeltest2.sh`):
+
+| hit test | routed to the viewport |
+| --- | --- |
+| old (the list being built) | 10 of 150 |
+| `paint_complete` under `hit_lock` (09-25) | 0 of 150, 0 of 300, 0 of 150 over the Items panel |
+
+The user's build at the time of the report predated that change. Also ruled out on the way: win32u's
+independent-input forwarder (nothing forwarded, also after leaving and reopening the editor), and focus -
+the wheel's hwnd stays the CoreWindow.
+
+**History scroll position after opening an item: Shapr3D re-creates the page.** Reproduced at 3440x1400:
+expand a row, press its **Edit...** (the panel navigates to the item's editor, Done/Cancel), Cancel. The list
+comes back shifted so the opened row sits at the bottom edge (`docs/screenshots/shapr3d-history-edit-back.png`:
+before, editor, after; offset 5935 -> 5403, and 6223 -> 6083 from the bottom). Double-clicking a row
+(edit in place), sketch edit and Escape all keep the position. What happens, from `WINE_UWP_BP` on
+windows.ui.xaml (26100.8972 syms):
+- Edit... and back are both forward `Frame::NavigateImpl` (`+0x31e7ac`); each misses the navigation cache
+  (`GetCachedContent` then `LoadContent`) and `NavigationCache::CacheContent` never runs, so the History page
+  is not cacheable (its `NavigationCacheMode`, app markup). The `ScrollViewer` after back (`ChangeViewInternal`'s
+  `rcx`) is an object never seen before, with a new DirectManipulation viewport; the old one is abandoned.
+- Shapr3D then calls `ListViewBase::ScrollIntoView` (from `Shapr3D.dll+0x1a04775`) and
+  `ScrollViewer::ChangeView` itself (`+0x1bbe5f9`). Both request 5403 - the vertical `IReference<double>`
+  unboxed at `ChangeViewInternal+0x602` (`windows.ui.xaml.dll+4070ca@rbp-50:2`, `0x40b51b00_00000000`) - the
+  selected row's bring-into-view from a list at 0. The second is a no-op because it equals the first. The
+  bottom case settles it: that list was placed at 6223 programmatically, not by the wheel, and still came
+  back at the row's bring-into-view offset, so no saved offset is being lost on our side.
+
+So a fresh, uncached page scrolled to its selected row, as the app asks. Expected to be the same on Windows;
+not compared with a Windows machine. Useful break points for next time: `ChangeViewInternal` `+0x406ac8`,
+`BringIntoViewportInternal` `+0x405ba4@rdx+0:4` (the target rect as floats), `Frame::NavigateImpl` `+0x31e7ac`.

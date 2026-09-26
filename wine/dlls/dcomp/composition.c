@@ -1167,6 +1167,9 @@ static UINT paint_interval( void )
         UINT hz = screen ? GetDeviceCaps( screen, VREFRESH ) : 0;
         if (screen) ReleaseDC( 0, screen );
         if (hz <= 1 || hz >= 1000) hz = 60;
+        /* WINE_UWP_TEST_HZ: as dxgi's vblank grid, a display of that rate */
+        if (getenv( "WINE_UWP_TEST_HZ" ) && atoi( getenv( "WINE_UWP_TEST_HZ" ) ) > 1)
+            hz = atoi( getenv( "WINE_UWP_TEST_HZ" ) );
         interval = max( 1000 / hz, 2 ) - 1;
         TRACE( "painting at most every %u ms (%u Hz).\n", interval, hz );
     }
