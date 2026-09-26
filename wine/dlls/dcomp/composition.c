@@ -176,7 +176,7 @@ static ULONGLONG scene_change_tick;
  * from its first change to its commit, and every paint but the commit's own waits for it (present_desktop_hwnd),
  * for at most XAML_BATCH_WAIT ms in case the changes were made outside a frame and no commit follows. */
 #define XAML_BATCH_WAIT 50
-static struct xaml_batch { DWORD thread; LONG open; ULONGLONG start; } xaml_batches[4];
+static struct xaml_batch { DWORD thread; LONG open; LONG structural; ULONGLONG start; } xaml_batches[4];
 /* Held exclusively by the painter while it walks the tree and checks for open batches, and shared by a XAML
  * thread while it opens one: so a batch either opens before a walk (which then waits for its commit) or after
  * it. Painting runs on the swap chain's readback thread and on a repaint timer, not only on the UI thread. */
@@ -213,6 +213,18 @@ static void scene_dirty( void )
     InterlockedIncrement( &scene_generation );
     scene_change_tick = GetTickCount64();
 }
+/* A change to the tree's shape (a visual inserted or removed) in the current thread's batch. Only those batches
+ * hold paints back: a menu rebuilt half-way is what flickered, while a batch that only moves and fades things
+ * (the view cube during an orbit commits every frame) is safe to paint mid-way, and waiting for it cost the
+ * viewport one frame in five. */
+static void scene_structure_changed( void )
+{
+    DWORD tid = GetCurrentThreadId();
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(xaml_batches) && xaml_batches[i].thread; i++)
+        if (xaml_batches[i].thread == tid && xaml_batches[i].open) xaml_batches[i].structural = TRUE;
+}
 /* how long a paint should still wait for an open batch, 0 for none. The committing thread's own paints
  * wait too: XAML takes a finished transition's subtree down after one commit and rebuilds it in the next
  * frame, and a repaint timer firing on that thread in between showed the context menu missing. */
@@ -223,7 +235,7 @@ static DWORD xaml_batch_wait( void )
     unsigned int i;
 
     for (i = 0; i < ARRAY_SIZE(xaml_batches) && xaml_batches[i].thread; i++)
-        if (xaml_batches[i].open && now - xaml_batches[i].start < XAML_BATCH_WAIT)
+        if (xaml_batches[i].open && xaml_batches[i].structural && now - xaml_batches[i].start < XAML_BATCH_WAIT)
             wait = max( wait, XAML_BATCH_WAIT - (DWORD)(now - xaml_batches[i].start) );
     return wait;
 }
@@ -237,7 +249,7 @@ static void xaml_batch_commit( void )
         if (!xaml_batches[i].thread && !InterlockedCompareExchange( (LONG *)&xaml_batches[i].thread, tid, 0 )) break;
         if (xaml_batches[i].thread == tid) break;
     }
-    if (i < ARRAY_SIZE(xaml_batches)) xaml_batches[i].open = FALSE;
+    if (i < ARRAY_SIZE(xaml_batches)) xaml_batches[i].open = xaml_batches[i].structural = FALSE;
     TRACE_(dcompgate)( "commit\n" );
 }
 static IVisual *last_desktop_root;
@@ -942,6 +954,23 @@ static void present_desktop_hwnd( HWND hwnd )
     }
 }
 
+/* The shortest time between two frames, one refresh of the display. A fixed 15 ms held a 175 Hz display to ~66
+ * frames a second while the swap chain presented 175. */
+static UINT paint_interval( void )
+{
+    static UINT interval;
+    if (!interval)
+    {
+        HDC screen = GetDC( 0 );
+        UINT hz = screen ? GetDeviceCaps( screen, VREFRESH ) : 0;
+        if (screen) ReleaseDC( 0, screen );
+        if (hz <= 1 || hz >= 1000) hz = 60;
+        interval = max( 1000 / hz, 2 ) - 1;
+        TRACE( "painting at most every %u ms (%u Hz).\n", interval, hz );
+    }
+    return interval;
+}
+
 static void present_desktop_hwnd_locked( HWND hwnd )
 {
     HDC hdc;
@@ -966,10 +995,10 @@ static void present_desktop_hwnd_locked( HWND hwnd )
         return;
     }
     now = GetTickCount64();
-    if (last_paint_tick && now - last_paint_tick < 15)
+    if (last_paint_tick && now - last_paint_tick < paint_interval())
     {
         perf.deferred++;
-        request_repaint( 16 - (UINT)(now - last_paint_tick) );
+        request_repaint( paint_interval() + 1 - (UINT)(now - last_paint_tick) );
         return;
     }
     last_paint_tick = now;
@@ -3374,6 +3403,22 @@ static void WINAPI present_notify_Presented( void *iface )
     BOOL submit = FALSE;
 
     if (FAILED( IDXGISwapChain_GetLastPresentCount( surface->swapchain, &count ) )) return;
+    /* Back-pressure, as a flip-model swap chain's queue gives on Windows: the app presents on the presenting
+     * thread (this call), and while the previous frame is still being read back or waits to be painted it waits, up to
+     * 20 ms, instead of rendering frames that would be skipped. At 175 Hz and 3440x1366 Shapr3D presented 175
+     * frames a second and 70 of them reached the screen, an uneven pick that looked less smooth than a
+     * steady rate. */
+    {
+        LARGE_INTEGER start, now, freq;
+        QueryPerformanceCounter( &start );
+        QueryPerformanceFrequency( &freq );
+        while (surface->readback_busy || surface->readback_ready)
+        {
+            QueryPerformanceCounter( &now );
+            if ((now.QuadPart - start.QuadPart) * 1000 >= 20 * freq.QuadPart) break;
+            Sleep( 1 );
+        }
+    }
     EnterCriticalSection( &swapchain_cs );
     /* a frame read back but not swapped in yet: the UI thread queues the next readback after the swap */
     if (count != surface->presented && !surface->readback_ready && !InterlockedCompareExchange( &surface->readback_busy, 1, 0 ))
@@ -5595,7 +5640,7 @@ static BOOL dcv_reserve_child( struct dcomp_visual *v )
     return TRUE;
 }
 
-static void dcv_insert_child( struct dcomp_visual *v, struct dcomp_visual *dcv, void *pub, unsigned index )
+static void dcv_insert_child_locked( struct dcomp_visual *v, struct dcomp_visual *dcv, void *pub, unsigned index )
 {
     unsigned i;
 
@@ -5625,6 +5670,16 @@ static void dcv_insert_child( struct dcomp_visual *v, struct dcomp_visual *dcv, 
             if (dcomp_visuals[i] == dcv) dcomp_visual_has_parent[i] = TRUE;
         LeaveCriticalSection( &dcomp_visual_cs );
     }
+}
+/* structural: waits out a walk in progress (walk_guard) and marks the batch structural */
+static void dcv_insert_child( struct dcomp_visual *v, struct dcomp_visual *dcv, void *pub, unsigned index )
+{
+
+    walk_guard_enter();
+    scene_structure_changed();
+    dcv_insert_child_locked( v, dcv, pub, index );
+    walk_guard_leave();
+
 }
 
 /* Resolve a child argument to our interop visual or a public visual's interop view, with a reference held. */
@@ -5681,12 +5736,22 @@ static HRESULT WINAPI dcv_AddVisual( void *iface, void *child, BOOL insert_above
     return S_OK;
 }
 
-static void dcv_release_child_at( struct dcomp_visual *v, unsigned i )
+static void dcv_release_child_at_locked( struct dcomp_visual *v, unsigned i )
 {
     if (v->children[i].dcv) dcv_Release( &v->children[i].dcv->vtbl );
     if (v->children[i].pub) IUnknown_Release( (IUnknown *)v->children[i].pub );
     memmove( v->children + i, v->children + i + 1, (v->child_count - i - 1) * sizeof(*v->children) );
     v->child_count--;
+}
+/* structural: waits out a walk in progress (walk_guard) and marks the batch structural */
+static void dcv_release_child_at( struct dcomp_visual *v, unsigned i )
+{
+
+    walk_guard_enter();
+    scene_structure_changed();
+    dcv_release_child_at_locked( v, i );
+    walk_guard_leave();
+
 }
 
 static HRESULT WINAPI dcv_RemoveVisual( void *iface, void *child )
@@ -8024,7 +8089,7 @@ static int collection_index_of( struct visual_collection *impl, IVisual *child )
     }
     return -1;
 }
-static void collection_detach( struct visual_collection *impl, IVisual *child )
+static void collection_detach_locked( struct visual_collection *impl, IVisual *child )
 {
     struct visual *v = public_visual_from( (IInspectable *)child );
     int i = collection_index_of( impl, child );
@@ -8038,8 +8103,18 @@ static void collection_detach( struct visual_collection *impl, IVisual *child )
     memmove( impl->children + i, impl->children + i + 1, (impl->count - i - 1) * sizeof(*impl->children) );
     impl->count--;
 }
+/* structural: waits out a walk in progress (walk_guard) and marks the batch structural */
+static void collection_detach( struct visual_collection *impl, IVisual *child )
+{
 
-static HRESULT collection_insert_at( struct visual_collection *impl, IVisual *child, unsigned int index,
+    walk_guard_enter();
+    scene_structure_changed();
+    collection_detach_locked( impl, child );
+    walk_guard_leave();
+
+}
+
+static HRESULT collection_insert_at_locked( struct visual_collection *impl, IVisual *child, unsigned int index,
                                      const char *how )
 {
     int existing;
@@ -8101,6 +8176,17 @@ static HRESULT collection_insert_at( struct visual_collection *impl, IVisual *ch
     }
     return S_OK;
 }
+/* structural: waits out a walk in progress (walk_guard) and marks the batch structural */
+static HRESULT collection_insert_at( struct visual_collection *impl, IVisual *child, unsigned int index,
+                                     const char *how )
+{
+    static HRESULT ret;
+    walk_guard_enter();
+    scene_structure_changed();
+    ret = collection_insert_at_locked( impl, child, index, how );
+    walk_guard_leave();
+    return ret;
+}
 
 static HRESULT WINAPI collection_InsertAbove( IVisualCollection *iface, IVisual *child, IVisual *sibling )
 {
@@ -8150,6 +8236,8 @@ static HRESULT WINAPI collection_RemoveAll( IVisualCollection *iface )
     struct visual_collection *impl = CONTAINING_RECORD( iface, struct visual_collection, IVisualCollection_iface );
     unsigned int i;
     TRACE( "owner %p.\n", impl->owner );
+    walk_guard_enter();
+    scene_structure_changed();
     for (i = 0; i < impl->count; i++)
     {
         struct visual *v = public_visual_from( impl->children[i] );
@@ -8157,6 +8245,7 @@ static HRESULT WINAPI collection_RemoveAll( IVisualCollection *iface )
         if (impl->children[i]) IInspectable_Release( impl->children[i] );
     }
     impl->count = 0;
+    walk_guard_leave();
     return S_OK;
 }
 static const struct IVisualCollectionVtbl collection_vtbl =

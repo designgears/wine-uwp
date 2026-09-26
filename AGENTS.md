@@ -446,6 +446,11 @@ paint-visible state must defer to the painter: cache DIBs through `retire_bitmap
 through `defer_surface_destroy()`. Only the painter frees them, under `present_cs`, after the frame.
 Freeing directly is what killed Shapr3D when leaving the editor.
 
+**Never edit the user's projects in a test, and never end a test with an unconditional Ctrl+Z.** A test
+drag that failed made the script's Ctrl+Z undo the previous real step of the user's drone project
+(`Face Offset 20`), and the project syncs to the cloud. Make test edits in a project of our own, check the
+edit happened before undoing anything, and prefer orbiting (no edit) when all you need is load.
+
 **Scripted drags are not a real mouse.** `xdotool` moves every 30-100 ms; a real mouse reports every few
 ms, and Shapr3D starts a preview only on a move that arrives while it is idle. My sparse drags made the
 drone's extrude look like 150 ms per preview; continuous 8 ms moves give ~78 ms. Measure interaction
@@ -455,6 +460,11 @@ rates with continuous input (`/tmp/smoothdrag.sh` in the session: a move every ~
 **Do not leave `WINEDEBUG=warn+heap` on in a session the user works in.** It turns off the LFH and
 fills and checks every free: Shapr3D's modelling took 2.3x the CPU, and the user reported extrusion as
 "painfully slow" in exactly such a session.
+
+**Frame pacing follows the display, which is 175 Hz on the user's machine.** A fixed 15 ms paint interval
+capped the viewport at ~66 frames a second there, and with no back-pressure the app rendered 175 frames
+and 70 were shown. `paint_interval()` is one refresh; `present_notify_Presented` makes a present wait
+while the previous frame is still unread or unpainted. Test pacing changes at 175 Hz as well as 60.
 
 **Painting must not run on the UI thread per swap chain frame.** At the user's 3440x1366 a full-window
 paint is ~6 ms; the swap chain presents 60 times a second, and while those paints ran in the UI thread's

@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     1aa94f4925baa195d247f1b830ee1a0441411482
-                 dcomp: dcompinput trace of routed pointer input; win32u: ptrdisp trace of pointer messages retrieved
+  wine HEAD:     1bcf33e71ccd97a90192193dc49b67f5044d36d9
+                 dcomp: hold paints only for structural XAML batches; paint interval from the display refresh; back-pressure on composition presents
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-26T00:47:07Z
+  captured:      2026-09-26T01:28:48Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

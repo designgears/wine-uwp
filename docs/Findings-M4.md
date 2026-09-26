@@ -9434,3 +9434,37 @@ channels: `dcompinput` for each pointer message routed to the input sink, `ptrdi
 What made extruding "painfully slow" on the user's desktop was what the previous entries fixed: the UI
 thread painting every swap chain frame at 3440 wide, and `warn+heap`. The rest is Parasolid's compute
 time. Wine's share could be cut a little with a faster heap; not attempted.
+
+### Orbit frame rate: the batch gate, a fixed 15 ms paint interval, and no back-pressure (2026-09-25)
+
+The user found orbiting a little less smooth after the painting moved off the UI thread. At 3440x1366,
+orbiting the drone (a right-drag with a move every ~8 ms), `+dcompperf`:
+
+| build | display | presents/s | frames shown/s |
+| --- | --- | --- | --- |
+| before today's painting change (640fce0d) | 60 Hz | 59 | 57 |
+| painting off the UI thread | 60 Hz | 60 | 48 |
+| + gate only structural batches | 60 Hz | 60 | 60 |
+| same | 175 Hz | 175 | 68-70 |
+| + refresh-rate paint interval + back-pressure | 175 Hz | 91-119 | 92-117 (all of them) |
+| same | 60 Hz | 60 | 59-60 |
+
+- **The batch gate held back every viewport frame during an orbit**: XAML commits every frame then (the
+  view cube), so a swap chain paint almost always found a batch open (59 deferrals a second). Only
+  batches that change the tree's *shape* need holding - a menu half-rebuilt is what flickered. Inserts
+  and removals (`dcv_insert_child`, `dcv_release_child_at`, `collection_insert_at`, `collection_detach`,
+  public `RemoveAll`) now mark the batch structural (`scene_structure_changed`) and run under the walk
+  guard, so they cannot interleave with a walk either. Menus: still no flicker in 6 timed opens.
+- **The painter refused to paint more often than every 15 ms**, from when everything assumed 60 Hz. The
+  user's display runs at 175 Hz. The interval is now one refresh (`paint_interval`, from
+  `GetDeviceCaps(VREFRESH)`).
+- **Nothing paced the app to what we show.** With the vblank grid at 175 Hz the app presented 175 frames a
+  second and 70 were shown, an uneven pick. `present_notify_Presented` (on the presenting thread) now
+  waits, up to 20 ms, while the previous frame is still being read back or waiting to be painted - the
+  back-pressure a flip-model swap chain's queue gives on Windows. Every presented frame is shown now.
+
+**And a mistake of mine with real consequences.** The drag scripts ended with Ctrl+Z to undo their
+extrude. One drag failed ("resulting body wouldn't be valid"), so the Ctrl+Z undid the previous real step
+of the user's drone project: `Face Offset 20`, the brown block on the front rotor guard. The project syncs
+to the cloud; redo was gone after the restart. The scripts no longer undo, and test edits belong in a
+project of our own, not the user's.
