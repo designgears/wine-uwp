@@ -273,7 +273,8 @@ struct drawing_surface;
 static BOOL paint_mapped_surface( HDC hdc, void *brush_iface, struct drawing_surface *surface, int x, int y,
                                   int width, int height, float opacity );
 static HDC scratch_dc( HDC hdc );
-static int apply_inset_clip( HDC hdc, void *clip_iface, float x, float y, float width, float height );
+static int apply_clip_object( HDC hdc, void *clip_iface, float x, float y, float width, float height, float sx, float sy );
+static struct comp_clip *clip_from_any( void *iface );
 /* The presenter's back buffer: a top-down 32-bit DIB so the painters can blend into it directly.
  * GDI's AlphaBlend costs a syscall and a clip setup per call, and a frame has sixty or more glyph
  * runs and fills; the direct path handles the common unscaled blend under a rectangular clip. */
@@ -314,6 +315,9 @@ struct paint_op
     BOOL opaque;            /* covers every pixel of dest with alpha 255 */
     BOOL swapchain;         /* OP_STRETCH of a swap chain's content: input there goes to its input sink */
     BYTE quarter;           /* OP_BLEND: the source is drawn turned this many quarter turns clockwise */
+    BOOL affine;            /* OP_BLEND/OP_FILL under a rotation that is not a quarter turn: odest mapped by xf */
+    RECT odest;             /* the op's rectangle before the rotation */
+    float xf[6];            /* m11 m12 m21 m22 dx dy, as struct paint_xform (row vectors) */
 };
 struct paint_list
 {
@@ -322,6 +326,12 @@ struct paint_list
 };
 static struct paint_list paint_lists[2];
 static unsigned int paint_current;      /* index of the list being built */
+/* The list the last finished walk built, for hit tests from other threads: the painter rebuilds the other one,
+ * on its own threads since swap chain frames are painted off the UI thread, and a wheel event tested against a
+ * list half rebuilt found the viewport before the panel drawn over it - scrolls over History and menus went to
+ * the viewport now and then. Switched under hit_lock, which a hit test holds shared. */
+static int paint_complete = -1;
+static SRWLOCK hit_lock = SRWLOCK_INIT;
 static RECT paint_clip;                 /* clip of the visual being walked */
 
 /* content generations are unique across objects: a freed surface or brush replaced by a new one at the same
@@ -414,6 +424,16 @@ static int matrix_quarter( float m11, float m12, float m21, float m22 )
     return -1;
 }
 
+/* The rotation of a matrix's linear part as a unit cos/sin, when it is a (uniformly scaled) rotation. */
+static BOOL matrix_rotation( float m11, float m12, float m21, float m22, float *c, float *sn )
+{
+    float s = sqrtf( m11 * m11 + m12 * m12 );
+    if (s < 1e-6f || fabsf( m11 - m22 ) > 1e-3f * s || fabsf( m12 + m21 ) > 1e-3f * s) return FALSE;
+    *c = m11 / s;
+    *sn = m12 / s;
+    return TRUE;
+}
+
 /* Enter a subtree turned q quarter turns about (px, py); the caller restores paint_xf, paint_rot_clip and
  * paint_clip when leaving it. */
 static void paint_enter_rotation( int q, float px, float py )
@@ -432,10 +452,54 @@ static void paint_enter_rotation( int q, float px, float py )
     paint_xf.m22 = local.m21 * old.m12 + local.m22 * old.m22;
     paint_xf.dx = local.dx * old.m11 + local.dy * old.m21 + old.dx;
     paint_xf.dy = local.dx * old.m12 + local.dy * old.m22 + old.dy;
-    paint_xf.quarter = (old.quarter + q) & 3;
+    paint_xf.quarter = old.quarter < 0 ? -1 : (old.quarter + q) & 3;
     paint_xf.active = TRUE;
     paint_rot_clip = outer;
     SetRect( &paint_clip, -0x100000, -0x100000, 0x100000, 0x100000 );
+}
+
+/* Any other rotation (unit cos c, sin s) about (px, py): XAML animates a chevron from one quarter turn to the
+ * next, and drawing the angles in between unturned showed the glyph pointing the wrong way for a few frames.
+ * quarter -1 marks the transform as general: paint_emit then records it on the op for the rasterizer. */
+static void paint_enter_turn( float c, float sn, float px, float py )
+{
+    struct paint_xform local, old = paint_xf;
+    RECT outer = old.active ? xf_rect( &old, &paint_clip ) : paint_clip;
+
+    if (old.active) IntersectRect( &outer, &outer, &paint_rot_clip );
+    local.m11 = c; local.m12 = sn; local.m21 = -sn; local.m22 = c;
+    local.dx = px - (px * local.m11 + py * local.m21);
+    local.dy = py - (px * local.m12 + py * local.m22);
+    paint_xf.m11 = local.m11 * old.m11 + local.m12 * old.m21;
+    paint_xf.m12 = local.m11 * old.m12 + local.m12 * old.m22;
+    paint_xf.m21 = local.m21 * old.m11 + local.m22 * old.m21;
+    paint_xf.m22 = local.m21 * old.m12 + local.m22 * old.m22;
+    paint_xf.dx = local.dx * old.m11 + local.dy * old.m21 + old.dx;
+    paint_xf.dy = local.dx * old.m12 + local.dy * old.m22 + old.dy;
+    paint_xf.quarter = -1;
+    paint_xf.active = TRUE;
+    paint_rot_clip = outer;
+    SetRect( &paint_clip, -0x100000, -0x100000, 0x100000, 0x100000 );
+}
+
+/* the bounding box of a rectangle under a general transform */
+static RECT xf_bbox( const struct paint_xform *xf, const RECT *r )
+{
+    float xs[4], ys[4], x0, y0, x1, y1;
+    unsigned int i;
+    RECT out;
+    xf_point( xf, r->left, r->top, &xs[0], &ys[0] );
+    xf_point( xf, r->right, r->top, &xs[1], &ys[1] );
+    xf_point( xf, r->left, r->bottom, &xs[2], &ys[2] );
+    xf_point( xf, r->right, r->bottom, &xs[3], &ys[3] );
+    x0 = x1 = xs[0]; y0 = y1 = ys[0];
+    for (i = 1; i < 4; i++)
+    {
+        x0 = min( x0, xs[i] ); x1 = max( x1, xs[i] );
+        y0 = min( y0, ys[i] ); y1 = max( y1, ys[i] );
+    }
+    out.left = floorf( x0 ); out.top = floorf( y0 ); out.right = ceilf( x1 ); out.bottom = ceilf( y1 );
+    return out;
 }
 
 static void paint_emit( const struct paint_op *in )
@@ -445,18 +509,45 @@ static void paint_emit( const struct paint_op *in )
     const struct paint_op *op = in;
     RECT covered;
 
-    if (paint_xf.active)
+    if (paint_xf.active && paint_xf.quarter < 0)
+    {
+        RECT clip;
+        xop = *in;
+        xop.dest = xf_bbox( &paint_xf, &in->dest );
+        clip = xf_bbox( &paint_xf, &in->clip );
+        if (!IntersectRect( &xop.clip, &clip, &paint_rot_clip )) SetRectEmpty( &xop.clip );
+        xop.quarter = 0;
+        /* a stretched surface too: its DIB's bits are sampled the same way (a History chevron's glyph drew
+         * unrotated, as "^", in the first frame of its turn) */
+        if (in->kind == OP_BLEND || in->kind == OP_FILL || in->kind == OP_STRETCH)
+        {
+            xop.affine = TRUE;
+            xop.odest = in->dest;
+            xop.xf[0] = paint_xf.m11; xop.xf[1] = paint_xf.m12; xop.xf[2] = paint_xf.m21;
+            xop.xf[3] = paint_xf.m22; xop.xf[4] = paint_xf.dx; xop.xf[5] = paint_xf.dy;
+            xop.opaque = FALSE;
+        }
+        op = &xop;
+    }
+    else if (paint_xf.active)
     {
         xop = *in;
         xop.dest = xf_rect( &paint_xf, &in->dest );
         xop.clip = xf_rect( &paint_xf, &in->clip );
         IntersectRect( &xop.clip, &xop.clip, &paint_rot_clip );
         xop.quarter = (in->quarter + paint_xf.quarter) & 3;
+        xop.affine = FALSE;
+        op = &xop;
+    }
+    else
+    {
+        xop = *in;
+        xop.affine = FALSE;   /* ops are often built on the stack field by field */
         op = &xop;
     }
     if (TRACE_ON(dcompops))
-        TRACE_(dcompops)( "op %d dest %s clip %s alpha %u quarter %u\n", op->kind, wine_dbgstr_rect( &op->dest ),
-                          wine_dbgstr_rect( &op->clip ), op->alpha, op->quarter );
+        TRACE_(dcompops)( "op %d dest %s clip %s alpha %u quarter %u%s\n", op->kind, wine_dbgstr_rect( &op->dest ),
+                          wine_dbgstr_rect( &op->clip ), op->alpha, op->quarter, op->swapchain ? " swapchain" : "" );
     if (paint_rect_empty( &op->dest ) || !IntersectRect( &covered, &op->dest, &op->clip )) return;
     if (list->count == list->capacity)
     {
@@ -497,6 +588,85 @@ static void raster_blend_turned( BYTE *target, int target_w, const struct paint_
             out[0] = DIV255( in[0] * op->alpha ) + DIV255( out[0] * inv );
             out[1] = DIV255( in[1] * op->alpha ) + DIV255( out[1] * inv );
             out[2] = DIV255( in[2] * op->alpha ) + DIV255( out[2] * inv );
+            out[3] = 255;
+        }
+    }
+}
+
+/* The source position of target pixel (px, py) under an affine op, in the op's unrotated rectangle. */
+static BOOL affine_source( const struct paint_op *op, int px, int py, float *x, float *y )
+{
+    float det = op->xf[0] * op->xf[3] - op->xf[1] * op->xf[2], tx, ty;
+    if (fabsf( det ) < 1e-9f) return FALSE;
+    tx = px + 0.5f - op->xf[4];
+    ty = py + 0.5f - op->xf[5];
+    *x = (tx * op->xf[3] - ty * op->xf[2]) / det;
+    *y = (ty * op->xf[0] - tx * op->xf[1]) / det;
+    return TRUE;
+}
+
+/* OP_BLEND under a general rotation: bilinear samples of the premultiplied source, rows stride bytes apart */
+static void raster_blend_affine( BYTE *target, int target_w, const struct paint_op *op, const RECT *clip, int stride )
+{
+    int ow = op->odest.right - op->odest.left, oh = op->odest.bottom - op->odest.top, px, py;
+    float kx = ow > 0 ? (float)op->src_w / ow : 1.0f, ky = oh > 0 ? (float)op->src_h / oh : 1.0f;
+
+    for (py = clip->top; py < clip->bottom; py++)
+    {
+        BYTE *out = target + (size_t)py * target_w * 4 + (size_t)clip->left * 4;
+        for (px = clip->left; px < clip->right; px++, out += 4)
+        {
+            float lx, ly, u, v, fu, fv, acc[4] = { 0 };
+            int iu, iv, k, j;
+            unsigned int a, inv;
+
+            if (!affine_source( op, px, py, &lx, &ly )) continue;
+            u = (lx - op->odest.left) * kx - 0.5f;
+            v = (ly - op->odest.top) * ky - 0.5f;
+            if (u < -1.0f || v < -1.0f || u >= op->src_w || v >= op->src_h) continue;
+            iu = (int)floorf( u ); iv = (int)floorf( v );
+            fu = u - iu; fv = v - iv;
+            for (j = 0; j < 2; j++)
+                for (k = 0; k < 2; k++)
+                {
+                    int sx = iu + k, sy = iv + j;
+                    float wgt = (k ? fu : 1.0f - fu) * (j ? fv : 1.0f - fv);
+                    const BYTE *in;
+                    if (sx < 0 || sy < 0 || sx >= op->src_w || sy >= op->src_h || wgt <= 0.0f) continue;
+                    in = op->bits + (size_t)sy * stride + (size_t)sx * 4;
+                    acc[0] += in[0] * wgt; acc[1] += in[1] * wgt; acc[2] += in[2] * wgt; acc[3] += in[3] * wgt;
+                }
+            a = DIV255( (unsigned int)(acc[3] + 0.5f) * op->alpha );
+            if (!a) continue;
+            inv = 255 - a;
+            out[0] = DIV255( (unsigned int)(acc[0] + 0.5f) * op->alpha ) + DIV255( out[0] * inv );
+            out[1] = DIV255( (unsigned int)(acc[1] + 0.5f) * op->alpha ) + DIV255( out[1] * inv );
+            out[2] = DIV255( (unsigned int)(acc[2] + 0.5f) * op->alpha ) + DIV255( out[2] * inv );
+            out[3] = 255;
+        }
+    }
+}
+
+/* OP_FILL under a general rotation: the pixels whose centre falls inside the turned rectangle */
+static void raster_fill_affine( BYTE *target, int target_w, const struct paint_op *op, const RECT *clip )
+{
+    unsigned int a = DIV255( op->color.A * op->alpha ), inv, r, g, b;
+    int px, py;
+
+    if (!a) return;
+    inv = 255 - a;
+    r = DIV255( op->color.R * a ); g = DIV255( op->color.G * a ); b = DIV255( op->color.B * a );
+    for (py = clip->top; py < clip->bottom; py++)
+    {
+        BYTE *out = target + (size_t)py * target_w * 4 + (size_t)clip->left * 4;
+        for (px = clip->left; px < clip->right; px++, out += 4)
+        {
+            float lx, ly;
+            if (!affine_source( op, px, py, &lx, &ly )) continue;
+            if (lx < op->odest.left || ly < op->odest.top || lx >= op->odest.right || ly >= op->odest.bottom) continue;
+            out[0] = b + DIV255( out[0] * inv );
+            out[1] = g + DIV255( out[1] * inv );
+            out[2] = r + DIV255( out[2] * inv );
             out[3] = 255;
         }
     }
@@ -649,23 +819,31 @@ static void soft_stretch( int x, int y, int dest_w, int dest_h, HBITMAP bmp, int
  * list built, on the thread that paints - the XAML UI thread, where the input hook runs too. */
 BOOL dcomp_point_on_swapchain( POINT pt, POINT *origin )
 {
-    const struct paint_list *list = &paint_lists[paint_current];
+    const struct paint_list *list;
+    BOOL ret = FALSE;
     unsigned int i;
     RECT r;
 
-    for (i = list->count; i > 0; i--)
+    AcquireSRWLockShared( &hit_lock );
+    if (paint_complete >= 0)
     {
-        const struct paint_op *op = &list->ops[i - 1];
-        if (!IntersectRect( &r, &op->dest, &op->clip ) || !PtInRect( &r, pt )) continue;
-        if (op->kind == OP_FILL && !DIV255( op->color.A * op->alpha )) continue;
-        if (op->swapchain && origin)
+        list = &paint_lists[paint_complete];
+        for (i = list->count; i > 0; i--)
         {
-            origin->x = op->dest.left;
-            origin->y = op->dest.top;
+            const struct paint_op *op = &list->ops[i - 1];
+            if (!IntersectRect( &r, &op->dest, &op->clip ) || !PtInRect( &r, pt )) continue;
+            if (op->kind == OP_FILL && !DIV255( op->color.A * op->alpha )) continue;
+            if (op->swapchain && origin)
+            {
+                origin->x = op->dest.left;
+                origin->y = op->dest.top;
+            }
+            ret = op->swapchain;
+            break;
         }
-        return op->swapchain;
     }
-    return FALSE;
+    ReleaseSRWLockShared( &hit_lock );
+    return ret;
 }
 
 static BOOL paint_op_equal( const struct paint_op *a, const struct paint_op *b )
@@ -673,7 +851,8 @@ static BOOL paint_op_equal( const struct paint_op *a, const struct paint_op *b )
     return a->kind == b->kind && EqualRect( &a->dest, &b->dest ) && EqualRect( &a->clip, &b->clip ) &&
            a->alpha == b->alpha && a->key == b->key && a->gen == b->gen && a->bits == b->bits && a->bmp == b->bmp &&
            a->src_w == b->src_w && a->src_h == b->src_h && a->opaque == b->opaque && a->quarter == b->quarter &&
-           !memcmp( &a->color, &b->color, sizeof(a->color) );
+           !memcmp( &a->color, &b->color, sizeof(a->color) ) && a->affine == b->affine &&
+           (!a->affine || (EqualRect( &a->odest, &b->odest ) && !memcmp( a->xf, b->xf, sizeof(a->xf) )));
 }
 
 #define PAINT_DAMAGE_RECTS 16
@@ -755,10 +934,12 @@ static void raster_ops( HDC dc, BYTE *target, int target_w, const struct paint_l
         switch (op->kind)
         {
         case OP_FILL:
-            raster_fill( target, target_w, &r, op->color, op->alpha );
+            if (op->affine) raster_fill_affine( target, target_w, op, &r );
+            else raster_fill( target, target_w, &r, op->color, op->alpha );
             break;
         case OP_BLEND:
-            if (op->quarter) raster_blend_turned( target, target_w, op, &r );
+            if (op->affine) raster_blend_affine( target, target_w, op, &r, op->src_w * 4 );
+            else if (op->quarter) raster_blend_turned( target, target_w, op, &r );
             else raster_blend( target, target_w, op->dest.left, op->dest.top, op->bits, op->src_w * 4, &r, op->alpha, op->opaque );
             break;
         case OP_HIT:
@@ -767,8 +948,28 @@ static void raster_ops( HDC dc, BYTE *target, int target_w, const struct paint_l
         {
             BLENDFUNCTION blend = { AC_SRC_OVER, 0, op->alpha, AC_SRC_ALPHA };
             static HRGN region;
-            HDC mem = scratch_dc( dc );
+            HDC mem;
             HBITMAP old;
+            DIBSECTION dib;
+            if (op->affine)
+            {
+                /* under a general rotation: the DIB's premultiplied, top-down bits as an affine blend */
+                struct paint_op blend_op = *op;
+                /* every DIB made here is top-down (GetObject reports a positive height for those too) */
+                if (GetObjectW( op->bmp, sizeof(dib), &dib ) == sizeof(dib) && dib.dsBm.bmBits &&
+                    dib.dsBm.bmBitsPixel == 32 &&
+                    dib.dsBm.bmWidth >= op->src_w && dib.dsBm.bmHeight >= op->src_h)
+                {
+                    blend_op.kind = OP_BLEND;
+                    blend_op.bits = dib.dsBm.bmBits;
+                    raster_blend_affine( target, target_w, &blend_op, &r, dib.dsBm.bmWidthBytes );
+                }
+                else TRACE_(dcompops)( "turned stretch of %p (%ux%u) not drawn: %d bpp, height %d, %dx%d\n", op->bmp,
+                                       op->src_w, op->src_h, dib.dsBm.bmBitsPixel, (int)dib.dsBmih.biHeight,
+                                       (int)dib.dsBm.bmWidth, (int)dib.dsBm.bmHeight );
+                break;
+            }
+            mem = scratch_dc( dc );
             if (!region) region = CreateRectRgn( 0, 0, 0, 0 );
             SetRectRgn( region, r.left, r.top, r.right, r.bottom );
             SelectClipRgn( dc, region );
@@ -956,6 +1157,7 @@ static void present_desktop_hwnd( HWND hwnd )
 
 /* The shortest time between two frames, one refresh of the display. A fixed 15 ms held a 175 Hz display to ~66
  * frames a second while the swap chain presented 175. */
+static void live_anims_tick( void );
 static UINT paint_interval( void )
 {
     static UINT interval;
@@ -985,6 +1187,8 @@ static void present_desktop_hwnd_locked( HWND hwnd )
 
     if (!hwnd || !IsWindow( hwnd )) return;
     if (TRACE_ON(dcompperf)) { perf_report(); perf.requests++; }
+    live_anims_tick();
+    generation = scene_generation;
     /* Repainting an unchanged scene reproduces the previous frame bit for bit (checked by hashing every such
      * frame over typing, hover, graph drag/zoom and resize runs), so only a new generation or a new window
      * size paints. It used to repaint for two seconds after every change, three frames in four. */
@@ -1091,6 +1295,9 @@ static void present_desktop_hwnd_locked( HWND hwnd )
         present_dcomp_visuals( mem );
         walk_owner = 0;
         ReleaseSRWLockExclusive( &walk_lock );
+        AcquireSRWLockExclusive( &hit_lock );
+        paint_complete = paint_current;
+        ReleaseSRWLockExclusive( &hit_lock );
         if (timing) QueryPerformanceCounter( &t1 );
 
         n_old = previous->count;
@@ -1381,6 +1588,15 @@ static const void *probe_vtbl[PROBE_SLOTS] =
     probe_slot_36, probe_slot_37, probe_slot_38, probe_slot_39,
 };
 
+/* An easing function, as a key frame keeps it. Composition's own shapes: cubic bezier (the one XAML's theme
+ * transitions use), and the storyboard easings XAML creates through ICompositorPrivate5; bounce and elastic
+ * run linear. mode: CompositionEasingFunctionMode In 0, Out 1, InOut 2. */
+enum ease_type { EASE_LINEAR, EASE_BEZIER, EASE_POWER, EASE_EXPONENTIAL, EASE_SINE, EASE_CIRCLE, EASE_BACK, EASE_STEP };
+struct kf_ease { enum ease_type type; int mode; float a, b, c, d; };
+static void easing_register( void *object, enum ease_type type, int mode, float a, float b );
+static void easing_lookup( void *function, struct kf_ease *ease );
+static float ease_apply( const struct kf_ease *ease, float t );
+
 /* ICompositorPrivate5 {509eab63} is CompositorCommon::DCPrivate (dcomp.pdb), an IUnknown-based
  * interface: 3 CreateBackEasingFunction, 4 CreateBounceEasingFunction, 5 CreateCircleEasingFunction,
  * 6 CreateCompositionSurfaceForDCompositionSurface, 7 CreateElasticEasingFunction,
@@ -1389,17 +1605,28 @@ static const void *probe_vtbl[PROBE_SLOTS] =
  * 12 OpenSharedManipulationTransformFromHandle, 13 CreateSineEasingFunction, 14 OpenSharedLightFromHandle,
  * 15 SetMaximumExpressionLength. XAML turns storyboard easings (quartic, quintic, sine, ...) into
  * these; refusing them stowed an E_NOTIMPL per animation and dropped the animation. The easing is
- * returned as a recording object, since key frames are not interpolated with easing here. */
+ * returned as a recording object, its shape registered for the key frames it is inserted with. */
 static HRESULT create_comp_object( const char *kind, void **out );
+static HRESULT create_easing( const char *kind, int mode, void **out );
+static HRESULT create_easing_with( const char *kind, enum ease_type type, int mode, float a, float b, void **out )
+{
+    HRESULT hr = create_easing( kind, mode, out );
+    if (SUCCEEDED(hr)) easing_register( *out, type, mode, a, b );
+    return hr;
+}
 static HRESULT create_easing( const char *kind, int mode, void **out )
 {
+    HRESULT hr;
+
     TRACE( "%s mode %d.\n", kind, mode );
     if (!out) return E_POINTER;
-    return create_comp_object( kind, out );
+    /* registered as linear first: a new object may reuse a freed easing's address */
+    if (SUCCEEDED(hr = create_comp_object( kind, out ))) easing_register( *out, EASE_LINEAR, mode, 0.0f, 0.0f );
+    return hr;
 }
 static HRESULT WINAPI dcprivate_CreateBackEasingFunction( void *iface, int mode, float amplitude, void **out )
 {
-    return create_easing( "BackEasingFunction", mode, out );
+    return create_easing_with( "BackEasingFunction", EASE_BACK, mode, amplitude, 0.0f, out );
 }
 static HRESULT WINAPI dcprivate_CreateBounceEasingFunction( void *iface, int mode, int bounces, float bounciness, void **out )
 {
@@ -1407,7 +1634,7 @@ static HRESULT WINAPI dcprivate_CreateBounceEasingFunction( void *iface, int mod
 }
 static HRESULT WINAPI dcprivate_CreateCircleEasingFunction( void *iface, int mode, void **out )
 {
-    return create_easing( "CircleEasingFunction", mode, out );
+    return create_easing_with( "CircleEasingFunction", EASE_CIRCLE, mode, 0.0f, 0.0f, out );
 }
 static HRESULT WINAPI dcprivate_CreateElasticEasingFunction( void *iface, int mode, int oscillations, float springiness, void **out )
 {
@@ -1415,15 +1642,15 @@ static HRESULT WINAPI dcprivate_CreateElasticEasingFunction( void *iface, int mo
 }
 static HRESULT WINAPI dcprivate_CreateExponentialEasingFunction( void *iface, int mode, float exponent, void **out )
 {
-    return create_easing( "ExponentialEasingFunction", mode, out );
+    return create_easing_with( "ExponentialEasingFunction", EASE_EXPONENTIAL, mode, exponent, 0.0f, out );
 }
 static HRESULT WINAPI dcprivate_CreatePowerEasingFunction( void *iface, int mode, float power, void **out )
 {
-    return create_easing( "PowerEasingFunction", mode, out );
+    return create_easing_with( "PowerEasingFunction", EASE_POWER, mode, power, 0.0f, out );
 }
 static HRESULT WINAPI dcprivate_CreateSineEasingFunction( void *iface, int mode, void **out )
 {
-    return create_easing( "SineEasingFunction", mode, out );
+    return create_easing_with( "SineEasingFunction", EASE_SINE, mode, 0.0f, 0.0f, out );
 }
 static HRESULT WINAPI dcprivate_SetMaximumExpressionLength( void *iface, UINT length )
 {
@@ -1740,7 +1967,7 @@ struct expr_animation
     IUnknown *refs[EXPR_REFS];
     WCHAR ref_names[EXPR_REFS][32];
     unsigned int ref_count;
-    WCHAR expression[256];
+    WCHAR expression[1024];    /* XAML's RotateTransform expression is ~280 characters; 256 cut it and it never evaluated */
     struct propset_value *params;   /* Set*Parameter values, referenced by bare name in the expression */
     unsigned int param_count;
     ICompositionPropertySet *properties; /* Properties: XAML binds it as "PS" and inserts X, Y, CenterX ... */
@@ -1799,7 +2026,8 @@ struct kf_animation
     float last_sampled;
     BOOL sampled_once;
     /* every key frame, for sampling at a controller's progress */
-    struct kf_key { float key; union { Color color; float scalar; boolean flag; Vector2 vector2; Vector3 vector3; } u; } keys[KF_KEYS];
+    struct kf_key { float key; union { Color color; float scalar; boolean flag; Vector2 vector2; Vector3 vector3; } u;
+                    struct kf_ease ease; } keys[KF_KEYS];   /* ease: the segment from the previous key to this one */
     const void **partner_vtbl;  /* ICompositionKeyFrameAnimationPartner, see kf_partner_vtbl */
     float iteration_count;
     const void **kfa_vtbl;      /* IKeyFrameAnimation, see kfa_vtbl */
@@ -1808,6 +2036,7 @@ struct kf_animation
     INT64 delay_time, duration; /* TimeSpan, 100 ns units */
     INT32 iteration_behavior, stop_behavior, direction, delay_behavior;
     INT32 iterations;
+    void *timeline;             /* XAML's clock for it (an anim_instance, SetCustomTimeline), or NULL */
 };
 static struct kf_animation *kf_animation_from( void *animation );
 static BOOL kf_sample( struct kf_animation *kf, float progress, struct kf_key *out );
@@ -5491,6 +5720,7 @@ static HRESULT WINAPI dcv_object_StopAnimation( void *iface, HSTRING name )
     const WCHAR *prop = WindowsGetStringRawBuffer( name, NULL );
 
     scene_changed();
+    TRACE_(dcompanim)( "dcomp visual %p stop %s\n", v, debugstr_w( prop ) );
     if (prop && !wcsicmp( prop, L"Opacity" ) && v->opacity_expr)
     {
         /* the animation stops at its current value */
@@ -6488,6 +6718,7 @@ static HRESULT WINAPI dcv_ivisual_put_Clip( void *iface, IUnknown *value )
     struct dcomp_visual *v = impl_from_dcv_ivisual( iface );
 
     TRACE( "%p clip %p.\n", v, value );
+    TRACE_(dcomptree)( "dcomp %p clip %p %s\n", v, value, value ? (clip_from_any( value ) ? "rect" : "other") : "none" );
     if (value) IUnknown_AddRef( value );
     if (v->clip_object) IUnknown_Release( v->clip_object );
     v->clip_object = value;
@@ -6714,6 +6945,10 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
     int saved = 0, quarter = -1;
     RECT saved_clip, rot_saved_clip, rot_saved_outer;
     struct paint_xform rot_saved_xf;
+    BOOL turned = FALSE, have_expr = FALSE;
+    float rot_c = 1.0f, rot_s = 0.0f;   /* the subtree's rotation, any angle */
+    float t11 = 0.0f, t12 = 0.0f, t21 = 0.0f, t22 = 0.0f, t41 = 0.0f, t42 = 0.0f;   /* the static TransformMatrix */
+    D2D_MATRIX_3X2_F em;
 
     /* SetTransformParent: this visual lives in its transform parent's space, not in the tree parent's. The
      * parent may paint later in the frame; its last recorded space is used, and a change repaints. */
@@ -6724,23 +6959,34 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
         sx = v->transform_parent->local_sx;
         sy = v->transform_parent->local_sy;
     }
-    x = ox + (v->offset_x + v->transform_x + v->transform4.M41) * sx;
-    y = oy + (v->offset_y + v->transform_y + v->transform4.M42) * sy;
-    /* a quarter-turn TransformMatrix (XAML's RotateTransform of a chevron): scale by its magnitude, turn the
-     * subtree below */
-    if (v->transform4.M12 != 0.0f || v->transform4.M21 != 0.0f || v->transform4.M11 < 0.0f || v->transform4.M22 < 0.0f)
-        quarter = matrix_quarter( v->transform4.M11, v->transform4.M12, v->transform4.M21, v->transform4.M22 );
-    if (quarter > 0)
+    /* An expression bound to TransformMatrix replaces the static matrix while it runs, as an animation replaces
+     * any property's value. Applying both turned a History row's chevron twice after it collapsed: XAML sets the
+     * static rotation, then binds the same rotation to its RotateAngle animation. */
+    if (v->transform_expr)
+        have_expr = expr_evaluate_matrix( v->transform_expr, v->properties,
+                                          v->manip && v->manip->has_matrix ? &v->manip->matrix : NULL, &em );
+    if (!have_expr)
     {
-        float mag = sqrtf( v->transform4.M11 * v->transform4.M11 + v->transform4.M12 * v->transform4.M12 );
+        t11 = v->transform4.M11; t12 = v->transform4.M12; t21 = v->transform4.M21; t22 = v->transform4.M22;
+        t41 = v->transform4.M41; t42 = v->transform4.M42;
+    }
+    x = ox + (v->offset_x + v->transform_x + t41) * sx;
+    y = oy + (v->offset_y + v->transform_y + t42) * sy;
+    /* a rotating TransformMatrix (XAML's RotateTransform of a chevron): scale by its magnitude, turn the subtree
+     * below by its angle */
+    if (t12 != 0.0f || t21 != 0.0f || t11 < 0.0f || t22 < 0.0f)
+        turned = matrix_rotation( t11, t12, t21, t22, &rot_c, &rot_s );
+    if (turned)
+    {
+        float mag = sqrtf( t11 * t11 + t12 * t12 );
         csx = sx * (v->scale_x != 0.0f ? v->scale_x : 1.0f) * mag;
         csy = sy * (v->scale_y != 0.0f ? v->scale_y : 1.0f) * mag;
     }
     else
     {
         /* the SetTransform matrix and XAML's IVisual TransformMatrix (an identity M11/M22 of 0 means unset) */
-        csx = sx * (v->scale_x != 0.0f ? v->scale_x : 1.0f) * (v->transform4.M11 != 0.0f ? v->transform4.M11 : 1.0f);
-        csy = sy * (v->scale_y != 0.0f ? v->scale_y : 1.0f) * (v->transform4.M22 != 0.0f ? v->transform4.M22 : 1.0f);
+        csx = sx * (v->scale_x != 0.0f ? v->scale_x : 1.0f) * (t11 != 0.0f ? t11 : 1.0f);
+        csy = sy * (v->scale_y != 0.0f ? v->scale_y : 1.0f) * (t22 != 0.0f ? t22 : 1.0f);
     }
     w = v->width * csx, h = v->height * csy;
 
@@ -6766,28 +7012,33 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
     }
     if (v->transform_expr)
     {
-        D2D_MATRIX_3X2_F m;
-        if (expr_evaluate_matrix( v->transform_expr, v->properties,
-                                  v->manip && v->manip->has_matrix ? &v->manip->matrix : NULL, &m ))
+        D2D_MATRIX_3X2_F m = em;
+        if (have_expr)
         {
             if (TRACE_ON(dcompanim) && wcsstr( v->transform_expr->expression, L"prependVisual" ))
                 TRACE_(dcompanim)( "visual %p offset %g,%g %s -> %g %g %g %g %g %g\n", v, v->offset_x, v->offset_y,
                                    debugstr_w( v->transform_expr->expression ), m._11, m._12, m._21, m._22, m._31, m._32 );
-            int q = (m._12 != 0.0f || m._21 != 0.0f || m._11 < 0.0f || m._22 < 0.0f) ?
-                    matrix_quarter( m._11, m._12, m._21, m._22 ) : 0;
+            float ec, es;
+            BOOL eturn;
+            TRACE_(dcomptree)( "dcomp %p %s -> %g %g %g %g %g %g\n", v, debugstr_w( v->transform_expr->expression ),
+                               m._11, m._12, m._21, m._22, m._31, m._32 );
+            eturn = (m._12 != 0.0f || m._21 != 0.0f || m._11 < 0.0f || m._22 < 0.0f) &&
+                         matrix_rotation( m._11, m._12, m._21, m._22, &ec, &es );
             x += m._31 * sx;
             y += m._32 * sy;
-            if (q > 0)
+            if (eturn)
             {
-                float mag = sqrtf( m._11 * m._11 + m._12 * m._12 );
+                float mag = sqrtf( m._11 * m._11 + m._12 * m._12 ), c = rot_c, sn = rot_s;
                 csx *= mag;
                 csy *= mag;
-                if (quarter <= 0) quarter = q;
-                else quarter = (quarter + q) & 3;
+                /* the two rotations' angles add */
+                rot_c = c * ec - sn * es;
+                rot_s = c * es + sn * ec;
+                turned = TRUE;
             }
             else
             {
-                /* other angles are not drawn turned: the painter positions and stretches */
+                /* a matrix that is no rotation (a skew, a non-uniform flip): the painter positions and stretches */
                 csx *= m._11;
                 csy *= m._22;
             }
@@ -6837,12 +7088,18 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
         xaml_content_branch = paint_branch;
     }
 
-    if (quarter > 0)
+    if (turned)
+    {
+        quarter = matrix_quarter( rot_c, rot_s, -rot_s, rot_c );
+        if (quarter == 0) turned = FALSE;
+    }
+    if (turned)
     {
         rot_saved_xf = paint_xf;
         rot_saved_outer = paint_rot_clip;
         rot_saved_clip = paint_clip;
-        paint_enter_rotation( quarter, x, y );
+        if (quarter > 0) paint_enter_rotation( quarter, x, y );
+        else paint_enter_turn( rot_c, rot_s, x, y );
     }
     saved_clip = paint_clip;
     if (v->has_clip)
@@ -6853,7 +7110,7 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
         if (!IntersectRect( &paint_clip, &paint_clip, &r )) SetRectEmpty( &paint_clip );
         saved = 1;
     }
-    else if (v->clip_object) saved = apply_inset_clip( hdc, v->clip_object, x, y, w, h );
+    else if (v->clip_object) saved = apply_clip_object( hdc, v->clip_object, x, y, w, h, csx, csy );
 
     /* Content set through IDCompositionVisual::SetContent is a surface XAML drew into
      * (DCompVisual::SetContentInternal); paint the texture itself. It carries its own size, and
@@ -6874,7 +7131,7 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
         else if (v->children[i].dcv) paint_dcomp_visual( hdc, v->children[i].dcv, x, y, csx, csy );
     }
     if (saved) paint_clip = saved_clip;
-    if (quarter > 0)
+    if (turned)
     {
         paint_xf = rot_saved_xf;
         paint_rot_clip = rot_saved_outer;
@@ -8699,9 +8956,12 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
            impl->relative_size.X, impl->relative_size.Y, impl->visible, impl->opacity, impl->collection.count );
     /* IsVisible = false hides the whole subtree (XAML collapses e.g. the NavigationView back button's
      * AnimatedIcon this way); so does zero opacity. */
-    TRACE_(dcomptree)( "visit public %p size %gx%g at %g,%g clip %s children %u (scale %g,%g parent scale %g,%g)\n", impl,
+    TRACE_(dcomptree)( "visit public %p size %gx%g at %g,%g clip %s children %u (scale %g,%g parent scale %g,%g rot %g/%g deg "
+                       "m %g %g %g %g orient %g %g %g %g center %g,%g anchor %g,%g)\n", impl,
                        width, height, x, y, wine_dbgstr_rect( &paint_clip ), impl->collection.count, impl->scale.X, impl->scale.Y,
-                       sx, sy );
+                       sx, sy, impl->rotation, impl->rotation_deg, impl->transform.M11, impl->transform.M12, impl->transform.M21,
+                       impl->transform.M22, impl->orientation.X, impl->orientation.Y, impl->orientation.Z, impl->orientation.W,
+                       impl->center.X, impl->center.Y, impl->anchor.X, impl->anchor.Y );
     if (!impl->visible || impl->opacity <= 0.01f)
     {
         TRACE_(dcompops)( "public %p %s, size %gx%g, %u children\n", impl, impl->visible ? "transparent" : "hidden",
@@ -8723,7 +8983,7 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
         turned = TRUE;
     }
     if (!xaml_island_container && impl->kind != VISUAL_SPRITE) xaml_island_container = impl;
-    saved = apply_inset_clip( hdc, impl->clip, x, y, width, height );
+    saved = apply_clip_object( hdc, impl->clip, x, y, width, height, csx, csy );
     if (impl->kind != VISUAL_SPRITE && (width < 0.5f || height < 0.5f))
     {
         clip = paint_clip;
@@ -9186,6 +9446,7 @@ static HRESULT WINAPI ivisual_put_Clip( IVisual *iface, ICompositionClip *value 
 {
     scene_changed();
     struct visual *impl = impl_from_ivisual( iface );
+    TRACE_(dcomptree)( "public %p clip %p %s\n", impl, value, value ? (clip_from_any( value ) ? "rect" : "other") : "none" );
     if (value) ICompositionClip_AddRef( value );
     if (impl->clip) ICompositionClip_Release( impl->clip );
     impl->clip = value;
@@ -9738,6 +9999,163 @@ static ULONG WINAPI propset_partner_Release( void *iface )
     }
     return ref;
 }
+/* Key frame animations of property set values, played. dcomp used to apply an animation's end value at once:
+ * a chevron's RotateTransform (90 -> 180 degrees) jumped, a menu's slide-in and every cross-fade popped. A
+ * started animation now writes its first key frame, and each paint samples it at its time - XAML's own clock
+ * when it gave one (SetCustomTimeline), else the time since it started - until it ends or XAML sets the value
+ * itself. While any is running the painter keeps asking for frames. */
+struct live_anim
+{
+    struct property_set *set;
+    WCHAR name[32];
+    struct kf_animation *kf;
+    LARGE_INTEGER start;
+};
+static struct live_anim live_anims[64];
+static unsigned int live_anim_count;
+static CRITICAL_SECTION live_anim_cs;
+static CRITICAL_SECTION_DEBUG live_anim_cs_debug =
+{
+    0, 0, &live_anim_cs,
+    { &live_anim_cs_debug.ProcessLocksList, &live_anim_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": live_anim_cs") }
+};
+static CRITICAL_SECTION live_anim_cs = { &live_anim_cs_debug, -1, 0, 0, 0, 0 };
+
+/* a->kf is a private snapshot, taken when the animation starts, as StartAnimation copies the animation on
+ * Windows: later changes to the animation object do not reach a running animation, and the object itself
+ * is not kept alive by it. */
+static void live_anim_release( struct live_anim *a )
+{
+    ICompositionPropertySet_Release( &a->set->ICompositionPropertySet_iface );
+    if (a->kf->timeline) IUnknown_Release( (IUnknown *)a->kf->timeline );
+    free( a->kf );
+}
+
+/* XAML set the value itself, or started another animation on it */
+static void live_anim_cancel( struct property_set *set, const WCHAR *name )
+{
+    struct live_anim gone[4];
+    unsigned int i, n = 0;
+
+    EnterCriticalSection( &live_anim_cs );
+    for (i = 0; i < live_anim_count;)
+    {
+        if (live_anims[i].set == set && !wcsicmp( live_anims[i].name, name ) && n < ARRAY_SIZE(gone))
+        {
+            gone[n++] = live_anims[i];
+            live_anims[i] = live_anims[--live_anim_count];
+        }
+        else i++;
+    }
+    LeaveCriticalSection( &live_anim_cs );
+    for (i = 0; i < n; i++) live_anim_release( &gone[i] );
+}
+
+/* the time into the animation, in seconds, and its progress 0..1; FALSE once it has ended */
+static BOOL live_anim_progress( struct live_anim *a, float *progress )
+{
+    double t, duration = a->kf->duration / 1e7, delay = a->kf->delay_time / 1e7;
+    LARGE_INTEGER now, freq;
+
+    if (a->kf->timeline) t = anim_instance_now( a->kf->timeline );
+    else
+    {
+        QueryPerformanceCounter( &now );
+        QueryPerformanceFrequency( &freq );
+        t = (double)(now.QuadPart - a->start.QuadPart) / freq.QuadPart;
+    }
+    t -= delay;
+    if (duration <= 0.0) { *progress = 1.0f; return FALSE; }
+    if (t < 0.0) { *progress = 0.0f; return TRUE; }
+    if (a->kf->iteration_behavior == 1)   /* Forever */
+    {
+        *progress = (float)fmod( t / duration, 1.0 );
+        return TRUE;
+    }
+    if (a->kf->iterations > 1 && t / duration < a->kf->iterations)
+    {
+        *progress = (float)fmod( t / duration, 1.0 );
+        return TRUE;
+    }
+    *progress = (float)min( t / duration, 1.0 );
+    return t < duration;
+}
+
+static void live_anim_apply( struct live_anim *a, float progress )
+{
+    struct kf_key key;
+    unsigned int i;
+
+    if (!kf_sample( a->kf, progress, &key )) return;
+    for (i = 0; i < a->set->value_count; i++)
+        if (!wcsicmp( a->set->values[i].name, a->name ) && a->set->values[i].type == PROP_SCALAR)
+        {
+            a->set->values[i].u.scalar = key.u.scalar;
+            break;
+        }
+}
+
+static UINT paint_interval( void );
+static void scene_dirty( void );
+static void request_repaint( DWORD delay );
+
+/* painter, before a frame: advance every running animation */
+static void live_anims_tick( void )
+{
+    struct live_anim done[16];
+    unsigned int i, n = 0;
+    BOOL running = FALSE;
+    float progress;
+
+    if (!live_anim_count) return;
+    EnterCriticalSection( &live_anim_cs );
+    for (i = 0; i < live_anim_count;)
+    {
+        BOOL more = live_anim_progress( &live_anims[i], &progress );
+        live_anim_apply( &live_anims[i], progress );
+        if (!more && n < ARRAY_SIZE(done))
+        {
+            done[n++] = live_anims[i];
+            live_anims[i] = live_anims[--live_anim_count];
+            continue;
+        }
+        running = TRUE;
+        i++;
+    }
+    LeaveCriticalSection( &live_anim_cs );
+    for (i = 0; i < n; i++) live_anim_release( &done[i] );
+    scene_dirty();
+    if (running) request_repaint( paint_interval() );
+}
+
+static void live_anim_start( struct property_set *set, const WCHAR *name, struct kf_animation *kf )
+{
+    struct live_anim a;
+    float progress;
+
+    live_anim_cancel( set, name );
+    if (!(a.kf = malloc( sizeof(*a.kf) ))) return;
+    *a.kf = *kf;
+    if (a.kf->timeline) IUnknown_AddRef( (IUnknown *)a.kf->timeline );
+    a.set = set;
+    lstrcpynW( a.name, name, ARRAY_SIZE(a.name) );
+    QueryPerformanceCounter( &a.start );
+    live_anim_progress( &a, &progress );
+    live_anim_apply( &a, progress );
+    ICompositionPropertySet_AddRef( &set->ICompositionPropertySet_iface );
+    EnterCriticalSection( &live_anim_cs );
+    if (live_anim_count < ARRAY_SIZE(live_anims))
+    {
+        live_anims[live_anim_count++] = a;
+        a.kf = NULL;
+    }
+    LeaveCriticalSection( &live_anim_cs );
+    if (a.kf) live_anim_release( &a );
+    scene_dirty();
+    request_repaint( 1 );
+}
+
 static HRESULT WINAPI propset_partner_CreateAnimatorPartner( void *iface, void *source, void *context, void **out )
 {
     struct propset_partner *impl = iface;
@@ -9762,8 +10180,16 @@ static HRESULT WINAPI propset_partner_CreateAnimatorPartner( void *iface, void *
         for (i = 0; i < set->value_count; i++)
             if (!wcsicmp( set->values[i].name, name ) && set->values[i].type == PROP_SCALAR)
             {
-                TRACE( "set %p %s settles at %g.\n", set, debugstr_w( name ), kf->scalar );
-                set->values[i].u.scalar = kf->scalar;
+                if (kf->key_count >= 2 && kf->duration > 0)
+                {
+                    TRACE( "set %p %s animates over %g s.\n", set, debugstr_w( name ), kf->duration / 1e7 );
+                    live_anim_start( set, name, kf );
+                }
+                else
+                {
+                    TRACE( "set %p %s settles at %g.\n", set, debugstr_w( name ), kf->scalar );
+                    set->values[i].u.scalar = kf->scalar;
+                }
                 scene_changed();
                 break;
             }
@@ -9981,6 +10407,7 @@ static HRESULT WINAPI propset_InsertScalar( ICompositionPropertySet *iface, HSTR
     struct propset_value *v = propset_find( set, name, TRUE );
     TRACE( "set %p %s = %g\n", set, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ), value );
     if (!v) return E_OUTOFMEMORY;
+    if (live_anim_count) live_anim_cancel( set, v->name );
     v->type = PROP_SCALAR; v->u.scalar = value;
     return S_OK;
 }
@@ -10681,11 +11108,20 @@ static ULONG WINAPI kf_partner_Release( void *iface )
     struct kf_animation *impl = kf_from_partner( iface );
     return comp_object_Release( &impl->vtbl );
 }
-/* The custom timeline is how XAML drives the animation from its own clock; animations here are
- * sampled at a controller's progress instead, so it is accepted and not used. */
+/* The custom timeline is how XAML drives the animation from its own clock: a property set value animated
+ * through CreateAnimatorPartner is sampled at its time (see live_anims_tick). */
+static const void *anim_instance_vtbl[];
 static HRESULT WINAPI kf_partner_SetCustomTimeline( void *iface, IUnknown *timeline )
 {
-    TRACE( "iface %p, timeline %p.\n", iface, timeline );
+    struct kf_animation *impl = kf_from_partner( iface );
+    TRACE_(dcompanim)( "key frames %p, timeline %p.\n", impl, timeline );
+    /* our own animation instances only: their time is what the property's value is sampled at */
+    if (timeline && *(const void ***)timeline == anim_instance_vtbl)
+    {
+        IUnknown_AddRef( timeline );
+        if (impl->timeline) IUnknown_Release( (IUnknown *)impl->timeline );
+        impl->timeline = timeline;
+    }
     return S_OK;
 }
 static HRESULT WINAPI kf_partner_GetIterationCount( void *iface, float *count )
@@ -10883,6 +11319,16 @@ static BOOL kf_take_key( struct kf_animation *impl, float key )
     impl->has_value = TRUE;
     return TRUE;
 }
+/* the key frame just inserted eases in with this function */
+static void kf_set_easing( struct kf_animation *impl, void *function )
+{
+    if (!impl->key_count || impl->key_count > KF_KEYS) return;
+    easing_lookup( function, &impl->keys[impl->key_count - 1].ease );
+    TRACE_(dcompanim)( "%p key %u eases with %p: type %u mode %d %g %g %g %g\n", impl, impl->key_count - 1, function,
+                       impl->keys[impl->key_count - 1].ease.type, impl->keys[impl->key_count - 1].ease.mode,
+                       impl->keys[impl->key_count - 1].ease.a, impl->keys[impl->key_count - 1].ease.b,
+                       impl->keys[impl->key_count - 1].ease.c, impl->keys[impl->key_count - 1].ease.d );
+}
 /* IColorKeyFrameAnimation */
 static HRESULT WINAPI kf_color_get_InterpolationColorSpace( void *iface, int *value )
 {
@@ -10906,8 +11352,9 @@ static HRESULT WINAPI kf_color_InsertKeyFrame( void *iface, FLOAT key, Color val
 }
 static HRESULT WINAPI kf_color_InsertKeyFrameWithEasingFunction( void *iface, FLOAT key, Color value, void *function )
 {
-    scene_changed();
-    return kf_color_InsertKeyFrame( iface, key, value );
+    HRESULT hr = kf_color_InsertKeyFrame( iface, key, value );
+    kf_set_easing( kf_from_typed( iface ), function );
+    return hr;
 }
 static const void *kf_color_vtbl[] =
 {
@@ -10928,8 +11375,9 @@ static HRESULT WINAPI kf_scalar_InsertKeyFrame( void *iface, FLOAT key, FLOAT va
 }
 static HRESULT WINAPI kf_scalar_InsertKeyFrameWithEasingFunction( void *iface, FLOAT key, FLOAT value, void *function )
 {
-    scene_changed();
-    return kf_scalar_InsertKeyFrame( iface, key, value );
+    HRESULT hr = kf_scalar_InsertKeyFrame( iface, key, value );
+    kf_set_easing( kf_from_typed( iface ), function );
+    return hr;
 }
 static const void *kf_scalar_vtbl[] =
 {
@@ -10965,8 +11413,9 @@ static HRESULT WINAPI kf_vector2_InsertKeyFrame( void *iface, FLOAT key, Vector2
 }
 static HRESULT WINAPI kf_vector2_InsertKeyFrameWithEasingFunction( void *iface, FLOAT key, Vector2 value, void *function )
 {
-    scene_changed();
-    return kf_vector2_InsertKeyFrame( iface, key, value );
+    HRESULT hr = kf_vector2_InsertKeyFrame( iface, key, value );
+    kf_set_easing( kf_from_typed( iface ), function );
+    return hr;
 }
 static const void *kf_vector2_vtbl[] =
 {
@@ -10985,8 +11434,9 @@ static HRESULT WINAPI kf_vector3_InsertKeyFrame( void *iface, FLOAT key, Vector3
 }
 static HRESULT WINAPI kf_vector3_InsertKeyFrameWithEasingFunction( void *iface, FLOAT key, Vector3 value, void *function )
 {
-    scene_changed();
-    return kf_vector3_InsertKeyFrame( iface, key, value );
+    HRESULT hr = kf_vector3_InsertKeyFrame( iface, key, value );
+    kf_set_easing( kf_from_typed( iface ), function );
+    return hr;
 }
 static const void *kf_vector3_vtbl[] =
 {
@@ -11041,32 +11491,54 @@ static HRESULT create_kf_animation( enum kf_kind kind, void **out )
     return S_OK;
 }
 
-/* InsetClip: the one composition clip XAML's ScrollViewer puts on its viewport visuals (and the only kind the
- * painter applies). IInsetClip {1e73e647-84c7-477a-b474-5880e0442e15}; ICompositionClip's centre/scale/offset
- * and ICompositionClip2's anchor point go to the generic recording view and are not applied. */
+/* Composition clips: InsetClip (XAML's ScrollViewer viewports, and a menu's reveal clip) and RectangleClip
+ * (UIElement.Clip and XAML's layout clips). Both carry ICompositionClip2's transform, which XAML animates: a
+ * menu opens with its content sliding down from under the button while the reveal clip's TransformMatrix
+ * (an expression over a translate) slides the other way, so only the part below the button shows. Without
+ * the transform the menu slid in over the title bar.
+ * IInsetClip {1e73e647-84c7-477a-b474-5880e0442e15}: 6-13 BottomInset, LeftInset, RightInset, TopInset.
+ * IRectangleClip {b3e7549e-...}: 6-21 Bottom, BottomLeftRadius, BottomRightRadius, Left, Right, Top,
+ * TopLeftRadius, TopRightRadius (the radii are kept, not drawn).
+ * ICompositionClip2 {5893e069-...}: 6-19 AnchorPoint, CenterPoint, Offset, RotationAngle,
+ * RotationAngleInDegrees, Scale, TransformMatrix (the anchor and rotation are kept, not applied). */
 static const GUID IID_IInsetClip_local = { 0x1e73e647, 0x84c7, 0x477a, { 0xb4, 0x74, 0x58, 0x80, 0xe0, 0x44, 0x2e, 0x15 } };
-struct inset_clip
+static const GUID IID_IRectangleClip_local = { 0xb3e7549e, 0x00b4, 0x5b53, { 0x8b, 0xe8, 0x35, 0x3f, 0x6c, 0x43, 0x31, 0x01 } };
+static const GUID IID_ICompositionClip2_local = { 0x5893e069, 0x3516, 0x40e1, { 0x89, 0xe0, 0x5b, 0xa9, 0x24, 0x92, 0x72, 0x35 } };
+struct comp_clip
 {
     const void **vtbl;          /* generic composition object layout, must stay first */
     const char *kind;
     LONG ref;
-    const void **typed_vtbl;    /* IInsetClip */
+    const void **typed_vtbl;    /* IInsetClip or IRectangleClip */
+    const void **clip2_vtbl;    /* ICompositionClip2 */
+    BOOL inset;                 /* left..bottom are insets from the visual's edges, not sides */
     float left, top, right, bottom;
+    float radii[4];
+    Vector2 anchor, center, offset, scale;
+    float rotation;
+    Matrix3x2 transform;
+    struct expr_animation *transform_expr;   /* TransformMatrix bound to an expression */
 };
-static void *inset_clip_vtbl[COMP_OBJECT_SLOTS];
-static LONG inset_clip_vtbl_ready;
-static const void *inset_clip_typed_vtbl[];
+static void *inset_clip_vtbl[COMP_OBJECT_SLOTS], *rect_clip_vtbl[COMP_OBJECT_SLOTS];
+static LONG inset_clip_vtbl_ready, rect_clip_vtbl_ready;
+static const void *inset_clip_typed_vtbl[], *rect_clip_typed_vtbl[], *clip2_vtbl[];
 
-static struct inset_clip *inset_clip_from_any( void *iface )
+static struct comp_clip *clip_from_any( void *iface )
 {
+    void **vtbl;
+
     if (!iface) return NULL;
-    if (*(void ***)iface == (void **)inset_clip_vtbl) return CONTAINING_RECORD( iface, struct inset_clip, vtbl );
-    if (*(void ***)iface == (void **)inset_clip_typed_vtbl) return CONTAINING_RECORD( iface, struct inset_clip, typed_vtbl );
+    vtbl = *(void ***)iface;
+    if (vtbl == (void **)inset_clip_vtbl || vtbl == (void **)rect_clip_vtbl)
+        return CONTAINING_RECORD( iface, struct comp_clip, vtbl );
+    if (vtbl == (void **)inset_clip_typed_vtbl || vtbl == (void **)rect_clip_typed_vtbl)
+        return CONTAINING_RECORD( iface, struct comp_clip, typed_vtbl );
+    if (vtbl == (void **)clip2_vtbl) return CONTAINING_RECORD( iface, struct comp_clip, clip2_vtbl );
     return NULL;
 }
-static HRESULT WINAPI inset_clip_QueryInterface( void *iface, REFIID iid, void **out )
+static HRESULT WINAPI clip_QueryInterface( void *iface, REFIID iid, void **out )
 {
-    struct inset_clip *impl = CONTAINING_RECORD( iface, struct inset_clip, vtbl );
+    struct comp_clip *impl = CONTAINING_RECORD( iface, struct comp_clip, vtbl );
 
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
     if (IsEqualGUID( iid, &IID_ICompositionObject ))
@@ -11074,28 +11546,50 @@ static HRESULT WINAPI inset_clip_QueryInterface( void *iface, REFIID iid, void *
     if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
         return create_object4_view( (IUnknown *)&impl->vtbl, out );
     InterlockedIncrement( &impl->ref );
-    *out = IsEqualGUID( iid, &IID_IInsetClip_local ) ? (void *)&impl->typed_vtbl : (void *)&impl->vtbl;
+    if (IsEqualGUID( iid, impl->inset ? &IID_IInsetClip_local : &IID_IRectangleClip_local )) *out = &impl->typed_vtbl;
+    else if (IsEqualGUID( iid, &IID_ICompositionClip2_local )) *out = &impl->clip2_vtbl;
+    else *out = &impl->vtbl;
     return S_OK;
 }
-static struct inset_clip *inset_clip_from_typed( void *iface ) { return CONTAINING_RECORD( iface, struct inset_clip, typed_vtbl ); }
-static HRESULT WINAPI inset_typed_QueryInterface( void *iface, REFIID iid, void **out )
+static ULONG WINAPI clip_Release( void *iface )
 {
-    return inset_clip_QueryInterface( &inset_clip_from_typed( iface )->vtbl, iid, out );
+    struct comp_clip *impl = CONTAINING_RECORD( iface, struct comp_clip, vtbl );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+
+    if (!ref)
+    {
+        if (impl->transform_expr) IUnknown_Release( (IUnknown *)&impl->transform_expr->vtbl );
+        free( impl );
+    }
+    return ref;
 }
-static ULONG WINAPI inset_typed_AddRef( void *iface ) { return comp_object_AddRef( &inset_clip_from_typed( iface )->vtbl ); }
-static ULONG WINAPI inset_typed_Release( void *iface ) { return comp_object_Release( &inset_clip_from_typed( iface )->vtbl ); }
-static HRESULT WINAPI inset_typed_GetIids( void *iface, ULONG *count, IID **iids )
+static struct comp_clip *clip_from_typed( void *iface ) { return CONTAINING_RECORD( iface, struct comp_clip, typed_vtbl ); }
+static struct comp_clip *clip_from_clip2( void *iface ) { return CONTAINING_RECORD( iface, struct comp_clip, clip2_vtbl ); }
+static HRESULT WINAPI clip_typed_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return clip_QueryInterface( &clip_from_typed( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI clip_typed_AddRef( void *iface ) { return comp_object_AddRef( &clip_from_typed( iface )->vtbl ); }
+static ULONG WINAPI clip_typed_Release( void *iface ) { return clip_Release( &clip_from_typed( iface )->vtbl ); }
+static HRESULT WINAPI clip2_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return clip_QueryInterface( &clip_from_clip2( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI clip2_AddRef( void *iface ) { return comp_object_AddRef( &clip_from_clip2( iface )->vtbl ); }
+static ULONG WINAPI clip2_Release( void *iface ) { return clip_Release( &clip_from_clip2( iface )->vtbl ); }
+static HRESULT WINAPI clip_GetIids( void *iface, ULONG *count, IID **iids )
 {
     if (!count || !iids) return E_POINTER;
     *count = 0; *iids = NULL;
     return S_OK;
 }
-static HRESULT WINAPI inset_typed_GetRuntimeClassName( void *iface, HSTRING *name )
+static HRESULT WINAPI clip_GetRuntimeClassName( void *iface, HSTRING *name )
 {
-    static const WCHAR nameW[] = L"Windows.UI.Composition.InsetClip";
-    return WindowsCreateString( nameW, ARRAY_SIZE(nameW) - 1, name );
+    struct comp_clip *impl = clip_from_any( iface );
+    const WCHAR *str = impl && impl->inset ? L"Windows.UI.Composition.InsetClip" : L"Windows.UI.Composition.RectangleClip";
+    return WindowsCreateString( str, wcslen( str ), name );
 }
-static HRESULT WINAPI inset_typed_GetTrustLevel( void *iface, TrustLevel *level )
+static HRESULT WINAPI clip_GetTrustLevel( void *iface, TrustLevel *level )
 {
     if (!level) return E_POINTER;
     *level = BaseTrust;
@@ -11103,59 +11597,170 @@ static HRESULT WINAPI inset_typed_GetTrustLevel( void *iface, TrustLevel *level 
 }
 #define INSET_CLIP_PROP( name, field ) \
     static HRESULT WINAPI inset_get_##name( void *iface, FLOAT *value ) \
-    { if (!value) return E_POINTER; *value = inset_clip_from_typed( iface )->field; return S_OK; } \
+    { if (!value) return E_POINTER; *value = clip_from_typed( iface )->field; return S_OK; } \
     static HRESULT WINAPI inset_put_##name( void *iface, FLOAT value ) \
-    { TRACE( "%p %s %g\n", inset_clip_from_typed( iface ), #name, value ); scene_changed(); inset_clip_from_typed( iface )->field = value; return S_OK; }
+    { TRACE( "%p %s %g\n", clip_from_typed( iface ), #name, value ); scene_changed(); clip_from_typed( iface )->field = value; return S_OK; }
 INSET_CLIP_PROP( BottomInset, bottom )
 INSET_CLIP_PROP( LeftInset, left )
 INSET_CLIP_PROP( RightInset, right )
 INSET_CLIP_PROP( TopInset, top )
 static const void *inset_clip_typed_vtbl[] =
 {
-    inset_typed_QueryInterface, inset_typed_AddRef, inset_typed_Release,
-    inset_typed_GetIids, inset_typed_GetRuntimeClassName, inset_typed_GetTrustLevel,
+    clip_typed_QueryInterface, clip_typed_AddRef, clip_typed_Release,
+    clip_GetIids, clip_GetRuntimeClassName, clip_GetTrustLevel,
     inset_get_BottomInset, inset_put_BottomInset, inset_get_LeftInset, inset_put_LeftInset,
     inset_get_RightInset, inset_put_RightInset, inset_get_TopInset, inset_put_TopInset,
 };
-static HRESULT create_inset_clip( float left, float top, float right, float bottom, void **out )
+static HRESULT create_clip( BOOL inset, float left, float top, float right, float bottom, void **out )
 {
-    struct inset_clip *impl;
+    void **vtbl = inset ? inset_clip_vtbl : rect_clip_vtbl;
+    LONG *ready = inset ? &inset_clip_vtbl_ready : &rect_clip_vtbl_ready;
+    struct comp_clip *impl;
     unsigned int i;
 
     if (!out) return E_POINTER;
     *out = NULL;
-    if (!inset_clip_vtbl_ready)
+    if (!*ready)
     {
-        inset_clip_vtbl[1] = comp_object_AddRef;
-        inset_clip_vtbl[2] = comp_object_Release;
-        for (i = 3; i < COMP_OBJECT_SLOTS; i++) inset_clip_vtbl[i] = comp_object_slot_fn( i );
-        inset_clip_vtbl[0] = inset_clip_QueryInterface;
-        comp_object_set_inspectable( inset_clip_vtbl );
-        InterlockedExchange( &inset_clip_vtbl_ready, 1 );
+        vtbl[1] = comp_object_AddRef;
+        vtbl[2] = clip_Release;
+        for (i = 3; i < COMP_OBJECT_SLOTS; i++) vtbl[i] = comp_object_slot_fn( i );
+        vtbl[0] = clip_QueryInterface;
+        comp_object_set_inspectable( vtbl );
+        InterlockedExchange( ready, 1 );
     }
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
-    impl->vtbl = (const void **)inset_clip_vtbl;
-    impl->kind = "InsetClip";
+    impl->vtbl = (const void **)vtbl;
+    impl->kind = inset ? "InsetClip" : "RectangleClip";
     impl->ref = 1;
-    impl->typed_vtbl = inset_clip_typed_vtbl;
+    impl->typed_vtbl = inset ? inset_clip_typed_vtbl : rect_clip_typed_vtbl;
+    impl->clip2_vtbl = clip2_vtbl;
+    impl->inset = inset;
     impl->left = left; impl->top = top; impl->right = right; impl->bottom = bottom;
-    /* the default interface is IInsetClip: XAML sets the insets through it without a QI */
+    impl->scale.X = impl->scale.Y = 1.0f;
+    impl->transform.M11 = impl->transform.M22 = 1.0f;
+    /* the default interface is the typed one: XAML sets the insets or sides through it without a QI */
     *out = &impl->typed_vtbl;
-    TRACE( "created InsetClip %p.\n", impl );
+    TRACE_(dcomptree)( "created %s %p %g,%g,%g,%g.\n", impl->kind, impl, left, top, right, bottom );
     return S_OK;
 }
-
-/* Clip a visual's subtree to its inset clip: narrows paint_clip; the caller restores the returned previous
- * clip when this returns TRUE. */
-static int apply_inset_clip( HDC hdc, void *clip_iface, float x, float y, float width, float height )
+static HRESULT create_inset_clip( float left, float top, float right, float bottom, void **out )
 {
-    struct inset_clip *clip = inset_clip_from_any( clip_iface );
-    RECT r;
+    return create_clip( TRUE, left, top, right, bottom, out );
+}
+static HRESULT create_rect_clip( float left, float top, float right, float bottom, void **out )
+{
+    return create_clip( FALSE, left, top, right, bottom, out );
+}
 
-    if (!clip || width <= 0.0f || height <= 0.0f) return 0;
-    SetRect( &r, (int)(x + clip->left), (int)(y + clip->top),
-             (int)(x + width - clip->right + 0.5f), (int)(y + height - clip->bottom + 0.5f) );
-    if (!IntersectRect( &paint_clip, &paint_clip, &r )) SetRectEmpty( &paint_clip );
+#define RECT_CLIP_FLOAT( name, field ) \
+    static HRESULT WINAPI rect_get_##name( void *iface, FLOAT *value ) \
+    { if (!value) return E_POINTER; *value = clip_from_typed( iface )->field; return S_OK; } \
+    static HRESULT WINAPI rect_put_##name( void *iface, FLOAT value ) \
+    { TRACE( "%p %s %g\n", clip_from_typed( iface ), #name, value ); scene_changed(); clip_from_typed( iface )->field = value; return S_OK; }
+RECT_CLIP_FLOAT( Bottom, bottom )
+RECT_CLIP_FLOAT( Left, left )
+RECT_CLIP_FLOAT( Right, right )
+RECT_CLIP_FLOAT( Top, top )
+/* the radii are Vector2 (8 bytes, by value in a register; returned through a pointer) */
+#define RECT_CLIP_RADIUS( name, index ) \
+    static HRESULT WINAPI rect_get_##name( void *iface, Vector2 *value ) \
+    { if (!value) return E_POINTER; value->X = value->Y = clip_from_typed( iface )->radii[index]; return S_OK; } \
+    static HRESULT WINAPI rect_put_##name( void *iface, Vector2 value ) \
+    { clip_from_typed( iface )->radii[index] = value.X; return S_OK; }
+RECT_CLIP_RADIUS( BottomLeftRadius, 0 )
+RECT_CLIP_RADIUS( BottomRightRadius, 1 )
+RECT_CLIP_RADIUS( TopLeftRadius, 2 )
+RECT_CLIP_RADIUS( TopRightRadius, 3 )
+static const void *rect_clip_typed_vtbl[] =
+{
+    clip_typed_QueryInterface, clip_typed_AddRef, clip_typed_Release,
+    clip_GetIids, clip_GetRuntimeClassName, clip_GetTrustLevel,
+    rect_get_Bottom, rect_put_Bottom, rect_get_BottomLeftRadius, rect_put_BottomLeftRadius,
+    rect_get_BottomRightRadius, rect_put_BottomRightRadius, rect_get_Left, rect_put_Left,
+    rect_get_Right, rect_put_Right, rect_get_Top, rect_put_Top,
+    rect_get_TopLeftRadius, rect_put_TopLeftRadius, rect_get_TopRightRadius, rect_put_TopRightRadius,
+};
+#define RECT_CLIP2_VEC2( name, field ) \
+    static HRESULT WINAPI rect2_get_##name( void *iface, Vector2 *value ) \
+    { if (!value) return E_POINTER; *value = clip_from_clip2( iface )->field; return S_OK; } \
+    static HRESULT WINAPI rect2_put_##name( void *iface, Vector2 value ) \
+    { TRACE( "%p %s %g,%g\n", clip_from_clip2( iface ), #name, value.X, value.Y ); scene_changed(); \
+      clip_from_clip2( iface )->field = value; return S_OK; }
+RECT_CLIP2_VEC2( AnchorPoint, anchor )
+RECT_CLIP2_VEC2( CenterPoint, center )
+RECT_CLIP2_VEC2( Offset, offset )
+RECT_CLIP2_VEC2( Scale, scale )
+static HRESULT WINAPI rect2_get_RotationAngle( void *iface, FLOAT *value )
+{ if (!value) return E_POINTER; *value = clip_from_clip2( iface )->rotation; return S_OK; }
+static HRESULT WINAPI rect2_put_RotationAngle( void *iface, FLOAT value )
+{ clip_from_clip2( iface )->rotation = value; return S_OK; }
+static HRESULT WINAPI rect2_get_RotationAngleInDegrees( void *iface, FLOAT *value )
+{ if (!value) return E_POINTER; *value = clip_from_clip2( iface )->rotation * 180.0f / 3.14159265f; return S_OK; }
+static HRESULT WINAPI rect2_put_RotationAngleInDegrees( void *iface, FLOAT value )
+{ clip_from_clip2( iface )->rotation = value * 3.14159265f / 180.0f; return S_OK; }
+static HRESULT WINAPI rect2_get_TransformMatrix( void *iface, Matrix3x2 *value )
+{ if (!value) return E_POINTER; *value = clip_from_clip2( iface )->transform; return S_OK; }
+/* a Matrix3x2 (24 bytes) is passed by pointer on x64 */
+static HRESULT WINAPI rect2_put_TransformMatrix( void *iface, const Matrix3x2 *value )
+{
+    struct comp_clip *impl = clip_from_clip2( iface );
+    if (!value) return E_POINTER;
+    TRACE( "%p %g %g %g %g %g %g\n", impl, value->M11, value->M12, value->M21, value->M22, value->M31, value->M32 );
+    scene_changed();
+    impl->transform = *value;
+    return S_OK;
+}
+static const void *clip2_vtbl[] =
+{
+    clip2_QueryInterface, clip2_AddRef, clip2_Release,
+    clip_GetIids, clip_GetRuntimeClassName, clip_GetTrustLevel,
+    rect2_get_AnchorPoint, rect2_put_AnchorPoint, rect2_get_CenterPoint, rect2_put_CenterPoint,
+    rect2_get_Offset, rect2_put_Offset, rect2_get_RotationAngle, rect2_put_RotationAngle,
+    rect2_get_RotationAngleInDegrees, rect2_put_RotationAngleInDegrees, rect2_get_Scale, rect2_put_Scale,
+    rect2_get_TransformMatrix, rect2_put_TransformMatrix,
+};
+/* A clip's rectangle in its visual's space (an inset clip's from the visual's size), through the clip's
+ * transform: scale about the centre point, the static or expression-bound TransformMatrix, the offset. A
+ * rotation is taken by its bounding box. */
+static void clip_bounds( struct comp_clip *clip, float width, float height, float *l, float *t, float *r, float *b )
+{
+    D2D_MATRIX_3X2_F m = { { { clip->transform.M11, clip->transform.M12, clip->transform.M21, clip->transform.M22,
+                               clip->transform.M31, clip->transform.M32 } } };
+    float x0 = clip->left, y0 = clip->top;
+    float x1 = clip->inset ? width - clip->right : clip->right, y1 = clip->inset ? height - clip->bottom : clip->bottom;
+    float xs[4] = { x0, x1, x0, x1 }, ys[4] = { y0, y0, y1, y1 };
+    unsigned int i;
+
+    if (clip->transform_expr) expr_evaluate_matrix( clip->transform_expr, NULL, NULL, &m );
+    for (i = 0; i < 4; i++)
+    {
+        float x = (xs[i] - clip->center.X) * clip->scale.X + clip->center.X;
+        float y = (ys[i] - clip->center.Y) * clip->scale.Y + clip->center.Y;
+        float tx = x * m._11 + y * m._21 + m._31 + clip->offset.X;
+        float ty = x * m._12 + y * m._22 + m._32 + clip->offset.Y;
+        if (!i) { *l = *r = tx; *t = *b = ty; }
+        else { *l = min( *l, tx ); *r = max( *r, tx ); *t = min( *t, ty ); *b = max( *b, ty ); }
+    }
+}
+
+/* Clip a visual's subtree to its composition clip: narrows paint_clip; the caller restores the returned
+ * previous clip when this returns TRUE. */
+static int apply_clip_object( HDC hdc, void *clip_iface, float x, float y, float width, float height, float sx, float sy )
+{
+    struct comp_clip *clip = clip_from_any( clip_iface );
+    float l, t, r, b;
+    RECT rect;
+
+    if (!clip) return 0;
+    if (clip->inset && (width <= 0.0f || height <= 0.0f)) return 0;
+    /* width and height are the visual's painted size; the clip is in its own units */
+    clip_bounds( clip, sx ? width / sx : width, sy ? height / sy : height, &l, &t, &r, &b );
+    /* an inset clip rounds as it always has (the Calculator baseline depends on it) */
+    if (clip->inset) SetRect( &rect, (int)(x + l * sx), (int)(y + t * sy), (int)(x + r * sx + 0.5f), (int)(y + b * sy + 0.5f) );
+    else SetRect( &rect, clamp_coord( floorf( x + l * sx ) ), clamp_coord( floorf( y + t * sy ) ),
+                  clamp_coord( ceilf( x + r * sx ) ), clamp_coord( ceilf( y + b * sy ) ) );
+    if (!IntersectRect( &paint_clip, &paint_clip, &rect )) SetRectEmpty( &paint_clip );
     return 1;
 }
 
@@ -11452,7 +12057,7 @@ static BOOL kf_sample( struct kf_animation *kf, float progress, struct kf_key *o
     /* before the first key the property keeps its static value (Lottie layers start hidden that way) */
     if (lo == ~0u) return FALSE;
     if (hi == ~0u || kf->value_kind == KF_BOOLEAN || kf->value_kind == KF_COLOR) { *out = kf->keys[lo]; return TRUE; }
-    t = (progress - kf->keys[lo].key) / (kf->keys[hi].key - kf->keys[lo].key);
+    t = ease_apply( &kf->keys[hi].ease, (progress - kf->keys[lo].key) / (kf->keys[hi].key - kf->keys[lo].key) );
     *out = kf->keys[lo];
     switch (kf->value_kind)
     {
@@ -12151,24 +12756,101 @@ static BOOL expr_vector( struct expr_ctx *c, float *x, float *y )
     *y *= factor;
     return TRUE;
 }
-static BOOL expr_scalar( struct expr_ctx *c, float *out )
+/* Scalar expressions: + - * / with the usual precedence, unary minus, parentheses, numbers (with an optional
+ * "f" suffix), pi, cos sin tan abs sqrt min max clamp, and scalar properties. XAML's RotateTransform binds
+ * "Matrix3x2(cos(PS.RotateAngle * pi / 180.0f), sin(...), -sin(...), cos(...), 0, 0)"; with only numbers and
+ * properties understood, a chevron's rotation failed to evaluate and drew unturned while it animated. */
+static BOOL expr_scalar_sum( struct expr_ctx *c, float *out );
+static BOOL expr_scalar_factor( struct expr_ctx *c, float *out )
 {
+    static const struct { const WCHAR *name; unsigned int args; } funcs[] =
+    {
+        { L"cos(", 1 }, { L"sin(", 1 }, { L"tan(", 1 }, { L"abs(", 1 }, { L"sqrt(", 1 },
+        { L"min(", 2 }, { L"max(", 2 }, { L"clamp(", 3 },
+    };
     WCHAR ref[48], prop[48];
     struct propset_value *v;
+    unsigned int i, k;
     WCHAR *end;
 
     expr_skip_space( c );
-    if (iswdigit( *c->p ) || *c->p == '-' || *c->p == '.')
+    if (*c->p == '-')
+    {
+        c->p++;
+        if (!expr_scalar_factor( c, out )) return FALSE;
+        *out = -*out;
+        return TRUE;
+    }
+    if (iswdigit( *c->p ) || *c->p == '.')
     {
         *out = wcstof( c->p, &end );
         if (end == c->p) return FALSE;
         c->p = end;
+        if (*c->p == 'f' || *c->p == 'F') c->p++;
+        return TRUE;
+    }
+    if (*c->p == '(')
+    {
+        c->p++;
+        return expr_scalar_sum( c, out ) && expr_accept( c, L")" );
+    }
+    for (i = 0; i < ARRAY_SIZE(funcs); i++)
+    {
+        float arg[3];
+        if (!expr_accept( c, funcs[i].name )) continue;
+        for (k = 0; k < funcs[i].args; k++)
+            if ((k && !expr_accept( c, L"," )) || !expr_scalar_sum( c, &arg[k] )) return FALSE;
+        if (!expr_accept( c, L")" )) return FALSE;
+        switch (i)
+        {
+        case 0: *out = cosf( arg[0] ); break;
+        case 1: *out = sinf( arg[0] ); break;
+        case 2: *out = tanf( arg[0] ); break;
+        case 3: *out = fabsf( arg[0] ); break;
+        case 4: *out = sqrtf( arg[0] ); break;
+        case 5: *out = min( arg[0], arg[1] ); break;
+        case 6: *out = max( arg[0], arg[1] ); break;
+        default: *out = min( max( arg[0], arg[1] ), arg[2] ); break;
+        }
+        return TRUE;
+    }
+    if (!wcsnicmp( c->p, L"pi", 2 ) && !iswalnum( c->p[2] ) && c->p[2] != '_' && c->p[2] != '.')
+    {
+        c->p += 2;
+        *out = 3.14159265358979f;
         return TRUE;
     }
     if (!expr_name( c, ref, ARRAY_SIZE(ref), prop, ARRAY_SIZE(prop) )) return FALSE;
-    if (!(v = expr_property( c, ref, prop )) || v->type != PROP_SCALAR) return FALSE;
+    v = expr_property( c, ref, prop );
+    if (!v || v->type != PROP_SCALAR) return FALSE;
     *out = v->u.scalar;
     return TRUE;
+}
+static BOOL expr_scalar_product( struct expr_ctx *c, float *out )
+{
+    float f;
+    if (!expr_scalar_factor( c, out )) return FALSE;
+    for (;;)
+    {
+        if (expr_accept( c, L"*" )) { if (!expr_scalar_factor( c, &f )) return FALSE; *out *= f; }
+        else if (expr_accept( c, L"/" )) { if (!expr_scalar_factor( c, &f )) return FALSE; *out /= f; }
+        else return TRUE;
+    }
+}
+static BOOL expr_scalar_sum( struct expr_ctx *c, float *out )
+{
+    float f;
+    if (!expr_scalar_product( c, out )) return FALSE;
+    for (;;)
+    {
+        if (expr_accept( c, L"+" )) { if (!expr_scalar_product( c, &f )) return FALSE; *out += f; }
+        else if (expr_accept( c, L"-" )) { if (!expr_scalar_product( c, &f )) return FALSE; *out -= f; }
+        else return TRUE;
+    }
+}
+static BOOL expr_scalar( struct expr_ctx *c, float *out )
+{
+    return expr_scalar_sum( c, out );
 }
 static BOOL expr_matrix_product( struct expr_ctx *c, D2D_MATRIX_3X2_F *out );
 static BOOL expr_matrix_term( struct expr_ctx *c, D2D_MATRIX_3X2_F *out )
@@ -12191,6 +12873,16 @@ static BOOL expr_matrix_term( struct expr_ctx *c, D2D_MATRIX_3X2_F *out )
     {
         if (!expr_vector( c, &x, &y ) || !expr_accept( c, L")" )) return FALSE;
         out->_11 = x; out->_22 = y;
+        return TRUE;
+    }
+    if (expr_accept( c, L"Matrix3x2(" ))
+    {
+        float m[6];
+        unsigned int k;
+        for (k = 0; k < 6; k++)
+            if ((k && !expr_accept( c, L"," )) || !expr_scalar( c, &m[k] )) return FALSE;
+        if (!expr_accept( c, L")" )) return FALSE;
+        out->_11 = m[0]; out->_12 = m[1]; out->_21 = m[2]; out->_22 = m[3]; out->_31 = m[4]; out->_32 = m[5];
         return TRUE;
     }
     if (!expr_name( c, ref, ARRAY_SIZE(ref), prop, ARRAY_SIZE(prop) )) return FALSE;
@@ -12226,7 +12918,17 @@ static BOOL expr_matrix_term( struct expr_ctx *c, D2D_MATRIX_3X2_F *out )
                 {
                     struct expr_ctx inner = { set->bindings[i].expr, set, c->dmanip, set->bindings[i].expr->expression, c->depth + 1 };
                     D2D_MATRIX_3X2_F m;
-                    if (expr_matrix_product( &inner, &m )) { expr_skip_space( &inner ); if (!*inner.p) { *out = m; return TRUE; } }
+                    if (expr_matrix_product( &inner, &m ))
+                    {
+                        expr_skip_space( &inner );
+                        if (!*inner.p)
+                        {
+                            *out = m;
+                            return TRUE;
+                        }
+                    }
+                    TRACE_(dcomptree)( "term %s.%s: binding %s failed at %s\n", debugstr_w( ref ), debugstr_w( prop ),
+                                       debugstr_w( set->bindings[i].expr->expression ), debugstr_w( inner.p ) );
                     break;
                 }
     }
@@ -13110,8 +13812,8 @@ static HRESULT WINAPI compositor_CreateContainerVisual( ICompositor *iface, ICon
     return create_visual( iface, VISUAL_CONTAINER, (void **)result );
 }
 
-/* Easing functions. Animations are not run yet, so these only have to exist and report what they were
- * created with. A cubic bezier function answers ICubicBezierEasingFunction through its own view; any other
+/* Easing functions. Key frames keep the function's shape (see easing_lookup); these only have to exist and
+ * report what they were created with. A cubic bezier function answers ICubicBezierEasingFunction through its own view; any other
  * interface gets the generic composition object. */
 static const GUID IID_ICubicBezierEasingFunction_ =
     { 0x32350666, 0xc1e8, 0x44f9, { 0x96, 0xb8, 0xc9, 0x8a, 0xcf, 0x0a, 0xe6, 0x98 } };
@@ -13219,6 +13921,99 @@ static HRESULT WINAPI compositor_CreateCubicBezierEasingFunction( ICompositor *i
     *result = (ICubicBezierEasingFunction *)&impl->bezier_vtbl;
     return S_OK;
 }
+/* Easing parameters of the functions created as plain composition objects (ICompositorPrivate5's, linear,
+ * step), by object address; each creation overwrites what a freed object at the same address left. */
+#define EASINGS 256
+static struct { void *object; struct kf_ease ease; } easings[EASINGS];
+static unsigned int easing_next;
+static SRWLOCK easing_lock = SRWLOCK_INIT;
+
+static void easing_register( void *object, enum ease_type type, int mode, float a, float b )
+{
+    unsigned int i;
+
+    AcquireSRWLockExclusive( &easing_lock );
+    for (i = 0; i < EASINGS; i++) if (easings[i].object == object) break;
+    if (i == EASINGS) i = easing_next++ % EASINGS;
+    easings[i].object = object;
+    easings[i].ease.type = type;
+    easings[i].ease.mode = mode;
+    easings[i].ease.a = a;
+    easings[i].ease.b = b;
+    ReleaseSRWLockExclusive( &easing_lock );
+}
+
+static void easing_lookup( void *function, struct kf_ease *ease )
+{
+    unsigned int i;
+
+    memset( ease, 0, sizeof(*ease) );
+    if (!function) return;
+    if (*(void ***)function == (void **)cubic_bezier_iface_vtbl || *(void ***)function == (void **)cubic_bezier_vtbl)
+    {
+        struct cubic_bezier_easing *bz = *(void ***)function == (void **)cubic_bezier_vtbl
+                ? CONTAINING_RECORD( function, struct cubic_bezier_easing, vtbl )
+                : CONTAINING_RECORD( function, struct cubic_bezier_easing, bezier_vtbl );
+        ease->type = EASE_BEZIER;
+        ease->a = bz->point1.X; ease->b = bz->point1.Y;
+        ease->c = bz->point2.X; ease->d = bz->point2.Y;
+        return;
+    }
+    AcquireSRWLockShared( &easing_lock );
+    for (i = 0; i < EASINGS; i++)
+        if (easings[i].object == function) { *ease = easings[i].ease; break; }
+    ReleaseSRWLockShared( &easing_lock );
+}
+
+static float bezier_coord( float p1, float p2, float s )
+{
+    float u = 1.0f - s;
+    return 3.0f * u * u * s * p1 + 3.0f * u * s * s * p2 + s * s * s;
+}
+
+/* the ease-in shape of a function, for t in 0..1 */
+static float ease_in( const struct kf_ease *ease, float t )
+{
+    switch (ease->type)
+    {
+    case EASE_POWER: return powf( t, max( ease->a, 0.0f ) );
+    case EASE_EXPONENTIAL:
+        if (fabsf( ease->a ) < 1e-4f) return t;
+        return (expf( ease->a * t ) - 1.0f) / (expf( ease->a ) - 1.0f);
+    case EASE_SINE: return 1.0f - cosf( t * 1.5707963f );
+    case EASE_CIRCLE: return 1.0f - sqrtf( max( 1.0f - t * t, 0.0f ) );
+    case EASE_BACK: return t * t * t - t * ease->a * sinf( t * 3.14159265f );
+    default: return t;
+    }
+}
+
+static float ease_apply( const struct kf_ease *ease, float t )
+{
+    float lo = 0.0f, hi = 1.0f, s = t;
+    unsigned int i;
+
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    switch (ease->type)
+    {
+    case EASE_LINEAR:
+    case EASE_STEP:
+        return t;
+    case EASE_BEZIER:
+        /* the curve's x is monotonic in s for control points in 0..1: bisect for x(s) = t */
+        for (i = 0; i < 24; i++)
+        {
+            s = (lo + hi) * 0.5f;
+            if (bezier_coord( ease->a, ease->c, s ) < t) lo = s; else hi = s;
+        }
+        return bezier_coord( ease->b, ease->d, (lo + hi) * 0.5f );
+    default:
+        if (ease->mode == 0) return ease_in( ease, t );
+        if (ease->mode == 1) return 1.0f - ease_in( ease, 1.0f - t );
+        return t < 0.5f ? ease_in( ease, 2.0f * t ) * 0.5f : 1.0f - ease_in( ease, 2.0f - 2.0f * t ) * 0.5f;
+    }
+}
+
 /* Effect brushes. The effect graph is not rendered yet: a CompositionEffectBrush remembers its source
  * parameters and paints like its source brush where the renderer can (see brush_surface), which keeps
  * images behind blur/tint effects visible. The factory reports a successful load. */
@@ -13679,7 +14474,7 @@ static HRESULT WINAPI compositor_CreateLinearEasingFunction( ICompositor *iface,
     TRACE( "iface %p.\n", iface );
     /* ILinearEasingFunction has no methods of its own */
     if (!result) return E_POINTER;
-    return create_comp_object( "LinearEasingFunction", (void **)result );
+    return create_easing( "LinearEasingFunction", 0, (void **)result );
 }
 
 static HRESULT WINAPI compositor_CreatePropertySet( ICompositor *iface, ICompositionPropertySet **result )
@@ -16941,7 +17736,12 @@ static HRESULT WINAPI compositor2_CreateNineGridBrush( void *iface, void **resul
 }
 COMPOSITOR2_RECORDING( CreatePointLight, "PointLight" )
 COMPOSITOR2_RECORDING( CreateSpotLight, "SpotLight" )
-COMPOSITOR2_RECORDING( CreateStepEasingFunction, "StepEasingFunction" )
+static HRESULT WINAPI compositor2_CreateStepEasingFunction( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_easing( "StepEasingFunction", 0, result );   /* runs linear */
+}
 
 static HRESULT WINAPI compositor2_CreateLayerVisual( void *iface, void **result )
 {
@@ -16954,7 +17754,7 @@ static HRESULT WINAPI compositor2_CreateStepEasingFunctionWithStepCount( void *i
 {
     TRACE( "iface %p, count %d.\n", iface, count );
     if (!result) return E_POINTER;
-    return create_comp_object( "StepEasingFunction", result );
+    return create_easing( "StepEasingFunction", 0, result );   /* runs linear */
 }
 
 static struct compositor *impl_from_compositor3( void *iface )
@@ -17164,6 +17964,18 @@ static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, voi
             ctrl->has_progress = TRUE;
         }
     }
+    {   /* a clip's TransformMatrix (a menu's reveal clip) follows its expression when painting */
+        struct comp_clip *rc = view->owner ? clip_from_any( view->owner ) : NULL;
+        struct expr_animation *cexpr = expr_animation_from_any( animation );
+        const WCHAR *cprop = WindowsGetStringRawBuffer( name, NULL );
+        if (rc && cexpr && cprop && !wcsicmp( cprop, L"TransformMatrix" ))
+        {
+            IUnknown_AddRef( (IUnknown *)&cexpr->vtbl );
+            if (rc->transform_expr) IUnknown_Release( (IUnknown *)&rc->transform_expr->vtbl );
+            rc->transform_expr = cexpr;
+            TRACE_(dcomptree)( "%s %p TransformMatrix <- %s\n", rc->kind, rc, debugstr_w( cexpr->expression ) );
+        }
+    }
     if (view->owner && *(void ***)view->owner == (void **)&propset_vtbl)
     {
         struct property_set *set = CONTAINING_RECORD( view->owner, struct property_set, ICompositionPropertySet_iface );
@@ -17204,7 +18016,10 @@ static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, voi
 }
 static HRESULT WINAPI object_view_StopAnimation( void *iface, HSTRING name )
 {
+    struct composition_object_view *view = impl_from_object_view( iface );
+
     scene_changed();
+    TRACE_(dcompanim)( "object %p (owner %p) stop %s\n", view, view->owner, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ) );
     return S_OK;
 }
 
@@ -17271,18 +18086,19 @@ static HRESULT WINAPI compositor7_CreateAnimationPropertyInfo( void *iface, void
     if (!result) return E_POINTER;
     return create_comp_object( "AnimationPropertyInfo", result );
 }
+static HRESULT create_rect_clip( float left, float top, float right, float bottom, void **out );
 static HRESULT WINAPI compositor7_CreateRectangleClip( void *iface, void **result )
 {
     TRACE( "iface %p.\n", iface );
     if (!result) return E_POINTER;
-    return create_comp_object( "RectangleClip", result );
+    return create_rect_clip( 0.0f, 0.0f, 0.0f, 0.0f, result );
 }
 static HRESULT WINAPI compositor7_CreateRectangleClipWithSides( void *iface, FLOAT left, FLOAT top, FLOAT right,
                                                                 FLOAT bottom, void **result )
 {
     TRACE( "iface %p, %f,%f-%f,%f.\n", iface, left, top, right, bottom );
     if (!result) return E_POINTER;
-    return create_comp_object( "RectangleClip", result );
+    return create_rect_clip( left, top, right, bottom, result );
 }
 /* The four Vector2 radii are passed by pointer on x64; only the out pointer position matters here. */
 static HRESULT WINAPI compositor7_CreateRectangleClipWithSidesAndRadius( void *iface, FLOAT left, FLOAT top,
@@ -17292,7 +18108,7 @@ static HRESULT WINAPI compositor7_CreateRectangleClipWithSidesAndRadius( void *i
 {
     TRACE( "iface %p, %f,%f-%f,%f.\n", iface, left, top, right, bottom );
     if (!result) return E_POINTER;
-    return create_comp_object( "RectangleClip", result );
+    return create_rect_clip( left, top, right, bottom, result );
 }
 
 static const void *compositor7_vtbl[] =

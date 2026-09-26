@@ -483,6 +483,20 @@ vanished for a frame. Paints other than a commit's own now wait for an open batc
 use `scene_dirty()`, not `scene_changed()`**: the latter opens a batch, and a repaint that opens one
 waits for itself (Media Player started blank white 3 times in 16 before that was found).
 
+**A heap address seen twice in a trace can be two objects.** A key-frame animation's address carried a
+RotateAngle turn and, two seconds later, an Opacity fade with a fresh key count, and I wrote here that XAML
+refills running animation objects. The key count can only grow, so it was a new object in freed memory.
+Before hanging a theory on "the same object", check for something only one object could show.
+
+**An animation bound to a property replaces its static value; it does not compose with it.** XAML set a
+chevron glyph's static `TransformMatrix` to a turn and bound the same turn through an expression; applying
+both drew 180 degrees about the wrong pivot and clipped the glyph away. When a value has both, the
+animated one wins while it runs.
+
+**Know whether a size is painted or local before scaling it.** `paint_public_visual` and
+`paint_dcomp_visual` pass the visual's *painted* size to the clip code; scaling it again shrank
+Calculator's hamburger to its top bar. Only the regression suite caught it - run it after any painter change.
+
 **An `IDCompositionVisual` slot we answer with a no-op can move things, not just decorate them.**
 `SetTransformParent` (slot 9, and `SetTransformParent2` at slot 50) was `dcv_ok`. XAML uses it to
 place a popup's visual in the space of the element it is attached to. Ignoring it drew every
@@ -965,6 +979,11 @@ tells you nothing the completion notification will not, and the harness rejects 
 outright. Start the wait with `run_in_background`, then *stop* and do unrelated work - or nothing -
 until the notification arrives.
 
+**The Bash tool's shell is zsh, not bash.** `for p in $list` does not split words, `set -- $p` gets one
+argument, and a stray `===` is a parse error. Anything that loops over pairs of coordinates belongs in a
+`#!/bin/bash` script file. Also: the `/tmp/wheeltest.sh` count matches log lines by `+timestamp`, and
+without that channel option it reports 0 whatever happened - I read one such 0 as a result.
+
 **I asked `winmd.py --type` for `MediaBindingEventArgs`** and got silence, because `--type` matches
 the fully-qualified name. `--grep` first, always.
 
@@ -998,6 +1017,8 @@ the fully-qualified name. `--grep` first, always.
   before trusting a run.
 - Wine's builtins win by module name. Pointing an `ActivatableClassId` at a native DLL is not enough;
   it also needs a `=n` override and the file in the prefix.
+- Wine's `GetObject( dib, sizeof(DIBSECTION) )` reports `dsBmih.biHeight` **positive** for a top-down DIB,
+  so it cannot tell you the row order. Every DIB `dcomp/composition.c` creates is top-down.
 - The unhandled-error text an app reports is often a *consequence*. `Delegate to an instance method
   cannot have null 'this'` was the second exception; the first, further up, was the real one.
 
@@ -1011,7 +1032,7 @@ the fully-qualified name. `--grep` first, always.
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
 | Solitaire | **Playable on the unpatched `Solitaire.exe`** (`docs/screenshots/solitaire-unpatched-menu-game.png`): main menu -> Klondike -> game, and clicks move cards. No exe byte patch is needed any more: `wineuwp` delivers `CoreWindow.VisibilityChanged`. The Sign In Error popup shows on top of the menu; Cancel is at about (813,549). The blank-window start-up flake (about 1 in 6 through 09-24) is gone again, 0/20, after two fixes to combase's `CoMsgWaitInProcessEvents` (Findings-M4, 2026-09-24). Shapr3D's rarer UI stall is fixed too (Findings-M4: a dcomp object written into ntdll's futex bucket, and unserialised painting) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
-| Shapr3D | **Models, syncs and exports** (`docs/screenshots/shapr3d-extruded-body.png`): sketch -> extrude -> Visualization, toolbar and menus, cloud upload of revisions and thumbnails, **File > Export to > STL** and **Drawings -> Create Drawing -> Export drawing (PDF)** both write correct files (`docs/screenshots/shapr3d-drawing-pdf.png`). The file pickers show Wine's common Open/Save/folder dialogs (starting in Documents). For scripted runs, `WINE_UWP_PICKER_FILE` / `WINE_UWP_PICKER_SAVE_FILE` still bypass them, and `WINE_UWP_PICKER_NODIALOG=1` makes an unstaged pick report a cancel. On `:98` the dialog is its own top-level window ("Open" / "Save As"), captured with `xwd -id`. Type into it with plain `xdotool type` after a click, not `--window`. The colon needs `xdotool key colon`, and Ctrl+A does not select the combo box text. Signs in once (Log In -> `./browser-callback.sh shapr3d`, a human solves the reCAPTCHA, run with `WINE_UWP_LAUNCHER=log`) and stays signed in. Project thumbnails and material swatches show (`docs/screenshots/shapr3d-project-thumbnails.png`, `shapr3d-used-material-swatches.png`). The save dialog offers the app's `FileTypeChoices` (Screenshot -> Capture: JPEG, PNG; `docs/screenshots/shapr3d-capture-output.png`). **The prefix's `Documents`, `Desktop` and `Pictures` are symlinks to the user's real home folders**, which is where the dialogs start - save test output to `C:\users\Public\` instead. Share -> copy link puts the project URL on the clipboard (`docs/screenshots/shapr3d-share-copy-link.png`); the share-sheet button does nothing (there is no share host). Typed dimensions work while sketching (`docs/screenshots/shapr3d-dimension-entry.png`); drive them with `xdotool type --delay 250`, because at the default 12 ms the key after the one that opens the field is lost. Start -> Visualization -> import Drone passes **30/30** (`docs/screenshots/shapr3d-import-soak-30of30.png`); it was about 3 in 4 before 09-24. Leaving the editor no longer kills it: 30 leaves in 10 runs, against 6 deaths in 10 runs before (`docs/screenshots/shapr3d-home-after-leaving.png`). Extrude/offset drags on the drone at the user's 3440x1366 no longer starve the UI thread (it used 1.95 s of CPU in a 2 s drag, now ~0.3 s; the result lands ~0.3-0.8 s after release instead of 1-2 s); with continuous input the drone's preview refreshes every ~78 ms, bound by Parasolid (Wine ~11% of it), see Findings-M4 2026-09-25. Menus are complete 32-85 ms after the press (were ~280 ms; `docs/screenshots/shapr3d-file-menu-50ms.png`), and expanded History rows show their chevron. |
+| Shapr3D | **Models, syncs and exports** (`docs/screenshots/shapr3d-extruded-body.png`): sketch -> extrude -> Visualization, toolbar and menus, cloud upload of revisions and thumbnails, **File > Export to > STL** and **Drawings -> Create Drawing -> Export drawing (PDF)** both write correct files (`docs/screenshots/shapr3d-drawing-pdf.png`). The file pickers show Wine's common Open/Save/folder dialogs (starting in Documents). For scripted runs, `WINE_UWP_PICKER_FILE` / `WINE_UWP_PICKER_SAVE_FILE` still bypass them, and `WINE_UWP_PICKER_NODIALOG=1` makes an unstaged pick report a cancel. On `:98` the dialog is its own top-level window ("Open" / "Save As"), captured with `xwd -id`. Type into it with plain `xdotool type` after a click, not `--window`. The colon needs `xdotool key colon`, and Ctrl+A does not select the combo box text. Signs in once (Log In -> `./browser-callback.sh shapr3d`, a human solves the reCAPTCHA, run with `WINE_UWP_LAUNCHER=log`) and stays signed in. Project thumbnails and material swatches show (`docs/screenshots/shapr3d-project-thumbnails.png`, `shapr3d-used-material-swatches.png`). The save dialog offers the app's `FileTypeChoices` (Screenshot -> Capture: JPEG, PNG; `docs/screenshots/shapr3d-capture-output.png`). **The prefix's `Documents`, `Desktop` and `Pictures` are symlinks to the user's real home folders**, which is where the dialogs start - save test output to `C:\users\Public\` instead. Share -> copy link puts the project URL on the clipboard (`docs/screenshots/shapr3d-share-copy-link.png`); the share-sheet button does nothing (there is no share host). Typed dimensions work while sketching (`docs/screenshots/shapr3d-dimension-entry.png`); drive them with `xdotool type --delay 250`, because at the default 12 ms the key after the one that opens the field is lost. Start -> Visualization -> import Drone passes **30/30** (`docs/screenshots/shapr3d-import-soak-30of30.png`); it was about 3 in 4 before 09-24. Leaving the editor no longer kills it: 30 leaves in 10 runs, against 6 deaths in 10 runs before (`docs/screenshots/shapr3d-home-after-leaving.png`). Extrude/offset drags on the drone at the user's 3440x1366 no longer starve the UI thread (it used 1.95 s of CPU in a 2 s drag, now ~0.3 s; the result lands ~0.3-0.8 s after release instead of 1-2 s); with continuous input the drone's preview refreshes every ~78 ms, bound by Parasolid (Wine ~11% of it), see Findings-M4 2026-09-25. Menus open with Windows' own animation now (key frames run live, with their easing, and the reveal clip slides with them): the first frame ~45 ms after the press, mostly out by ~60-90 ms, settled ~300 ms (`docs/screenshots/shapr3d-file-menu-reveal.png`). History chevrons turn > to v and back (`docs/screenshots/shapr3d-chevron-turn.png`). Not reproduced here, still open: the user sees some wheel events over a panel reach the viewport, and History losing its scroll position after opening an item (Findings-M4, 2026-09-25). |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
 them. **Testing that, and making them the default if it holds, is a standing job** - they change the

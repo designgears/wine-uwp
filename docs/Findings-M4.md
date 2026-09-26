@@ -9468,3 +9468,82 @@ extrude. One drag failed ("resulting body wouldn't be valid"), so the Ctrl+Z und
 of the user's drone project: `Face Offset 20`, the brown block on the front rotor guard. The project syncs
 to the cloud; redo was gone after the restart. The scripts no longer undo, and test edits belong in a
 project of our own, not the user's.
+
+### Menus and chevrons animate: live key frames, easing, clips (2026-09-25)
+
+Reported: the History chevron "flips up for a moment then down as it fully opens", and the menus should
+feel as native as possible. Until today no composition animation ran at all: XAML's key frames were
+applied at their end value, so every transition was a jump, and the parts that did move moved wrong.
+
+**The chevron's turn.** XAML turns an expanding row's chevron with a property-set partner animation
+(`RotateAngle` 90 -> 180, a `CreateAnimatorPartner` over a `SetCustomTimeline` clock) and binds the glyph's
+`TransformMatrix` to `Matrix3x2.CreateFromTranslation(-vector2(PS.CenterX, PS.CenterY)) *
+Matrix3x2(cos(PS.RotateAngle * pi / 180.0f), sin(...), -sin(...), cos(...), 0, 0) * ...`. Three things
+each drew it as "^" (its unrotated glyph):
+- `struct expr_animation` kept 256 characters and that expression is longer: the parse failed and the
+  stored identity was used. Now 1024.
+- The scalar grammar had no arithmetic or functions. It now has unary minus, parentheses, `* / + -`,
+  the `f` suffix, `pi`, `cos sin tan abs sqrt min max clamp`, and `Matrix3x2(a,b,c,d,e,f)`.
+- The painter turned only quarter turns. Other angles now enter `paint_enter_turn`: ops record the affine
+  map and rasterize with bilinear sampling (`raster_blend_affine`, `raster_fill_affine`). A stretched
+  surface (`OP_STRETCH`) went unrotated; it now samples its DIB the same way. Note **Wine's `GetObject`
+  reports a positive `dsBmih.biHeight` for a top-down DIB**, so a sign test on it rejects every DIB made
+  here (my first version drew nothing for those frames).
+
+**Live key frames.** `propset_partner_CreateAnimatorPartner` with two or more keys and a duration starts a
+live animation (`live_anims`, advanced by `live_anims_tick` at the start of each paint, on the animation's
+custom timeline when it has one). `InsertScalar` on the property cancels it, as setting a value does on
+Windows. Two things found on the way:
+- **The live animation takes a snapshot** (keys, duration, easing, its own timeline reference), as
+  `StartAnimation` copies the animation on Windows. I first thought XAML refilled a running animation
+  object - the chevron's RotateAngle 90->180 object's address later carried an Opacity 0->0 fade with a
+  fresh key count. It cannot have: `key_count` never goes down and `IKeyFrameAnimation` has no way to clear
+  key frames, so that was a new object at a freed address. The snapshot is right, but it fixed nothing I
+  saw; the "^" and vanished-chevron frames were the two painter bugs below.
+- **Easing.** Key frames carry their easing function (`kf_set_easing`): cubic bezier from its control
+  points, and the ICompositorPrivate5 easings (power, exponential, sine, circle, back; bounce, elastic and
+  step run linear) through a side table by object address. XAML's menus use the decelerate bezier
+  (0,0)-(0,1): the menu is mostly out at ~60 ms and done at ~90 ms, with a sub-pixel tail to ~300 ms.
+
+**A running expression replaces the static value.** After collapsing, a row's chevron vanished for good.
+Its glyph visual had a static `TransformMatrix` (turn 90, translate 11,1) *and* the expression bound to
+the same turn, and `paint_dcomp_visual` applied both: 180 degrees about the wrong pivot, clipped away
+(`+dcompops` showed quarter 2 at (1252,316) against its neighbours' quarter 1 at (1242,288)). An
+expression that evaluates now replaces the static matrix, as an animation replaces any property value.
+
+**The menu reveal is a clip.** A File menu opens with its content sliding down (keyframe Y -257.5 -> 0)
+while an `InsetClip`'s `TransformMatrix`, bound to `... * PS.Translate`, slides the other way, so only the
+part below the button shows. The clip transform was ignored and the sliding menu drew over the title bar.
+`InsetClip` and `RectangleClip` are now one `struct comp_clip` with `ICompositionClip2` (anchor, centre,
+offset, scale, TransformMatrix; a bound TransformMatrix expression through the clip's object view), and
+`apply_clip_object` maps the clip's rectangle through it. `RectangleClip` was a recording object and is now
+applied. Regression caught by the suite: the painter passes the visual's *painted* size, and scaling the
+inset clip's far edge again cut Calculator's hamburger to its top bar (AE 35); the clip is computed in the
+visual's own units now (AE 0).
+
+Measured on :97, drone open (`/tmp/latency-c20.sh`, `/tmp/chevcap.sh`, `/tmp/chevblank.sh`):
+- File menu: first frame ~45 ms after the press, the slide revealed from under the button (the title bar
+  stays visible throughout), settled ~290-300 ms, no stray frame after it (2 of 2).
+- Row "..." menu: the same reveal, done at ~150 ms.
+- Chevron: turns > -> v on expand and back on collapse through the diagonals, ~150 ms; 22 toggles on
+  two rows with no blank or "^" frame (`/tmp/chevblank.sh`).
+- Orbit at 3440 on 60 Hz: 60 presents, 61 frames shown a second, unchanged.
+- `regress.sh`: Calculator AE 0, Feedback Hub 896 / 0 fail-fasts, Media Player 2242, Solitaire 3/3.
+
+**Not reproduced: the wheel reaching the viewport, and the lost History scroll position.** The hit test
+now reads the last *completed* paint list (`paint_complete` under `hit_lock`) instead of the one the
+painter is rebuilding on its own thread, where the viewport's swap chain op is emitted before the panels
+drawn over it. With the old read restored (a temporary switch), 1 of 80 wheels over a scrolling History
+list leaked at 1280x800 and 0 of 150 at 3440, so that race is real but rare here. Every other probe routed
+correctly: 77 points over the History panel (rows, gaps, scrollbar, header), the toolbars and their labels,
+the Insert flyout, with a menu open (XAML's light-dismiss layer is hit), after a viewport click and after an
+orbit drag; the wheel's hwnd stayed the CoreWindow throughout (`ptrdisp`). Note that wineserver sends a
+wheel to the **capture** window if there is one, else the window under the pointer, and `input_sink_hook_proc`
+reroutes only messages not already addressed to the sink - so anything that leaves the sink hwnd holding
+capture would send every wheel to the viewport. Not seen here. Scroll position: expand/collapse at the top
+and at the bottom of the list, and opening a row for editing (single click; Escape to leave) all kept it.
+
+Also seen once in ~12 starts, before any interaction: Sentry caught an access violation in
+`CoreMessaging.dll+0x2733e` (`Object::ReleaseNotFrozen` on a pointer to a vtable), from
+`BufferHeapBlock::~BufferHeapBlock` under XAML's message dispatch - the same function as the timer-drain
+crashes above. It did not repeat.

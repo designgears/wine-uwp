@@ -3649,7 +3649,7 @@ BOOL WINAPI NtUserPeekMessage( MSG *msg_out, HWND hwnd, UINT first, UINT last, U
         return FALSE;
     }
     *msg_out = msg;
-    if (msg.message >= WM_POINTERUPDATE && msg.message <= WM_POINTERUP)
+    if ((msg.message >= WM_POINTERUPDATE && msg.message <= WM_POINTERUP) || msg.message == WM_MOUSEWHEEL)
         TRACE_(ptrdisp)( "peeked %#x for %p flags %#x, posted at %u (now %u)\n", msg.message, msg.hwnd, flags,
                          (unsigned)msg.time, (unsigned)NtGetTickCount() );
     return TRUE;
@@ -3688,7 +3688,7 @@ BOOL WINAPI NtUserGetMessage( MSG *msg, HWND hwnd, UINT first, UINT last )
     if (ret < 0) return -1;
 
     check_for_driver_events();
-    if (msg->message >= WM_POINTERUPDATE && msg->message <= WM_POINTERUP)
+    if ((msg->message >= WM_POINTERUPDATE && msg->message <= WM_POINTERUP) || msg->message == WM_MOUSEWHEEL)
         TRACE_(ptrdisp)( "got %#x for %p, posted at %u (now %u)\n", msg->message, msg->hwnd,
                          (unsigned)msg->time, (unsigned)NtGetTickCount() );
 
@@ -4089,7 +4089,7 @@ LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
     struct win_proc_params params;
     LRESULT retval = 0;
 
-    if (msg->message >= WM_POINTERUPDATE && msg->message <= WM_POINTERUP)
+    if ((msg->message >= WM_POINTERUPDATE && msg->message <= WM_POINTERUP) || msg->message == WM_MOUSEWHEEL)
         TRACE_(ptrdisp)( "%#x to %p, posted at %u (now %u)\n", msg->message, msg->hwnd, (unsigned)msg->time,
                                  (unsigned)NtGetTickCount() );
     /* Process timer messages */
