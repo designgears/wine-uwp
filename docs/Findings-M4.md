@@ -9613,3 +9613,24 @@ the product of the ancestors' opacities and `paint_emit` scales every op's alpha
 `opaque`). Result: `docs/screenshots/shapr3d-settings-crossfade.png`, a clean cross-fade done in ~150 ms.
 Regression suite unchanged (Calculator AE 0). Orbit at 3440/60 Hz with and without the change: 55-57 vs
 54-61 frames shown, paint 5.3-6.5 vs 4.0-4.2 ms - within run-to-run noise.
+
+### The view cube popup drew its page over its tabs: a transform parent that is an ancestor (2026-09-26)
+
+Reported: clicking the view-cube button opens a popup whose content sits behind the Views/Appearance tabs, then
+"pops down" after about a second. Reproduced at 1280. `+dcomptree` and `dcomptree.py`: the Views page is wrapped
+by XAML's transition machinery, and the wrapper (`dcomp ...546570`) gets a transform parent through
+`SetTransformParent2` (slot 50; all 39 transform-parent changes in the open came through it, none through slot
+9). That parent is the popup's scroll content (`expr V.Offset * LOCAL.DManip`, at the popup's top, y 101), which
+is also the wrapper's **ancestor**, three levels up; the visual in between carries the page's layout offset
+(`m42 48`, the tab row). The painter placed a transform-parented visual in the parent's space, dropping those 48
+px, so the page drew over the tabs until the transition ended (~0.8 s) and XAML put the page back in the plain
+tree - the "pop". A transform parent that is being painted as an ancestor (`in_walk`) is now ignored: the tree
+already composes it. ComboBox dropdowns, whose transform parent is not an ancestor, are unchanged (Language
+dropdown captured with and without: identical). After: `docs/screenshots/shapr3d-viewcube-open.png`, the page
+below the tabs from its first frame. The slot names came from Windows' dcomp.dll + dcomp.pdb
+(`??_7Api@InteropVisual@...` at `0x199150`); slot 7 `SetTransform(IDCompositionTransform *)` is still not
+applied - XAML was not seen to call it past start-up.
+
+**Capture trap:** grabbing `xwd -id` frames back to back at 1280 froze our painting - the popup looked stuck
+on its header for 2 s while a sampler with 70 ms gaps saw it finish at ~0.9 s. `/tmp/winframes.sh` takes
+`GAP=0.04` now. Before calling something "stuck", sample it with gaps.

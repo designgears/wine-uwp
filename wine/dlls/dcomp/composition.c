@@ -5383,6 +5383,7 @@ struct dcomp_visual
     /* SetTransformParent: position relative to that visual's space instead of the tree parent's. Weak:
      * transform_parent_links clears it when either end is destroyed. */
     struct dcomp_visual *transform_parent;
+    BOOL in_walk;               /* its children are being painted: it is an ancestor of whatever paints now */
     /* the origin and scale this visual last handed its children, for visuals using it as transform parent */
     float local_x, local_y, local_sx, local_sy;
     BOOL has_local;
@@ -6907,6 +6908,8 @@ static HRESULT WINAPI dcv_SetTransformParent( void *iface, IUnknown *parent )
     struct dcomp_visual *pdcv = parent ? dcv_from_any( parent ) : NULL;
     struct visual *ppub = parent && !pdcv ? visual_from_interop( parent ) : NULL;
     TRACE( "visual %p transform parent %p (dcv %p pub %p)\n", v, parent, pdcv, ppub );
+    if (pdcv != v->transform_parent)
+        TRACE_(dcomptree)( "dcomp %p transform parent %p (was %p)\n", v, pdcv, v->transform_parent );
     if (pdcv == v) pdcv = NULL;
     if (pdcv != v->transform_parent)
     {
@@ -6914,6 +6917,20 @@ static HRESULT WINAPI dcv_SetTransformParent( void *iface, IUnknown *parent )
         scene_changed();
     }
     if (ppub) FIXME( "transform parent %p is a public visual, ignored\n", ppub );
+    return S_OK;
+}
+/* slot 50 */
+static HRESULT WINAPI dcv_SetTransformParent2( void *iface, IUnknown *parent )
+{
+    TRACE_(dcomptree)( "dcomp %p SetTransformParent2 %p\n", CONTAINING_RECORD( iface, struct dcomp_visual, vtbl ), parent );
+    return dcv_SetTransformParent( iface, parent );
+}
+/* slot 7, SetTransform(IDCompositionTransform *) */
+static HRESULT WINAPI dcv_SetTransformObject( void *iface, IUnknown *transform )
+{
+    struct dcomp_visual *v = CONTAINING_RECORD( iface, struct dcomp_visual, vtbl );
+    /* not applied: XAML was not seen to use it (two calls at start-up) */
+    TRACE_(dcomptree)( "dcomp %p SetTransform object %p\n", v, transform );
     return S_OK;
 }
 static HRESULT WINAPI dcv_ok_args( void *iface, void *a, void *b, void *c )
@@ -6926,7 +6943,7 @@ static const void *dcomp_visual_vtbl[] =
     /* 0-2 */ dcv_QueryInterface, dcv_AddRef, dcv_Release,
     /* 3-4 */ dcv_ok /*SetOffsetX anim*/, dcv_SetOffsetX,
     /* 5-6 */ dcv_ok /*SetOffsetY anim*/, dcv_SetOffsetY,
-    /* 7-9 */ dcv_ok /*SetTransform object*/, dcv_SetTransformMatrix, dcv_SetTransformParent,
+    /* 7-9 */ dcv_SetTransformObject, dcv_SetTransformMatrix, dcv_SetTransformParent,
     /* 10 */ dcv_ok, /* SetEffect */
     /* 11-12 */ dcv_ok, dcv_ok, /* SetBitmapInterpolationMode, SetBorderMode */
     /* 13-14 */ dcv_ok /*SetClip object*/, dcv_SetClipRect,
@@ -6948,7 +6965,7 @@ static const void *dcomp_visual_vtbl[] =
     /* 42-44 */ dcv_ok, dcv_ok_args, dcv_ok, /* Interaction / Transparent / RasterScale */
     /* 45 */ dcv_GetVisualCollection,
     /* 46 */ dcv_RealClose,
-    /* 47-51 */ dcv_ok_args, dcv_ok, dcv_ok, dcv_SetTransformParent /* SetTransformParent2(IDCompositionVisual *) */, dcv_ok,
+    /* 47-51 */ dcv_ok_args, dcv_ok, dcv_ok, dcv_SetTransformParent2 /* SetTransformParent2(IDCompositionVisual *) */, dcv_ok,
 };
 
 /* sx, sy: the scale the ancestors apply (SetTransform matrices, XAML's Viewbox and RenderTransform scale go
@@ -6970,7 +6987,10 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
 
     /* SetTransformParent: this visual lives in its transform parent's space, not in the tree parent's. The
      * parent may paint later in the frame; its last recorded space is used, and a change repaints. */
-    if (v->transform_parent && v->transform_parent->has_local)
+    /* A transform parent that is also an ancestor (XAML's transition wrappers inside a popup's scroll content, via
+     * SetTransformParent2) changes nothing: the tree already composes it, and taking its space instead dropped the
+     * layout offsets in between - the view cube popup's Views page drew over its tabs until the transition ended. */
+    if (v->transform_parent && v->transform_parent->has_local && !v->transform_parent->in_walk)
     {
         ox = v->transform_parent->local_x;
         oy = v->transform_parent->local_y;
@@ -7143,6 +7163,7 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
     /* No debug fill for visuals without drawable content: now that XAML's IVisual sizes reach these
      * visuals, the blue placeholder covered the real UI underneath. */
     (void)rc; (void)brush;
+    v->in_walk = TRUE;
     for (i = 0; i < v->child_count; i++)
     {
         TRACE( "child %u of dcomp %p is %s %p\n", i, v, v->children[i].pub ? "public" : "dcomp",
@@ -7150,6 +7171,7 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
         if (v->children[i].pub) paint_public_visual( hdc, v->children[i].pub, x, y, w, h, csx, csy );
         else if (v->children[i].dcv) paint_dcomp_visual( hdc, v->children[i].dcv, x, y, csx, csy );
     }
+    v->in_walk = FALSE;
     paint_opacity = saved_opacity;
     if (saved) paint_clip = saved_clip;
     if (turned)

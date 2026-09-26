@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     75a74d293d72103d12b309343c0dafaa762543a8
-                 dcomp: Apply a visual's opacity to its subtree; hold paints for a structural batch up to 250 ms.
+  wine HEAD:     0f451e946ffa9a508f51badd7075ca0d35ce2b95
+                 dcomp: A transform parent that is also an ancestor changes nothing.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-26T19:10:56Z
+  captured:      2026-09-26T19:41:11Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
