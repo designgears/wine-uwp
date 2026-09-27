@@ -9684,3 +9684,54 @@ equal paints every second (62/62, 163/162, then 175/175), no gap over 30 ms once
 
 What remains in the first ~second: the app itself presents few frames while the project loads (62 in that
 second), with readbacks slow while its device is busy.
+
+### The batch gate held the viewport still while the editor was built (2026-09-27)
+
+"Better, but still noticeably laggy right after loading the project for a couple of seconds." The "app presents
+few frames" reading at the end of the previous entry was only half right. Measured on the test XWayland at
+3440x1440, 175 Hz, opening the drone and orbiting from 1.8 s after the double-click:
+
+- The render thread was not slow: it spent the stall inside `present_notify_Presented`, our back-pressure, whose
+  20 ms wait timed out on every present (`notify 20.0` on each `trace+d3dperf` present line). Its frames were read
+  back in 3-9 ms and then sat unshown.
+- A frame reaches the screen only through a paint, and the paint was held by the XAML batch gate
+  (`XAML_BATCH_WAIT`, 250 ms since the folder-selection fix): while the editor's panels are built XAML keeps
+  batches that insert visuals open, one for 207 ms and many for 5-40 ms. `trace+dcompgate` shows `deferred, wait
+  206` then `painting after 207 ms deferred`, with no viewport frame in between. Every "before" run had a worst gap
+  of 251-253 ms, the gate's timeout exactly.
+
+Two fixes in `dlls/dcomp/composition.c`:
+
+1. **`paint_swapchains_only`**: when the gate defers a paint, finished swap chain frames are swapped in anyway and
+   written into the last complete paint list (the tree as last committed, which is what is on screen); only their
+   rectangles are rasterized and flushed. On Windows the swap chain flips independently of the UI thread's
+   commits, which is the same thing. To make re-rasterizing an old list safe, retired bitmaps now live one full
+   frame longer (`retired_older`): every op source is a DIB freed only through `free_retired_bitmaps()`.
+2. **`request_repaint` dropped any request while a timer was pending**, even one due sooner. A swap chain frame
+   paced to ~3 ms waited behind the gate's ~90 ms retry, so the first fix alone still left 128-191 ms gaps. The
+   pending timer's due time is kept, and an earlier request gets its own timer. The due time is compared as a
+   value passed to each timer, not against the clock: timers fire up to 5 ms early by `GetTickCount64`, and a
+   clock-slack version left due times behind that swallowed requests.
+
+Frames shown per 250 ms over the first 4 s, `docs/screenshots/viewport-after-open-gated.png`: before, 3-4 in the
+first quarter second and a 252 ms worst gap in all three runs; after, 8-26 in the first quarter second and a
+61-70 ms worst gap in all four. `docs/screenshots/shapr3d-drone-orbit-after-open.png` is the editor after such a
+run. `./shownframes.py` counts `swap chain frame N shown`, a new `dcompgate` line; `dcompperf` now reports
+`N shown (M while gated)`.
+
+Not it, and reverted: making wined3d give `MAP_R` buffers a GPU bo (`wined3d_buffer_vk_init`), from a profile of
+the command thread in `vkWaitForFences` under `wined3d_cs_exec_map`. The stall stayed the same.
+Also measured and not it: input. The viewport's pointer input is forwarded by a `WH_GETMESSAGE` hook on the UI
+thread, which looked like the obvious suspect while that thread is busy, but `trace+dcompinput` gives a mean delay
+of ~1 ms and a worst of 30 ms after opening. And Shapr3D's swap chain has alpha mode 0 (`UNSPECIFIED`), so skipping
+the per-frame opaque scan for `IGNORE` chains would not help it.
+
+Regression: Calculator AE 0, Feedback Hub 896 / 0 fail-fasts, Media Player 2242. Solitaire failed 3 of the first
+12 runs inside full suites (one blank, two stopping after `PlayFab Logged in` - the old never-ticked signature, one
+of them capturing Feedback Hub's 896 colours), then passed 29 in a row, 20 alone and 9 in three more suites; the
+committed dcomp gave 0/9 in three suites. The early failures all followed the long Shapr3D test runs. Not
+conclusive; watch Solitaire's rate.
+
+Seen once during this work, not investigated: Shapr3D died while opening the drone with the
+`CoreMessaging.dll+0x27ed3` access violation already noted above for Solitaire (`DispatchItem::ForceWakeLevel`,
+a NULL list node, reached from `TimeoutManager::Callback_OnDispatch`). It is not only Solitaire's.

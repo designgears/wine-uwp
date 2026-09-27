@@ -28,6 +28,7 @@
 #include "d3d11.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dxgi);
+WINE_DECLARE_DEBUG_CHANNEL(d3dperf);
 
 /* Undocumented; XAML's SwapChainPanel::SetSwapChain queries it to tell a composition swap chain
  * from a window one (failure is its 0x88001b00 error) and only releases the result. */
@@ -293,8 +294,13 @@ static HRESULT comp_swapchain_present(struct comp_swapchain *swapchain, UINT syn
         WARN("Invalid sync interval %u.\n", sync_interval);
         return DXGI_ERROR_INVALID_CALL;
     }
+    LARGE_INTEGER t0, t1, t2, t3;
+    static LARGE_INTEGER last_present;
+
     if (flags & DXGI_PRESENT_TEST) return S_OK;
+    QueryPerformanceCounter(&t0);
     if (sync_interval) comp_swapchain_wait_vblank(swapchain, sync_interval);
+    QueryPerformanceCounter(&t1);
 
     /* Snapshot the frame for the compositor, in order on the app's own context, and make sure
      * it is finished before the compositor copies it. The compositor reads buffer 0 on its own
@@ -315,6 +321,7 @@ static HRESULT comp_swapchain_present(struct comp_swapchain *swapchain, UINT syn
         ID3D11DeviceContext_Flush(context);
         ID3D11DeviceContext_Release(context);
     }
+    QueryPerformanceCounter(&t2);
     InterlockedIncrement(&swapchain->present_count);
     if (swapchain->latency_event) SetEvent(swapchain->latency_event);
     /* The compositor registers a notifier as private data so it can pick the frame up right away instead
@@ -330,6 +337,21 @@ static HRESULT comp_swapchain_present(struct comp_swapchain *swapchain, UINT syn
             IUnknown_Release(notify);
         }
     }
+    QueryPerformanceCounter(&t3);
+    if (TRACE_ON(d3dperf))
+    {
+        LARGE_INTEGER freq;
+        double gap, total;
+        QueryPerformanceFrequency(&freq);
+        gap = last_present.QuadPart ? (t0.QuadPart - last_present.QuadPart) * 1000.0 / freq.QuadPart : 0.0;
+        total = (t3.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+        /* only the slow ones: a stall between presents is the app, one inside is us */
+        if (gap >= 30.0 || total >= 8.0)
+            TRACE_(d3dperf)("present after %.1f ms outside; inside %.1f ms (vblank %.1f, copy %.1f, notify %.1f).\n",
+                    gap, total, (t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart,
+                    (t2.QuadPart - t1.QuadPart) * 1000.0 / freq.QuadPart, (t3.QuadPart - t2.QuadPart) * 1000.0 / freq.QuadPart);
+    }
+    last_present = t3;
     return S_OK;
 }
 

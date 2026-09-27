@@ -135,12 +135,12 @@ static void *guarded_realloc( void *ptr, size_t size )
  * on while measuring (the +dcomp trace itself costs more than the painting). */
 static struct
 {
-    unsigned int requests, deferred, unchanged, frames, commits, swapchain_frames, presents, readbacks;
+    unsigned int requests, deferred, unchanged, frames, commits, swapchain_frames, presents, readbacks, gated_swapchain;
     double readback_ms, readback_max;
     double walk_ms, raster_ms;
     unsigned int batched, batches;
     unsigned int visits, ops, pixels, verified, verify_bad;
-    double paint_ms, paint_max, blit_ms;
+    double paint_ms, paint_max, blit_ms, flush_ms, flush_max;
     ULONGLONG start;
 } perf;
 static void perf_report( void )
@@ -153,11 +153,11 @@ static void perf_report( void )
                            perf.walk_ms / perf.frames, perf.raster_ms / perf.frames, perf.visits / perf.frames, perf.ops / perf.frames,
                            perf.pixels / perf.frames / 1000, perf.batched, perf.batches, perf.verified, perf.verify_bad );
     if (perf.requests)
-        TRACE_(dcompperf)( "%I64u ms: %u commits, swap chain %u presents %u readbacks (%.2f avg %.2f max ms) %u shown, %u requests, %u deferred, %u unchanged, %u frames, paint %.2f avg %.2f max, blit %.2f avg.\n",
+        TRACE_(dcompperf)( "%I64u ms: %u commits, swap chain %u presents %u readbacks (%.2f avg %.2f max ms) %u shown (%u while gated), %u requests, %u deferred, %u unchanged, %u frames, paint %.2f avg %.2f max, blit %.2f avg, flush %.2f avg %.2f max.\n",
                            now - perf.start, perf.commits, perf.presents, perf.readbacks,
-                           perf.readbacks ? perf.readback_ms / perf.readbacks : 0.0, perf.readback_max, perf.swapchain_frames, perf.requests, perf.deferred, perf.unchanged, perf.frames,
+                           perf.readbacks ? perf.readback_ms / perf.readbacks : 0.0, perf.readback_max, perf.swapchain_frames, perf.gated_swapchain, perf.requests, perf.deferred, perf.unchanged, perf.frames,
                            perf.frames ? perf.paint_ms / perf.frames : 0.0, perf.paint_max,
-                           perf.frames ? perf.blit_ms / perf.frames : 0.0 );
+                           perf.frames ? perf.blit_ms / perf.frames : 0.0 , perf.frames ? perf.flush_ms / perf.frames : 0.0, perf.flush_max);
     memset( &perf, 0, sizeof(perf) );
     perf.start = now;
 }
@@ -359,6 +359,11 @@ static CRITICAL_SECTION_DEBUG retired_cs_debug =
 static CRITICAL_SECTION retired_cs = { &retired_cs_debug, -1, 0, 0, 0, 0 };
 static HBITMAP *retired_bitmaps;
 static unsigned int retired_count, retired_capacity;
+/* Retired before the last full frame ended: freed at the end of the next one. The last complete paint list is
+ * rasterized again for a swap chain frame while a XAML batch holds the walk back (paint_swapchains_only), and
+ * any bitmap it names was alive when it was built, so it has to outlive the frame after it. */
+static HBITMAP *retired_older;
+static unsigned int retired_older_count, retired_older_capacity;
 
 static void retire_bitmap( HBITMAP bmp )
 {
@@ -381,12 +386,21 @@ static void retire_bitmap( HBITMAP bmp )
     LeaveCriticalSection( &retired_cs );
 }
 
+/* at the end of a full frame */
 static void free_retired_bitmaps( void )
 {
-    unsigned int i;
+    unsigned int i, capacity;
+    HBITMAP *list;
 
     EnterCriticalSection( &retired_cs );
-    for (i = 0; i < retired_count; i++) DeleteObject( retired_bitmaps[i] );
+    for (i = 0; i < retired_older_count; i++) DeleteObject( retired_older[i] );
+    list = retired_older;
+    capacity = retired_older_capacity;
+    retired_older = retired_bitmaps;
+    retired_older_count = retired_count;
+    retired_older_capacity = retired_capacity;
+    retired_bitmaps = list;
+    retired_capacity = capacity;
     retired_count = 0;
     LeaveCriticalSection( &retired_cs );
 }
@@ -1071,11 +1085,16 @@ static double readback_ms;   /* readback time accumulated over a frame (TRACE_ON
  * lost whenever the thread that asked - a commit on some worker - never pumped messages again; and a
  * surface whose read-back came up empty (XAML's D2D drawing not yet executed) waited for the next unrelated
  * commit. The timer paints itself. */
-static LONG repaint_pending;
+/* When the earliest pending repaint fires, 0 for none. A request due sooner than the pending one gets a timer of its
+ * own: dropping it, as a single pending flag did, held a swap chain frame paced to 3 ms behind the batch gate's
+ * 90 ms retry, and the viewport stood still for that long while Shapr3D's editor was being built. */
+static LONGLONG repaint_due;
 static void scene_dirty( void );
 static void CALLBACK repaint_timer_proc( void *arg, BOOLEAN fired )
 {
-    InterlockedExchange( &repaint_pending, 0 );
+    /* arg is this timer's due time; a later timer than the earliest leaves that one's alone. Compared as a value, not
+     * with the clock: timers fire a few ms early by GetTickCount64, and a due time left behind swallowed requests. */
+    InterlockedCompareExchange64( &repaint_due, 0, (LONGLONG)(ULONG_PTR)arg );
     if (!last_desktop_hwnd) return;
     /* painted here, on a pool thread: a WM_PAINT for the window's thread queued every deferred frame (and at
      * 60 a second, every swap chain frame) behind the app's own work on the UI thread */
@@ -1086,10 +1105,19 @@ static void CALLBACK repaint_timer_proc( void *arg, BOOLEAN fired )
 static void request_repaint( DWORD delay )
 {
     HANDLE timer;
-    if (!last_desktop_hwnd || InterlockedCompareExchange( &repaint_pending, 1, 0 )) return;
-    if (!CreateTimerQueueTimer( &timer, NULL, repaint_timer_proc, NULL, max( delay, 1 ), 0,
+    LONGLONG due, pending;
+
+    if (!last_desktop_hwnd) return;
+    delay = max( delay, 1 );
+    due = GetTickCount64() + delay;
+    do
+    {
+        pending = repaint_due;
+        if (pending && pending <= due) return;   /* an earlier repaint will see this */
+    } while (InterlockedCompareExchange64( &repaint_due, due, pending ) != pending);
+    if (!CreateTimerQueueTimer( &timer, NULL, repaint_timer_proc, (void *)(ULONG_PTR)due, delay, 0,
                                 WT_EXECUTEONLYONCE | WT_EXECUTELONGFUNCTION ))
-        InterlockedExchange( &repaint_pending, 0 );
+        InterlockedCompareExchange64( &repaint_due, 0, due );
 }
 
 /* present_desktop_hwnd() is reached from Commit on whichever thread commits and from a thread timer,
@@ -1153,6 +1181,7 @@ static void destroy_deferred_surfaces( void )
 
 static void present_desktop_hwnd_locked( HWND hwnd );
 static void request_repaint( DWORD delay );
+static void paint_swapchains_only( HWND hwnd, HDC hdc );
 static void present_desktop_hwnd( HWND hwnd )
 {
     present_request_hwnd = hwnd;
@@ -1300,6 +1329,7 @@ static void present_desktop_hwnd_locked( HWND hwnd )
                     TRACE_(dcompgate)( "deferred, wait %lu, since %I64u\n", wait, gate_now - deferred_since );
                     paint_current ^= 1;         /* the last frame's list stays the previous one */
                     painted_generation = -1;    /* and this scene still needs painting */
+                    paint_swapchains_only( hwnd, hdc );
                     ReleaseDC( hwnd, hdc );
                     request_repaint( min( wait, XAML_BATCH_WAIT - (DWORD)(gate_now - deferred_since) ) );
                     return;
@@ -1356,7 +1386,21 @@ static void present_desktop_hwnd_locked( HWND hwnd )
          * message loop goes idle, or every 50 ms when none does: while Shapr3D's UI thread was busy (a project
          * opening, the panels updating after an edit) the viewport reached the screen in 50 ms steps however
          * fast it was painted - 31 flushes in the first second after opening, one gap of 234 ms. */
-        if (damage.count) NtUserCallHwnd( hwnd, NtUserCallHwnd_FlushWindowSurface );
+        if (damage.count)
+        {
+            LARGE_INTEGER f0, f1, ff;
+            if (timing) QueryPerformanceCounter( &f0 );
+            NtUserCallHwnd( hwnd, NtUserCallHwnd_FlushWindowSurface );
+            if (timing)
+            {
+                double ms;
+                QueryPerformanceCounter( &f1 );
+                QueryPerformanceFrequency( &ff );
+                ms = (f1.QuadPart - f0.QuadPart) * 1000.0 / ff.QuadPart;
+                perf.flush_ms += ms;
+                if (ms > perf.flush_max) perf.flush_max = ms;
+            }
+        }
         free_retired_bitmaps();
         if (timing)
         {
@@ -3594,6 +3638,7 @@ static void surface_sync_swapchain( struct drawing_surface *surface )
         surface->readback_ready = FALSE;
         perf.swapchain_frames++;
         TRACE( "surface %p: frame %u swapped in.\n", surface, surface->presented );
+        TRACE_(dcompgate)( "swap chain frame %u shown\n", surface->presented );
     }
     LeaveCriticalSection( &swapchain_cs );
 
@@ -3615,6 +3660,65 @@ static void surface_sync_swapchain( struct drawing_surface *surface )
         if (!TrySubmitThreadpoolCallback( swapchain_readback_job, surface, NULL ))
             InterlockedExchange( &surface->readback_busy, 0 );
     }
+}
+
+/* A swap chain frame while a XAML batch holds the walk back. On Windows the app's swap chain flips on its own,
+ * whatever the UI thread is doing; here its frames reached the screen only through a full paint, and the gate
+ * held that back for as long as XAML kept a batch open. While Shapr3D's editor was being built after a project
+ * opened, one batch stayed open 207 ms and many for 5-40 ms, and the viewport stood still or stuttered for the
+ * first seconds. So the new frame goes into the last complete paint list - the tree as last committed, which is
+ * what is on screen - and only its rectangles are rasterized again. Called holding present_cs. */
+static void paint_swapchains_only( HWND hwnd, HDC hdc )
+{
+    struct drawing_surface *surfaces[8];
+    struct paint_damage damage = { { { 0 } } };
+    RECT bounds = { 0, 0, back_w, back_h }, rc;
+    struct paint_list *list;
+    unsigned int i, j, count;
+
+    if (paint_complete < 0 || !back_bmp || !back_dc || !GetClientRect( hwnd, &rc ) ||
+        rc.right != back_w || rc.bottom != back_h)
+        return;
+    EnterCriticalSection( &swapchain_cs );
+    count = min( swapchain_surface_count, ARRAY_SIZE(surfaces) );
+    memcpy( surfaces, swapchain_surfaces, count * sizeof(*surfaces) );
+    LeaveCriticalSection( &swapchain_cs );
+
+    list = &paint_lists[paint_complete];
+    for (i = 0; i < count; i++)
+    {
+        struct drawing_surface *surface = surfaces[i];
+
+        if (!surface->readback_ready) continue;
+        surface_sync_swapchain( surface );
+        AcquireSRWLockExclusive( &hit_lock );
+        for (j = 0; j < list->count; j++)
+        {
+            struct paint_op *op = &list->ops[j];
+
+            if (!op->swapchain || op->key != surface) continue;
+            /* a new size is left to the next full paint */
+            if (op->src_w != (int)surface->cache_w || op->src_h != (int)surface->cache_h) continue;
+            if (op->kind == OP_BLEND)
+            {
+                op->bits = surface->cache;
+                op->opaque = op->alpha == 255 && !op->affine && surface->opaque;
+            }
+            else if (op->kind == OP_STRETCH) op->bmp = surface->cache_dib;
+            else continue;
+            op->gen = surface->generation;
+            damage_add_op( &damage, op, &bounds );
+        }
+        ReleaseSRWLockExclusive( &hit_lock );
+    }
+    if (!damage.count) return;
+    for (i = 0; i < damage.count; i++) raster_ops( back_dc, back_bits, back_w, list, &damage.rects[i] );
+    for (i = 0; i < damage.count; i++)
+        BitBlt( hdc, damage.rects[i].left, damage.rects[i].top, damage.rects[i].right - damage.rects[i].left,
+                damage.rects[i].bottom - damage.rects[i].top, back_dc, damage.rects[i].left, damage.rects[i].top, SRCCOPY );
+    NtUserCallHwnd( hwnd, NtUserCallHwnd_FlushWindowSurface );
+    perf.gated_swapchain++;
+    TRACE_(dcompgate)( "swap chain frame while gated, %u rects\n", damage.count );
 }
 
 /* Present notifier registered on composition swap chains (dxgi's comp_swapchain_present calls method 3 on
