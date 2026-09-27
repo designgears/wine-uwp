@@ -9676,7 +9676,7 @@ and win32u copies a surface to the display only in `flush_window_surfaces()` - w
 idle, or every 50 ms when none does. Right after a project opens, or after an edit, Shapr3D's UI thread is busy,
 so the viewport went out in 50 ms steps however fast we painted.
 
-Measured with `trace+win` (`Flushing hwnd` lines, `/tmp/flushgaps.py`): before, 31 flushes in the first second
+Measured with `trace+win` (`Flushing hwnd` lines, `flushgaps.py`): before, 31 flushes in the first second
 after opening against 95 paints, with a 234 ms gap, and 101 flushes against 90 paints in the next; after, flushes
 equal paints every second (62/62, 163/162, then 175/175), no gap over 30 ms once the app presents. New
 `NtUserCallHwnd_FlushWindowSurface` (appended to the enum, so no code shifts), called by dcomp after each frame's
