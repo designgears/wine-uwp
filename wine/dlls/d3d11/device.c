@@ -20,6 +20,7 @@
 #include "d3d11_private.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(d3d11);
+WINE_DECLARE_DEBUG_CHANNEL(d3dperf);
 
 static BOOL d3d_array_reserve(void **elements, SIZE_T *capacity, SIZE_T count, SIZE_T size)
 {
@@ -5757,6 +5758,7 @@ static ULONG STDMETHODCALLTYPE d3d_device_inner_Release(IUnknown *iface)
 
     if (!refcount)
     {
+        TRACE_(d3dperf)("device %p destroyed, thread %04lx.\n", device, GetCurrentThreadId());
         if (device->state)
             d3d_device_context_state_private_release(device->state);
         for (i = 0; i < device->context_state_count; ++i)

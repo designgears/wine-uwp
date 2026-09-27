@@ -586,6 +586,12 @@ struct dxgi_factory *unsafe_impl_from_IDXGIFactory(IDXGIFactory *iface)
     return factory;
 }
 
+/* One wined3d for every factory in the process, as DXGI's adapters are process-wide on Windows. Each wined3d
+ * brings its own Vulkan instance, and a device can only reuse a parked Vulkan device of the same instance:
+ * Win2D makes a D3D11 device (a new factory each time) for every thumbnail it draws and drops it again, ten
+ * a second on Shapr3D's home screen, and each took ~72 ms of its render thread. */
+static struct wined3d *shared_wined3d;
+
 static HRESULT dxgi_factory_init(struct dxgi_factory *factory, BOOL extended)
 {
     factory->IWineDXGIFactory_iface.lpVtbl = &dxgi_factory_vtbl;
@@ -593,7 +599,8 @@ static HRESULT dxgi_factory_init(struct dxgi_factory *factory, BOOL extended)
     wined3d_private_store_init(&factory->private_store);
 
     wined3d_mutex_lock();
-    factory->wined3d = wined3d_create(0);
+    if (!shared_wined3d) shared_wined3d = wined3d_create(0);   /* the static reference is never dropped */
+    if ((factory->wined3d = shared_wined3d)) wined3d_incref(factory->wined3d);
     wined3d_mutex_unlock();
     if (!factory->wined3d)
     {

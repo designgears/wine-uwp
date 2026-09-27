@@ -9634,3 +9634,35 @@ applied - XAML was not seen to call it past start-up.
 **Capture trap:** grabbing `xwd -id` frames back to back at 1280 froze our painting - the popup looked stuck
 on its header for 2 s while a sampler with 70 ms gaps saw it finish at ~0.9 s. `/tmp/winframes.sh` takes
 `GAP=0.04` now. Before calling something "stuck", sample it with gaps.
+
+### The viewport stuttered while Win2D made and dropped D3D devices (2026-09-27)
+
+Reported: the viewport is choppy right after opening a project and right after a change. Measured at 3440x1400
+with `WINE_UWP_TEST_HZ=175` (`/tmp/openorbit.sh`: open the drone from Home, orbit with 8 ms moves from 1.5 s on,
+`+dcompperf` per second, `schedtl.py` on every thread, and `WINE_UWP_PROFILE` snapshots before and after, diffed by
+`profdiff.py`).
+
+- The batch gate is not it: one hold over 20 ms (99 ms) in the whole open.
+- The app presented fewer frames (73-152 a second for 1-4 s after opening, 175 after), and we showed all of them.
+- `profsym` on the render thread: **48% of its busy samples in `vkCreateDevice` and 15% in `vkDestroyDevice`**,
+  from `Microsoft.Graphics.Canvas.dll` -> `D3D11CreateDevice` and `d2d_device_Release`. New `d3dperf` trace
+  channel in d3d11 (each device created with its time, thread and caller, and each destroyed): **100 devices in
+  11 s, one every ~110 ms, ~72 ms each, all on the render thread, each destroyed ~15 ms after creation** - Win2D
+  drawing the Home screen's thumbnails, holding its shared `CanvasDevice` only by weak reference. Every creation
+  went through a new DXGI factory, so a new wined3d, a new Vulkan instance and a new Vulkan device.
+- Fix: DXGI factories share one wined3d (as DXGI's adapters are process-wide on Windows), and wined3d parks the
+  last destroyed device's idle `VkDevice` (`vkDeviceWaitIdle` first; one spare; dropped before its instance in
+  `adapter_vk_destroy`) for the next device on the same adapter. **Median creation 72 ms -> 3.7 ms**; the same 100
+  thumbnails now take ~2 s instead of 11. Regression suite unchanged; soak below.
+- Not reproduced here, because it needs an edit and the tests do not edit the user's projects: Shapr3D redraws a
+  project's thumbnail after changes, through the same Win2D path, which fits "choppy right after a change".
+
+What is left in the first second after opening, measured: readbacks of the swap chain average 72 ms (max 144)
+while the project loads and the device's command stream is busy, 3-4 ms after; and paints peak at ~31 ms while
+XAML still commits 40-100 times a second. The app's render thread is mostly waiting then; our painter threads
+use ~0.4 s of CPU each over those seconds.
+
+Soak after the change: 3 of 3 runs, 9 open/orbit/File menu/chevron/leave cycles. Memory (VmRSS) across three
+open-and-leave cycles from Home: 1735 -> 2470 -> 2788 -> 3365 MB with the change, 1734 -> 2471 -> 2911 -> 3595 MB
+without it - so device reuse leaks nothing, but **something already grows ~300-700 MB per open/leave cycle**. Not
+investigated yet.

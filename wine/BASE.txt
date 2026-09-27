@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     0f451e946ffa9a508f51badd7075ca0d35ce2b95
-                 dcomp: A transform parent that is also an ancestor changes nothing.
+  wine HEAD:     2317d66553b50182b9ea16cc918ca38fe291bd8d
+                 dxgi, wined3d: Share one wined3d between factories and reuse a released Vulkan device.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-26T19:41:11Z
+  captured:      2026-09-27T08:29:05Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

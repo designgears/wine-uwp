@@ -210,6 +210,8 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | What is the visual tree doing? | `WINEDEBUG=+dcomp`; `present_desktop_hwnd frame: N ops` - 0 ops means nothing to draw |
 | Which thread is spending the CPU in an interaction? | `/proc/<pid>/task/*/stat` (utime+stime) before and after; Wine names the Linux threads (`KernelRunLoop`, `ApplicationView`, `Render thread`, `wine_threadpool`). For *when*: `./schedtl.py <pid> <s> <out>` samples every thread's `schedstat` every 5 ms, `./schedview.py <out> [t0 t1 N]` prints a 10 ms-per-character busy strip per thread. That showed Shapr3D's UI thread saturated by our painting, and the kernel's compute/wait rhythm |
 | Symbolize a `WINE_UWP_PROFILE` dump | `$UWP_BIN/venv/bin/python profsym.py <dump>` (threads by name), `profsym.py <dump> <tid> [N]` (top leaves with real 8-frame unwound callers; `DEPTH=n`), `BUSY=1` to drop samples parked in waits. Profile at 5 ms: 3 ms with ~80 threads crashed Shapr3D once |
+| Is something creating D3D devices? | `WINEDEBUG=+timestamp,trace+d3dperf`: every `D3D11CreateDevice` with its time, thread and caller, and every device destroyed. Win2D made 100 in 11 s on Shapr3D's render thread, 72 ms each |
+| What did a thread do between two moments? | copy the `WINE_UWP_PROFILE` dump at both moments and `./profdiff.py before after diff` (cumulative counts subtracted), then `profsym.py diff` |
 | Reproduce at the user's refresh rate | `WINE_UWP_TEST_HZ=175` paces dcomp's painter and dxgi's vblank grid as a 175 Hz display would; Xvfb reports 60. The wheel-over-panel leak was 10 in 150 at 175 Hz and never showed at 60 |
 | Which offset did XAML scroll to, and who asked? | `WINE_UWP_BP` on `ScrollViewer::ChangeViewInternal` (`windows.ui.xaml.dll+406ac8`, `ret` names the caller) and `BringIntoViewportInternal` (`+405ba4@rdx+0:4`, the target rect as floats); `trace+manipulation` shows what reaches DirectManipulation (`set to scale ... offset`, `scrolled to`) |
 | Reproduce at the user's window size | the user's screen is 3440x1440: `Xvfb :96 -screen 0 3440x1440x24`, then `wine $UWP_BIN/build-probes/probe-resize.exe 3440 1400 Shapr3D`. Per-frame painting costs scale with it, and a 1280x800 run hid a UI thread at 100% |
@@ -503,6 +505,11 @@ paints must go through `paint_emit` to get it.
 **The batch gate's timeout must outlast XAML's slowest frame at the user's size.** At 3440 wide a frame that
 rebuilds a toolbar takes 70 ms and more; the gate's old 50 ms let a paint draw the new buttons at the origin
 with their positions unset. Reproduce layout glitches at 3440 and 175 Hz before calling them fixed.
+
+**A D3D device here is a whole Vulkan device, tens of milliseconds, and apps treat it as cheap.** Win2D creates
+one per thumbnail and drops it; each went through a new DXGI factory, wined3d and Vulkan instance. DXGI factories
+now share one wined3d and wined3d reuses the last released `VkDevice` (72 ms -> 3.7 ms). When a render thread
+stalls, look for device churn with `trace+d3dperf` before anything subtler.
 
 **A tight `xwd` capture loop can freeze what it is measuring.** Back-to-back `xwd -id` grabs at 1280 stalled
 our painting: the view cube popup looked stuck on its header for 2 s, while a sampler with 70 ms gaps saw it
@@ -1036,11 +1043,10 @@ the fully-qualified name. `--grep` first, always.
   before trusting a run.
 - Wine's builtins win by module name. Pointing an `ActivatableClassId` at a native DLL is not enough;
   it also needs a `=n` override and the file in the prefix.
-- **`xdotool` was removed from the system on 2026-09-25** (a `pacman -Rns` clean-up), and every
-  `/tmp` test script drives the apps with it. Without it, find a window with
-  `DISPLAY=:0 xprop -root _NET_CLIENT_LIST` plus `xprop -id <w> WM_NAME`, and capture with `xwd -id`.
-  Reinstalling is the user's call (it needs sudo). A `2>/dev/null` on an `xdotool search` hides the
-  "command not found" and looks like "no such window".
+- **`xdotool` was removed once** (2026-09-25, a `pacman -Rns` clean-up) and the user reinstalled it; every
+  `/tmp` test script drives the apps with it. If it is missing, find a window with
+  `xprop -root _NET_CLIENT_LIST` plus `xprop -id <w> WM_NAME`, capture with `xwd -id`, and ask - it needs sudo.
+  A `2>/dev/null` on an `xdotool search` hides the "command not found" and looks like "no such window".
 - Wine's `GetObject( dib, sizeof(DIBSECTION) )` reports `dsBmih.biHeight` **positive** for a top-down DIB,
   so it cannot tell you the row order. Every DIB `dcomp/composition.c` creates is top-down.
 - The unhandled-error text an app reports is often a *consequence*. `Delegate to an instance method
