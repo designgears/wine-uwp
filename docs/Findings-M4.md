@@ -9666,3 +9666,21 @@ Soak after the change: 3 of 3 runs, 9 open/orbit/File menu/chevron/leave cycles.
 open-and-leave cycles from Home: 1735 -> 2470 -> 2788 -> 3365 MB with the change, 1734 -> 2471 -> 2911 -> 3595 MB
 without it - so device reuse leaks nothing, but **something already grows ~300-700 MB per open/leave cycle**. Not
 investigated yet.
+
+### The viewport reached the screen in 50 ms steps while the UI thread was busy (2026-09-27)
+
+The device reuse above was real but did not fix the user's report. Painted-frame gaps on Xvfb were already
+smooth (6 ms median, 19 ms max even in the first second after opening), so the measurement was of the wrong
+thing: **a frame we paint is not a frame on screen.** dcomp paints into the window's surface from pool threads,
+and win32u copies a surface to the display only in `flush_window_surfaces()` - when some thread's message loop goes
+idle, or every 50 ms when none does. Right after a project opens, or after an edit, Shapr3D's UI thread is busy,
+so the viewport went out in 50 ms steps however fast we painted.
+
+Measured with `trace+win` (`Flushing hwnd` lines, `/tmp/flushgaps.py`): before, 31 flushes in the first second
+after opening against 95 paints, with a 234 ms gap, and 101 flushes against 90 paints in the next; after, flushes
+equal paints every second (62/62, 163/162, then 175/175), no gap over 30 ms once the app presents. New
+`NtUserCallHwnd_FlushWindowSurface` (appended to the enum, so no code shifts), called by dcomp after each frame's
+`BitBlt`. Regression suite unchanged.
+
+What remains in the first ~second: the app itself presents few frames while the project loads (62 in that
+second), with readbacks slow while its device is busy.

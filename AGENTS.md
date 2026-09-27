@@ -506,6 +506,12 @@ paints must go through `paint_emit` to get it.
 rebuilds a toolbar takes 70 ms and more; the gate's old 50 ms let a paint draw the new buttons at the origin
 with their positions unset. Reproduce layout glitches at 3440 and 175 Hz before calling them fixed.
 
+**A painted frame is not a frame on screen.** dcomp paints into the window surface from pool threads; win32u copies
+a surface out only when a message loop goes idle, or every 50 ms. While the UI thread was busy the viewport went
+out in 50 ms steps while every paint-side measurement looked perfect. dcomp now flushes after each frame
+(`NtUserCallHwnd_FlushWindowSurface`). Measure what reaches the display: `trace+win` `Flushing hwnd` lines, or
+`xwd` frames with gaps between them.
+
 **A D3D device here is a whole Vulkan device, tens of milliseconds, and apps treat it as cheap.** Win2D creates
 one per thumbnail and drops it; each went through a new DXGI factory, wined3d and Vulkan instance. DXGI factories
 now share one wined3d and wined3d reuses the last released `VkDevice` (72 ms -> 3.7 ms). When a render thread

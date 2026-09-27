@@ -35,6 +35,7 @@
 #include "winbase.h"
 #include "winuser.h"
 #include "wingdi.h"
+#include "ntuser.h"
 #include "winstring.h"
 #include "objbase.h"
 #include "activation.h"
@@ -1351,6 +1352,11 @@ static void present_desktop_hwnd_locked( HWND hwnd )
         for (i = 0; i < damage.count; i++)
             BitBlt( hdc, damage.rects[i].left, damage.rects[i].top, damage.rects[i].right - damage.rects[i].left,
                     damage.rects[i].bottom - damage.rects[i].top, mem, damage.rects[i].left, damage.rects[i].top, SRCCOPY );
+        /* Put the frame on the display now. A window surface is otherwise copied out only when some thread's
+         * message loop goes idle, or every 50 ms when none does: while Shapr3D's UI thread was busy (a project
+         * opening, the panels updating after an edit) the viewport reached the screen in 50 ms steps however
+         * fast it was painted - 31 flushes in the first second after opening, one gap of 234 ms. */
+        if (damage.count) NtUserCallHwnd( hwnd, NtUserCallHwnd_FlushWindowSurface );
         free_retired_bitmaps();
         if (timing)
         {

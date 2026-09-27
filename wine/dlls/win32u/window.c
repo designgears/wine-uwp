@@ -2499,6 +2499,20 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     return ret;
 }
 
+static BOOL flush_window_surface( HWND hwnd )
+{
+    struct window_surface *surface;
+    WND *win;
+
+    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
+    if ((surface = win->surface)) window_surface_add_ref( surface );
+    release_win_ptr( win );
+    if (!surface) return FALSE;
+    window_surface_flush( surface );
+    window_surface_release( surface );
+    return TRUE;
+}
+
 static BOOL expose_window_surface( HWND hwnd, UINT flags, const RECT *rect )
 {
     struct window_surface *surface;
@@ -6279,6 +6293,9 @@ ULONG_PTR WINAPI NtUserCallHwnd( HWND hwnd, DWORD code )
 
     case NtUserCallHwnd_GetDpiForWindow:
         return get_dpi_for_window( hwnd ).num;
+
+    case NtUserCallHwnd_FlushWindowSurface:
+        return flush_window_surface( hwnd );
 
     case NtUserCallHwnd_GetLastActivePopup:
         return (ULONG_PTR)get_last_active_popup( hwnd );

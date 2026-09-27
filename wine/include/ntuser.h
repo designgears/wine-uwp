@@ -1313,6 +1313,9 @@ enum
     NtUserGetFullWindowHandle,
     NtUserIsCurrentProcessWindow,
     NtUserIsCurrentThreadWindow,
+    /* wine-uwp: copy what was drawn into a window's surface to the display now (dcomp paints off the UI
+     * thread, and a surface is otherwise flushed only when some thread's message loop goes idle) */
+    NtUserCallHwnd_FlushWindowSurface,
 };
 
 static inline void NtUserActivateOtherWindow( HWND hwnd )

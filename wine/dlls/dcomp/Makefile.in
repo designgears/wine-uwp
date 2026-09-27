@@ -1,5 +1,5 @@
 MODULE    = dcomp.dll
-IMPORTS   = combase uuid user32 gdi32 d2d1 d3d11 dxguid
+IMPORTS   = combase uuid user32 win32u gdi32 d2d1 d3d11 dxguid
 
 VER_PRODUCTVERSION = 10,0,14393,0
 
