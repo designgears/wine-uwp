@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     e3a9f2179be6273997e17ae062ab15f6becafde4
-                 wineuwp: Leave App.xaml to XAML (WINE_UWP_APP_XAML=1 restores the manual load).
+  wine HEAD:     f4d2a5c12c528ae5d223f73e63e13bb016b95ee6
+                 ntdll: Allow re-associating a wait completion packet whose wait has fired; wineuwp: keep loading App.xaml by default.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-28T08:40:09Z
+  captured:      2026-09-28T09:37:47Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

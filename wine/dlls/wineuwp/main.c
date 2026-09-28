@@ -4174,10 +4174,11 @@ static void broadcast_load_app_xaml( void )
     THREADENTRY32 te;
     HANDLE snap, thr;
 
-    /* Off unless asked for (WINE_UWP_APP_XAML=1). With an unpatched Windows.UI.Xaml.dll XAML loads App.xaml itself,
-     * as on Windows; this load was the other half of a byte patch that made DXamlCore::ShouldTryLoadAppXaml return
-     * false, and with both in place Media Player painted nothing when the patch was removed. */
-    if (!GetEnvironmentVariableW( L"WINE_UWP_APP_XAML", NULL, 0 )) return;
+    /* This load is the other half of a byte patch in Windows.UI.Xaml.dll that makes DXamlCore::ShouldTryLoadAppXaml
+     * return false. With an unpatched XAML and WINE_UWP_NO_APP_XAML=1, XAML loads App.xaml itself, as on Windows, and
+     * everything renders - but about one start in five then stalls in OnLaunched (Calculator 17/20, against 20/20
+     * this way), most likely a CoreMessaging wake lost in the different timing. Keep this until that is fixed. */
+    if (GetEnvironmentVariableW( L"WINE_UWP_NO_APP_XAML", NULL, 0 )) return;
     if (SUCCEEDED( load_application_xaml() ) && app_xaml_loaded) return;
     if ((snap = CreateToolhelp32Snapshot( TH32CS_SNAPTHREAD, 0 )) == INVALID_HANDLE_VALUE) return;
     te.dwSize = sizeof(te);

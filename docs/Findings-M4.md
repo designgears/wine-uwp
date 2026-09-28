@@ -9949,3 +9949,12 @@ the thread's message wait (`NtUserInitThreadCoreMessagingIocp`); our win32u does
 messages post a completion to the port). A completion on the port - a timer's wait packet firing - does not wake a
 thread sleeping in its message wait (Windows.UI's dispatcher waits in `CoMsgWaitInProcessEvents`). That is the
 Wine-side work that retires these patches.
+
+**Correction the same day: the unpatched XAML is not yet usable.** Measured over more starts, the pristine
+Windows.UI.Xaml.dll with XAML loading `App.xaml` itself fails about one start in five (Calculator 17/20, 11/15; `regress.sh
+kb` 7/10), against 20/20 and 19/20 for the one-patch XAML with `wineuwp`'s manual load. A failing start is a plain dcomp
+backdrop: the app stops in `OnLaunched` after four `ITitleBarClientAdapter` queries on the navigation client and never
+calls `Window.Activate()`; XAML never gets as far as `DCompTreeHost::UpdateDebugSettings`. Most likely the same lost
+CoreMessaging wake, exposed by the different timing. **Live again: one-patch XAML (`ShouldTryLoadAppXaml`) and
+`wineuwp` loading App.xaml** (`WINE_UWP_NO_APP_XAML=1` turns the load off). The fixes that retired the other XAML patches
+stay. A two-run suite pass was not enough to see a 1-in-5 start failure; count starts (`/tmp/calcstarts.sh`, N=20).

@@ -1630,7 +1630,16 @@ NTSTATUS WINAPI NtAssociateWaitCompletionPacket( HANDLE handle, HANDLE iocp, HAN
     packet = find_packet( handle );
     RtlLeaveCriticalSection( &packets_cs );
     if (!packet) return STATUS_INVALID_HANDLE;
-    if (packet->wait) return STATUS_INVALID_PARAMETER;  /* already associated */
+    if (packet->wait)
+    {
+        /* Still armed: associating twice is an error. Fired: its completion has been queued, and on Windows the
+         * packet can be associated again - CoreMessaging re-arms its timer's packet after every expiry. Refusing
+         * that left its UI-thread timers firing once and never again, which byte patches in CoreMessaging.dll
+         * (a mailbox between SetRelative and DrainSignaledWaits) worked around. */
+        if (packet->pending) return STATUS_INVALID_PARAMETER;
+        RtlDeregisterWaitEx( packet->wait, NULL );
+        packet->wait = NULL;
+    }
 
     packet->iocp = iocp; packet->key = key; packet->apc_context = apc_context;
     packet->status = status; packet->information = information;
