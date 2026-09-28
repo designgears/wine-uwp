@@ -10179,3 +10179,13 @@ crashed run's breadcrumbs were overwritten by the next session's. Not reproduced
 focus-away-and-back cycles (a Wine notepad as the other window) and drags in between, then three History edits of
 the Face Offset with focus cycles and header toggles - no abort. The blank Environment panel has not come back either
 (it rendered after the drag-visual drags above).
+
+### Blank start-ups with windowed popups: the app never calls Window.Activate (2026-09-28)
+
+Both kept blank starts log `no Window.Activate() 3000 ms after showing` and none of the activations a good start
+makes after `Windows.System.Threading.ThreadPool` (`ThreadPoolTimer`, `ToolTipService`, ...): the app's launch code is
+awaiting something that never completes. Mouse input does not revive it (no XAML commit follows), so it is a lost
+continuation, not a missed wake of the UI thread. Wine's `ThreadPool.RunAsync` handed out an `IAsyncAction` whose
+`put_Completed`, `Status` and `GetResults` were all `E_NOTIMPL`; it is a real one now (status, error, a handler that
+fires on completion or at once when already done, Cancel/Close). That was not the cause: 2 blanks in 24 starts
+with popups on after it. Why windowed popups raise the rate is still open; they stay opt-in.

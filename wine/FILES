@@ -103,6 +103,7 @@ dlls/shcore/main.c
 dlls/shcore/shcore.spec
 dlls/shell32/shell32.spec
 dlls/shell32/shellord.c
+dlls/threadpoolwinrt/main.c
 dlls/ucrtbase/ucrtbase.spec
 dlls/urlmon/urlmon.spec
 dlls/urlmon/urlmon_main.c

@@ -183,7 +183,7 @@ which looks like a Wine regression and is not. **If a run suddenly fails at acti
 `DISPLAY=:98 xdpyinfo` first**, and restart the display with
 `Xvfb :98 -screen 0 1600x1000x24 -nolisten tcp &`.
 
-**Run it with `TESTDISPLAY=:97 ./regress.sh`** (or name apps: `./regress.sh calc mp`), **plus `./regress.sh kb`** after anything touching input or Windows.UI: Calculator `12+3` Enter / Backspace `7` / Escape against `docs/baselines/calc-kb-*.png`. It polls each
+**Run it with `TESTDISPLAY=:97 ./regress.sh`** (or name apps: `./regress.sh calc mp`), **plus `./regress.sh kb`** (on `:97`: at `:96`'s 3440x1440 it differs from its baselines by design) after anything touching input or Windows.UI: Calculator `12+3` Enter / Backspace `7` / Escape against `docs/baselines/calc-kb-*.png`. It polls each
 app once a second and moves on when it passes, so the suite takes under 2 minutes. Do not go back to
 fixed sleeps; the apps are up in 3-6 s. What it checks, by hand:
 
