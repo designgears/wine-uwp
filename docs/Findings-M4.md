@@ -10056,3 +10056,23 @@ operation that is already complete, with a surface whose `ICompositionDrawingSur
 fail-fast followed by a NULL dereference. XAML now commits during and after a drag; two drops (ABS, Clear Glass) each
 followed by Environment, Camera and the File menu all repaint (`docs/screenshots/shapr3d-after-drop-environment.png`).
 Suite, `kb` pass. A real capture would give the drag a ghost image; it is not done.
+
+### Open: drag ghost, stuck header chevron, "..." button, a render-thread abort (2026-09-28)
+
+- **Drag ghost.** XAML's `DragVisual` renders the dragged element through a RenderTargetBitmap and hands the
+  bitmap to the drag operation (`SetDragUIContentFromSoftwareBitmap`; `IXamlMobileDragOperation` {69527042} is the
+  other route). The capture path now works end to end - `IVisualInternal::CaptureAsync`, `HasValidPixels`,
+  `ICompositionDrawingSurfaceInteropInternalDebug` {374b307f} slot 10 -> an `IDXGISurface` XAML `Map`s and copies -
+  but the visual XAML asks us to capture (`element->[0x118]` vtable slot 97, its composition node's visual) is an empty
+  container in dcomp's tree through five commits. Next: find how XAML fills that visual (not `IVisualCollection`, not
+  the interop `AddVisual`, which it never calls).
+- **Operation header chevron** (Extrude - One-Sided): after expand/collapse the chevron keeps its previous x. XAML sets
+  that stale offset itself (`put_Offset 717,69` after collapsing), a relayout at a new window size keeps it, and a fresh
+  layout of either state is right, so something sets it explicitly from stale input. Not implicit animations (not run),
+  not a `Translation` facade on it, not batch timing: scoped batches now complete when their animations end (they fired
+  16 ms after `End`), which is closer to Windows but did not change it.
+- **History row "..."** disappears while its menu is open; the menu itself renders.
+- **Render-thread abort**: the user's session died in `std::terminate` on Shapr3D's render thread while in the Face
+  Offset tool (Sentry dump in `LocalState/crash_report`, breadcrumbs `SKFaceOffsetTool::Initialize`, window
+  deactivate/activate). Not investigated yet.
+- The blank Environment panel the user saw has not reproduced (5 drags, library drops, a clicked swatch, 2029 wide).

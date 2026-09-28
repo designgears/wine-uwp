@@ -329,7 +329,7 @@ struct paint_list
     struct paint_op *ops;
     unsigned int count, capacity;
 };
-static struct paint_list paint_lists[2];
+static struct paint_list paint_lists[3];   /* two for frames, the third for captures */
 static unsigned int paint_current;      /* index of the list being built */
 /* The list the last finished walk built, for hit tests from other threads: the painter rebuilds the other one,
  * on its own threads since swap chain frames are painted off the UI thread, and a wheel event tested against a
@@ -6973,8 +6973,13 @@ struct capture_surface
 {
     const void **vtbl;          /* IInspectable, ICompositionSurface */
     const void **interop_vtbl;  /* ICompositionDrawingSurfaceInterop(2)/InteropPrivate layout */
+    const void **debug_vtbl;    /* ICompositionDrawingSurfaceInteropInternalDebug, see capture_debug_vtbl */
     LONG ref;
+    BYTE *pixels;               /* premultiplied BGRA, width * 4 a row; NULL when nothing was captured */
+    int width, height;
 };
+static const GUID IID_ICompositionDrawingSurfaceInteropInternalDebug_local =
+    { 0x374b307f, 0x8b79, 0x4bc6, { 0xa9, 0x05, 0x2a, 0x2b, 0x47, 0x2d, 0xd2, 0xf4 } };
 static const GUID IID_ICompositionSurface_local =
     { 0x1527540d, 0x42c7, 0x47a6, { 0xa4, 0x08, 0x66, 0x8f, 0x79, 0xa9, 0x0d, 0xfb } };
 static const GUID IID_ICompositionDrawingSurfaceInteropPrivate_local =
@@ -6995,6 +7000,8 @@ static HRESULT WINAPI capture_surface_QueryInterface( void *iface, REFIID iid, v
              IsEqualGUID( iid, &IID_ICompositionDrawingSurfaceInterop_local ) ||
              IsEqualGUID( iid, &IID_ICompositionDrawingSurfaceInterop2_local ))
         *out = &impl->interop_vtbl;
+    else if (IsEqualGUID( iid, &IID_ICompositionDrawingSurfaceInteropInternalDebug_local ))
+        *out = &impl->debug_vtbl;
     else
     {
         TRACE( "capture surface %p: no %s.\n", impl, debugstr_guid( iid ) );
@@ -7012,7 +7019,11 @@ static ULONG WINAPI capture_surface_Release( void *iface )
 {
     struct capture_surface *impl = CONTAINING_RECORD( iface, struct capture_surface, vtbl );
     ULONG ref = InterlockedDecrement( &impl->ref );
-    if (!ref) (free)( impl );
+    if (!ref)
+    {
+        (free)( impl->pixels );
+        (free)( impl );
+    }
     return ref;
 }
 static HRESULT WINAPI capture_surface_GetIids( void *iface, ULONG *count, IID **iids )
@@ -7052,10 +7063,241 @@ static HRESULT WINAPI capture_interop_notimpl( void *iface )
 }
 static HRESULT WINAPI capture_interop_HasValidPixels( void *iface, int *valid )
 {
-    TRACE( "capture surface %p: no pixels.\n", iface );
+    struct capture_surface *impl = CONTAINING_RECORD( iface, struct capture_surface, interop_vtbl );
+
+    TRACE_(dcompgate)( "capture surface %p: pixels %p.\n", impl, impl->pixels );
     if (!valid) return E_POINTER;
-    *valid = FALSE;
+    *valid = impl->pixels != NULL;
     return S_OK;
+}
+
+/* A read-only IDXGISurface over a capture's pixels. XAML's ProcessCaptureThreaded takes one from
+ * ICompositionDrawingSurfaceInteropInternalDebug slot 10, calls GetDesc and Map(READ), and copies the rows into its
+ * own texture. */
+struct capture_dxgi
+{
+    IDXGISurface IDXGISurface_iface;
+    LONG ref;
+    struct capture_surface *owner;
+};
+static struct capture_dxgi *capture_dxgi_from( IDXGISurface *iface )
+{
+    return CONTAINING_RECORD( iface, struct capture_dxgi, IDXGISurface_iface );
+}
+static HRESULT WINAPI capture_dxgi_QueryInterface( IDXGISurface *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IDXGIObject ) ||
+        IsEqualGUID( iid, &IID_IDXGIDeviceSubObject ) || IsEqualGUID( iid, &IID_IDXGISurface ))
+    {
+        IDXGISurface_AddRef( iface );
+        *out = iface;
+        return S_OK;
+    }
+    TRACE( "capture dxgi surface %p: no %s.\n", iface, debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI capture_dxgi_AddRef( IDXGISurface *iface )
+{
+    return InterlockedIncrement( &capture_dxgi_from( iface )->ref );
+}
+static ULONG WINAPI capture_dxgi_Release( IDXGISurface *iface )
+{
+    struct capture_dxgi *impl = capture_dxgi_from( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref)
+    {
+        capture_surface_Release( &impl->owner->vtbl );
+        (free)( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI capture_dxgi_SetPrivateData( IDXGISurface *iface, REFGUID guid, UINT size, const void *data )
+{
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI capture_dxgi_SetPrivateDataInterface( IDXGISurface *iface, REFGUID guid, const IUnknown *object )
+{
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI capture_dxgi_GetPrivateData( IDXGISurface *iface, REFGUID guid, UINT *size, void *data )
+{
+    return DXGI_ERROR_NOT_FOUND;
+}
+static HRESULT WINAPI capture_dxgi_GetParent( IDXGISurface *iface, REFIID iid, void **parent )
+{
+    *parent = NULL;
+    return E_NOINTERFACE;
+}
+static HRESULT WINAPI capture_dxgi_GetDevice( IDXGISurface *iface, REFIID iid, void **device )
+{
+    *device = NULL;
+    return E_NOINTERFACE;
+}
+static HRESULT WINAPI capture_dxgi_GetDesc( IDXGISurface *iface, DXGI_SURFACE_DESC *desc )
+{
+    struct capture_dxgi *impl = capture_dxgi_from( iface );
+
+    if (!desc) return E_POINTER;
+    desc->Width = impl->owner->width;
+    desc->Height = impl->owner->height;
+    desc->Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc->SampleDesc.Count = 1;
+    desc->SampleDesc.Quality = 0;
+    return S_OK;
+}
+static HRESULT WINAPI capture_dxgi_Map( IDXGISurface *iface, DXGI_MAPPED_RECT *rect, UINT flags )
+{
+    struct capture_dxgi *impl = capture_dxgi_from( iface );
+
+    TRACE_(dcompgate)( "capture dxgi surface %p, flags %#x.\n", iface, flags );
+    if (!rect) return E_POINTER;
+    if (!impl->owner->pixels) return DXGI_ERROR_INVALID_CALL;
+    rect->Pitch = impl->owner->width * 4;
+    rect->pBits = impl->owner->pixels;
+    return S_OK;
+}
+static HRESULT WINAPI capture_dxgi_Unmap( IDXGISurface *iface )
+{
+    return S_OK;
+}
+static const IDXGISurfaceVtbl capture_dxgi_vtbl =
+{
+    capture_dxgi_QueryInterface, capture_dxgi_AddRef, capture_dxgi_Release,
+    capture_dxgi_SetPrivateData, capture_dxgi_SetPrivateDataInterface, capture_dxgi_GetPrivateData,
+    capture_dxgi_GetParent, capture_dxgi_GetDevice, capture_dxgi_GetDesc, capture_dxgi_Map, capture_dxgi_Unmap,
+};
+
+/* ICompositionDrawingSurfaceInteropInternalDebug {374b307f}: only slot 10 is known, called with NULL and an
+ * IDXGISurface ** - the shape of the interop's CopySurface(rect, IDXGISurface **). */
+static HRESULT WINAPI capture_debug_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return capture_surface_QueryInterface( &CONTAINING_RECORD( iface, struct capture_surface, debug_vtbl )->vtbl, iid, out );
+}
+static ULONG WINAPI capture_debug_AddRef( void *iface )
+{
+    return capture_surface_AddRef( &CONTAINING_RECORD( iface, struct capture_surface, debug_vtbl )->vtbl );
+}
+static ULONG WINAPI capture_debug_Release( void *iface )
+{
+    return capture_surface_Release( &CONTAINING_RECORD( iface, struct capture_surface, debug_vtbl )->vtbl );
+}
+static HRESULT WINAPI capture_debug_GetSurface( void *iface, const RECT *rect, IDXGISurface **out )
+{
+    struct capture_surface *owner = CONTAINING_RECORD( iface, struct capture_surface, debug_vtbl );
+    struct capture_dxgi *impl;
+
+    TRACE_(dcompgate)( "capture surface %p, rect %s.\n", owner, wine_dbgstr_rect( rect ) );
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!owner->pixels) return E_FAIL;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->IDXGISurface_iface.lpVtbl = &capture_dxgi_vtbl;
+    impl->ref = 1;
+    impl->owner = owner;
+    capture_surface_AddRef( &owner->vtbl );
+    *out = &impl->IDXGISurface_iface;
+    return S_OK;
+}
+static const void *capture_debug_vtbl[] =
+{
+    capture_debug_QueryInterface, capture_debug_AddRef, capture_debug_Release,
+    capture_interop_notimpl, capture_interop_notimpl, capture_interop_notimpl, capture_interop_notimpl,
+    capture_interop_notimpl, capture_interop_notimpl, capture_interop_notimpl, capture_debug_GetSurface,
+    capture_interop_notimpl, capture_interop_notimpl, capture_interop_notimpl, capture_interop_notimpl,
+    capture_interop_notimpl, capture_interop_notimpl,
+};
+
+/* Paint a visual's subtree into width x height premultiplied BGRA, with the visual's own offset at the origin: the
+ * painter's walk, into a list of its own, rasterized into a DIB of its own. It holds the painter's locks meanwhile
+ * (present_cs, then walk_lock and dcomp_visual_cs, as a frame does), but only tries present_cs for a while - a
+ * painter on another thread may be waiting for this one's window thread. */
+static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float oy, float sx, float sy );
+static struct visual *public_visual_from( IInspectable *object );
+static void capture_paint_public( HDC dc, struct visual *pv, int width, int height );
+static BYTE *capture_visual_pixels( IUnknown *visual, int width, int height )
+{
+    struct dcomp_visual *dv = dcv_from_any( visual );
+    struct visual *pv = dv ? NULL : public_visual_from( (IInspectable *)visual );
+    RECT area = { 0, 0, width, height }, saved_clip, saved_rot_clip;
+    struct paint_xform saved_xf;
+    float saved_opacity;
+    unsigned int saved_current, i;
+    struct visual *saved_island;
+    struct dcomp_visual *saved_branch;
+    BITMAPINFO info = { { 0 } };
+    BYTE *bits = NULL, *pixels = NULL;
+    HBITMAP dib = NULL, old = NULL;
+    HDC dc = NULL;
+
+    if ((!dv && !pv) || width <= 0 || height <= 0 || width > 4096 || height > 4096)
+    {
+        TRACE_(dcompgate)( "cannot capture %p (%dx%d).\n", visual, width, height );
+        return NULL;
+    }
+    for (i = 0; i < 200 && !TryEnterCriticalSection( &present_cs ); i++) Sleep( 1 );
+    if (i == 200)
+    {
+        TRACE_(dcompgate)( "painter busy, %p not captured.\n", visual );
+        return NULL;
+    }
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    if ((dc = CreateCompatibleDC( NULL )) && (dib = CreateDIBSection( dc, &info, DIB_RGB_COLORS, (void **)&bits, NULL, 0 )))
+    {
+        old = SelectObject( dc, dib );
+
+        AcquireSRWLockExclusive( &walk_lock );
+        walk_owner = GetCurrentThreadId();
+        saved_current = paint_current;
+        saved_clip = paint_clip;
+        saved_rot_clip = paint_rot_clip;
+        saved_xf = paint_xf;
+        saved_opacity = paint_opacity;
+        saved_island = xaml_island_container;
+        saved_branch = paint_branch;
+
+        paint_current = 2;
+        paint_lists[2].count = 0;
+        paint_clip = area;
+        paint_xf.m11 = paint_xf.m22 = 1.0f; paint_xf.m12 = paint_xf.m21 = paint_xf.dx = paint_xf.dy = 0.0f;
+        paint_xf.quarter = 0; paint_xf.active = FALSE;
+        paint_opacity = 1.0f;
+        xaml_island_container = NULL;
+        paint_branch = NULL;
+        EnterCriticalSection( &dcomp_visual_cs );
+        if (dv) paint_dcomp_visual( dc, dv, -(dv->offset_x + dv->transform_x), -(dv->offset_y + dv->transform_y), 1.0f, 1.0f );
+        else capture_paint_public( dc, pv, width, height );
+        LeaveCriticalSection( &dcomp_visual_cs );
+
+        paint_current = saved_current;
+        paint_clip = saved_clip;
+        paint_rot_clip = saved_rot_clip;
+        paint_xf = saved_xf;
+        paint_opacity = saved_opacity;
+        xaml_island_container = saved_island;
+        paint_branch = saved_branch;
+        walk_owner = 0;
+        ReleaseSRWLockExclusive( &walk_lock );
+
+        raster_ops( dc, bits, width, &paint_lists[2], &area );
+        GdiFlush();
+        TRACE_(dcompgate)( "captured %s visual %p %dx%d: %u ops.\n", dv ? "dcomp" : "public", visual, width, height, paint_lists[2].count );
+        if (paint_lists[2].count && (pixels = (malloc)( (size_t)width * height * 4 )))
+            memcpy( pixels, bits, (size_t)width * height * 4 );
+    }
+    LeaveCriticalSection( &present_cs );
+    if (dc)
+    {
+        if (old) SelectObject( dc, old );
+        DeleteDC( dc );
+    }
+    if (dib) DeleteObject( dib );
+    return pixels;
 }
 /* slots from CompositionDrawingSurface::Interop: 3 BeginDraw, 4 EndDraw, 5 Resize, 6 Scroll, 7 ResumeDraw,
  * 8 SuspendDraw, 9 CopySurface(to), 10 CopySurface(rect, IDXGISurface **), 11 BeginDrawWithGutters, 12 HasValidPixels */
@@ -7075,7 +7317,22 @@ struct capture_op
     LONG ref;
     IUnknown *surface;
     IUnknown *handler;
+    BOOL completed;
+    IUnknown *visual;           /* to capture at the next commit */
+    unsigned int tries;
 };
+/* Captures wait for XAML's commit: it asks for one in PreCommit and fills the captured visual later in the same
+ * batch (the root was an empty container when CaptureAsync ran). */
+static CRITICAL_SECTION capture_cs;
+static CRITICAL_SECTION_DEBUG capture_cs_debug =
+{
+    0, 0, &capture_cs,
+    { &capture_cs_debug.ProcessLocksList, &capture_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": capture_cs") }
+};
+static CRITICAL_SECTION capture_cs = { &capture_cs_debug, -1, 0, 0, 0, 0 };
+static struct capture_op *pending_captures[16];
+static unsigned int pending_capture_count;
 static const GUID IID_IAsyncOperation_ICompositionSurface_local =
     { 0x66613cdd, 0x5076, 0x50d6, { 0xab, 0x32, 0xba, 0x76, 0xdf, 0x49, 0xc4, 0x10 } };
 static HRESULT WINAPI capture_op_QueryInterface( void *iface, REFIID iid, void **out )
@@ -7108,6 +7365,7 @@ static ULONG WINAPI capture_op_Release( void *iface )
     {
         if (impl->surface) IUnknown_Release( impl->surface );
         if (impl->handler) IUnknown_Release( impl->handler );
+        if (impl->visual) IUnknown_Release( impl->visual );
         (free)( impl );
     }
     return ref;
@@ -7123,11 +7381,17 @@ static HRESULT WINAPI capture_op_put_Completed( void *iface, IUnknown *handler )
     struct capture_op *impl = CONTAINING_RECORD( iface, struct capture_op, vtbl );
     HRESULT (WINAPI *invoke)( IUnknown *, void *, AsyncStatus );
 
+    BOOL completed;
+
     TRACE( "capture operation %p, handler %p.\n", impl, handler );
     if (!handler) return E_POINTER;
     IUnknown_AddRef( handler );
+    EnterCriticalSection( &capture_cs );
     if (impl->handler) IUnknown_Release( impl->handler );
     impl->handler = handler;
+    completed = impl->completed;
+    LeaveCriticalSection( &capture_cs );
+    if (!completed) return S_OK;
     invoke = (*(void ***)handler)[3];
     invoke( handler, iface, Completed );
     return S_OK;
@@ -7171,7 +7435,7 @@ static HRESULT WINAPI capture_info_get_Id( void *iface, UINT32 *id )
 }
 static HRESULT WINAPI capture_info_get_Status( void *iface, AsyncStatus *status )
 {
-    *status = Completed;
+    *status = CONTAINING_RECORD( iface, struct capture_op, info_vtbl )->completed ? Completed : Started;
     return S_OK;
 }
 static HRESULT WINAPI capture_info_get_ErrorCode( void *iface, HRESULT *error )
@@ -7228,7 +7492,7 @@ static HRESULT WINAPI dcv_internal_CaptureAsync( void *iface, IUnknown *visual, 
     struct capture_surface *surface;
     struct capture_op *op;
 
-    TRACE( "visual %p: capture of %p, %dx%d format %d alpha %d: not captured.\n", dcomp_visual_from_internal( iface ),
+    TRACE_(dcompgate)( "visual %p: capture of %p, %dx%d format %d alpha %d.\n", dcomp_visual_from_internal( iface ),
            visual, width, height, format, alpha );
     if (!operation) return E_POINTER;
     *operation = NULL;
@@ -7240,13 +7504,72 @@ static HRESULT WINAPI dcv_internal_CaptureAsync( void *iface, IUnknown *visual, 
     }
     surface->vtbl = capture_surface_vtbl;
     surface->interop_vtbl = capture_interop_vtbl;
+    surface->debug_vtbl = capture_debug_vtbl;
     surface->ref = 1;
+    surface->width = width;
+    surface->height = height;
     op->vtbl = capture_op_vtbl;
     op->info_vtbl = capture_info_vtbl;
     op->ref = 1;
     op->surface = (IUnknown *)&surface->vtbl;
+    if (visual) IUnknown_AddRef( (op->visual = visual) );
+    EnterCriticalSection( &capture_cs );
+    if (op->visual && pending_capture_count < ARRAY_SIZE(pending_captures))
+    {
+        capture_op_AddRef( &op->vtbl );
+        pending_captures[pending_capture_count++] = op;
+    }
+    else op->completed = TRUE;
+    LeaveCriticalSection( &capture_cs );
     *operation = &op->vtbl;
     return S_OK;
+}
+
+/* At XAML's commit: capture every pending visual that has something in it by now, and complete those operations.
+ * One still empty is tried again at the next commits, and completed without pixels after a few. */
+static void run_pending_captures( void )
+{
+    struct capture_op *todo[ARRAY_SIZE(pending_captures)];
+    unsigned int i, count;
+
+    EnterCriticalSection( &capture_cs );
+    count = pending_capture_count;
+    memcpy( todo, pending_captures, count * sizeof(*todo) );
+    pending_capture_count = 0;
+    LeaveCriticalSection( &capture_cs );
+
+    for (i = 0; i < count; i++)
+    {
+        struct capture_op *op = todo[i];
+        struct capture_surface *surface = CONTAINING_RECORD( op->surface, struct capture_surface, vtbl );
+        HRESULT (WINAPI *invoke)( IUnknown *, void *, AsyncStatus );
+        IUnknown *handler;
+
+        surface->pixels = capture_visual_pixels( op->visual, surface->width, surface->height );
+        if (!surface->pixels && ++op->tries < 5)
+        {
+            EnterCriticalSection( &capture_cs );
+            if (pending_capture_count < ARRAY_SIZE(pending_captures))
+            {
+                pending_captures[pending_capture_count++] = op;
+                LeaveCriticalSection( &capture_cs );
+                continue;
+            }
+            LeaveCriticalSection( &capture_cs );
+        }
+        EnterCriticalSection( &capture_cs );
+        op->completed = TRUE;
+        if ((handler = op->handler)) IUnknown_AddRef( handler );
+        LeaveCriticalSection( &capture_cs );
+        TRACE_(dcompgate)( "capture operation %p completed after %u commits, pixels %p.\n", op, op->tries + 1, surface->pixels );
+        if (handler)
+        {
+            invoke = (*(void ***)handler)[3];
+            invoke( handler, &op->vtbl, Completed );
+            IUnknown_Release( handler );
+        }
+        capture_op_Release( &op->vtbl );
+    }
 }
 static HRESULT WINAPI dcv_internal_GetInputSinkHandle( void *iface, INT64 *handle )
 {
@@ -8296,6 +8619,7 @@ static HRESULT WINAPI device_slot_69( void *iface )
     TRACE_(dcompops)( "commit main device, scene generation %ld\n", scene_generation );
     perf.commits++;
     xaml_batch_commit();
+    if (pending_capture_count) run_pending_captures();
     fire_animation_time_events();
     if (last_desktop_hwnd) present_desktop_hwnd( last_desktop_hwnd );
     /* Telling XAML the composition is dirty after every commit keeps it scheduling frames forever.
@@ -9010,6 +9334,16 @@ static struct visual *public_visual_from( IInspectable *object )
     IUnknown_Release( (IUnknown *)view );
     return impl;
 }
+
+/* capture_visual_pixels' walk of a public visual, with its own offset at the origin */
+static void capture_paint_public( HDC dc, struct visual *pv, int width, int height )
+{
+    TRACE_(dcompgate)( "capture root %p: kind %d visible %d opacity %f size %gx%g offset %g,%g children %u brush %p parent %p\n",
+                       pv, pv->kind, pv->visible, pv->opacity, pv->size.X, pv->size.Y, pv->offset.X, pv->offset.Y,
+                       pv->collection.count, pv->brush, pv->parent );
+    paint_public_visual( dc, &pv->interop_vtbl, -(pv->offset.X + pv->transform.M41), -(pv->offset.Y + pv->transform.M42),
+                         (float)width, (float)height, 1.0f, 1.0f );
+}
 static int collection_index_of( struct visual_collection *impl, IVisual *child )
 {
     struct visual *wanted = public_visual_from( (IInspectable *)child );
@@ -9398,13 +9732,30 @@ static HRESULT WINAPI visual_interop_GetVisualCollection( void *iface, void **ou
 static HRESULT WINAPI visual_interop_SetOffsetX( void *iface, float x )
 {
     scene_changed();
+    TRACE_(dcomptree)( "public visual %p interop SetOffsetX %f\n", impl_from_visual_interop( iface ), x );
     impl_from_visual_interop( iface )->offset.X = x;
     return S_OK;
 }
 static HRESULT WINAPI visual_interop_SetOffsetY( void *iface, float y )
 {
     scene_changed();
+    TRACE_(dcomptree)( "public visual %p interop SetOffsetY %f\n", impl_from_visual_interop( iface ), y );
     impl_from_visual_interop( iface )->offset.Y = y;
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_slot3( void *iface, void *animation )
+{
+    TRACE_(dcomptree)( "public visual %p interop SetOffsetX(animation %p): ignored\n", impl_from_visual_interop( iface ), animation );
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_slot5( void *iface, void *animation )
+{
+    TRACE_(dcomptree)( "public visual %p interop SetOffsetY(animation %p): ignored\n", impl_from_visual_interop( iface ), animation );
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_slot7( void *iface, void *transform )
+{
+    TRACE_(dcomptree)( "public visual %p interop SetTransform(object %p): ignored\n", impl_from_visual_interop( iface ), transform );
     return S_OK;
 }
 static HRESULT WINAPI visual_interop_SetTransformMatrix( void *iface, const D2D_MATRIX_3X2_F *matrix )
@@ -9416,6 +9767,7 @@ static HRESULT WINAPI visual_interop_SetTransformMatrix( void *iface, const D2D_
     /* Only the translation is used by the painter. */
     impl->transform.M41 = matrix->_31;
     impl->transform.M42 = matrix->_32;
+    TRACE_(dcomptree)( "public visual %p interop SetTransformMatrix %f,%f\n", impl, matrix->_31, matrix->_32 );
     return S_OK;
 }
 static HRESULT WINAPI visual_interop_SetOpacity( void *iface, float opacity )
@@ -9474,13 +9826,34 @@ static HRESULT WINAPI visual_interop_SetRelativeHeight( void *iface, float value
     return S_OK;
 }
 
+static HRESULT WINAPI visual_interop_SetContent_trace( void *iface, IUnknown *content )
+{
+    TRACE_(dcompgate)( "public %p SetContent %p\n", impl_from_visual_interop( iface ), content );
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_AddVisual_trace( void *iface, IUnknown *visual, BOOL above, IUnknown *ref )
+{
+    TRACE_(dcompgate)( "public %p AddVisual %p above %d ref %p (dcv %p)\n", impl_from_visual_interop( iface ), visual, above,
+                       ref, dcv_from_any( visual ) );
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_RemoveVisual_trace( void *iface, IUnknown *visual )
+{
+    TRACE_(dcompgate)( "public %p RemoveVisual %p\n", impl_from_visual_interop( iface ), visual );
+    return S_OK;
+}
+static HRESULT WINAPI visual_interop_RemoveAllVisuals_trace( void *iface )
+{
+    TRACE_(dcompgate)( "public %p RemoveAllVisuals\n", impl_from_visual_interop( iface ) );
+    return S_OK;
+}
 static const void *visual_interop_vtbl[] =
 {
-    visual_interop_QueryInterface, visual_interop_AddRef, visual_interop_Release, visual_interop_ok,
-    visual_interop_SetOffsetX, visual_interop_ok, visual_interop_SetOffsetY, visual_interop_ok,
+    visual_interop_QueryInterface, visual_interop_AddRef, visual_interop_Release, visual_interop_slot3,
+    visual_interop_SetOffsetX, visual_interop_slot5, visual_interop_SetOffsetY, visual_interop_slot7,
     visual_interop_SetTransformMatrix, visual_interop_ok, visual_interop_ok, visual_interop_ok,
-    visual_interop_ok, visual_interop_ok, visual_interop_ok, visual_interop_ok,
-    visual_interop_ok, visual_interop_ok, visual_interop_ok, visual_interop_ok,
+    visual_interop_ok, visual_interop_ok, visual_interop_ok, visual_interop_SetContent_trace,
+    visual_interop_AddVisual_trace, visual_interop_RemoveVisual_trace, visual_interop_RemoveAllVisuals_trace, visual_interop_ok,
     visual_interop_ok, visual_interop_ok, visual_interop_ok, visual_interop_ok,
     visual_interop_ok, visual_interop_ok, visual_interop_ok, visual_interop_ok,
     visual_interop_ok, visual_interop_ok, visual_interop_SetOpacity, visual_interop_ok,
@@ -10120,7 +10493,7 @@ static HRESULT WINAPI ivisual_GetTrustLevel( IVisual *iface, TrustLevel *level )
         struct visual *impl = impl_from_ivisual( iface );                                          \
         scene_changed();\
         impl->field = value;                                                                       \
-        TRACE( "public visual %p " #name " %f,%f.\n", impl, value.X, value.Y );     \
+        TRACE_(dcomptree)( "public visual %p " #name " %f,%f.\n", impl, value.X, value.Y );     \
         return S_OK;                                                                               \
     }
 #define VISUAL_VEC3_GET( name, field )                                                             \
@@ -10136,7 +10509,7 @@ static HRESULT WINAPI ivisual_GetTrustLevel( IVisual *iface, TrustLevel *level )
         struct visual *impl = impl_from_ivisual( iface );                                          \
         scene_changed();\
         impl->field = value;                                                                       \
-        TRACE( "public visual %p " #name " %f,%f,%f.\n",                          \
+        TRACE_(dcomptree)( "public visual %p " #name " %f,%f,%f.\n",                          \
                impl, value.X, value.Y, value.Z );                                                  \
         return S_OK;                                                                               \
     }
@@ -10153,7 +10526,7 @@ static HRESULT WINAPI ivisual_GetTrustLevel( IVisual *iface, TrustLevel *level )
         struct visual *impl = impl_from_ivisual( iface );                                          \
         scene_changed();\
         impl->field = value;                                                                       \
-        TRACE( "public visual %p " #name " %f.\n", impl, value );                   \
+        TRACE_(dcomptree)( "public visual %p " #name " %f.\n", impl, value );                   \
         return S_OK;                                                                               \
     }
 
@@ -10756,7 +11129,10 @@ struct live_anim
     WCHAR name[32];
     struct kf_animation *kf;
     LARGE_INTEGER start;
+    LONG id;                    /* for the scoped batches waiting for it, see batch_note_animation */
 };
+static LONG live_anim_next_id;
+static void batch_note_animation( LONG id );
 static struct live_anim live_anims[64];
 static unsigned int live_anim_count;
 static CRITICAL_SECTION live_anim_cs;
@@ -10877,6 +11253,17 @@ static void live_anims_tick( void )
     if (running) request_repaint( paint_interval() );
 }
 
+static BOOL live_anim_running( LONG id )
+{
+    BOOL running = FALSE;
+    unsigned int i;
+
+    EnterCriticalSection( &live_anim_cs );
+    for (i = 0; i < live_anim_count; i++) if (live_anims[i].id == id) { running = TRUE; break; }
+    LeaveCriticalSection( &live_anim_cs );
+    return running;
+}
+
 static void live_anim_start( struct property_set *set, const WCHAR *name, struct kf_animation *kf )
 {
     struct live_anim a;
@@ -10889,6 +11276,8 @@ static void live_anim_start( struct property_set *set, const WCHAR *name, struct
     a.set = set;
     lstrcpynW( a.name, name, ARRAY_SIZE(a.name) );
     QueryPerformanceCounter( &a.start );
+    a.id = InterlockedIncrement( &live_anim_next_id );
+    batch_note_animation( a.id );
     live_anim_progress( &a, &progress );
     live_anim_apply( &a, progress );
     ICompositionPropertySet_AddRef( &set->ICompositionPropertySet_iface );
@@ -12536,7 +12925,18 @@ struct comp_batch
     INT64 tokens[BATCH_HANDLERS];
     INT64 next_token;
     struct comp_batch *next_pending;
+    DWORD thread;               /* that created it; animations it starts while active are its own */
+    LONG anims[16];             /* live animations started while it was active, see live_anim_running */
+    unsigned int anim_count;
+    ULONGLONG ended_at;
+    struct comp_batch *next_active;
 };
+/* Scoped batches currently collecting animations. XAML's CTimeManager::AddActiveWUCAnimation wraps every
+ * composition animation it starts in one and treats Completed as "the animation has finished": completing 16 ms
+ * after End, mid-animation, left layouts that are finished off in that handler behind (Shapr3D's operation header
+ * kept its expand chevron where the old layout had it). */
+static struct comp_batch *active_batches;
+static void batch_set_active( struct comp_batch *batch, BOOL active );
 static void *comp_batch_vtbl[COMP_OBJECT_SLOTS];
 static LONG comp_batch_vtbl_ready;
 static const void *scoped_batch_typed_vtbl[], *commit_batch_typed_vtbl[];
@@ -12559,6 +12959,7 @@ static ULONG WINAPI comp_batch_Release( void *iface )
     ULONG ref = InterlockedDecrement( &batch->ref );
     if (!ref)
     {
+        if (batch->active) batch_set_active( batch, FALSE );
         batch_release_handlers( batch );
         free( batch );
     }
@@ -12638,21 +13039,45 @@ static void batch_fire_completed( struct comp_batch *batch )
         HRESULT (STDMETHODCALLTYPE *invoke)( IUnknown *, IUnknown *, void * );
         if (!handlers[i]) continue;
         invoke = (*(void ***)handlers[i])[3];
-        TRACE( "%s %p: Completed -> handler %p.\n", batch->kind, batch, handlers[i] );
+        TRACE_(dcompanim)( "%s %p: Completed -> handler %p.\n", batch->kind, batch, handlers[i] );
         invoke( handlers[i], (IUnknown *)&batch->vtbl, args );
         IUnknown_Release( handlers[i] );
     }
     if (args) IUnknown_Release( (IUnknown *)args );
 }
+static BOOL batch_due( struct comp_batch *batch )
+{
+    unsigned int i;
+
+    if (GetTickCount64() - batch->ended_at > 10000) return TRUE;   /* Forever animations, a lost tick */
+    for (i = 0; i < batch->anim_count; i++) if (live_anim_running( batch->anims[i] )) return FALSE;
+    return TRUE;
+}
 static void CALLBACK batch_timer_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD time )
 {
-    struct comp_batch *list, *batch;
+    struct comp_batch *list = NULL, **tail = &list, *batch, **prev;
+    BOOL waiting = FALSE;
 
     KillTimer( hwnd, id );
     EnterCriticalSection( &batch_cs );
-    list = pending_batches;
-    pending_batches = NULL;
+    /* take the due ones, in End order; the rest wait for their animations */
+    for (prev = &pending_batches; (batch = *prev);)
+    {
+        if (batch_due( batch ))
+        {
+            *prev = batch->next_pending;
+            batch->next_pending = NULL;
+            *tail = batch;
+            tail = &batch->next_pending;
+        }
+        else
+        {
+            waiting = TRUE;
+            prev = &batch->next_pending;
+        }
+    }
     LeaveCriticalSection( &batch_cs );
+    if (waiting) SetTimer( NULL, 0, 16, batch_timer_proc );
     /* the list was built newest first; complete in the order the batches were ended */
     for (batch = list; batch; )
     {
@@ -12685,12 +13110,41 @@ static void batch_schedule_completion( struct comp_batch *batch )
     LeaveCriticalSection( &batch_cs );
     SetTimer( NULL, 0, 16, batch_timer_proc );
 }
+static void batch_set_active( struct comp_batch *batch, BOOL active )
+{
+    struct comp_batch **prev;
+
+    EnterCriticalSection( &batch_cs );
+    for (prev = &active_batches; *prev; prev = &(*prev)->next_active)
+        if (*prev == batch) { *prev = batch->next_active; break; }
+    batch->next_active = NULL;
+    if (active)
+    {
+        batch->next_active = active_batches;
+        active_batches = batch;
+    }
+    batch->active = active;
+    LeaveCriticalSection( &batch_cs );
+}
+/* a live animation started: it belongs to every scoped batch the starting thread has active */
+static void batch_note_animation( LONG id )
+{
+    DWORD tid = GetCurrentThreadId();
+    struct comp_batch *batch;
+
+    EnterCriticalSection( &batch_cs );
+    for (batch = active_batches; batch; batch = batch->next_active)
+        if (batch->thread == tid && batch->anim_count < ARRAY_SIZE(batch->anims))
+            batch->anims[batch->anim_count++] = id;
+    LeaveCriticalSection( &batch_cs );
+}
 static HRESULT WINAPI batch_End( void *iface )
 {
     struct comp_batch *batch = batch_from_typed( iface );
-    TRACE( "%p.\n", batch );
+    TRACE_(dcompanim)( "batch %p %s ended, %u animations.\n", batch, batch->kind, batch->anim_count );
+    batch_set_active( batch, FALSE );
     batch->ended = TRUE;
-    batch->active = FALSE;
+    batch->ended_at = GetTickCount64();
     batch_schedule_completion( batch );
     return S_OK;
 }
@@ -12698,14 +13152,14 @@ static HRESULT WINAPI batch_Resume( void *iface )
 {
     struct comp_batch *batch = batch_from_typed( iface );
     TRACE( "%p.\n", batch );
-    if (!batch->ended) batch->active = TRUE;
+    if (!batch->ended) batch_set_active( batch, TRUE );
     return S_OK;
 }
 static HRESULT WINAPI batch_Suspend( void *iface )
 {
     struct comp_batch *batch = batch_from_typed( iface );
     TRACE( "%p.\n", batch );
-    batch->active = FALSE;
+    batch_set_active( batch, FALSE );
     return S_OK;
 }
 static HRESULT WINAPI batch_add_Completed( void *iface, IUnknown *handler, EventRegistrationToken *token )
@@ -12713,7 +13167,7 @@ static HRESULT WINAPI batch_add_Completed( void *iface, IUnknown *handler, Event
     struct comp_batch *batch = batch_from_typed( iface );
     unsigned int i;
 
-    TRACE( "%p, handler %p.\n", batch, handler );
+    TRACE_(dcompanim)( "batch %p %s, Completed handler %p from %p.\n", batch, batch->kind, handler, __builtin_return_address( 0 ) );
     if (!handler) return E_POINTER;
     EnterCriticalSection( &batch_cs );
     for (i = 0; i < BATCH_HANDLERS; i++) if (!batch->handlers[i]) break;
@@ -12781,8 +13235,10 @@ static HRESULT create_comp_batch( BOOL scoped, void **out )
     batch->ref = 1;
     batch->scoped = scoped;
     batch->typed_vtbl = scoped ? scoped_batch_typed_vtbl : commit_batch_typed_vtbl;
-    batch->active = scoped;
+    batch->thread = GetCurrentThreadId();
     batch->ended = !scoped;     /* a commit batch is complete at the next commit, which is now */
+    batch->ended_at = GetTickCount64();
+    if (scoped) batch_set_active( batch, TRUE );
     *out = &batch->typed_vtbl;
     TRACE( "created %s %p.\n", batch->kind, batch );
     return S_OK;
