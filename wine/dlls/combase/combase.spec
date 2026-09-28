@@ -174,7 +174,7 @@
 @ stub CoVrfGetThreadState
 @ stub CoVrfReleaseThreadState
 @ stdcall CoWaitForMultipleHandles(long long long ptr ptr)
-@ stub CoWaitForMultipleObjects
+@ stdcall CoWaitForMultipleObjects(long long long ptr ptr)
 @ stdcall CreateErrorInfo(ptr)
 @ stdcall CreateStreamOnHGlobal(ptr long ptr)
 @ stub DcomChannelSetHResult

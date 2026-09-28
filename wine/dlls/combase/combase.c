@@ -2081,6 +2081,23 @@ static BOOL com_peek_message(struct apartment *apt, MSG *msg)
 }
 
 /***********************************************************************
+ *           CoWaitForMultipleObjects    (combase.@)
+ *
+ * Windows 8's variant of CoWaitForMultipleHandles, waiting for any one handle. Windows' own
+ * Windows.Web.Http.dll calls it from its worker threads; as a stub it raised EXCEPTION_WINE_STUB and
+ * Shapr3D died with it during cloud sync. The CWMO_ flags only add dispatching, which the apartment
+ * decides here anyway: an STA waits in a message loop, anything else waits plainly.
+ */
+HRESULT WINAPI CoWaitForMultipleObjects(DWORD flags, DWORD timeout, ULONG handle_count, const HANDLE *handles,
+        DWORD *index)
+{
+    TRACE("%#lx, %#lx, %lu, %p, %p\n", flags, timeout, handle_count, handles, index);
+
+    if (handle_count > 56 /* CWMO_MAX_HANDLES */) return E_INVALIDARG;
+    return CoWaitForMultipleHandles(0, timeout, handle_count, (HANDLE *)handles, index);
+}
+
+/***********************************************************************
  *           CoWaitForMultipleHandles    (combase.@)
  */
 HRESULT WINAPI CoWaitForMultipleHandles(DWORD flags, DWORD timeout, ULONG handle_count, HANDLE *handles,

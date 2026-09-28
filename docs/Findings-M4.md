@@ -9788,3 +9788,18 @@ Checked afterwards (same build, `:96`, 3440, 175 Hz):
   face selected, Offset Face hint, History "Related to Selection", view turned).
 - The XAML UI thread is ~19% busy during an orbit. The one Wine cost that stands out there is `NtUserSetCursor` on
   every pointer move (~9% of that thread's busy samples).
+
+### Shapr3D died in Windows.Web.Http on an unimplemented CoWaitForMultipleObjects (2026-09-27)
+
+`wine: Call from 00006FFFFF495157 to unimplemented function combase.dll.CoWaitForMultipleObjects, aborting`, and a
+Sentry dump with `EXCEPTION_WINE_STUB` (0x80000100) on a `Windows.Web.Http.dll` worker thread (`+0xc3e0e` calling
+through combase). The earlier unexplained 04:38 crash "in Windows.Web.Http during network failures" is the same one.
+`CoWaitForMultipleObjects` was `@ stub` in `combase.spec`; it now forwards to `CoWaitForMultipleHandles`, which
+already waits in a message loop in an STA and plainly otherwise, with the documented 56-handle limit.
+
+Also in: `trace+x11perf` in winex11. Every `XShmPutImage` now asks for its completion event, and once a second the
+trace gives the puts, their size, how late their completions were seen and how many were still queued in the
+server before each put. On Xvfb the server keeps up (queued ~0). On the user's XWayland at 3440 and 175 Hz a
+~19 MB upload per frame may not keep up, which would show as queued puts and a screen that trails the app;
+`WINE_X11_SHM_WAIT=1` makes a put wait for the previous one to complete, to compare. Not measured on the real
+display yet.

@@ -279,3 +279,4 @@ dlls/ntdll/heap.c
 # 2026-09-27: device reuse for Win2D thumbnails
 dlls/d3d11/d3d11_main.c
 dlls/wined3d/adapter_vk.c
+dlls/winex11.drv/bitblt.c

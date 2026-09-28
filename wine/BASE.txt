@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     970487f892c06970a9b0ecdcc5cd0b22de6ab5d3
-                 dcomp: Back off upload retries, show lone swap chain frames without a walk, scan alpha while copying.
+  wine HEAD:     28c0da3d58162d2598728839e8c61a619b4e5d03
+                 combase: Implement CoWaitForMultipleObjects; winex11: Measure XShm put completion (trace+x11perf, WINE_X11_SHM_WAIT).
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-28T00:02:47Z
+  captured:      2026-09-28T02:56:52Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
