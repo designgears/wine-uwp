@@ -102,8 +102,15 @@ that were ours; the Calculator tree is no longer involved.
   prefix copy that differs from it whenever its stamp changes, and changing the `win11` file changes the stamp. A
   variant written only to the prefix was silently replaced; `WINE_UWP_BP`'s `BP armed ... (byte xx)` line shows which
   bytes were really loaded.
-- **Which patches are still load-bearing is measured, not remembered**: Findings-M4 2026-09-28 bisected
-  Windows.UI.Xaml.dll's 13 patches down to 3 (`OnTick` x2, `ShouldTryLoadAppXaml`) and retired a fourth in dcomp.
+- **Which patches are still load-bearing is measured, not remembered.** Findings-M4 2026-09-28 bisected all three
+  patched DLLs, one region reverted at a time. Live today, each the pristine file plus only these (the fuller versions
+  are kept as `.bak-full` / `.bak-18regions`): **Windows.UI.Xaml** `OnTick` x2 (XAML learns the window size after its
+  first frame tick) and `ShouldTryLoadAppXaml` (Media Player only); **CoreMessaging** `DrainSignaledWaits`,
+  `DrainSignaledIocpWaits` and the `SetRelative` timer cave (timers and waits not reaching the UI thread);
+  **Windows.UI** the `ProcessMessage` -> `DrainCoreMessaging` trampoline and the `CKeyEventArgs` `Handled` byte (Enter,
+  Backspace, Escape). Every one of these stands for a Wine-side bug; fixing that is what retires the patch, as
+  `IDCompositionDeviceDebug` in dcomp retired XAML's `UpdateDebugSettings` patch. **The four-app suite cannot judge a
+  keyboard patch** - run `./regress.sh kb` too.
 - **A byte patch's "free BSS" may not be free.** The CoreMessaging timer patch kept its mailbox
   and a thread id at `+0x10d000..+0x10d010`, which are wil's error counters and a cached function
   pointer, so the two overwrote each other. Look an address up in the PDB `.syms` before claiming it.
@@ -167,7 +174,7 @@ which looks like a Wine regression and is not. **If a run suddenly fails at acti
 `DISPLAY=:98 xdpyinfo` first**, and restart the display with
 `Xvfb :98 -screen 0 1600x1000x24 -nolisten tcp &`.
 
-**Run it with `TESTDISPLAY=:97 ./regress.sh`** (or name apps: `./regress.sh calc mp`). It polls each
+**Run it with `TESTDISPLAY=:97 ./regress.sh`** (or name apps: `./regress.sh calc mp`), **plus `./regress.sh kb`** after anything touching input or Windows.UI: Calculator `12+3` Enter / Backspace `7` / Escape against `docs/baselines/calc-kb-*.png`. It polls each
 app once a second and moves on when it passes, so the suite takes under 2 minutes. Do not go back to
 fixed sleeps; the apps are up in 3-6 s. What it checks, by hand:
 
@@ -1086,7 +1093,7 @@ the fully-qualified name. `--grep` first, always.
 
 | App | State |
 | --- | --- |
-| Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0). **Depends on hand-patched `CoreMessaging.dll` and `Windows.UI.dll`** - see the byte-patch rule above |
+| Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0), and the keyboard baseline (`regress.sh kb`). **Depends on patched `CoreMessaging.dll`, `Windows.UI.dll` and `Windows.UI.Xaml.dll`**, now 3+2+3 patches - see the byte-patch rules above |
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15. Regression capture: 2250 or 2242 colours, both a pass - 2242 is XAML not showing the keyboard focus rectangle on Open file(s), usual since painting left the UI thread |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |

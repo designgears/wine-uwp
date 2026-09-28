@@ -9883,3 +9883,14 @@ region 1, every load-bearing CoreMessaging/Windows.UI patch is about the dispatc
 Calculator, `12+3` Enter, Backspace `7`, Escape) showed Enter, Backspace and Escape all ignored without it
 (3 / 37 / 37 instead of 15 / 7 / 0). The fail-fast NOPs are unjudged the same way: they matter only when an error path
 fires, which no test here provokes.
+
+**Minimal set adopted.** Pristine plus only the load-bearing regions - CoreMessaging 3, 4, 5 (+ the cave; 412 bytes),
+Windows.UI 1, 2 (+ the cave; 75 bytes), Windows.UI.Xaml 4, 5, 11 (+ #4's cave) - passes the suite twice (Calculator AE 0,
+Feedback Hub 896 / 0, Media Player 2242/2250, Solitaire 6/6), Shapr3D twice (worst gaps 47 ms) and the keyboard test
+pixel-identical to the fully patched build. It is live in both copies. `regress.sh kb` is new: Calculator after
+`12+3` Enter, Backspace `7` and Escape, against `docs/baselines/calc-kb-{enter,bs,esc}.png` (15, 7, 0), deterministic
+over two runs.
+
+Left to retire, each by fixing what it compensates for in Wine: XAML's window size arriving after its first tick
+(XAML 4, 5); the dispatcher's timers and waits not reaching the UI thread (CoreMessaging 3, 4, 5; Windows.UI 1); key
+events' `Handled` state (Windows.UI 2); `ShouldTryLoadAppXaml` (XAML 11, Media Player).

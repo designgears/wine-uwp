@@ -8,6 +8,9 @@
 # fh    Feedback Hub: colour count settles at ~896, no fail-fasts
 # mp    Media Player: 2250 colours (2242 = the Open button's focus rectangle missing, a known variant)
 # sol   Solitaire: reaches its front end (FEState), >= 1000 colours, no CRITICAL ERROR; SOLRUNS runs
+# kb    Calculator keyboard: 12+3 Enter, Backspace 7, Escape, each identical to docs/baselines/calc-kb-*.png. Not in the
+#       default set of four only for time; run it after any change to input, Windows.UI or its byte patches (Enter,
+#       Backspace and Escape all died once while calc, fh, mp and sol still passed). KB_BASELINE=1 rewrites the baselines.
 cd "$(dirname "$0")"; . ./env.sh; export PATH="$WINE_BUILD:$PATH"
 D=${TESTDISPLAY:-:98}
 apps=${*:-calc fh mp sol}
@@ -49,6 +52,23 @@ for app in $apps; do
       stop
     done
     echo "sol: $bad/${SOLRUNS:-3} bad";;
+  kb)
+    start UWP_LOG=/tmp/rg-kb.log
+    ae() { shot /tmp/rg-calc.png && [ "$(magick compare -metric AE /tmp/rg-calc.png docs/baselines/calc-regress.png null: 2>&1 | cut -d' ' -f1)" = 0 ]; }
+    if ! poll 60 ae; then echo "kb: Calculator did not come up"; stop; continue; fi
+    W=$(DISPLAY=$D xdotool search --onlyvisible --name Calculator | tail -1); DISPLAY=$D xdotool windowactivate $W; sleep 0.5
+    res=""
+    for step in enter bs esc; do
+      case $step in
+      enter) DISPLAY=$D xdotool type --delay 150 "12+3"; DISPLAY=$D xdotool key --delay 150 Return;;
+      bs)    DISPLAY=$D xdotool key --delay 150 BackSpace; DISPLAY=$D xdotool type --delay 150 "7";;
+      esc)   DISPLAY=$D xdotool key --delay 150 Escape;;
+      esac
+      sleep 1; shot /tmp/rg-kb-$step.png
+      if [ -n "${KB_BASELINE:-}" ]; then cp /tmp/rg-kb-$step.png docs/baselines/calc-kb-$step.png; res="$res $step:baseline"
+      else res="$res $step:$(magick compare -metric AE /tmp/rg-kb-$step.png docs/baselines/calc-kb-$step.png null: 2>&1 | cut -d' ' -f1)"; fi
+    done
+    echo "kb AE$res (0 = identical; Enter shows 15, Backspace 7 then 7, Escape 0) ($((SECONDS-t0)) s)";;
   esac
   stop
 done
