@@ -28,6 +28,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <emmintrin.h>
 
 #define COBJMACROS
 #include "initguid.h"
@@ -135,10 +136,10 @@ static void *guarded_realloc( void *ptr, size_t size )
  * on while measuring (the +dcomp trace itself costs more than the painting). */
 static struct
 {
-    unsigned int requests, deferred, unchanged, frames, commits, swapchain_frames, presents, readbacks, gated_swapchain;
+    unsigned int requests, deferred, unchanged, frames, commits, swapchain_frames, presents, readbacks, walkless;
     double readback_ms, readback_max;
-    double walk_ms, raster_ms;
-    unsigned int batched, batches;
+    double walk_ms, raster_ms, batch_ms, single_ms;
+    unsigned int batched, batches, singles, retries;
     unsigned int visits, ops, pixels, verified, verify_bad;
     double paint_ms, paint_max, blit_ms, flush_ms, flush_max;
     ULONGLONG start;
@@ -149,13 +150,13 @@ static void perf_report( void )
     if (!perf.start) perf.start = now;
     if (now - perf.start < 1000) return;
     if (perf.frames)
-        TRACE_(dcompperf)( "frames: walk %.2f ms, raster %.2f ms, %u visits, %u ops, %u damaged kpixels per frame; %u surfaces read back in %u batches; verified %u, %u bad.\n",
-                           perf.walk_ms / perf.frames, perf.raster_ms / perf.frames, perf.visits / perf.frames, perf.ops / perf.frames,
+        TRACE_(dcompperf)( "frames: walk %.2f ms (surface readback %.2f batched, %.2f single: %u, %u upload retries), raster %.2f ms, %u visits, %u ops, %u damaged kpixels per frame; %u surfaces read back in %u batches; verified %u, %u bad.\n",
+                           perf.walk_ms / perf.frames, perf.batch_ms / perf.frames, perf.single_ms / perf.frames, perf.singles, perf.retries, perf.raster_ms / perf.frames, perf.visits / perf.frames, perf.ops / perf.frames,
                            perf.pixels / perf.frames / 1000, perf.batched, perf.batches, perf.verified, perf.verify_bad );
     if (perf.requests)
-        TRACE_(dcompperf)( "%I64u ms: %u commits, swap chain %u presents %u readbacks (%.2f avg %.2f max ms) %u shown (%u while gated), %u requests, %u deferred, %u unchanged, %u frames, paint %.2f avg %.2f max, blit %.2f avg, flush %.2f avg %.2f max.\n",
+        TRACE_(dcompperf)( "%I64u ms: %u commits, swap chain %u presents %u readbacks (%.2f avg %.2f max ms) %u shown (%u without a walk), %u requests, %u deferred, %u unchanged, %u frames, paint %.2f avg %.2f max, blit %.2f avg, flush %.2f avg %.2f max.\n",
                            now - perf.start, perf.commits, perf.presents, perf.readbacks,
-                           perf.readbacks ? perf.readback_ms / perf.readbacks : 0.0, perf.readback_max, perf.swapchain_frames, perf.gated_swapchain, perf.requests, perf.deferred, perf.unchanged, perf.frames,
+                           perf.readbacks ? perf.readback_ms / perf.readbacks : 0.0, perf.readback_max, perf.swapchain_frames, perf.walkless, perf.requests, perf.deferred, perf.unchanged, perf.frames,
                            perf.frames ? perf.paint_ms / perf.frames : 0.0, perf.paint_max,
                            perf.frames ? perf.blit_ms / perf.frames : 0.0 , perf.frames ? perf.flush_ms / perf.frames : 0.0, perf.flush_max);
     memset( &perf, 0, sizeof(perf) );
@@ -1097,8 +1098,8 @@ static void CALLBACK repaint_timer_proc( void *arg, BOOLEAN fired )
     InterlockedCompareExchange64( &repaint_due, 0, (LONGLONG)(ULONG_PTR)arg );
     if (!last_desktop_hwnd) return;
     /* painted here, on a pool thread: a WM_PAINT for the window's thread queued every deferred frame (and at
-     * 60 a second, every swap chain frame) behind the app's own work on the UI thread */
-    scene_dirty();
+     * 60 a second, every swap chain frame) behind the app's own work on the UI thread. Whoever asked has bumped the
+     * scene if the tree needs walking; a swap chain frame alone does not (see present_desktop_hwnd_locked). */
     last_paint_tick = 0;
     present_desktop_hwnd( last_desktop_hwnd );
 }
@@ -1181,7 +1182,8 @@ static void destroy_deferred_surfaces( void )
 
 static void present_desktop_hwnd_locked( HWND hwnd );
 static void request_repaint( DWORD delay );
-static void paint_swapchains_only( HWND hwnd, HDC hdc );
+static BOOL paint_swapchains_only( HWND hwnd, HDC hdc );
+static BOOL swapchain_frame_ready( void );
 static void present_desktop_hwnd( HWND hwnd )
 {
     present_request_hwnd = hwnd;
@@ -1229,6 +1231,7 @@ static void present_desktop_hwnd_locked( HWND hwnd )
 
     static LONG painted_generation = -1;
     LONG generation = scene_generation;
+    BOOL swapchain_only;
     ULONGLONG now;
 
     if (!hwnd || !IsWindow( hwnd )) return;
@@ -1238,11 +1241,18 @@ static void present_desktop_hwnd_locked( HWND hwnd )
     /* Repainting an unchanged scene reproduces the previous frame bit for bit (checked by hashing every such
      * frame over typing, hover, graph drag/zoom and resize runs), so only a new generation or a new window
      * size paints. It used to repaint for two seconds after every change, three frames in four. */
+    swapchain_only = FALSE;
     if (generation == painted_generation && GetClientRect( hwnd, &rc ) && back_bmp &&
         rc.right == back_w && rc.bottom == back_h)
     {
-        perf.unchanged++;
-        return;
+        /* Only the app's swap chain has a new frame: show it against the last list instead of walking the whole
+         * tree again. The walk of Shapr3D's editor visits ~5000 visuals, 2.5-10 ms of every orbit frame at 3440. */
+        if (!swapchain_frame_ready())
+        {
+            perf.unchanged++;
+            return;
+        }
+        swapchain_only = TRUE;
     }
     now = GetTickCount64();
     if (last_paint_tick && now - last_paint_tick < paint_interval())
@@ -1252,6 +1262,13 @@ static void present_desktop_hwnd_locked( HWND hwnd )
         return;
     }
     last_paint_tick = now;
+    if (swapchain_only && (hdc = GetDC( hwnd )))
+    {
+        BOOL shown = paint_swapchains_only( hwnd, hdc );
+        ReleaseDC( hwnd, hdc );
+        if (shown) return;
+        /* nothing in the last list to put it in: a full frame */
+    }
     painted_generation = generation;
     /* painting runs on other threads too; ShowWindow would send to the window's thread every frame */
     if (!IsWindowVisible( hwnd )) ShowWindow( hwnd, SW_SHOW );
@@ -1308,7 +1325,16 @@ static void present_desktop_hwnd_locked( HWND hwnd )
         paint_xf.m11 = paint_xf.m22 = 1.0f; paint_xf.m12 = paint_xf.m21 = paint_xf.dx = paint_xf.dy = 0.0f;
         paint_xf.quarter = 0; paint_xf.active = FALSE;
         paint_opacity = 1.0f;
-        readback_batch();
+        if (timing)
+        {
+            LARGE_INTEGER b0, b1;
+            QueryPerformanceCounter( &b0 );
+            readback_batch();
+            QueryPerformanceCounter( &b1 );
+            QueryPerformanceFrequency( &freq );
+            perf.batch_ms += (b1.QuadPart - b0.QuadPart) * 1000.0 / freq.QuadPart;
+        }
+        else readback_batch();
         /* A batch is half done: its commit paints, or a repaint once the wait runs out. Not before the first
          * frame, and not for longer than XAML_BATCH_WAIT in a row: two UI threads committing in turn can each
          * find the other's batch open every time. Checked under walk_lock, which the walk keeps. */
@@ -3416,6 +3442,7 @@ struct drawing_surface
     BOOL drawing;
     BOOL texture_out;           /* BeginDraw handed the texture itself out; EndDraw invalidates the read-back */
     unsigned int upload_retries; /* read-backs left to wait for a direct texture upload to land */
+    ULONGLONG upload_retry_at;  /* tick of the next of them */
     /* CPU copy of the texture, refreshed after XAML draws into it. The painter reads every sprite's
      * surface every frame, and a staging copy plus Map per sprite per frame (each a wined3d
      * round trip) took seconds a frame once the Scientific keypad was up, starving input. */
@@ -3477,6 +3504,36 @@ static BOOL surface_alloc_cache( UINT w, UINT h, UINT bpp, BYTE **bits, HBITMAP 
     return !!(*bits = malloc( (size_t)w * h ));
 }
 
+/* Copy a mapped frame and learn whether every pixel has alpha 255 in the same pass. A separate scan read all of a
+ * 3440x1366 frame again, about a third of each readback. */
+static BOOL copy_rows_opaque( BYTE *dst, const BYTE *src, UINT pitch, UINT width, UINT height )
+{
+    const __m128i alpha = _mm_set1_epi32( 0xff000000 );
+    __m128i all = alpha;
+    UINT row, x, tail = 0xff000000;
+
+    for (row = 0; row < height; row++)
+    {
+        const BYTE *in = src + (size_t)row * pitch;
+        BYTE *out = dst + (size_t)row * width * 4;
+
+        for (x = 0; x + 4 <= width; x += 4)
+        {
+            __m128i v = _mm_loadu_si128( (const __m128i *)(in + x * 4) );
+            _mm_storeu_si128( (__m128i *)(out + x * 4), v );
+            all = _mm_and_si128( all, v );
+        }
+        for (; x < width; x++)
+        {
+            UINT v = ((const UINT *)in)[x];
+            ((UINT *)out)[x] = v;
+            tail &= v;
+        }
+    }
+    all = _mm_and_si128( all, alpha );
+    return _mm_movemask_epi8( _mm_cmpeq_epi32( all, alpha ) ) == 0xffff && (tail & 0xff000000) == 0xff000000;
+}
+
 static void CALLBACK swapchain_readback_job( PTP_CALLBACK_INSTANCE instance, void *arg )
 {
     struct drawing_surface *surface = arg;
@@ -3485,7 +3542,7 @@ static void CALLBACK swapchain_readback_job( PTP_CALLBACK_INSTANCE instance, voi
     D3D11_MAPPED_SUBRESOURCE map;
     D3D11_TEXTURE2D_DESC desc;
     ID3D11Device *device;
-    UINT count, row;
+    UINT count;
     BOOL ok = FALSE;
 
     LARGE_INTEGER rb_start, rb_end, rb_freq;
@@ -3566,11 +3623,8 @@ static void CALLBACK swapchain_readback_job( PTP_CALLBACK_INSTANCE instance, voi
         }
         if (SUCCEEDED( ID3D11DeviceContext_Map( context, (ID3D11Resource *)surface->worker_staging, 0, D3D11_MAP_READ, 0, &map ) ))
         {
-            for (row = 0; row < desc.Height; row++)
-                memcpy( surface->back_cache + (size_t)row * desc.Width * 4, (BYTE *)map.pData + (size_t)row * map.RowPitch,
-                        desc.Width * 4 );
+            surface->back_opaque = copy_rows_opaque( surface->back_cache, map.pData, map.RowPitch, desc.Width, desc.Height );
             ID3D11DeviceContext_Unmap( context, (ID3D11Resource *)surface->worker_staging, 0 );
-            surface->back_opaque = bits_opaque( surface->back_cache, desc.Width, desc.Height );
             ok = TRUE;
         }
         ID3D11DeviceContext_Release( context );
@@ -3597,7 +3651,7 @@ static void CALLBACK swapchain_readback_job( PTP_CALLBACK_INSTANCE instance, voi
     InterlockedExchange( &surface->readback_busy, 0 );
     if (ok)
     {
-        scene_dirty();
+        /* no scene_dirty(): a new swap chain frame needs no walk of the tree (present_desktop_hwnd_locked) */
         /* Painted here rather than through a WM_PAINT on the UI thread: at 60 frames a second a full-window paint
          * there took most of Shapr3D's UI thread (at 3440x1366), and an extrude drag, which needs it, updated
          * 5-7 times a second while orbiting, which does not, stayed smooth. */
@@ -3668,8 +3722,21 @@ static void surface_sync_swapchain( struct drawing_surface *surface )
  * opened, one batch stayed open 207 ms and many for 5-40 ms, and the viewport stood still or stuttered for the
  * first seconds. So the new frame goes into the last complete paint list - the tree as last committed, which is
  * what is on screen - and only its rectangles are rasterized again. Called holding present_cs. */
-static void paint_swapchains_only( HWND hwnd, HDC hdc )
+static BOOL swapchain_frame_ready( void )
 {
+    unsigned int i;
+    BOOL ready = FALSE;
+
+    EnterCriticalSection( &swapchain_cs );
+    for (i = 0; i < swapchain_surface_count && !ready; i++) ready = swapchain_surfaces[i]->readback_ready;
+    LeaveCriticalSection( &swapchain_cs );
+    return ready;
+}
+
+static BOOL paint_swapchains_only( HWND hwnd, HDC hdc )
+{
+    LARGE_INTEGER t0, t1, t2, freq;
+    BOOL timing = TRACE_ON(dcompperf);
     struct drawing_surface *surfaces[8];
     struct paint_damage damage = { { { 0 } } };
     RECT bounds = { 0, 0, back_w, back_h }, rc;
@@ -3678,7 +3745,8 @@ static void paint_swapchains_only( HWND hwnd, HDC hdc )
 
     if (paint_complete < 0 || !back_bmp || !back_dc || !GetClientRect( hwnd, &rc ) ||
         rc.right != back_w || rc.bottom != back_h)
-        return;
+        return FALSE;
+    if (timing) QueryPerformanceCounter( &t0 );
     EnterCriticalSection( &swapchain_cs );
     count = min( swapchain_surface_count, ARRAY_SIZE(surfaces) );
     memcpy( surfaces, swapchain_surfaces, count * sizeof(*surfaces) );
@@ -3711,14 +3779,29 @@ static void paint_swapchains_only( HWND hwnd, HDC hdc )
         }
         ReleaseSRWLockExclusive( &hit_lock );
     }
-    if (!damage.count) return;
+    if (!damage.count) return FALSE;
     for (i = 0; i < damage.count; i++) raster_ops( back_dc, back_bits, back_w, list, &damage.rects[i] );
+    if (timing) QueryPerformanceCounter( &t1 );
     for (i = 0; i < damage.count; i++)
         BitBlt( hdc, damage.rects[i].left, damage.rects[i].top, damage.rects[i].right - damage.rects[i].left,
                 damage.rects[i].bottom - damage.rects[i].top, back_dc, damage.rects[i].left, damage.rects[i].top, SRCCOPY );
     NtUserCallHwnd( hwnd, NtUserCallHwnd_FlushWindowSurface );
-    perf.gated_swapchain++;
-    TRACE_(dcompgate)( "swap chain frame while gated, %u rects\n", damage.count );
+    perf.walkless++;
+    if (timing)
+    {
+        double raster;
+        QueryPerformanceCounter( &t2 );
+        QueryPerformanceFrequency( &freq );
+        raster = (t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+        perf.frames++;
+        perf.raster_ms += raster;
+        perf.paint_ms += raster;
+        if (raster > perf.paint_max) perf.paint_max = raster;
+        perf.blit_ms += (t2.QuadPart - t1.QuadPart) * 1000.0 / freq.QuadPart;
+        for (i = 0; i < damage.count; i++) perf.pixels += rect_area( &damage.rects[i] );
+    }
+    TRACE_(dcompgate)( "swap chain frame without a walk, %u rects\n", damage.count );
+    return TRUE;
 }
 
 /* Present notifier registered on composition swap chains (dxgi's comp_swapchain_present calls method 3 on
@@ -3844,11 +3927,16 @@ static void surface_invalidate_cache( struct drawing_surface *surface )
 }
 
 /* XAML's image decoder writes a LoadedImageSurface's texture after EndDraw has returned, so the
- * first read-back can find it still empty. Until pixels appear, read it again on later frames
- * (bounded: a picture that really is transparent stops being re-read). */
+ * first read-back can find it still empty. Until pixels appear, read it again later (bounded: a picture
+ * that really is transparent stops being re-read). The retries back off: every frame for 120 frames, one
+ * single read-back each, cost Shapr3D's editor 2-2.6 ms of every frame for its first seconds - 4000-5000 a
+ * second - because XAML's nine-grid masks, copied in from a staging texture before EndDraw returns, are
+ * mostly empty by design (210 of 256 staging sources were all zero). */
+#define UPLOAD_RETRIES 12
 static void surface_check_upload( struct drawing_surface *surface, unsigned int bpp )
 {
     size_t i, n;
+    unsigned int done;
 
     if (!surface->upload_retries || !surface->cache) return;
     n = (size_t)surface->cache_w * surface->cache_h;
@@ -3856,9 +3944,10 @@ static void surface_check_upload( struct drawing_surface *surface, unsigned int 
         if (bpp == 4 ? surface->cache[i * 4 + 3] : surface->cache[i]) break;
     if (i < n) { surface->upload_retries = 0; return; }
     surface->upload_retries--;
-    /* stale, but not queued to the read-back worker: the painter re-reads it itself on the next frame,
-     * so the cache is never reallocated under a blend */
-    surface->cache_valid = FALSE;
+    /* the painter re-reads it itself when due (surface_cached_pixels), not the read-back batch, so the cache is
+     * never reallocated under a blend: 16, 32, 64 ... 500 ms, about 3.5 s in all */
+    done = UPLOAD_RETRIES - surface->upload_retries;
+    surface->upload_retry_at = GetTickCount64() + min( 16u << min( done - 1, 5 ), 500u );
 }
 
 static void surface_free_cache( struct drawing_surface *surface );
@@ -4141,7 +4230,10 @@ static HRESULT WINAPI surface_EndDraw( void *iface )
         /* stale, re-read by the painter on its next frame: queueing it to the read-back worker made
          * that read race the caller's own copy into the texture on the same immediate context */
         surface->texture_out = FALSE;
-        surface->upload_retries = 120;
+        /* XAML fills its A8 nine-grid masks by copying from a staging texture before EndDraw returns: the
+         * first read-back already has them, and the empty ones are empty by design. */
+        surface->upload_retries = surface->format == DXGI_FORMAT_A8_UNORM ? 0 : UPLOAD_RETRIES;
+        surface->upload_retry_at = 0;
         surface->cache_valid = FALSE;
     }
     if (surface->drawing)
@@ -4909,6 +5001,8 @@ static const BYTE *surface_cached_pixels( struct drawing_surface *surface, D3D11
     if (desc->Format == DXGI_FORMAT_B8G8R8A8_UNORM) bpp = 4;
     else if (desc->Format == DXGI_FORMAT_A8_UNORM) bpp = 1;
     else return NULL;
+    if (surface->upload_retries && surface->cache_valid && GetTickCount64() >= surface->upload_retry_at)
+        surface->cache_valid = FALSE;   /* an upload retry is due */
     if (surface->cache_valid && surface->cache && surface->cache_w == desc->Width &&
         surface->cache_h == desc->Height && surface->cache_bpp == bpp)
         return surface->cache;
@@ -4944,7 +5038,7 @@ static const BYTE *surface_cached_pixels( struct drawing_surface *surface, D3D11
     staging = surface->staging;
     ID3D11Device_GetImmediateContext( device, &context );
     ID3D11Device_Release( device );
-    if (TRACE_ON(dcomp)) QueryPerformanceCounter( &rb0 );
+    if (TRACE_ON(dcomp) || TRACE_ON(dcompperf)) QueryPerformanceCounter( &rb0 );
     ID3D11DeviceContext_CopyResource( context, (ID3D11Resource *)staging, (ID3D11Resource *)surface->texture );
     if (SUCCEEDED( ID3D11DeviceContext_Map( context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map ) ))
     {
@@ -4954,11 +5048,14 @@ static const BYTE *surface_cached_pixels( struct drawing_surface *surface, D3D11
         ID3D11DeviceContext_Unmap( context, (ID3D11Resource *)staging, 0 );
         copied = TRUE;
     }
-    if (TRACE_ON(dcomp))
+    if (TRACE_ON(dcomp) || TRACE_ON(dcompperf))
     {
         LARGE_INTEGER rb1, freq;
         QueryPerformanceCounter( &rb1 ); QueryPerformanceFrequency( &freq );
         readback_ms += (rb1.QuadPart - rb0.QuadPart) * 1000.0 / freq.QuadPart;
+        perf.single_ms += (rb1.QuadPart - rb0.QuadPart) * 1000.0 / freq.QuadPart;
+        perf.singles++;
+        if (surface->upload_retries) perf.retries++;
     }
     ID3D11DeviceContext_Release( context );
     if (!copied) return NULL;

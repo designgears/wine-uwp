@@ -345,11 +345,10 @@ static HRESULT comp_swapchain_present(struct comp_swapchain *swapchain, UINT syn
         QueryPerformanceFrequency(&freq);
         gap = last_present.QuadPart ? (t0.QuadPart - last_present.QuadPart) * 1000.0 / freq.QuadPart : 0.0;
         total = (t3.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
-        /* only the slow ones: a stall between presents is the app, one inside is us */
-        if (gap >= 30.0 || total >= 8.0)
-            TRACE_(d3dperf)("present after %.1f ms outside; inside %.1f ms (vblank %.1f, copy %.1f, notify %.1f).\n",
-                    gap, total, (t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart,
-                    (t2.QuadPart - t1.QuadPart) * 1000.0 / freq.QuadPart, (t3.QuadPart - t2.QuadPart) * 1000.0 / freq.QuadPart);
+        /* every present: the time outside is the app's, the time inside ours */
+        TRACE_(d3dperf)("present after %.1f ms outside; inside %.1f ms (vblank %.1f, copy %.1f, notify %.1f).\n",
+                gap, total, (t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart,
+                (t2.QuadPart - t1.QuadPart) * 1000.0 / freq.QuadPart, (t3.QuadPart - t2.QuadPart) * 1000.0 / freq.QuadPart);
     }
     last_present = t3;
     return S_OK;

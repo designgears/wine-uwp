@@ -157,3 +157,7 @@ add_executable(probe-peek probes/probe-peek.cpp)
 set_target_properties(probe-peek PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
 add_executable(probe-uaf probes/probe-uaf.cpp)
 set_target_properties(probe-uaf PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
+
+add_executable(probe-a8 probes/probe-a8.cpp)
+target_link_libraries(probe-a8 PRIVATE d3d11.lib d2d1.lib dxguid.lib)
+set_target_properties(probe-a8 PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")

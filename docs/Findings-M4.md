@@ -9735,3 +9735,43 @@ conclusive; watch Solitaire's rate.
 Seen once during this work, not investigated: Shapr3D died while opening the drone with the
 `CoreMessaging.dll+0x27ed3` access violation already noted above for Solitaire (`DispatchItem::ForceWakeLevel`,
 a NULL list node, reached from `TimeoutManager::Callback_OnDispatch`). It is not only Solitaire's.
+
+### The viewport after opening, round two: 4000 wasted read-backs a second, and walks nobody needed (2026-09-27)
+
+Measured on Xvfb `:96` at 3440x1400, `WINE_UWP_TEST_HZ=175`, opening the drone and orbiting from 1.8 s. (The test
+KWin on `:1` stopped taking XTEST input after a restart - `xdotool getmouselocation` never moved - so this round
+moved to Xvfb; the committed build was re-measured there too.) Every present is now traced by `trace+d3dperf`,
+which splits its cycle into the app's time between presents and ours inside `Present`. Steady orbit before:
+the app's own work was ~2.5 ms a frame, and it waited ~5 ms in `present_notify_Presented` for our painter - 120-130
+frames a second, with us as the limit.
+
+1. **Upload retries were most of the walk while the editor loaded.** `dcompperf` now splits surface read-backs
+   out of the walk (`surface readback X batched, Y single: N, M upload retries`): 4000-5000 single read-backs a
+   second, 2-4.7 ms of every frame, nearly all of them `surface_check_upload` retries - a surface whose texture
+   the caller wrote itself is re-read every frame, 120 times, until it has pixels. 126 of the surfaces that never
+   got any were 9x9 A8 nine-grid masks. `d3d11` traces showed how XAML fills those: `BeginDraw` hands out the
+   texture as `IDXGISurface`, then `CopySubresourceRegion` from a CPU-writable `A8_UNORM` staging texture, box
+   (1,1)-(10,10), before `EndDraw` - and reading the staging source at that moment found 210 of 256 all zero. They
+   are empty by design, and complete when `EndDraw` returns. Retries now back off (16 ms doubling to 500 ms, 12 of
+   them, ~3.5 s), and A8 surfaces get none. `probes/probe-a8.cpp` checks clears, uploads, box copies from staging
+   and D2D fills into A8 on both renderers: all correct on Vulkan, which the apps use; on the GL renderer
+   `ClearRenderTargetView` leaves A8 empty (not pursued - nothing here runs on GL).
+2. **A swap chain frame alone no longer walks the tree.** The read-back thread bumped the scene for every frame,
+   so each one walked Shapr3D's ~5000 visuals (2.5-10 ms at 3440). With the tree unchanged, the painter now shows
+   the frame through `paint_swapchains_only` against the last complete list, as the batch gate already did; if
+   that list has no op for it yet, a full frame follows. The repaint timer no longer bumps the scene either:
+   anything that needs a walk bumps it itself.
+3. **The read-back copy scans alpha as it copies** (`copy_rows_opaque`, SSE2) instead of reading the whole
+   3440x1366 frame a second time in `bits_opaque`: read-back 3.4 -> 2.6 ms.
+
+Result, `docs/screenshots/viewport-after-open-round2.png` (frames shown per 250 ms; 44 would be 175 Hz): the
+committed build gave one run that collapsed to 16-45 presents a second with 347 ms gaps (the retry storm), one
+with a 271 ms gap, and one fine one; now four runs of four reach 37-44 a quarter second within 0.75 s, 155-166
+presents a second from the second second on, no notify timeouts, worst gap 59-64 ms. That remaining gap is the
+viewport's first frame at load: the last complete list is still the Home page's, so gated frames have nowhere to
+go until XAML commits the editor. `docs/screenshots/shapr3d-drone-orbit-round2.png` is the editor after such a
+run; Home's thumbnails still show. Regression: Calculator AE 0, Feedback Hub 896 / 0, Media Player 2242,
+Solitaire 6/6, twice.
+
+What is left per frame when XAML is committing (the view cube turns with every orbit frame): raster ~2-4 ms and
+blit ~1.2-2.6 ms of a 4.2 MP frame, then the flush.
