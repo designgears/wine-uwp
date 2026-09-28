@@ -4299,6 +4299,19 @@ static HRESULT d2d_device_context_init(struct d2d_device_context *render_target,
     {
         const struct shape_info *si = &shape_info[i];
 
+        ID3D11InputLayout *il;
+        ID3D11VertexShader *vs;
+
+        /* Shared by all the device's contexts. Creating them per context compiled five vertex shaders and a
+         * pixel shader each time, and an app that makes a context per surface (XAML, through dcomp) spent tens
+         * of milliseconds in the shader compiler for every menu it opened. */
+        if ((il = device->shape_il[si->shape_type]) && (vs = device->shape_vs[si->shape_type]))
+        {
+            ID3D11InputLayout_AddRef(render_target->shape_resources[si->shape_type].il = il);
+            ID3D11VertexShader_AddRef(render_target->shape_resources[si->shape_type].vs = vs);
+            continue;
+        }
+
         assert(device->precompiled_shape_vs[i]);
         precompiled = device->precompiled_shape_vs[i];
         if (FAILED(hr = ID3D11Device1_CreateInputLayout(render_target->d3d_device, si->il_desc, si->il_element_count,
@@ -4316,6 +4329,13 @@ static HRESULT d2d_device_context_init(struct d2d_device_context *render_target,
             WARN("Failed to create vertex shader for shape type %#x, hr %#lx.\n", si->shape_type, hr);
             goto err;
         }
+
+        il = render_target->shape_resources[si->shape_type].il;
+        vs = render_target->shape_resources[si->shape_type].vs;
+        if (!InterlockedCompareExchangePointer((void **)&device->shape_il[si->shape_type], il, NULL))
+            ID3D11InputLayout_AddRef(il);
+        if (!InterlockedCompareExchangePointer((void **)&device->shape_vs[si->shape_type], vs, NULL))
+            ID3D11VertexShader_AddRef(vs);
     }
 
     buffer_desc.ByteWidth = sizeof(struct d2d_vs_cb);
@@ -4331,14 +4351,23 @@ static HRESULT d2d_device_context_init(struct d2d_device_context *render_target,
         goto err;
     }
 
-    assert(device->precompiled_shape_ps);
-    precompiled = device->precompiled_shape_ps;
-    if (FAILED(hr = ID3D11Device1_CreatePixelShader(render_target->d3d_device,
-            ID3D10Blob_GetBufferPointer(precompiled), ID3D10Blob_GetBufferSize(precompiled),
-            NULL, &render_target->ps)))
+    if (device->shape_ps)
     {
-        WARN("Failed to create pixel shader, hr %#lx.\n", hr);
-        goto err;
+        ID3D11PixelShader_AddRef(render_target->ps = device->shape_ps);
+    }
+    else
+    {
+        assert(device->precompiled_shape_ps);
+        precompiled = device->precompiled_shape_ps;
+        if (FAILED(hr = ID3D11Device1_CreatePixelShader(render_target->d3d_device,
+                ID3D10Blob_GetBufferPointer(precompiled), ID3D10Blob_GetBufferSize(precompiled),
+                NULL, &render_target->ps)))
+        {
+            WARN("Failed to create pixel shader, hr %#lx.\n", hr);
+            goto err;
+        }
+        if (!InterlockedCompareExchangePointer((void **)&device->shape_ps, render_target->ps, NULL))
+            ID3D11PixelShader_AddRef(render_target->ps);
     }
 
     buffer_desc.ByteWidth = sizeof(struct d2d_ps_cb);
@@ -4586,9 +4615,15 @@ static ULONG WINAPI d2d_device_Release(ID2D1Device6 *iface)
         {
             if (device->precompiled_shape_vs[i])
                 ID3D10Blob_Release(device->precompiled_shape_vs[i]);
+            if (device->shape_il[i])
+                ID3D11InputLayout_Release(device->shape_il[i]);
+            if (device->shape_vs[i])
+                ID3D11VertexShader_Release(device->shape_vs[i]);
         }
         if (device->precompiled_shape_ps)
             ID3D10Blob_Release(device->precompiled_shape_ps);
+        if (device->shape_ps)
+            ID3D11PixelShader_Release(device->shape_ps);
         free(device);
     }
 

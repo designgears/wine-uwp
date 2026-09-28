@@ -682,6 +682,10 @@ struct d2d_device
 
     ID3D10Blob *precompiled_shape_vs[D2D_SHAPE_TYPE_COUNT];
     ID3D10Blob *precompiled_shape_ps;
+    /* Created by the first device context and shared by the rest: they depend only on the device. */
+    ID3D11InputLayout *shape_il[D2D_SHAPE_TYPE_COUNT];
+    ID3D11VertexShader *shape_vs[D2D_SHAPE_TYPE_COUNT];
+    ID3D11PixelShader *shape_ps;
 
     struct d2d_indexed_objects shaders;
 };

@@ -228,6 +228,8 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | What is the visual tree doing? | `WINEDEBUG=+dcomp`; `present_desktop_hwnd frame: N ops` - 0 ops means nothing to draw |
 | Which thread is spending the CPU in an interaction? | `/proc/<pid>/task/*/stat` (utime+stime) before and after; Wine names the Linux threads (`KernelRunLoop`, `ApplicationView`, `Render thread`, `wine_threadpool`). For *when*: `./schedtl.py <pid> <s> <out>` samples every thread's `schedstat` every 5 ms, `./schedview.py <out> [t0 t1 N]` prints a 10 ms-per-character busy strip per thread. That showed Shapr3D's UI thread saturated by our painting, and the kernel's compute/wait rhythm |
 | Symbolize a `WINE_UWP_PROFILE` dump | `$UWP_BIN/venv/bin/python profsym.py <dump>` (threads by name), `profsym.py <dump> <tid> [N]` (top leaves with real 8-frame unwound callers; `DEPTH=n`), `BUSY=1` to drop samples parked in waits. Profile at 5 ms: 3 ms with ~80 threads crashed Shapr3D once |
+| Is something creating shaders every time the UI changes? | `WINEDEBUG=+timestamp,trace+d3dperf`: every `d3d11_device_Create{Vertex,Pixel}Shader` with its caller, and every wined3d CPU blit (`cpu blt`, source and destination access and locations). A menu open created ~1200 shaders from d2d1 until contexts shared them |
+| How smooth is a menu or popup transition? | act with the uptime logged (`cut -d' ' -f1 /proc/uptime`), run with `+timestamp,trace+dcompgate`, then `./transitions.py <log> <times>`: first frame, changed frames, largest gap, gate stalls. `frame done` lines give each frame's walk, raster and damage. Check positions with one `xwd` per open at fixed delays, never a tight loop |
 | Is something creating D3D devices? | `WINEDEBUG=+timestamp,trace+d3dperf`: every `D3D11CreateDevice` with its time, thread and caller, and every device destroyed. Win2D made 100 in 11 s on Shapr3D's render thread, 72 ms each |
 | What did a thread do between two moments? | copy the `WINE_UWP_PROFILE` dump at both moments and `./profdiff.py before after diff` (cumulative counts subtracted), then `profsym.py diff` |
 | Reproduce at the user's refresh rate | `WINE_UWP_TEST_HZ=175` paces dcomp's painter and dxgi's vblank grid as a 175 Hz display would; Xvfb reports 60. The wheel-over-panel leak was 10 in 150 at 175 Hz and never showed at 60 |
@@ -542,6 +544,11 @@ frame, 120 times, until it had pixels. XAML's A8 nine-grid masks are mostly empt
 2-4.7 ms of every frame for its first seconds on 4000-5000 single read-backs a second. `dcompperf`'s `surface
 readback ... single: N, M upload retries` shows it; retries now back off. Before adding anything that repeats until
 something appears, bound it in time and in cost.
+
+**A D2D device context costs six shader compilations - never make one per surface.** Wine's d2d1 built its shape shaders
+for every context and dcomp made a context for every drawing surface, even ones XAML fills through the texture: ~1200
+compilations per menu open, and the menu's first frame waited for all of them in the command stream. The wait showed up
+in dcomp's readback `Map`, which is only the first thing to wait; profile `wined3d_cs` before blaming the waiter.
 
 **A D3D device here is a whole Vulkan device, tens of milliseconds, and apps treat it as cheap.** Win2D creates
 one per thumbnail and drops it; each went through a new DXGI factory, wined3d and Vulkan instance. DXGI factories

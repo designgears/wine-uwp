@@ -2737,6 +2737,8 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
             };
 
             update_pointer_from_msg( PT_MOUSE, &pointer_msg );
+            TRACE_(ptrdisp)( "sending %#x to %p at %d,%d, input at %u (now %u)\n", message, msg->hwnd,
+                             (int)msg->pt.x, (int)msg->pt.y, (unsigned)msg->time, (unsigned)NtGetTickCount() );
             send_message( msg->hwnd, message, pointer_msg.wParam, pointer_msg.lParam );
             forward_pointer_to_independent_input( msg->hwnd, message, pointer_msg.wParam, pointer_msg.lParam );
         }

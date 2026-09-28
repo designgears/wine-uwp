@@ -4309,6 +4309,7 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CreateVertexShader(ID3D11Device5 *
 
     TRACE("iface %p, byte_code %p, byte_code_length %Iu, class_linkage %p, shader %p.\n",
             iface, byte_code, byte_code_length, class_linkage, shader);
+    TRACE_(d3dperf)("vertex shader, %Iu bytes, from %p.\n", byte_code_length, __builtin_return_address(0));
 
     *shader = NULL;
 
@@ -4386,6 +4387,7 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CreatePixelShader(ID3D11Device5 *i
 
     TRACE("iface %p, byte_code %p, byte_code_length %Iu, class_linkage %p, shader %p.\n",
             iface, byte_code, byte_code_length, class_linkage, shader);
+    TRACE_(d3dperf)("pixel shader, %Iu bytes, from %p.\n", byte_code_length, __builtin_return_address(0));
 
     *shader = NULL;
 

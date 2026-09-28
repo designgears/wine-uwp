@@ -285,3 +285,4 @@ dlls/dataexchange/dragoperation.c
 dlls/dataexchange/Makefile.in
 dlls/dataexchange/private.h
 include/windows.applicationmodel.datatransfer.dragdrop.core.idl
+dlls/wined3d/surface.c

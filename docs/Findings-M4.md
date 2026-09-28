@@ -10005,3 +10005,34 @@ handler was registered, waiting on each returned operation. What was learned on 
 Result: dragging ABS onto the sample drone's top cover and Clear Glass onto its side body applies them, with the live hover
 preview while dragging (`docs/screenshots/shapr3d-material-drop-abs.png`, `shapr3d-material-drop-glass.png`: before, mid-drag,
 after), in two fresh projects of our own. `trace+dataexchange` logs every target call with its position and result.
+
+### Menu jank: ~1200 shader compilations per menu, and a gated paint that used up the refresh (2026-09-28)
+
+Measured at 3440x1400 and `WINE_UWP_TEST_HZ=175` on `:96`, opening and closing Shapr3D's File, Edit, Item and View menus.
+The tool is `transitions.py` (per open/close: first frame, frames that changed pixels, the largest gap, batch-gate stalls,
+from `+timestamp,trace+dcompgate`; the new `frame done` line gives each frame's walk/raster/flush and damaged area).
+
+- **What was not wrong.** The open animation is right: one capture per open at fixed delays (a tight `xwd` loop stalls the
+  painter and showed a fake 58 px jump) gives an ease-out from 38 px above at 100 ms to settled at 250 ms, no end pop. Hover
+  highlights show within 10 ms (pixel-sampled after jumping the pointer); a sweep's 120-300 ms "latencies" came from guessing
+  row boundaries and from disabled items, which do not highlight. Pointer input reaches the UI thread with 0 ms lag (new
+  `ptrdisp` "sending" line). The submenu opens after 400-500 ms, which is `SPI_GETMENUSHOWDELAY` as on Windows. Gaps late in
+  an open are the ease-out moving less than a pixel a frame.
+- **The first frame of a new menu waited for ~1200 shader compilations.** The View menu's first frame came 63-89 ms after the
+  click, of which 23-31 ms was dcomp's readback `Map` - the first thing to wait for the command stream. Profiling
+  `wined3d_cs` showed vkd3d parsing and compiling shaders, and a `d3dperf` trace in `d3d11_device_Create{Vertex,Pixel}Shader`
+  counted **985 vertex and 197 pixel shaders per open, from d2d1**: Wine's d2d1 created its five shape shaders, input layouts
+  and pixel shader for every device context, and dcomp created a D2D context for every drawing surface even when XAML only
+  asked for the texture (how it fills its text and nine-grid masks). d2d1 now shares them per `ID2D1Device`, and dcomp creates
+  a surface's context only for D2D callers. Per View-menu open: 0 shaders, readback wait 4 ms, first frame 30-55 ms, ~58
+  frames in the open instead of ~35, worst gap 24-28 ms instead of 40-50 (`docs/screenshots/shapr3d-view-menu.png`).
+- Two smaller fixes on the way: a paint attempt the XAML batch gate turned away still set `last_paint_tick`, so the commit
+  that closed the batch was paced to the next repaint timer (6 ms more of every stall; closes are now 60-85 ms with no gap over
+  9 ms); and wined3d's CPU blitter downloaded the destination even when the copy replaced all of it (now `prepare`d, as the
+  Vulkan blitter does - 31 -> 26 ms before the shader fix). dcomp's readback also gathers surfaces in a GPU atlas and downloads
+  it once, since a copy into a staging texture is a CPU blit that downloads its source.
+- **Tried and reverted:** posting CoreMessaging's queue completion for the internal queue bits too (`QS_DRIVER` - input still
+  on the X connection - and `QS_HARDWARE`) in `server/queue.c`. It changed nothing for menus (input was not late) and Calculator
+  reached its baseline in 18/20 starts with it against 20/20 without; two Shapr3D starts in a row came up blank with it.
+- Still there: a 15-20 ms batch-gate stall where XAML takes the finished transition down (motion is under a pixel by then),
+  and the painter keeps walking the tree with nothing damaged every ~5 ms for a while after an animation.

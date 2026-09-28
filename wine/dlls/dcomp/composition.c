@@ -1232,7 +1232,7 @@ static void present_desktop_hwnd_locked( HWND hwnd )
     static LONG painted_generation = -1;
     LONG generation = scene_generation;
     BOOL swapchain_only;
-    ULONGLONG now;
+    ULONGLONG now, prev_paint_tick;
 
     if (!hwnd || !IsWindow( hwnd )) return;
     if (TRACE_ON(dcompperf)) { perf_report(); perf.requests++; }
@@ -1261,6 +1261,7 @@ static void present_desktop_hwnd_locked( HWND hwnd )
         request_repaint( paint_interval() + 1 - (UINT)(now - last_paint_tick) );
         return;
     }
+    prev_paint_tick = last_paint_tick;
     last_paint_tick = now;
     if (swapchain_only && (hdc = GetDC( hwnd )))
     {
@@ -1313,7 +1314,7 @@ static void present_desktop_hwnd_locked( HWND hwnd )
         struct paint_damage damage = { { { 0 } } };
         RECT bounds = { 0, 0, back_w, back_h };
         LARGE_INTEGER t0, t1, t2, t3, freq;
-        BOOL timing = TRACE_ON(dcomp) || TRACE_ON(dcompperf);
+        BOOL timing = TRACE_ON(dcomp) || TRACE_ON(dcompperf) || TRACE_ON(dcompgate);
         unsigned int i, n_old, n_new, head = 0, tail = 0;
 
         if (timing) QueryPerformanceCounter( &t0 );
@@ -1355,7 +1356,10 @@ static void present_desktop_hwnd_locked( HWND hwnd )
                     TRACE_(dcompgate)( "deferred, wait %lu, since %I64u\n", wait, gate_now - deferred_since );
                     paint_current ^= 1;         /* the last frame's list stays the previous one */
                     painted_generation = -1;    /* and this scene still needs painting */
-                    paint_swapchains_only( hwnd, hdc );
+                    /* An attempt that showed nothing must not use up the refresh: the commit that closes the batch
+                     * came a few ms after one and was paced to the next repaint timer, 6 ms more of every menu
+                     * transition's stall at 175 Hz. */
+                    if (!paint_swapchains_only( hwnd, hdc )) last_paint_tick = prev_paint_tick;
                     ReleaseDC( hwnd, hdc );
                     request_repaint( min( wait, XAML_BATCH_WAIT - (DWORD)(gate_now - deferred_since) ) );
                     return;
@@ -1445,6 +1449,13 @@ static void present_desktop_hwnd_locked( HWND hwnd )
             for (i = 0; i < damage.count; i++) perf.pixels += rect_area( &damage.rects[i] );
             TRACE( "frame: %u ops, %u damage rects, walk %.2f ms, raster %.2f ms, readback %.2f.\n", n_new, damage.count,
                    walk, raster, readback_ms );
+            if (TRACE_ON(dcompgate))
+            {
+                unsigned int kpx = 0;
+                for (i = 0; i < damage.count; i++) kpx += rect_area( &damage.rects[i] ) / 1000;
+                TRACE_(dcompgate)( "frame done: %u ops, %u kpx damaged, walk %.2f raster %.2f blit+flush %.2f ms\n",
+                                   n_new, kpx, walk, raster, (t3.QuadPart - t2.QuadPart) * 1000.0 / freq.QuadPart );
+            }
             readback_ms = 0;
         }
         if (paint_verify < 0) paint_verify = getenv( "WINE_DCOMP_VERIFY_DAMAGE" ) ? 1 : 0;
@@ -4129,7 +4140,11 @@ static HRESULT ensure_d2d_device( void )
     return S_OK;
 }
 
-static HRESULT surface_ensure_target( struct drawing_surface *surface )
+/* The texture always; the D2D context and its target bitmap only when a caller draws through D2D. XAML fills most
+ * of its surfaces itself (text and nine-grid masks through the texture), and creating a D2D context for each built
+ * five vertex shaders and a pixel shader: ~200 contexts and ~1200 shader compilations every time Shapr3D opened a
+ * menu, which the first frame of the menu then waited for. */
+static HRESULT surface_ensure_target( struct drawing_surface *surface, BOOL with_context )
 {
     D2D1_BITMAP_PROPERTIES1 properties = { { 0 } };
     D3D11_TEXTURE2D_DESC desc = { 0 };
@@ -4163,6 +4178,7 @@ static HRESULT surface_ensure_target( struct drawing_surface *surface )
             }
         }
     }
+    if (!with_context) return S_OK;
     if (!surface->context &&
         FAILED( hr = ID2D1Device_CreateDeviceContext( interop_d2d_device,
                                                       D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
@@ -4208,7 +4224,8 @@ static HRESULT WINAPI surface_BeginDraw( void *iface, const RECT *update_rect, R
     if (!update_object) return S_OK;
     *update_object = NULL;
 
-    if (SUCCEEDED( hr = surface_ensure_target( surface ) ) && !IsEqualGUID( iid, &IID_ID2D1DeviceContext ) &&
+    if (SUCCEEDED( hr = surface_ensure_target( surface, IsEqualGUID( iid, &IID_ID2D1DeviceContext ) ) ) &&
+        !IsEqualGUID( iid, &IID_ID2D1DeviceContext ) &&
         SUCCEEDED( ID3D11Texture2D_QueryInterface( surface->texture, iid, update_object ) ))
     {
         /* IDXGISurface / D3D11 texture callers (XAML image and atlas updates) write the texture directly. */
@@ -4216,6 +4233,7 @@ static HRESULT WINAPI surface_BeginDraw( void *iface, const RECT *update_rect, R
         surface->texture_out = TRUE;
         return S_OK;
     }
+    if (SUCCEEDED( hr )) hr = surface_ensure_target( surface, TRUE );
     if (SUCCEEDED( hr ))
     {
         ID2D1DeviceContext_BeginDraw( surface->context );
@@ -4284,7 +4302,7 @@ static HRESULT WINAPI surface_HasValidPixels( void *iface, BOOL *valid )
     struct drawing_surface *surface = CONTAINING_RECORD( iface, struct drawing_surface, vtbl );
 
     if (!valid) return E_POINTER;
-    *valid = surface->context != NULL;
+    *valid = surface->texture != NULL;
     return S_OK;
 }
 static HRESULT WINAPI surface_Resize( void *iface, UINT width, UINT height )
@@ -4897,14 +4915,15 @@ static BOOL surface_ensure_cache( struct drawing_surface *surface, UINT width, U
  * that do not fit, or live on another device, are left to surface_cached_pixels. */
 static void readback_batch_format( struct drawing_surface **list, unsigned int count, DXGI_FORMAT format, UINT bpp )
 {
-    static ID3D11Texture2D *atlases[2];
-    ID3D11Texture2D **atlas = &atlases[bpp == 4 ? 0 : 1];
+    static ID3D11Texture2D *atlases[2], *gpu_atlases[2];
+    ID3D11Texture2D **atlas = &atlases[bpp == 4 ? 0 : 1], **gpu_atlas = &gpu_atlases[bpp == 4 ? 0 : 1];
     ID3D11Device *device = NULL, *other;
     ID3D11DeviceContext *context;
     D3D11_TEXTURE2D_DESC desc, have;
     D3D11_MAPPED_SUBRESOURCE map;
     struct { struct drawing_surface *surface; UINT x, y, w, h; } placed[512];
     UINT atlas_w = 1024, x = 0, y = 0, row_h = 0, needed_h, i, n = 0, row;
+    LARGE_INTEGER q0, q1, q2, q3, qf;
 
     for (i = 0; i < count; i++)
     {
@@ -4947,6 +4966,8 @@ static void readback_batch_format( struct drawing_surface **list, unsigned int c
             needed_h = max( needed_h, have.Height );
             ID3D11Texture2D_Release( *atlas );
             *atlas = NULL;
+            if (*gpu_atlas) ID3D11Texture2D_Release( *gpu_atlas );
+            *gpu_atlas = NULL;
         }
     }
     if (!*atlas)
@@ -4967,13 +4988,29 @@ static void readback_batch_format( struct drawing_surface **list, unsigned int c
             ID3D11Device_Release( device );
             return;
         }
+        /* The surfaces are gathered on the GPU first and the atlas comes down in one copy: copied into the staging
+         * atlas one by one, wined3d downloaded each and waited for it - 0.47 ms a surface, 31 ms for the 67 masks of
+         * Shapr3D's View menu, all of it before the menu's first frame. */
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.CPUAccessFlags = 0;
+        if (FAILED( ID3D11Device_CreateTexture2D( device, &desc, NULL, gpu_atlas ) )) *gpu_atlas = NULL;
     }
     ID3D11Device_GetImmediateContext( device, &context );
+    if (TRACE_ON(dcompgate)) QueryPerformanceCounter( &q0 );
     for (i = 0; i < n; i++)
-        ID3D11DeviceContext_CopySubresourceRegion( context, (ID3D11Resource *)*atlas, 0, placed[i].x, placed[i].y, 0,
+        ID3D11DeviceContext_CopySubresourceRegion( context, (ID3D11Resource *)(*gpu_atlas ? *gpu_atlas : *atlas), 0,
+                                                   placed[i].x, placed[i].y, 0,
                                                    (ID3D11Resource *)placed[i].surface->texture, 0, NULL );
+    if (*gpu_atlas)
+    {
+        D3D11_BOX box = { 0, 0, 0, atlas_w, needed_h, 1 };
+        ID3D11DeviceContext_CopySubresourceRegion( context, (ID3D11Resource *)*atlas, 0, 0, 0, 0,
+                                                   (ID3D11Resource *)*gpu_atlas, 0, &box );
+    }
+    if (TRACE_ON(dcompgate)) QueryPerformanceCounter( &q1 );
     if (SUCCEEDED( ID3D11DeviceContext_Map( context, (ID3D11Resource *)*atlas, 0, D3D11_MAP_READ, 0, &map ) ))
     {
+        if (TRACE_ON(dcompgate)) QueryPerformanceCounter( &q2 );
         for (i = 0; i < n; i++)
         {
             struct drawing_surface *surface = placed[i].surface;
@@ -4989,6 +5026,14 @@ static void readback_batch_format( struct drawing_surface **list, unsigned int c
         ID3D11DeviceContext_Unmap( context, (ID3D11Resource *)*atlas, 0 );
         perf.batched += n;
         perf.batches++;
+        if (TRACE_ON(dcompgate))
+        {
+            QueryPerformanceCounter( &q3 );
+            QueryPerformanceFrequency( &qf );
+            TRACE_(dcompgate)( "readback of %u surfaces (%ux%u, %u bpp): copies %.2f, map %.2f, unpack %.2f ms\n", n,
+                               atlas_w, needed_h, bpp, (q1.QuadPart - q0.QuadPart) * 1000.0 / qf.QuadPart,
+                               (q2.QuadPart - q1.QuadPart) * 1000.0 / qf.QuadPart, (q3.QuadPart - q2.QuadPart) * 1000.0 / qf.QuadPart );
+        }
     }
     ID3D11DeviceContext_Release( context );
     ID3D11Device_Release( device );
@@ -14145,7 +14190,7 @@ static void paint_shape_visual( HDC hdc, struct visual *impl, float x, float y, 
         impl->shape_signature = signature;
         impl->shape_drawn = TRUE;
     }
-    if (FAILED( hr = surface_ensure_target( surface ) ) || !surface->context)
+    if (FAILED( hr = surface_ensure_target( surface, TRUE ) ) || !surface->context)
     {
         WARN( "no D2D target for the shapes of %p, hr %#lx.\n", impl, hr );
         impl->shape_drawn = FALSE;
