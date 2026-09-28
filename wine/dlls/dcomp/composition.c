@@ -2336,6 +2336,9 @@ static const GUID IID_IMap_animations_local =
 static HRESULT comp_map_for_owner( IUnknown *owner, void **out );
 static HRESULT WINAPI comp_object_GetRuntimeClassName( void *iface, HSTRING *name );
 
+static const GUID IID_IDCompositionSurfaceCopy_local =
+    { 0x43390de3, 0xac87, 0x4fc4, { 0xa8, 0xee, 0xbe, 0x3a, 0x1f, 0x43, 0xeb, 0xdd } };
+static HRESULT surface_copy_query( void *iface, void *caller, void **out );
 static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void **out )
 {
     struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
@@ -2356,6 +2359,10 @@ static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void 
         return create_composition_object_view( (IUnknown *)&object->vtbl, out );
     if (IsEqualGUID( iid, &IID_IMap_animations_local ))
         return comp_map_for_owner( (IUnknown *)&object->vtbl, out );
+    /* dcomp's surface-copy interface has a contract (CopySurface must return a surface): surfaces answer it, anything
+     * else must refuse rather than hand XAML a vtable whose slot 3 returns nothing */
+    if (IsEqualGUID( iid, &IID_IDCompositionSurfaceCopy_local ))
+        return surface_copy_query( iface, __builtin_return_address( 0 ), out );
     InterlockedIncrement( &object->ref );
     *out = &object->vtbl;
     return S_OK;
@@ -7069,7 +7076,7 @@ static ULONG WINAPI capture_interop_Release( void *iface )
 }
 static HRESULT WINAPI capture_interop_notimpl( void *iface )
 {
-    TRACE( "capture surface %p.\n", iface );
+    TRACE_(dcompgate)( "capture surface %p: not implemented, called from %p.\n", iface, __builtin_return_address( 0 ) );
     return E_NOTIMPL;
 }
 static HRESULT WINAPI capture_interop_HasValidPixels( void *iface, int *valid )
@@ -7219,6 +7226,120 @@ static const void *capture_debug_vtbl[] =
     capture_interop_notimpl, capture_interop_notimpl,
 };
 
+
+/* {43390de3-ac87-4fc4-a8ee-be3a1f43ebdd}: dcomp's own surface-copy interface (CCompositionSurface answers it;
+ * CompositionDrawingSurface::CopySurface goes through it). Slot 3 is CopySurface( const RECT *, IDXGISurface ** ).
+ * XAML's RenderTargetBitmap reads its pixels back with it (DCompSurface::CopyToSurface), and the catch-all QI's
+ * answer gave it a NULL surface to Map: the app crashed on the first drag with a drag visual. */
+struct surface_copy
+{
+    const void **vtbl;
+    LONG ref;
+    struct drawing_surface *surface;
+};
+static HRESULT WINAPI surface_copy_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct surface_copy *impl = CONTAINING_RECORD( iface, struct surface_copy, vtbl );
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IDCompositionSurfaceCopy_local ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = iface;
+        return S_OK;
+    }
+    return comp_object_QueryInterface( &impl->surface->vtbl, iid, out );
+}
+static ULONG WINAPI surface_copy_AddRef( void *iface )
+{
+    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct surface_copy, vtbl )->ref );
+}
+static ULONG WINAPI surface_copy_Release( void *iface )
+{
+    struct surface_copy *impl = CONTAINING_RECORD( iface, struct surface_copy, vtbl );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref)
+    {
+        surface_Release( &impl->surface->vtbl );
+        (free)( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI surface_copy_CopySurface( void *iface, const RECT *rect, IDXGISurface **out )
+{
+    struct surface_copy *impl = CONTAINING_RECORD( iface, struct surface_copy, vtbl );
+    struct capture_surface *copy = NULL;
+    struct capture_dxgi *dxgi;
+    D3D11_TEXTURE2D_DESC desc;
+    const BYTE *pixels;
+    RECT area;
+    int y, i;
+
+    if (!out) return E_POINTER;
+    *out = NULL;
+    for (i = 0; i < 200 && !TryEnterCriticalSection( &present_cs ); i++) Sleep( 1 );
+    if (i == 200) return E_FAIL;
+    if ((pixels = surface_cached_pixels( impl->surface, &desc )) && desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM)
+    {
+        SetRect( &area, 0, 0, desc.Width, desc.Height );
+        if (rect) IntersectRect( &area, &area, rect );
+        if (!IsRectEmpty( &area ) && (copy = calloc( 1, sizeof(*copy) )) &&
+            (copy->pixels = (malloc)( (size_t)(area.right - area.left) * (area.bottom - area.top) * 4 )))
+        {
+            copy->vtbl = capture_surface_vtbl;
+            copy->interop_vtbl = capture_interop_vtbl;
+            copy->debug_vtbl = capture_debug_vtbl;
+            copy->ref = 1;
+            copy->width = area.right - area.left;
+            copy->height = area.bottom - area.top;
+            for (y = 0; y < copy->height; y++)
+                memcpy( copy->pixels + (size_t)y * copy->width * 4,
+                        pixels + ((size_t)(area.top + y) * desc.Width + area.left) * 4, (size_t)copy->width * 4 );
+        }
+        else if (copy)
+        {
+            (free)( copy );
+            copy = NULL;
+        }
+    }
+    LeaveCriticalSection( &present_cs );
+    TRACE_(dcompgate)( "surface %p, rect %s: copy %p (%ux%u, format %u).\n", impl->surface, wine_dbgstr_rect( rect ),
+                       copy, pixels ? desc.Width : 0, pixels ? desc.Height : 0, pixels ? desc.Format : 0 );
+    if (!copy) return E_FAIL;
+    if (!(dxgi = calloc( 1, sizeof(*dxgi) )))
+    {
+        capture_surface_Release( &copy->vtbl );
+        return E_OUTOFMEMORY;
+    }
+    dxgi->IDXGISurface_iface.lpVtbl = &capture_dxgi_vtbl;
+    dxgi->ref = 1;
+    dxgi->owner = copy;   /* takes the reference */
+    *out = &dxgi->IDXGISurface_iface;
+    return S_OK;
+}
+static const void *surface_copy_vtbl[] =
+{
+    surface_copy_QueryInterface, surface_copy_AddRef, surface_copy_Release, surface_copy_CopySurface,
+};
+static HRESULT surface_copy_query( void *iface, void *caller, void **out )
+{
+    struct drawing_surface *surface = surface_from_iface( iface );
+    struct surface_copy *copy;
+
+    if (!surface)
+    {
+        TRACE_(dcompgate)( "%s %p: no surface copy (from %p).\n", CONTAINING_RECORD( iface, struct comp_object, vtbl )->kind,
+                           iface, caller );
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    if (!(copy = calloc( 1, sizeof(*copy) ))) return E_OUTOFMEMORY;
+    copy->vtbl = surface_copy_vtbl;
+    copy->ref = 1;
+    copy->surface = surface;
+    comp_object_AddRef( &surface->vtbl );
+    *out = &copy->vtbl;
+    return S_OK;
+}
+
 /* Paint a visual's subtree into width x height premultiplied BGRA, with the visual's own offset at the origin: the
  * painter's walk, into a list of its own, rasterized into a DIB of its own. It holds the painter's locks meanwhile
  * (present_cs, then walk_lock and dcomp_visual_cs, as a frame does), but only tries present_cs for a while - a
@@ -7226,8 +7347,10 @@ static const void *capture_debug_vtbl[] =
 static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float oy, float sx, float sy );
 static struct visual *public_visual_from( IInspectable *object );
 static void capture_paint_public( HDC dc, struct visual *pv, int width, int height );
-static BYTE *capture_visual_pixels( IUnknown *visual, int width, int height )
+static BOOL public_visual_scale( IUnknown *iface, float *sx, float *sy );
+static BYTE *capture_visual_pixels( IUnknown *visual, IUnknown *frame, int width, int height )
 {
+    float fsx = 1.0f, fsy = 1.0f;
     struct dcomp_visual *dv = dcv_from_any( visual );
     struct visual *pv = dv ? NULL : public_visual_from( (IInspectable *)visual );
     RECT area = { 0, 0, width, height }, saved_clip, saved_rot_clip;
@@ -7281,7 +7404,11 @@ static BYTE *capture_visual_pixels( IUnknown *visual, int width, int height )
         xaml_island_container = NULL;
         paint_branch = NULL;
         EnterCriticalSection( &dcomp_visual_cs );
-        if (dv) paint_dcomp_visual( dc, dv, -(dv->offset_x + dv->transform_x), -(dv->offset_y + dv->transform_y), 1.0f, 1.0f );
+        /* the frame's scale (the element's rasterization and zoom), not its translation: the bitmap starts at the
+         * element's own origin */
+        if (frame) public_visual_scale( frame, &fsx, &fsy );
+        if (dv) paint_dcomp_visual( dc, dv, -(dv->offset_x + dv->transform_x + dv->transform4.M41) * fsx,
+                                    -(dv->offset_y + dv->transform_y + dv->transform4.M42) * fsy, fsx, fsy );
         else capture_paint_public( dc, pv, width, height );
         LeaveCriticalSection( &dcomp_visual_cs );
 
@@ -7332,6 +7459,7 @@ struct capture_op
     IUnknown *handler;
     BOOL completed;
     IUnknown *visual;           /* to capture at the next commit */
+    IUnknown *frame;            /* the visual XAML passed: an empty container carrying the element's transform */
     unsigned int tries;
 };
 /* Captures wait for XAML's commit: it asks for one in PreCommit and fills the captured visual later in the same
@@ -7379,6 +7507,7 @@ static ULONG WINAPI capture_op_Release( void *iface )
         if (impl->surface) IUnknown_Release( impl->surface );
         if (impl->handler) IUnknown_Release( impl->handler );
         if (impl->visual) IUnknown_Release( impl->visual );
+        if (impl->frame) IUnknown_Release( impl->frame );
         (free)( impl );
     }
     return ref;
@@ -7525,7 +7654,11 @@ static HRESULT WINAPI dcv_internal_CaptureAsync( void *iface, IUnknown *visual, 
     op->info_vtbl = capture_info_vtbl;
     op->ref = 1;
     op->surface = (IUnknown *)&surface->vtbl;
-    if (visual) IUnknown_AddRef( (op->visual = visual) );
+    /* RenderTargetBitmapImplUsingSpriteVisuals::PreCommit calls this on the element's own visual and passes a new,
+     * empty ContainerVisual whose TransformMatrix is the element's combined transform: the capture is of this visual,
+     * drawn in that frame. Capturing the argument gave an empty bitmap, and no drag ghost. */
+    IUnknown_AddRef( (op->visual = (IUnknown *)&dcomp_visual_from_internal( iface )->vtbl) );
+    if (visual) IUnknown_AddRef( (op->frame = visual) );
     EnterCriticalSection( &capture_cs );
     if (op->visual && pending_capture_count < ARRAY_SIZE(pending_captures))
     {
@@ -7558,7 +7691,7 @@ static void run_pending_captures( void )
         HRESULT (WINAPI *invoke)( IUnknown *, void *, AsyncStatus );
         IUnknown *handler;
 
-        surface->pixels = capture_visual_pixels( op->visual, surface->width, surface->height );
+        surface->pixels = capture_visual_pixels( op->visual, op->frame, surface->width, surface->height );
         if (!surface->pixels && ++op->tries < 5)
         {
             EnterCriticalSection( &capture_cs );
@@ -9559,6 +9692,18 @@ static struct visual *public_visual_from( IInspectable *object )
     impl = visual_from_interop( view );
     IUnknown_Release( (IUnknown *)view );
     return impl;
+}
+
+/* the axis-aligned scale of a public visual's TransformMatrix, for capture_visual_pixels' frame */
+static BOOL public_visual_scale( IUnknown *iface, float *sx, float *sy )
+{
+    struct visual *pv = public_visual_from( (IInspectable *)iface );
+    if (!pv) return FALSE;
+    if (pv->transform.M11 > 0.0f) *sx = pv->transform.M11;
+    if (pv->transform.M22 > 0.0f) *sy = pv->transform.M22;
+    TRACE_(dcompgate)( "capture frame %p: transform %g %g %g %g, %g %g.\n", pv, pv->transform.M11, pv->transform.M12,
+                       pv->transform.M21, pv->transform.M22, pv->transform.M41, pv->transform.M42 );
+    return TRUE;
 }
 
 /* capture_visual_pixels' walk of a public visual, with its own offset at the origin */

@@ -42,6 +42,7 @@ dlls/dwrite/font.c
 dlls/dwrite/format.c
 dlls/dwrite/layout.c
 dlls/dwrite/main.c
+dlls/dxgi/device.c
 dlls/dxgi/Makefile.in
 dlls/dxgi/compswapchain.c
 dlls/dxgi/dxgi_private.h

@@ -10108,7 +10108,8 @@ PointerMoved, `a`/`c` Pressed/Released, `f` Tapped, `0x12` PointerCaptureLost, `
 
 ### Windowed popups: flyouts, menus and dropdowns are windows of their own (2026-09-28)
 
-`GetSystemMetrics(0x1800)` now answers 1 (win32u; `WINE_UWP_WINDOWED_POPUPS=0` turns it off), so XAML's
+`GetSystemMetrics(0x1800)` answers 1 with `WINE_UWP_WINDOWED_POPUPS=1` (win32u; **opt-in**, see the start-up count
+below), so XAML's
 `CPopup::DoesPlatformSupportWindowedPopup` holds and every popup gets a `WS_POPUP` window (`WS_EX_NOACTIVATE |
 WS_EX_NOREDIRECTIONBITMAP`, shown with `SWP_NOACTIVATE`, so winex11 maps it override-redirect like a Win32 menu).
 `CPopup::EnsureDCompResourcesForWindowedPopup` asks the desktop device for `CreateTargetForHwnd` (slot 24),
@@ -10135,3 +10136,35 @@ list is open (`CPopup+0x218`, set by `Open`) and not closing (`+0x228` bit 12, s
 since it was requested (`+0x120` counter), `GetPointerInfo` fails for the stored pointer id, or the stored message's
 `POINTER_INFO.hwndTarget` is neither the host window nor an open popup's window. Which of those differs on Windows is
 not known yet.
+
+**Windowed popups are opt-in, because they cost start-ups.** Counted in a second reflinked prefix on `:97`, the same
+build alternating the switch: 24 of 24 Shapr3D starts painted with it off; with it on, 4 of about 30 stayed blank
+(all threads idle, no XAML commit at all - the CoreMessaging lost wake, before any popup opened). With the platform
+supporting them, every popup XAML creates hooks a CoreWindow position event through `IInternalCoreWindow2`
+(`Popup::HookupWindowPositionChangedHandlerImpl`), and tooltips set that up at load. Turning them on by default waits
+for the CoreMessaging wake fix.
+
+### Drag visual: the dragged item now follows the pointer (2026-09-28)
+
+Four links were missing between XAML's `DragVisual` and a picture on screen:
+
+- **`IVisualInternal::CaptureAsync` captures the visual it is called on.** `RenderTargetBitmapImplUsingSpriteVisuals::
+  PreCommit` calls it on the element's own visual (`element->[0x118]` slot 97) and passes a *new, empty* ContainerVisual
+  whose `TransformMatrix` is the element's combined transform (`TransformAndClipStack::GetCombinedTransform`). We
+  captured that argument - the empty container "that nothing ever fills" of the earlier entry. Now the source is drawn
+  at its own origin in the frame's scale; the ABS row gives 12 ops on its first commit.
+- **dxgi `EnqueueSetEvent`** was `E_NOTIMPL`, and XAML's `RenderTargetBitmap.GetPixelsAsync` waits for its copy with it,
+  so `DragVisual::GetSoftwareBitmap` failed (found with `WINE_UWP_BP=combase.dll+15fc0@stk:12` on
+  `RoGetMatchingRestrictedErrorInfo`). It now issues a wined3d event query, waits for it and sets the event.
+- **dcomp's surface-copy interface `{43390de3-ac87-4fc4-a8ee-be3a1f43ebdd}`** (Windows' `CCompositionSurface` answers it;
+  slot 3 `CopySurface(const RECT *, IDXGISurface **)`, what `CompositionDrawingSurface::CopySurface` uses). XAML's
+  `DCompSurface::CopyToSurface` reads the RTB's pixels with it; our catch-all QI answered, slot 3 returned nothing, and
+  `ByteAccessDxgiSurface::ReadBytes` called `Map` through NULL - the app fail-fasted on the first drag once the first two
+  were fixed. Surfaces answer it now with a read-only `IDXGISurface` over their pixels, and the catch-all refuses it.
+- **dataexchange shows the bitmap.** `SetDragUIContentFromSoftwareBitmap(WithAnchorPoint)` reads the SoftwareBitmap
+  (Microsoft's own, through `LockBuffer` and `IMemoryBufferByteAccess`) into a premultiplied copy, and the drag thread
+  shows it in a layered `WS_EX_TRANSPARENT | WS_EX_NOACTIVATE` window under the pointer at the anchor, pumping its
+  messages; `WindowFromPoint` skips it, so the drop target lookup is unchanged.
+
+`docs/screenshots/shapr3d-drag-visual.png`: the ABS material row dragged over the drone (its transparent background is
+black on Xvfb). The drop still applies and the panels still repaint afterwards; suite and `kb` pass.

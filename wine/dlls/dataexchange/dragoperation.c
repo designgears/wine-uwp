@@ -1031,7 +1031,186 @@ struct drag_operation
     struct drag_async *async;
     ICoreDispatcher *dispatcher;   /* of the thread that started the drag, which gets the completion */
     UINT button;          /* the mouse button holding the drag */
+    /* the drag visual, premultiplied BGRA, under drag_cs; the drag thread shows it under the pointer */
+    BYTE *ghost_bits;
+    int ghost_width, ghost_height;
+    POINT ghost_anchor;
+    LONG ghost_generation;
 };
+
+/* IMemoryBufferByteAccess {5b0d3235-4dba-4d44-865e-8f1d0e4fd04d}: GetBuffer( BYTE **value, UINT32 *capacity ) */
+DEFINE_GUID( IID_IMemoryBufferByteAccess_ours, 0x5b0d3235, 0x4dba, 0x4d44, 0x86, 0x5e, 0x8f, 0x1d, 0x0e, 0x4f, 0xd0, 0x4d );
+typedef struct { IUnknown IUnknown_iface; } memory_byte_access;
+typedef HRESULT (WINAPI *get_buffer_fn)( IUnknown *iface, BYTE **value, UINT32 *capacity );
+
+/* XAML's DragVisual renders the dragged element into a SoftwareBitmap and hands it over here. Keep a premultiplied
+ * copy: the bitmap is Microsoft's own (native Windows.Graphics), read through LockBuffer. */
+static HRESULT set_drag_ghost( struct drag_operation *drag, ISoftwareBitmap *bitmap, const Point *anchor )
+{
+    IMemoryBufferReference *reference = NULL;
+    BitmapPlaneDescription plane;
+    IBitmapBuffer *buffer = NULL;
+    IMemoryBuffer *memory = NULL;
+    IUnknown *access = NULL;
+    BitmapPixelFormat format;
+    BitmapAlphaMode alpha;
+    BYTE *data, *bits = NULL;
+    UINT32 capacity;
+    INT32 width, height, x, y;
+    HRESULT hr;
+
+    if (!bitmap) return S_OK;
+    if (FAILED(hr = ISoftwareBitmap_get_BitmapPixelFormat( bitmap, &format ))) return hr;
+    ISoftwareBitmap_get_BitmapAlphaMode( bitmap, &alpha );
+    ISoftwareBitmap_get_PixelWidth( bitmap, &width );
+    ISoftwareBitmap_get_PixelHeight( bitmap, &height );
+    TRACE( "drag %p: bitmap %dx%d format %d alpha %d anchor %s\n", drag, width, height, format, alpha,
+           anchor ? wine_dbg_sprintf( "%.1f,%.1f", anchor->X, anchor->Y ) : "none" );
+    if (format != BitmapPixelFormat_Bgra8 || width <= 0 || height <= 0 || width > 2048 || height > 2048) return S_OK;
+
+    if (SUCCEEDED(hr = ISoftwareBitmap_LockBuffer( bitmap, BitmapBufferAccessMode_Read, &buffer )) &&
+        SUCCEEDED(hr = IBitmapBuffer_GetPlaneDescription( buffer, 0, &plane )) &&
+        SUCCEEDED(hr = IBitmapBuffer_QueryInterface( buffer, &IID_IMemoryBuffer, (void **)&memory )) &&
+        SUCCEEDED(hr = IMemoryBuffer_CreateReference( memory, &reference )) &&
+        SUCCEEDED(hr = IMemoryBufferReference_QueryInterface( reference, &IID_IMemoryBufferByteAccess_ours, (void **)&access )) &&
+        SUCCEEDED(hr = ((get_buffer_fn)(*(void ***)access)[3])( access, &data, &capacity )) &&
+        plane.StartIndex >= 0 && plane.Stride >= width * 4 &&
+        (UINT64)plane.StartIndex + (UINT64)plane.Stride * (height - 1) + width * 4 <= capacity &&
+        (bits = malloc( (size_t)width * height * 4 )))
+    {
+        for (y = 0; y < height; y++)
+        {
+            const BYTE *in = data + plane.StartIndex + (size_t)y * plane.Stride;
+            BYTE *out = bits + (size_t)y * width * 4;
+            for (x = 0; x < width; x++, in += 4, out += 4)
+            {
+                BYTE a = alpha == BitmapAlphaMode_Ignore ? 255 : in[3];
+                if (alpha == BitmapAlphaMode_Straight)
+                {
+                    out[0] = in[0] * a / 255; out[1] = in[1] * a / 255; out[2] = in[2] * a / 255;
+                }
+                else
+                {
+                    out[0] = in[0]; out[1] = in[1]; out[2] = in[2];
+                }
+                out[3] = a;
+            }
+        }
+    }
+    else WARN( "cannot read the bitmap, hr %#lx\n", hr );
+    if (access) IUnknown_Release( access );
+    if (reference)
+    {
+        IClosable *closable;
+        if (SUCCEEDED(IMemoryBufferReference_QueryInterface( reference, &IID_IClosable, (void **)&closable )))
+        {
+            IClosable_Close( closable );
+            IClosable_Release( closable );
+        }
+        IMemoryBufferReference_Release( reference );
+    }
+    if (memory) IMemoryBuffer_Release( memory );
+    if (buffer)
+    {
+        IClosable *closable;
+        if (SUCCEEDED(IBitmapBuffer_QueryInterface( buffer, &IID_IClosable, (void **)&closable )))
+        {
+            IClosable_Close( closable );
+            IClosable_Release( closable );
+        }
+        IBitmapBuffer_Release( buffer );
+    }
+    if (!bits) return S_OK;
+
+    EnterCriticalSection( &drag_cs );
+    free( drag->ghost_bits );
+    drag->ghost_bits = bits;
+    drag->ghost_width = width;
+    drag->ghost_height = height;
+    if (anchor)
+    {
+        drag->ghost_anchor.x = anchor->X;
+        drag->ghost_anchor.y = anchor->Y;
+    }
+    else
+    {
+        drag->ghost_anchor.x = width / 2;
+        drag->ghost_anchor.y = height / 2;
+    }
+    drag->ghost_generation++;
+    LeaveCriticalSection( &drag_cs );
+    return S_OK;
+}
+
+/* The drag visual follows the pointer in a window of its own: layered and WS_EX_TRANSPARENT, so WindowFromPoint (and
+ * the drop target lookup) sees through it, and shown without activation, so X maps it override-redirect. */
+static LRESULT CALLBACK ghost_wndproc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+{
+    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
+    return DefWindowProcW( hwnd, msg, wparam, lparam );
+}
+
+static void update_drag_ghost( struct drag_operation *drag, HWND *ghost, LONG *shown_generation, POINT pt )
+{
+    static const WCHAR class_name[] = L"WineDragVisual";
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 0xe0, AC_SRC_ALPHA };
+    POINT dst, src = { 0, 0 };
+    SIZE size;
+    HBITMAP dib, old;
+    HDC dc;
+    void *bits;
+
+    EnterCriticalSection( &drag_cs );
+    if (!drag->ghost_bits)
+    {
+        LeaveCriticalSection( &drag_cs );
+        return;
+    }
+    dst.x = pt.x - drag->ghost_anchor.x;
+    dst.y = pt.y - drag->ghost_anchor.y;
+    if (*ghost && *shown_generation == drag->ghost_generation)
+    {
+        LeaveCriticalSection( &drag_cs );
+        SetWindowPos( *ghost, HWND_TOPMOST, dst.x, dst.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE );
+        return;
+    }
+    if (!*ghost)
+    {
+        WNDCLASSW wc = { 0 };
+        wc.lpfnWndProc = ghost_wndproc;
+        wc.hInstance = GetModuleHandleW( NULL );
+        wc.lpszClassName = class_name;
+        RegisterClassW( &wc );
+        *ghost = CreateWindowExW( WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                                  class_name, NULL, WS_POPUP, dst.x, dst.y, drag->ghost_width, drag->ghost_height,
+                                  NULL, NULL, wc.hInstance, NULL );
+        if (!*ghost)
+        {
+            LeaveCriticalSection( &drag_cs );
+            return;
+        }
+    }
+    size.cx = drag->ghost_width;
+    size.cy = drag->ghost_height;
+    {
+        BITMAPINFO info = { { sizeof(info.bmiHeader), size.cx, -size.cy, 1, 32, BI_RGB } };
+        dc = CreateCompatibleDC( NULL );
+        dib = CreateDIBSection( dc, &info, DIB_RGB_COLORS, &bits, NULL, 0 );
+        if (dib) memcpy( bits, drag->ghost_bits, (size_t)size.cx * size.cy * 4 );
+    }
+    *shown_generation = drag->ghost_generation;
+    LeaveCriticalSection( &drag_cs );
+    if (dib)
+    {
+        old = SelectObject( dc, dib );
+        UpdateLayeredWindow( *ghost, NULL, &dst, &size, dc, &src, 0, &blend, ULW_ALPHA );
+        SelectObject( dc, old );
+        DeleteObject( dib );
+        ShowWindow( *ghost, SW_SHOWNA );
+        TRACE( "drag %p: visual %ldx%ld shown at %ld,%ld\n", drag, size.cx, size.cy, dst.x, dst.y );
+    }
+    DeleteDC( dc );
+}
 
 /* XAML's completion handler must run on the UI thread that started the drag: it looks up that thread's
  * XAML core, and faulted on a NULL one when called from the drag thread. */
@@ -1169,6 +1348,9 @@ static DWORD WINAPI drag_thread( void *arg )
     BOOL entered = FALSE;
     POINT pt, last = { -1, -1 };
     DWORD last_over = 0;
+    HWND ghost = NULL;
+    LONG ghost_generation = -1;
+    MSG msg;
 
     SetThreadDescription( GetCurrentThread(), L"wine_dataexchange_drag" );
     CoInitializeEx( NULL, COINIT_MULTITHREADED );
@@ -1179,6 +1361,9 @@ static DWORD WINAPI drag_thread( void *arg )
         BOOL down = GetAsyncKeyState( drag->button ) < 0;
 
         GetCursorPos( &pt );
+        update_drag_ghost( drag, &ghost, &ghost_generation, pt );
+        /* the drag visual's window is this thread's */
+        while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE )) DispatchMessageW( &msg );
         if (GetAsyncKeyState( VK_ESCAPE ) < 0)
         {
             TRACE( "cancelled\n" );
@@ -1226,6 +1411,7 @@ static DWORD WINAPI drag_thread( void *arg )
     }
 
     TRACE( "drag %p finished, result %#x\n", drag, result );
+    if (ghost) DestroyWindow( ghost );
     if (target) ICoreDropOperationTarget_Release( target );
     complete_on_ui( drag, result );
     ICoreDragOperation_Release( &drag->ICoreDragOperation_iface );
@@ -1278,6 +1464,7 @@ static ULONG WINAPI drag_operation_Release( ICoreDragOperation *iface )
         if (impl->package) IDataPackage_Release( impl->package );
         if (impl->async) IAsyncOperation_DataPackageOperation_Release( &impl->async->IAsyncOperation_DataPackageOperation_iface );
         if (impl->dispatcher) ICoreDispatcher_Release( impl->dispatcher );
+        free( impl->ghost_bits );
         free( impl );
     }
     return ref;
@@ -1338,14 +1525,14 @@ static HRESULT WINAPI drag_operation_SetPointerId( ICoreDragOperation *iface, UI
 static HRESULT WINAPI drag_operation_SetDragUIContentFromSoftwareBitmap( ICoreDragOperation *iface, ISoftwareBitmap *bitmap )
 {
     TRACE( "iface %p, bitmap %p\n", iface, bitmap );
-    return S_OK;
+    return set_drag_ghost( impl_from_ICoreDragOperation( iface ), bitmap, NULL );
 }
 
 static HRESULT WINAPI drag_operation_SetDragUIContentFromSoftwareBitmapWithAnchorPoint( ICoreDragOperation *iface,
                                                                                          ISoftwareBitmap *bitmap, Point anchor )
 {
     TRACE( "iface %p, bitmap %p, anchor %.1f,%.1f\n", iface, bitmap, anchor.X, anchor.Y );
-    return S_OK;
+    return set_drag_ghost( impl_from_ICoreDragOperation( iface ), bitmap, &anchor );
 }
 
 static HRESULT WINAPI drag_operation_get_DragUIContentMode( ICoreDragOperation *iface, CoreDragUIContentMode *value )

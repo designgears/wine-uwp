@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     ba19edcedb2f689552fdf21fceea0932ba4b949e
-                 win32u: Report windowed popup support; dcomp: Real per-window targets painted with per-pixel alpha; wineuwp: @stk breakpoint backtraces.
+  wine HEAD:     ed0662821fce2ec7532042d1cf59108397328eff
+                 dcomp: Capture the called-on visual, answer the surface-copy interface; dxgi: Implement EnqueueSetEvent; dataexchange: Show the drag visual; win32u: Windowed popups opt-in.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-28T13:51:53Z
+  captured:      2026-09-28T14:20:51Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
