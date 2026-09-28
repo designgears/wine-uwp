@@ -10105,3 +10105,33 @@ Wine returns 0. Turning it on means XAML creates popup windows and asks dcomp fo
 (`CreateTargetForHwnd`, a placeholder today), so dcomp's painter would have to draw several windows. Tracing aids used:
 `RaiseRoutedEvent` (`+0x111338`, event id in `rdx`, source vtable at `r8`) gives XAML's routed-event stream; `b` is
 PointerMoved, `a`/`c` Pressed/Released, `f` Tapped, `0x12` PointerCaptureLost, `0x1f/0x20/3/4` focus.
+
+### Windowed popups: flyouts, menus and dropdowns are windows of their own (2026-09-28)
+
+`GetSystemMetrics(0x1800)` now answers 1 (win32u; `WINE_UWP_WINDOWED_POPUPS=0` turns it off), so XAML's
+`CPopup::DoesPlatformSupportWindowedPopup` holds and every popup gets a `WS_POPUP` window (`WS_EX_NOACTIVATE |
+WS_EX_NOREDIRECTIONBITMAP`, shown with `SWP_NOACTIVATE`, so winex11 maps it override-redirect like a Win32 menu).
+`CPopup::EnsureDCompResourcesForWindowedPopup` asks the desktop device for `CreateTargetForHwnd` (slot 24),
+`CreateWindowedPopupWindowVisual` makes a visual for the window (`CreateVisual`) and `AddVisual`s the popup's content
+under it, and the target's `SetRoot` takes that visual. dcomp's targets were placeholders whose `SetRoot` replaced the
+one global root; `hwnd_target` is real now. A target for the CoreWindow (or before it is known) still sets the main
+root; any other window is a popup target, listed and painted after each main frame by `paint_hwnd_targets`: the tree is
+walked into the capture list and rasterized in full into a DIB, then `UpdateLayeredWindow` with per-pixel alpha (the
+window is made `WS_EX_LAYERED` when the target is created). The window is larger than the menu by its drop shadow, so
+the rasterizer keeps destination alpha now (`out[3] = a + inv * out[3]`, identical where the destination is opaque) and
+leaves out its blue debug backdrop for transparent targets (`raster_transparent`, captures too). XAML also puts a
+theme-coloured sprite under the content that fades in after 350 ms (`ShowWindowedPopupBackgroundAfterDelay`), sized to
+the content. Menus now open past the window's edge as on Windows (`docs/screenshots/shapr3d-windowed-popup-menu.png`);
+hover, clicks, light dismiss and ComboBox dropdowns work. On Xvfb the margins are black (no compositor); the user's KWin
+composites them.
+
+**It does not keep the History "..." button visible**, and the earlier entry's reason was wrong. Measured with
+`WINE_UWP_BP` (`GoToState` with `@stk`, routed events, `ReplayPreviousPointerUpdate`): the click opens the flyout, XAML
+replays the last pointer update (`CXcpBrowserHost::ReplayPreviousPointerUpdate`, requested when the popup opens), the
+replay's hit test lands on `CPopupRoot`, the row gets `PointerExited`, and the app's handler sets `IsNotHovered`.
+`CPopupRoot::HitTestLocalInternal` (both the point and the polygon variants) claims the hit whenever any popup in its
+list is open (`CPopup+0x218`, set by `Open`) and not closing (`+0x228` bit 12, set by `Close`) - windowed or not
+(`+0x226` is the windowed flag, set by `SetIsWindowed`). The replay is skipped only when a newer pointer message arrived
+since it was requested (`+0x120` counter), `GetPointerInfo` fails for the stored pointer id, or the stored message's
+`POINTER_INFO.hwndTarget` is neither the host window nor an open popup's window. Which of those differs on Windows is
+not known yet.

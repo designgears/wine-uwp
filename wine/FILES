@@ -119,6 +119,7 @@ dlls/win32u/main.c
 dlls/win32u/message.c
 dlls/win32u/ntuser_private.h
 dlls/win32u/syscall.c
+dlls/win32u/sysparams.c
 dlls/win32u/win32syscalls.h
 dlls/win32u/win32u.spec
 dlls/win32u/win32u_private.h

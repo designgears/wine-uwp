@@ -5005,25 +5005,70 @@ static void code_bp_dump( const struct code_bp *bp, const CONTEXT *ctx )
         { "r14", offsetof(CONTEXT, R14) }, { "r15", offsetof(CONTEXT, R15) },
     };
     const DWORD *mem;
-    unsigned int i;
-    char line[1024];
-    int len = 0;
+    unsigned int i, start;
+    char line[512];
+    int len;
 
+    if (!strcmp( bp->dump_reg, "stk" ))
+    {
+        /* @stk:N - the caller chain, unwound through .pdata like the stack dumper: N frames, module+offset */
+        CONTEXT frame = *ctx;
+        unsigned int depth;
+
+        len = 0;
+        for (depth = 0; depth < bp->dump_count; depth++)
+        {
+            RUNTIME_FUNCTION *func;
+            ULONG64 base, establisher;
+            void *handler_data;
+            char name[128];
+
+            __TRY
+            {
+                if ((func = RtlLookupFunctionEntry( frame.Rip, &base, NULL )))
+                    RtlVirtualUnwind( UNW_FLAG_NHANDLER, base, frame.Rip, func, &frame, &handler_data, &establisher, NULL );
+                else
+                {
+                    frame.Rip = *(ULONG64 *)frame.Rsp;
+                    frame.Rsp += 8;
+                }
+            }
+            __EXCEPT_ALL { frame.Rip = 0; }
+            __ENDTRY
+            if (!frame.Rip) break;
+            code_bp_describe( frame.Rip, name, sizeof(name) );
+            len += snprintf( line + len, sizeof(line) - len, " %s", name );
+            if (len > sizeof(line) - 160 || depth % 6 == 5)
+            {
+                ERR( "BP %s+%#Ix  stack:%s\n", bp->module, bp->rva, line );
+                len = 0;
+            }
+        }
+        if (len) ERR( "BP %s+%#Ix  stack:%s\n", bp->module, bp->rva, line );
+        return;
+    }
     for (i = 0; i < ARRAY_SIZE(regs); i++) if (!strcmp( regs[i].name, bp->dump_reg )) break;
     if (i == ARRAY_SIZE(regs)) return;
     mem = (const DWORD *)(*(const ULONG_PTR *)((const BYTE *)ctx + regs[i].offset) + bp->dump_off);
-    __TRY
+    /* short dumps as hex and float; long ones (a stack) as hex only, eight dwords a line: one debug line holds
+     * about 1 KiB, and overflowing it aborts the process */
+    for (start = 0; start < bp->dump_count; start += 8)
     {
-        for (i = 0; i < bp->dump_count && len < sizeof(line) - 40; i++)
+        len = 0;
+        __TRY
         {
-            float f;
-            memcpy( &f, &mem[i], sizeof(f) );
-            len += snprintf( line + len, sizeof(line) - len, " %08lx(%g)", mem[i], f );
+            for (i = start; i < bp->dump_count && i < start + 8; i++)
+            {
+                float f;
+                memcpy( &f, &mem[i], sizeof(f) );
+                if (bp->dump_count <= 8) len += snprintf( line + len, sizeof(line) - len, " %08lx(%g)", mem[i], f );
+                else len += snprintf( line + len, sizeof(line) - len, " %08lx", mem[i] );
+            }
         }
+        __EXCEPT_ALL { len += snprintf( line + len, sizeof(line) - len, " <fault>" ); start = bp->dump_count; }
+        __ENDTRY
+        ERR( "BP %s+%#Ix  [%s%+Id]:%s\n", bp->module, bp->rva, bp->dump_reg, (INT_PTR)(bp->dump_off + start * 4), line );
     }
-    __EXCEPT_ALL { len += snprintf( line + len, sizeof(line) - len, " <fault>" ); }
-    __ENDTRY
-    ERR( "BP %s+%#Ix  [%s%+Id]:%s\n", bp->module, bp->rva, bp->dump_reg, bp->dump_off, line );
 }
 
 static LONG CALLBACK code_bp_handler( EXCEPTION_POINTERS *info )
@@ -5129,7 +5174,7 @@ static void maybe_start_code_bps(void)
         {
             char *colon = strchr( at, ':' ), *off;
             *at++ = 0;
-            if (colon) { *colon = 0; bp->dump_count = min( atoi( colon + 1 ), 64 ); }
+            if (colon) { *colon = 0; bp->dump_count = min( atoi( colon + 1 ), 1024 ); }
             else bp->dump_count = 4;
             off = strpbrk( at, "+-" );
             if (off) bp->dump_off = strtoll( off, NULL, 16 );

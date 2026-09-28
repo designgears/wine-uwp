@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     e24b19e0c98063c0b1c615894a60dc0ba2e60d5e
-                 dcomp: Run XAML facade animations (UIElement.StartAnimation).
+  wine HEAD:     ba19edcedb2f689552fdf21fceea0932ba4b949e
+                 win32u: Report windowed popup support; dcomp: Real per-window targets painted with per-pixel alpha; wineuwp: @stk breakpoint backtraces.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-28T12:46:11Z
+  captured:      2026-09-28T13:51:53Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

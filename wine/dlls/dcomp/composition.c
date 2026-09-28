@@ -34,8 +34,8 @@
 #include "initguid.h"
 #include "windef.h"
 #include "winbase.h"
-#include "winuser.h"
 #include "wingdi.h"
+#include "winuser.h"
 #include "ntuser.h"
 #include "winstring.h"
 #include "objbase.h"
@@ -617,7 +617,7 @@ static void raster_blend_turned( BYTE *target, int target_w, const struct paint_
             out[0] = DIV255( in[0] * op->alpha ) + DIV255( out[0] * inv );
             out[1] = DIV255( in[1] * op->alpha ) + DIV255( out[1] * inv );
             out[2] = DIV255( in[2] * op->alpha ) + DIV255( out[2] * inv );
-            out[3] = 255;
+            out[3] = a + DIV255( out[3] * inv );
         }
     }
 }
@@ -671,7 +671,7 @@ static void raster_blend_affine( BYTE *target, int target_w, const struct paint_
             out[0] = DIV255( (unsigned int)(acc[0] + 0.5f) * op->alpha ) + DIV255( out[0] * inv );
             out[1] = DIV255( (unsigned int)(acc[1] + 0.5f) * op->alpha ) + DIV255( out[1] * inv );
             out[2] = DIV255( (unsigned int)(acc[2] + 0.5f) * op->alpha ) + DIV255( out[2] * inv );
-            out[3] = 255;
+            out[3] = a + DIV255( out[3] * inv );
         }
     }
 }
@@ -696,7 +696,7 @@ static void raster_fill_affine( BYTE *target, int target_w, const struct paint_o
             out[0] = b + DIV255( out[0] * inv );
             out[1] = g + DIV255( out[1] * inv );
             out[2] = r + DIV255( out[2] * inv );
-            out[3] = 255;
+            out[3] = a + DIV255( out[3] * inv );
         }
     }
 }
@@ -730,7 +730,7 @@ static void raster_blend( BYTE *target, int target_w, int x, int y, const BYTE *
                 out[0] = in[0] + DIV255( out[0] * inv );
                 out[1] = in[1] + DIV255( out[1] * inv );
                 out[2] = in[2] + DIV255( out[2] * inv );
-                out[3] = 255;
+                out[3] = a + DIV255( out[3] * inv );
                 continue;
             }
             a = DIV255( a * constant_alpha );
@@ -738,7 +738,7 @@ static void raster_blend( BYTE *target, int target_w, int x, int y, const BYTE *
             out[0] = DIV255( in[0] * constant_alpha ) + DIV255( out[0] * inv );
             out[1] = DIV255( in[1] * constant_alpha ) + DIV255( out[1] * inv );
             out[2] = DIV255( in[2] * constant_alpha ) + DIV255( out[2] * inv );
-            out[3] = 255;
+            out[3] = a + DIV255( out[3] * inv );
         }
     }
 }
@@ -770,7 +770,7 @@ static void raster_fill( BYTE *target, int target_w, const RECT *clip, Color col
             out[0] = b + DIV255( out[0] * inv );
             out[1] = g + DIV255( out[1] * inv );
             out[2] = r + DIV255( out[2] * inv );
-            out[3] = 255;
+            out[3] = a + DIV255( out[3] * inv );
         }
     }
 }
@@ -937,6 +937,8 @@ static void damage_add_op( struct paint_damage *damage, const struct paint_op *o
 }
 
 /* Rasterize every operation of list onto target within area. */
+/* set while rasterizing into a transparent target (a popup window, a capture), which has no backdrop */
+static BOOL raster_transparent;
 static void raster_ops( HDC dc, BYTE *target, int target_w, const struct paint_list *list, const RECT *area )
 {
     static const Color backdrop = { 255, 0x20, 0x60, 0xc0 };
@@ -954,7 +956,7 @@ static void raster_ops( HDC dc, BYTE *target, int target_w, const struct paint_l
             break;
         }
     }
-    if (!i) raster_fill( target, target_w, area, backdrop, 255 );   /* nothing opaque covers it */
+    if (!i && !raster_transparent) raster_fill( target, target_w, area, backdrop, 255 );   /* nothing opaque covers it */
     for (i = first; i < list->count; i++)
     {
         const struct paint_op *op = &list->ops[i];
@@ -1182,6 +1184,7 @@ static void destroy_deferred_surfaces( void )
 
 static void present_desktop_hwnd_locked( HWND hwnd );
 static void request_repaint( DWORD delay );
+static void paint_hwnd_targets( void );
 static BOOL paint_swapchains_only( HWND hwnd, HDC hdc );
 static BOOL swapchain_frame_ready( void );
 static void present_desktop_hwnd( HWND hwnd )
@@ -1431,6 +1434,7 @@ static void present_desktop_hwnd_locked( HWND hwnd )
                 if (ms > perf.flush_max) perf.flush_max = ms;
             }
         }
+        paint_hwnd_targets();
         free_retired_bitmaps();
         if (timing)
         {
@@ -7291,7 +7295,9 @@ static BYTE *capture_visual_pixels( IUnknown *visual, int width, int height )
         walk_owner = 0;
         ReleaseSRWLockExclusive( &walk_lock );
 
+        raster_transparent = TRUE;
         raster_ops( dc, bits, width, &paint_lists[2], &area );
+        raster_transparent = FALSE;
         GdiFlush();
         TRACE_(dcompgate)( "captured %s visual %p %dx%d: %u ops.\n", dv ? "dcomp" : "public", visual, width, height, paint_lists[2].count );
         if (paint_lists[2].count && (pixels = (malloc)( (size_t)width * height * 4 )))
@@ -8234,42 +8240,255 @@ DEVICE_CREATE3( CreateTransform3DGroup )
 DEVICE_CREATE1( CreateEffectGroup )
 DEVICE_CREATE1( CreateRectangleClip )
 DEVICE_CREATE1( CreateAnimation )
-/* IDCompositionTarget: 3 SetRoot(IDCompositionVisual *). Everything else stays a recording slot. */
-static void *dcomp_target_vtbl[COMP_OBJECT_SLOTS];
+/* IDCompositionTarget: 3 SetRoot(IDCompositionVisual *).
+ *
+ * The CoreWindow's own tree reaches us through __wine_dcomp_set_target_window; a target for that window (or for
+ * any window before it is known) sets the root that present_dcomp_visuals paints, as it always did. A target for
+ * any other window is one of XAML's windowed popups (CPopup::EnsureDCompResourcesForWindowedPopup): XAML creates
+ * a WS_POPUP window per open flyout, menu or tooltip, a visual for it, and puts the popup's content under that.
+ * Those are painted after each frame into their own window (paint_hwnd_targets). */
+DEFINE_GUID( IID_IDCompositionTarget_ours, 0xeacdd04c, 0x117e, 0x4e17, 0x88, 0xf4, 0xd1, 0xb1, 0x2b, 0x0e, 0x3d, 0x89 );
 
-static HRESULT WINAPI dcomp_target_SetRoot( void *iface, void *visual )
+struct hwnd_target
 {
+    const void **vtbl;
+    LONG ref;
+    HWND hwnd;
+    BOOL topmost;
+    BOOL popup;                  /* a window of its own, painted by paint_hwnd_targets */
+    struct dcomp_visual *root;   /* under dcomp_visual_cs */
+    /* the painter's, under present_cs */
+    HDC dc;
+    HBITMAP dib;
+    BYTE *bits;
+    int w, h;
+    unsigned int wait_visible;   /* frames asked for while the window was not shown yet */
+    BOOL shown;
+};
+static struct hwnd_target *hwnd_targets[32];   /* popup targets with a root, under dcomp_visual_cs */
+static unsigned int hwnd_target_count;
+
+static struct hwnd_target *hwnd_target_from( void *iface );
+
+static HRESULT WINAPI hwnd_target_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IDCompositionTarget_ours ))
+    {
+        InterlockedIncrement( &hwnd_target_from( iface )->ref );
+        *out = iface;
+        return S_OK;
+    }
+    TRACE( "target %p: %s not supported.\n", iface, debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI hwnd_target_AddRef( void *iface )
+{
+    return InterlockedIncrement( &hwnd_target_from( iface )->ref );
+}
+static void hwnd_target_unlist( struct hwnd_target *t )
+{
+    unsigned int i;
+    for (i = 0; i < hwnd_target_count; i++)
+        if (hwnd_targets[i] == t)
+        {
+            memmove( &hwnd_targets[i], &hwnd_targets[i + 1], (hwnd_target_count - i - 1) * sizeof(*hwnd_targets) );
+            hwnd_target_count--;
+            break;
+        }
+}
+static ULONG WINAPI hwnd_target_Release( void *iface )
+{
+    struct hwnd_target *t = hwnd_target_from( iface );
+    ULONG ref = InterlockedDecrement( &t->ref );
+    struct dcomp_visual *root;
+
+    if (ref) return ref;
+    TRACE_(dcompgate)( "destroying target %p for hwnd %p.\n", t, t->hwnd );
+    EnterCriticalSection( &dcomp_visual_cs );
+    hwnd_target_unlist( t );
+    root = t->root;
+    t->root = NULL;
+    LeaveCriticalSection( &dcomp_visual_cs );
+    if (root) dcv_Release( &root->vtbl );
+    if (t->dc) DeleteDC( t->dc );
+    if (t->dib) DeleteObject( t->dib );
+    (free)( t );
+    if (last_desktop_hwnd) scene_dirty();
+    return 0;
+}
+
+static HRESULT WINAPI hwnd_target_SetRoot( void *iface, void *visual )
+{
+    struct hwnd_target *t = hwnd_target_from( iface );
+    struct dcomp_visual *root = NULL, *old;
+
     scene_changed();
-    struct dcomp_visual *root = NULL;
-
     if (visual && *(const void ***)visual == dcomp_visual_vtbl) root = dcomp_visual_from( visual );
-    TRACE( "target %p root %p (%s).\n", iface, visual, root ? "interop visual" : visual ? "foreign" : "none" );
-    struct dcomp_visual *old;
-
+    TRACE_(dcompgate)( "target %p (hwnd %p%s) root %p (%s).\n", t, t->hwnd, t->popup ? ", popup" : "", visual,
+           root ? "interop visual" : visual ? "foreign" : "none" );
+    if (!t->popup)
+    {
+        EnterCriticalSection( &dcomp_visual_cs );
+        if (root) dcv_AddRef( visual );
+        old = dcomp_target_root;
+        dcomp_target_root = root;
+        LeaveCriticalSection( &dcomp_visual_cs );
+        /* outside the lock the walk takes: a release may wait for the walk (walk_guard_enter) */
+        if (old) dcv_Release( &old->vtbl );
+        return S_OK;
+    }
     EnterCriticalSection( &dcomp_visual_cs );
     if (root) dcv_AddRef( visual );
-    old = dcomp_target_root;
-    dcomp_target_root = root;
+    old = t->root;
+    t->root = root;
+    hwnd_target_unlist( t );
+    if (root && hwnd_target_count < ARRAY_SIZE(hwnd_targets)) hwnd_targets[hwnd_target_count++] = t;
+    t->wait_visible = 0;
     LeaveCriticalSection( &dcomp_visual_cs );
-    /* outside the lock the walk takes: a release may wait for the walk (walk_guard_enter) */
     if (old) dcv_Release( &old->vtbl );
     return S_OK;
 }
 
+static const void *hwnd_target_vtbl[] =
+{
+    hwnd_target_QueryInterface, hwnd_target_AddRef, hwnd_target_Release, hwnd_target_SetRoot,
+};
+static struct hwnd_target *hwnd_target_from( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct hwnd_target, vtbl );
+}
+
 static HRESULT WINAPI device_CreateTargetForHwnd( void *iface, void *hwnd, void *topmost, void **out )
 {
-    unsigned int i;
+    struct hwnd_target *t;
 
-    TRACE( "CreateTargetForHwnd hwnd %p topmost %p.\n", hwnd, topmost );
-    if (!dcomp_target_vtbl[3])
+    if (!out) return E_POINTER;
+    if (!(t = calloc( 1, sizeof(*t) ))) return E_OUTOFMEMORY;
+    t->vtbl = hwnd_target_vtbl;
+    t->ref = 1;
+    t->hwnd = hwnd;
+    t->topmost = !!topmost;
+    t->popup = last_desktop_hwnd && hwnd && hwnd != last_desktop_hwnd && GetAncestor( hwnd, GA_ROOT ) != last_desktop_hwnd;
+    TRACE_(dcompgate)( "CreateTargetForHwnd hwnd %p topmost %p: target %p%s.\n", hwnd, topmost, t, t->popup ? ", a popup window" : "" );
+    if (t->popup)
     {
-        for (i = 0; i < COMP_OBJECT_SLOTS; i++) dcomp_target_vtbl[i] = comp_object_slot_fn( i );
-        dcomp_target_vtbl[1] = comp_object_AddRef;
-        dcomp_target_vtbl[2] = comp_object_Release;
-        dcomp_target_vtbl[3] = dcomp_target_SetRoot;
-        dcomp_target_vtbl[0] = comp_object_QueryInterface;
+        /* per-pixel alpha: a popup's window is larger than its content by the drop shadow and its rounded corners */
+        LONG ex = GetWindowLongW( hwnd, GWL_EXSTYLE );
+        if (!(ex & WS_EX_LAYERED)) SetWindowLongW( hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED );
     }
-    return create_comp_object_vtbl( "CreateTargetForHwnd", dcomp_target_vtbl, out );
+    *out = &t->vtbl;
+    return S_OK;
+}
+
+/* Paint every popup window's tree into its window, after the CoreWindow's frame and under present_cs. A popup
+ * is small and changes as a whole (its open and close transitions), so each is rasterized in full. */
+static void paint_hwnd_target( struct hwnd_target *t )
+{
+    RECT rc, area, saved_clip = paint_clip, saved_rot_clip = paint_rot_clip;
+    struct paint_xform saved_xf = paint_xf;
+    float saved_opacity = paint_opacity;
+    unsigned int saved_current = paint_current;
+    struct visual *saved_island = xaml_island_container;
+    struct dcomp_visual *saved_branch = paint_branch;
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    POINT src = { 0, 0 };
+    SIZE size;
+
+    if (!IsWindow( t->hwnd )) return;
+    if (!IsWindowVisible( t->hwnd ))
+    {
+        /* XAML shows the window after its first commit; nothing else would paint it then */
+        t->shown = FALSE;
+        if (t->wait_visible++ < 60)
+        {
+            scene_dirty();
+            request_repaint( 16 );
+        }
+        return;
+    }
+    if (!GetClientRect( t->hwnd, &rc ) || rc.right <= 0 || rc.bottom <= 0) return;
+    if (rc.right > 8192 || rc.bottom > 8192) return;
+    if (t->dib && (t->w != rc.right || t->h != rc.bottom))
+    {
+        DeleteObject( t->dib );
+        t->dib = NULL;
+        t->bits = NULL;
+    }
+    if (!t->dc && !(t->dc = CreateCompatibleDC( NULL ))) return;
+    if (!t->dib)
+    {
+        BITMAPINFO info = { { sizeof(info.bmiHeader), rc.right, -rc.bottom, 1, 32, BI_RGB } };
+        void *bits;
+        if (!(t->dib = CreateDIBSection( t->dc, &info, DIB_RGB_COLORS, &bits, NULL, 0 ))) return;
+        SelectObject( t->dc, t->dib );
+        t->bits = bits;
+        t->w = rc.right;
+        t->h = rc.bottom;
+    }
+    SetRect( &area, 0, 0, t->w, t->h );
+    memset( t->bits, 0, (size_t)t->w * t->h * 4 );
+
+    AcquireSRWLockExclusive( &walk_lock );
+    walk_owner = GetCurrentThreadId();
+    paint_current = 2;
+    paint_lists[2].count = 0;
+    paint_clip = area;
+    paint_xf.m11 = paint_xf.m22 = 1.0f; paint_xf.m12 = paint_xf.m21 = paint_xf.dx = paint_xf.dy = 0.0f;
+    paint_xf.quarter = 0; paint_xf.active = FALSE;
+    paint_opacity = 1.0f;
+    xaml_island_container = NULL;
+    paint_branch = NULL;
+    EnterCriticalSection( &dcomp_visual_cs );
+    if (t->root) paint_dcomp_visual( t->dc, t->root, 0.0f, 0.0f, 1.0f, 1.0f );
+    LeaveCriticalSection( &dcomp_visual_cs );
+    paint_current = saved_current;
+    paint_clip = saved_clip;
+    paint_rot_clip = saved_rot_clip;
+    paint_xf = saved_xf;
+    paint_opacity = saved_opacity;
+    xaml_island_container = saved_island;
+    paint_branch = saved_branch;
+    walk_owner = 0;
+    ReleaseSRWLockExclusive( &walk_lock );
+
+    raster_transparent = TRUE;
+    raster_ops( t->dc, t->bits, t->w, &paint_lists[2], &area );
+    raster_transparent = FALSE;
+    GdiFlush();
+    TRACE_(dcompgate)( "popup window %p %dx%d: %u ops\n", t->hwnd, t->w, t->h, paint_lists[2].count );
+    size.cx = t->w;
+    size.cy = t->h;
+    if (!UpdateLayeredWindow( t->hwnd, NULL, NULL, &size, t->dc, &src, 0, &blend, ULW_ALPHA ))
+    {
+        HDC hdc = GetDC( t->hwnd );
+        if (hdc)
+        {
+            BitBlt( hdc, 0, 0, t->w, t->h, t->dc, 0, 0, SRCCOPY );
+            ReleaseDC( t->hwnd, hdc );
+        }
+    }
+    t->shown = TRUE;
+}
+
+static void paint_hwnd_targets( void )
+{
+    struct hwnd_target *list[ARRAY_SIZE(hwnd_targets)];
+    unsigned int i, count;
+
+    if (!hwnd_target_count) return;
+    EnterCriticalSection( &dcomp_visual_cs );
+    for (count = 0; count < hwnd_target_count; count++)
+    {
+        list[count] = hwnd_targets[count];
+        InterlockedIncrement( &list[count]->ref );
+    }
+    LeaveCriticalSection( &dcomp_visual_cs );
+    for (i = 0; i < count; i++)
+    {
+        paint_hwnd_target( list[i] );
+        hwnd_target_Release( &list[i]->vtbl );
+    }
 }
 DEVICE_CREATE2( CreateSurfaceFromHandle )
 DEVICE_CREATE2( CreateSurfaceFromHwnd )
