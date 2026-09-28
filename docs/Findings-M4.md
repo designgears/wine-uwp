@@ -9917,3 +9917,16 @@ Shadows are still not drawn.
 With both fixes, Windows.UI.Xaml.dll carries **one patch** (#11 `ShouldTryLoadAppXaml`, Media Player): the suite passes
 twice, Shapr3D twice (worst gaps 52/54 ms, editor normal), `regress.sh kb` identical. It is live (`.bak-1patch`;
 `.bak-3patches` kept).
+
+### Windows.UI.Xaml.dll runs unmodified (2026-09-28)
+
+The last XAML patch, #11 `DXamlCore::ShouldTryLoadAppXaml` -> false (without it Media Player painted nothing), was one
+half of a pair: `wineuwp` loaded `App.xaml` itself (`load_application_xaml`, from a time when nothing else did), and
+with the patch gone XAML loaded it too. The pristine DLL with `wineuwp`'s load off passes the suite twice, `regress.sh
+kb` twice and Shapr3D twice (worst gaps 54/40 ms); Media Player shows its Home page
+(`docs/screenshots/mediaplayer-unpatched-xaml.png`). `wineuwp` now leaves App.xaml to XAML (`WINE_UWP_APP_XAML=1` restores
+the old load), and the live `Windows.UI.Xaml.dll` is the pristine 26100.8972 file (`pecheck.py`: pristine).
+
+Of the 13 functional XAML patches: 9 were dead weight, 4 were Wine bugs - dcomp's `IDCompositionDeviceDebug`, `wineuwp`
+not connecting dcomp when XAML loaded it late, dcomp's missing `ILayerVisual2`/`ICompositorWithVisualSurface`, and
+`wineuwp`'s own `App.xaml` load.

@@ -104,8 +104,9 @@ that were ours; the Calculator tree is no longer involved.
   bytes were really loaded.
 - **Which patches are still load-bearing is measured, not remembered.** Findings-M4 2026-09-28 bisected all three
   patched DLLs, one region reverted at a time. Live today, each the pristine file plus only these (the fuller versions
-  are kept as `.bak-full` / `.bak-18regions`): **Windows.UI.Xaml** `ShouldTryLoadAppXaml` only (Media Player; its two `OnTick` patches
-  were retired by `wineuwp` loading dcomp for the CoreWindow and dcomp answering XAML's drop-shadow interfaces); **CoreMessaging** `DrainSignaledWaits`,
+  are kept as `.bak-full` / `.bak-18regions`): **Windows.UI.Xaml none - it runs unmodified** (its last four patches were Wine bugs, all fixed:
+  dcomp's `IDCompositionDeviceDebug`, `ILayerVisual2` and `ICompositorWithVisualSurface`, `wineuwp` connecting dcomp late,
+  and `wineuwp` loading `App.xaml` itself, now opt-in via `WINE_UWP_APP_XAML=1`); **CoreMessaging** `DrainSignaledWaits`,
   `DrainSignaledIocpWaits` and the `SetRelative` timer cave (timers and waits not reaching the UI thread);
   **Windows.UI** the `ProcessMessage` -> `DrainCoreMessaging` trampoline and the `CKeyEventArgs` `Handled` byte (Enter,
   Backspace, Escape). Every one of these stands for a Wine-side bug; fixing that is what retires the patch, as
@@ -115,8 +116,8 @@ that were ours; the Calculator tree is no longer involved.
   and a thread id at `+0x10d000..+0x10d010`, which are wil's error counters and a cached function
   pointer, so the two overwrote each other. Look an address up in the PDB `.syms` before claiming it.
   `HotPatchSpareGlobals` is the space Microsoft reserves for exactly this.
-- **Never patch the last pristine copy of a Windows DLL.** Three DLLs are patched today
-  (`CoreMessaging.dll`, `Windows.UI.dll`, `Windows.UI.Xaml.dll`, all 26100.8972); their originals are
+- **Never patch the last pristine copy of a Windows DLL.** Two DLLs are patched today
+  (`CoreMessaging.dll`, `Windows.UI.dll`, both 26100.8972; `Windows.UI.Xaml.dll` runs pristine since 2026-09-28); their originals are
   kept as `<name>.pristine-26100.8972` and **cannot be re-obtained** - the tree is a mix of builds,
   and the machine they were copied from has serviced past them. `./pecheck.py` tells a pristine
   Microsoft PE from a patched one with no reference copy. Check before patching, and never delete a
@@ -1093,7 +1094,7 @@ the fully-qualified name. `--grep` first, always.
 
 | App | State |
 | --- | --- |
-| Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0), and the keyboard baseline (`regress.sh kb`). **Depends on patched `CoreMessaging.dll`, `Windows.UI.dll` and `Windows.UI.Xaml.dll`**, now 3+2+1 patches - see the byte-patch rules above |
+| Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0), and the keyboard baseline (`regress.sh kb`). **Depends on patched `CoreMessaging.dll` and `Windows.UI.dll`**, now 3+2 patches, XAML unpatched - see the byte-patch rules above |
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15. Regression capture: 2250 or 2242 colours, both a pass - 2242 is XAML not showing the keyboard focus rectangle on Open file(s), usual since painting left the UI thread |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
