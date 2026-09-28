@@ -1669,6 +1669,18 @@ static HRESULT WINAPI probe_slot_8( void *iface )
 PROBE_STUB(30) PROBE_STUB(31) PROBE_STUB(32) PROBE_STUB(33) PROBE_STUB(34) PROBE_STUB(35)
 PROBE_STUB(36) PROBE_STUB(37) PROBE_STUB(38) PROBE_STUB(39)
 
+/* IDCompositionDeviceDebug: there are no debug counters to show; both calls succeed. */
+static HRESULT WINAPI device_debug_counters( void *iface )
+{
+    TRACE( "iface %p.\n", iface );
+    return S_OK;
+}
+static const void *device_debug_vtbl[] =
+{
+    probe_QueryInterface, probe_AddRef, probe_Release,
+    device_debug_counters /* EnableDebugCounters */, device_debug_counters /* DisableDebugCounters */,
+};
+
 static const void *probe_vtbl[PROBE_SLOTS] =
 {
     probe_QueryInterface, probe_AddRef, probe_Release,
@@ -1856,8 +1868,11 @@ static const GUID IID_IInteropCompositorPartner =
     { 0x0e779a72, 0x3f2a, 0x502d, { 0xa7, 0xa9, 0xbf, 0x99, 0x98, 0x8c, 0xfe, 0x4d } };
 static const GUID IID_IInteropVisual_private =
     { 0xfe93b735, 0xe574, 0x4a5d, { 0xa2, 0x1a, 0xf7, 0x05, 0xc2, 0x19, 0x45, 0xfa } };
-/* DCompTreeHost::UpdateDebugSettings QIs the compositor for this and throws the failing hr
- * through its raise helper; refusing it stowed an E_POINTER into every primitive submission. */
+/* IDCompositionDeviceDebug. DCompTreeHost::UpdateDebugSettings QIs the compositor for it and throws the failing
+ * hr through its raise helper; refusing it stowed an E_POINTER into every primitive submission. Its two methods,
+ * EnableDebugCounters and DisableDebugCounters, are slots 3 and 4: the generic probe answered slot 4 with
+ * GetRuntimeClassName, which failed on XAML's missing argument, and a byte patch in Windows.UI.Xaml.dll
+ * (UpdateDebugSettings -> return S_OK) was what kept every XAML app alive. See device_debug_vtbl. */
 static const GUID IID_ICompositorDebug_private =
     { 0xa1a3c64a, 0x224f, 0x4a81, { 0x97, 0x73, 0x4f, 0x03, 0xa8, 0x9d, 0x3c, 0x6c } };
 static const GUID IID_IDCompositionVisual_ =
@@ -8037,7 +8052,8 @@ static HRESULT get_probe( struct compositor *owner, REFIID iid, void **out )
         if (probes[i]->owner == owner && IsEqualGUID( &probes[i]->iid, iid )) probe = probes[i];
     if (!probe && probe_count < MAX_PROBES && (probe = calloc( 1, sizeof(*probe) )))
     {
-        probe->vtbl = IsEqualGUID( iid, &IID_ICompositorPrivate5 ) ? dcprivate_get_vtbl() : probe_vtbl;
+        probe->vtbl = IsEqualGUID( iid, &IID_ICompositorPrivate5 ) ? dcprivate_get_vtbl()
+                    : IsEqualGUID( iid, &IID_ICompositorDebug_private ) ? device_debug_vtbl : probe_vtbl;
         probe->iid = *iid;
         probe->owner = owner;
         probes[probe_count++] = probe;

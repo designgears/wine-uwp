@@ -98,6 +98,12 @@ that were ours; the Calculator tree is no longer involved.
   missing). Patch both copies. Always keep a
   backup and verify the restore with `cmp` before moving on. Leaving one behind silently poisons
   every later run - it has happened.
+- **A DLL variant under test goes into both copies.** `install-overrides.sh` copies `$UWP_BIN/win11/...` over a
+  prefix copy that differs from it whenever its stamp changes, and changing the `win11` file changes the stamp. A
+  variant written only to the prefix was silently replaced; `WINE_UWP_BP`'s `BP armed ... (byte xx)` line shows which
+  bytes were really loaded.
+- **Which patches are still load-bearing is measured, not remembered**: Findings-M4 2026-09-28 bisected
+  Windows.UI.Xaml.dll's 13 patches down to 3 (`OnTick` x2, `ShouldTryLoadAppXaml`) and retired a fourth in dcomp.
 - **A byte patch's "free BSS" may not be free.** The CoreMessaging timer patch kept its mailbox
   and a thread id at `+0x10d000..+0x10d010`, which are wil's error counters and a cached function
   pointer, so the two overwrote each other. Look an address up in the PDB `.syms` before claiming it.

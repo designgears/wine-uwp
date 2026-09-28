@@ -9809,3 +9809,49 @@ display yet.
 shown a second, `shownframes.py` 31 then 43-44 per 250 ms (44 = 175 Hz), no gap while moving. The X server keeps up:
 175 puts a second of ~1.8 MP each, each completed before the next (`queued before a put 0.00 avg 0 max`), so
 `WINE_X11_SHM_WAIT` is not needed. The user: "very smooth".
+
+## Getting off the patched Windows DLLs: what the patches still do (2026-09-28)
+
+Goal: stop depending on byte patches (and eventually on the borrowed DLLs). First step: find out which patches are
+still load-bearing. Method: rebuild each DLL as its pristine `.pristine-26100.8972` plus all patch regions but one,
+and run Calculator, Feedback Hub, Media Player and a Shapr3D open+orbit (`/tmp/xaml_bisect.sh` in the session;
+`/tmp/patchmap.py` names each region's function from the PDB `.syms`).
+
+**Windows.UI.Xaml.dll with no patches at all: every app blank.** Its 18 patch regions are 13 functional patches plus
+four code caves and the PE checksum. Reverting one at a time:
+
+| # | Function | Patch | Without it |
+| --- | --- | --- | --- |
+| 1 | `XamlOneCoreTransforms::FailFastIfEnabled` | ret | fine |
+| 2 | `XamlOneCoreTransforms::IsEnabled` | return false | fine |
+| 3 | `HWCompTreeNodeWinRT::UpdateTreeChildren` | null guard (cave) | fine |
+| 4 | `CXcpBrowserHost::OnTick` +0x8e | no window size -> `EnsureCorrectWindowSize(800, 600)` (cave) | **all blank** |
+| 5 | `CXcpBrowserHost::OnTick` +0x10f | NOP a `jne` on `+0x238` | **all blank** |
+| 6 | `DXamlCore::QueryScaleFactor` | return 1.0 | fine |
+| 7 | `DXamlCore::GetWindowForScaling` | return no window | fine |
+| 8 | `VisualContentRenderer::GeneralImageRenderContent` | null guard (cave) | fine (one 158 ms gap, one run) |
+| 9 | `DCompTreeHost::UpdateDebugSettings` | return S_OK | **all blank** - now fixed in dcomp, below |
+| 10 | `FrameworkView::Initialize` | cave | fine |
+| 11 | `DXamlCore::ShouldTryLoadAppXaml` | return false | **Media Player blank** |
+| 12 | `DXamlServices::GetCurrentCoreWindowNoRef` | cave | fine |
+| 13 | `CoreWindowIslandAdapter` ctor | forced branch | fine |
+
+The pristine file plus only 4, 5, 9, 11 (and #4's cave) passes the suite twice and Shapr3D twice; that went live
+(`.bak-18regions` keeps the old one).
+
+**#9 is retired by a dcomp fix.** Breakpoints on `UpdateDebugSettings` showed it skip the `IDCompositionVisualDebug`
+branch and QI the compositor for `{a1a3c64a}` - `IDCompositionDeviceDebug` - then call slot 4,
+`DisableDebugCounters`, which returned `E_INVALIDARG`: dcomp answered that IID with its generic probe, whose slot 4 is
+`GetRuntimeClassName`. It now gets a real two-method object (`device_debug_vtbl`). With patch #9 reverted and the dcomp
+fix, the suite passes twice and Shapr3D is normal. **Live Windows.UI.Xaml.dll: three patches, 4, 5 and 11**
+(`.bak-3patches`).
+
+**#4/#5: XAML learns the window size too late.** Breakpoints: the view's first `OnTick` runs during
+`CreateCoreWindow`, finds no size, and the cave forces 800x600; the real `SetWindowSize(1280x800)` arrives 0.55 s
+later from `CJupiterControl::OnJupiterWindowSizeChanged`, when `wineuwp`'s view pump dispatches it. On Windows the
+size is known before the first frame. Delivering it before the first tick is the Wine-side fix to find.
+
+Trap met on the way: **`install-overrides.sh` copies the `win11` copy over a *differing* prefix copy whenever its stamp
+changes**, and replacing the `win11` file changes the stamp. A variant placed only in the prefix was silently undone and
+the breakpoints armed over the patched bytes (`BP armed ... (byte 31)` where the pristine byte is `48`). Test a
+variant in both copies, and read the armed byte.
