@@ -9803,3 +9803,9 @@ server before each put. On Xvfb the server keeps up (queued ~0). On the user's X
 ~19 MB upload per frame may not keep up, which would show as queued puts and a screen that trails the app;
 `WINE_X11_SHM_WAIT=1` makes a put wait for the previous one to complete, to compare. Not measured on the real
 display yet.
+
+**Measured on the user's own display** (KDE/XWayland, 3440x1440 at 174.91 Hz, their instance run with
+`trace+dcompperf,trace+d3dperf,trace+dcompgate,trace+x11perf`): opening the drone and orbiting gave 166-176 frames
+shown a second, `shownframes.py` 31 then 43-44 per 250 ms (44 = 175 Hz), no gap while moving. The X server keeps up:
+175 puts a second of ~1.8 MP each, each completed before the next (`queued before a put 0.00 avg 0 max`), so
+`WINE_X11_SHM_WAIT` is not needed. The user: "very smooth".
