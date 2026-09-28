@@ -1251,6 +1251,67 @@ static LRESULT CALLBACK core_window_subclass_proc( HWND hwnd, UINT msg, WPARAM w
     return CallWindowProcW( core_window_proc_orig, hwnd, msg, wparam, lparam );
 }
 
+/* Tell the view's CoreApplicationViewTitleBar how much of its top edge the system uses, as Windows' shell does.
+ * twinapi.appcore answers SystemOverlayLeftInset/RightInset/Height from values pushed through
+ * ICoreApplicationViewTitleBarInternal::OnLayoutMetricsChanged( left, right, height ) (slot 7), and otherwise asks an
+ * ITitleBarClientAdapter we do not have, which leaves all three 0. Apps that draw into the title bar lay their
+ * right-hand controls out against RightInset: Shapr3D's Share button sat flush against the window edge. The window
+ * manager's frame holds the caption buttons here, so there is no overlay to keep clear of; the right inset is the
+ * margin that gives (WINE_UWP_TITLEBAR_RIGHT_INSET, in view pixels). OnLayoutMetricsChanged raises LayoutMetricsChanged,
+ * so an app that read the insets before this still gets the values. */
+static const GUID IID_ICoreApplication_local = {0x0aacf7a4, 0x5e1d, 0x49df, {0x80, 0x34, 0xfb, 0x6a, 0x68, 0xbc, 0x5e, 0xd1}};
+static const GUID IID_ICoreApplicationView3_local = {0x07ebe1b3, 0xa4cf, 0x4550, {0xab, 0x70, 0xb0, 0x7e, 0x85, 0x33, 0x0b, 0xc8}};
+static const GUID IID_ICoreApplicationViewTitleBarInternal_local = {0x6e470d39, 0xe79f, 0x453c, {0x92, 0xef, 0x63, 0x10, 0xed, 0xef, 0xd4, 0x40}};
+
+static BOOL push_title_bar_metrics(void)
+{
+    static const WCHAR class_name[] = L"Windows.ApplicationModel.Core.CoreApplication";
+    HRESULT (WINAPI **vtbl)( IUnknown *, ... );
+    IUnknown *app = NULL, *view = NULL, *view3 = NULL, *title_bar = NULL, *internal = NULL;
+    HSTRING_HEADER header;
+    double right = 10.0;   /* lines the right edge up with the panels below, which keep 10 px from the window edge */
+    WCHAR buf[16];
+    HSTRING str;
+    HRESULT hr = E_FAIL;
+    int step = 0;
+
+    if (GetEnvironmentVariableW( L"WINE_UWP_TITLEBAR_RIGHT_INSET", buf, ARRAY_SIZE(buf) )) right = wcstod( buf, NULL );
+    if (FAILED( WindowsCreateStringReference( class_name, ARRAY_SIZE(class_name) - 1, &header, &str ) )) return TRUE;
+    step++; if (FAILED( hr = RoGetActivationFactory( str, &IID_ICoreApplication_local, (void **)&app ) )) goto done;
+    vtbl = *(void **)app;
+    step++; if (FAILED( hr = vtbl[12]( app, &view ) ) || (!view && (hr = E_POINTER))) goto done;   /* GetCurrentView */
+    step++; if (FAILED( hr = IUnknown_QueryInterface( view, &IID_ICoreApplicationView3_local, (void **)&view3 ) )) goto done;
+    vtbl = *(void **)view3;
+    step++; if (FAILED( hr = vtbl[7]( view3, &title_bar ) ) || (!title_bar && (hr = E_POINTER))) goto done;   /* get_TitleBar */
+    step++; if (FAILED( hr = IUnknown_QueryInterface( title_bar, &IID_ICoreApplicationViewTitleBarInternal_local, (void **)&internal ) )) goto done;
+    step++;
+    vtbl = *(void **)internal;
+    hr = ((HRESULT (WINAPI *)( IUnknown *, double, double, double ))vtbl[7])( internal, 0.0, right, 32.0 );
+done:
+    TRACE( "right inset %g, step %d, hr %#lx\n", right, step, hr );
+    if (internal) IUnknown_Release( internal );
+    if (title_bar) IUnknown_Release( title_bar );
+    if (view3) IUnknown_Release( view3 );
+    if (view) IUnknown_Release( view );
+    if (app) IUnknown_Release( app );
+    if (step == 4 && hr == E_POINTER) return FALSE;   /* the view has no title bar yet */
+    if (FAILED( hr )) ERR( "could not set the title bar metrics (step %d), hr %#lx\n", step, hr );
+    return TRUE;
+}
+
+/* The view creates its title bar after its CoreWindow, so keep trying on the view thread for a while. */
+static void CALLBACK title_bar_metrics_timer( HWND hwnd, UINT msg, UINT_PTR id, DWORD time )
+{
+    static unsigned int tries;
+
+    if (push_title_bar_metrics() || ++tries >= 200) KillTimer( NULL, id );
+}
+
+static void push_title_bar_metrics_later(void)
+{
+    if (!push_title_bar_metrics()) SetTimer( NULL, 0, 25, title_bar_metrics_timer );
+}
+
 /* Give the CoreWindow its text input producer, as Windows does. Windows.UI routes a key to the producer at
  * WindowServer+0x168 (ITextInputConsumer::put_TextInputProducer), which builds the KeyEventArgs the app sees.
  * Without one it falls back to WindowServer::OnKeyDownEvent's own CKeyEventArgs, whose Initialize leaves
@@ -4456,6 +4517,7 @@ static HRESULT WINAPI wf_CreateCoreWindow( struct window_factory *wf, HSTRING ti
         connect_dcomp_target( core_window );
     }
     if (!GetEnvironmentVariableW( L"WINE_UWP_NO_TEXT_INPUT_PRODUCER", NULL, 0 )) attach_text_input_producer( (IUnknown *)*window );
+    push_title_bar_metrics_later();
     if (FAILED( hr = attach_navigation_client( *window ) ))
     {
         ERR( "could not attach a navigation client, hr %#lx\n", hr );

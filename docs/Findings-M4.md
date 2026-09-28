@@ -10425,3 +10425,26 @@ CoreWindow position event, one more chance for the CoreMessaging wake that win32
 - a default Shapr3D start opens File as a second top-level window.
 
 `WINE_UWP_WINDOWED_POPUPS=0` turns them off.
+
+### Shapr3D's Share button sat against the window edge: title bar insets (2026-09-28)
+
+Shapr3D lays out its title-bar row against `CoreApplicationViewTitleBar.SystemOverlayRightInset`. It reads it from
+`Shapr3D.dll+0x1a04775` and listens for `LayoutMetricsChanged`. On Windows that inset is the width of the caption
+buttons, and here it was 0, so Share touched the edge.
+
+twinapi.appcore's title bar takes its metrics from two places:
+
+- values pushed through `ICoreApplicationViewTitleBarInternal` `{6e470d39-e79f-453c-92ef-6310edefd440}`, slot 7
+  `OnLayoutMetricsChanged(left, right, height)`, which sets a flag at `+0x7c` and raises `LayoutMetricsChanged`;
+- failing that, an `ITitleBarClientAdapter` `{ba5e7927}`, which our navigation client refuses.
+
+Our navigation client's own `TitleBarSystemOverlay*Inset` methods are never called.
+
+`wineuwp` now pushes left 0, right 10, height 32 once the view has created its title bar. The title bar does not exist
+yet when the CoreWindow is made, so a 25 ms thread timer on the view thread retries for up to 5 s. The window manager's
+frame holds the caption buttons here, so 10 px is a margin, chosen so Share lines up with the panels below, which keep
+10 px from the edge. `WINE_UWP_TITLEBAR_RIGHT_INSET` overrides it; 138 reproduces Windows' gap.
+
+One wrong turn: I first called slot 6 of `ICoreApplicationView3` for `get_TitleBar`. Slot 6 is `get_IsComponent`, which
+wrote a zero boolean into the pointer. That looked exactly like "no title bar yet". Suite and `kb` unchanged.
+`docs/screenshots/shapr3d-share-inset.png` shows the result.
