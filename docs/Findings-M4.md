@@ -9861,3 +9861,25 @@ variant in both copies, and read the armed byte.
 (`Win32EventLoopBridge::DrainSignaledWaits`) is: without it every app is blank. The first bisect run was killed by the
 session ending mid-region and **left its variant (region 4 reverted) in both copies** - the script restored only at the
 end. It now restores after every region and on exit.
+
+**CoreMessaging.dll and Windows.UI.dll, complete (2026-09-28).**
+
+| DLL | Region | Function | Without it |
+| --- | --- | --- | --- |
+| CoreMessaging | 0, 1, 2, 6, 7, 8 | `Abandonment::Fail`/`FailWithException`/`FailWithHR`/`UseOfInvalidatedExportAdapter`, `FailFast::ForNtStatus`/`ForWin32` soft-NOPs | suite and Shapr3D fine (they only act when a fail-fast fires) |
+| CoreMessaging | 3 | `Win32EventLoopBridge::DrainSignaledWaits` -> hook into the cave | all blank |
+| CoreMessaging | 4 | `WaitController::DrainSignaledIocpWaits` +0x10d | all blank |
+| CoreMessaging | 5 | `Dispatcher::SetRelative` (timer) -> cave | all blank |
+| Windows.UI | 0 | PE header byte | fine |
+| Windows.UI | 1 | `CDispatcher::ProcessMessage` -> `DrainCoreMessaging` trampoline | all blank |
+| Windows.UI | 2 | `CKeyEventArgs::Initialize` +0x16 (`Handled`) | **Enter, Backspace, Escape ignored** |
+
+Regions 3 and 5 are one mechanism: the `SetRelative` cave puts a timer armed on another thread into a mailbox, and
+the hook on `DrainSignaledWaits` fires it on the UI thread (checked against the thread id `wineuwp` writes into
+CoreMessaging). Under our Wine that timer never wakes the UI thread's IOCP wait by itself. With region 4 and Windows.UI
+region 1, every load-bearing CoreMessaging/Windows.UI patch is about the dispatcher's waits reaching the UI thread.
+
+**The suite cannot judge a keyboard patch.** Windows.UI region 2 passed it, and a keyboard test (`/tmp/kbtest.sh`:
+Calculator, `12+3` Enter, Backspace `7`, Escape) showed Enter, Backspace and Escape all ignored without it
+(3 / 37 / 37 instead of 15 / 7 / 0). The fail-fast NOPs are unjudged the same way: they matter only when an error path
+fires, which no test here provokes.
