@@ -135,6 +135,7 @@ dlls/windows.graphics/main.c
 dlls/windows.graphics/private.h
 dlls/windows.graphics/weakref.c
 dlls/windows.graphics/weakref.h
+dlls/windows.graphics/displayinformation.c
 dlls/windows.media.playback.mediaplayer/Makefile.in
 dlls/windows.media.playback.mediaplayer/main.c
 dlls/windows.media.playback.mediaplayer/playback_engine.c
