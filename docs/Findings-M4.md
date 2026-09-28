@@ -9958,3 +9958,15 @@ calls `Window.Activate()`; XAML never gets as far as `DCompTreeHost::UpdateDebug
 CoreMessaging wake, exposed by the different timing. **Live again: one-patch XAML (`ShouldTryLoadAppXaml`) and
 `wineuwp` loading App.xaml** (`WINE_UWP_NO_APP_XAML=1` turns the load off). The fixes that retired the other XAML patches
 stay. A two-run suite pass was not enough to see a 1-in-5 start failure; count starts (`/tmp/calcstarts.sh`, N=20).
+
+### Material swatches flickered and greyed: `RPC_E_WRONG_THREAD` from a pool-thread painter (2026-09-28)
+
+Visualization's material swatches (and Used Materials thumbnails) flickered between their picture and flat grey. They
+are `LoadedImageSurface`s behind XAML's surface facade: dcomp asks the facade `ICompositionSurfaceFacade::GetRealSurface`
+and `ILoadedImageSurface::get_DecodedPhysicalSize` which surface to paint. Both are UI-thread objects and answer
+`RPC_E_WRONG_THREAD` (0x8001010E) from any other thread - and since painting moved to pool threads (readback job,
+repaint timer) most paints ask from one. `brush_surface` read that as "no real surface", dropped the brush's surface and
+drew grey, until the next UI-thread paint put it back. Not the upload-retry back-off (the old per-frame retries were grey
+too), and not `ILayerVisual` (tested). `surface_from_facade` now reports "unknown" for a wrong-thread answer and the
+brush keeps its last surface (`docs/screenshots/shapr3d-material-swatches-fixed.png`; a 50-frame burst has no grey
+frame). The facade failure paths trace under `trace+dcompops`.

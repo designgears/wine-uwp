@@ -4368,7 +4368,7 @@ static struct drawing_surface *surface_from_iface( void *iface )
 /* ICompositionSurfaceFacade {e01622c8-2332-55c7-8868-a7312c5c229d}: slot 6 GetRealSurface. XAML's
  * LoadedImageSurface is a facade over the composition surface it decodes into; apps hand the facade
  * to CreateSurfaceBrush, and the real surface only exists once XAML has allocated it. */
-static struct drawing_surface *surface_from_facade( IUnknown *facade )
+static struct drawing_surface *surface_from_facade( IUnknown *facade, BOOL *unknown )
 {
     static const GUID IID_ICompositionSurfaceFacade_ =
         { 0xe01622c8, 0x2332, 0x55c7, { 0x88, 0x68, 0xa7, 0x31, 0x2c, 0x5c, 0x22, 0x9d } };
@@ -4385,6 +4385,7 @@ static struct drawing_surface *surface_from_facade( IUnknown *facade )
         { 0x050c8313, 0x6737, 0x45ba, { 0x85, 0x31, 0x33, 0x09, 0x4f, 0xeb, 0xef, 0x55 } };
     typedef HRESULT (WINAPI *get_size)( void *, Size * );
 
+    if (unknown) *unknown = FALSE;
     if (!facade) return NULL;
     if (SUCCEEDED(IUnknown_QueryInterface( facade, &IID_ILoadedImageSurface_, (void **)&iface )))
     {
@@ -4392,19 +4393,38 @@ static struct drawing_surface *surface_from_facade( IUnknown *facade )
         hr = ((get_size *)*(void ***)iface)[6]( iface, &decoded );
         IUnknown_Release( iface );
         iface = NULL;
+        /* A LoadedImageSurface answers only on its UI thread, and the painter mostly runs on pool threads since it
+         * left the UI thread: every such paint got RPC_E_WRONG_THREAD here and dropped the surface it had resolved,
+         * so Shapr3D's material swatches stayed grey, and flickered when a UI-thread paint resolved them again.
+         * The caller keeps what it has. */
+        if (hr == RPC_E_WRONG_THREAD)
+        {
+            if (unknown) *unknown = TRUE;
+            return NULL;
+        }
         if (FAILED(hr) || decoded.Width <= 0.0f || decoded.Height <= 0.0f)
         {
-            TRACE( "facade %p: not decoded yet (hr %#lx, %gx%g).\n", facade, hr, decoded.Width, decoded.Height );
+            TRACE_(dcompops)( "facade %p: not decoded yet (hr %#lx, %gx%g).\n", facade, hr, decoded.Width, decoded.Height );
             return NULL;
         }
     }
-    if (FAILED(hr = IUnknown_QueryInterface( facade, &IID_ICompositionSurfaceFacade_, (void **)&iface ))) return NULL;
+    if (FAILED(hr = IUnknown_QueryInterface( facade, &IID_ICompositionSurfaceFacade_, (void **)&iface )))
+    {
+        TRACE_(dcompops)( "facade %p: no ICompositionSurfaceFacade, hr %#lx.\n", facade, hr );
+        return NULL;
+    }
     hr = ((get_real_surface *)*(void ***)iface)[6]( iface, &real );
     IUnknown_Release( iface );
+    if (hr == RPC_E_WRONG_THREAD)
+    {
+        if (unknown) *unknown = TRUE;
+        return NULL;
+    }
+    if (FAILED(hr) || !real) TRACE_(dcompops)( "facade %p: GetRealSurface hr %#lx, %p.\n", facade, hr, real );
     if (SUCCEEDED(hr) && real)
     {
         if ((surface = surface_from_iface( real ))) return surface;  /* keeps GetRealSurface's reference */
-        TRACE( "facade %p: real surface %p is not ours.\n", facade, real );
+        TRACE_(dcompops)( "facade %p: real surface %p is not ours (vtbl %p).\n", facade, real, *(void **)real );
         IUnknown_Release( real );
     }
     return NULL;
@@ -4434,7 +4454,7 @@ static HRESULT WINAPI surface_brush_put_Surface( void *iface, void *value )
     if (!surface && value)
     {
         IUnknown_AddRef( (brush->facade = value) );
-        surface = surface_from_facade( brush->facade );
+        surface = surface_from_facade( brush->facade, NULL );
     }
     brush->surface = surface;
     return S_OK;
@@ -4804,7 +4824,7 @@ static HRESULT create_surface_brush( void *surface_iface, void **out )
     else if (surface_iface)
     {
         IUnknown_AddRef( (brush->facade = surface_iface) );
-        brush->surface = surface_from_facade( brush->facade );
+        brush->surface = surface_from_facade( brush->facade, NULL );
     }
 
     TRACE( "created SurfaceBrush %p over surface %p.\n", brush, brush->surface );
@@ -4825,8 +4845,10 @@ static struct drawing_surface *brush_surface( void *brush_iface )
     if (brush->facade)
     {
         /* asked every time: a LoadedImageSurface may replace its surface (a new decode size) */
-        struct drawing_surface *real = surface_from_facade( brush->facade );
-        if (real != brush->surface)
+        BOOL unknown;
+        struct drawing_surface *real = surface_from_facade( brush->facade, &unknown );
+        if (unknown) ;   /* asked from the wrong thread: keep the last answer */
+        else if (real != brush->surface)
         {
             TRACE( "brush %p: facade %p resolved to surface %p (was %p).\n", brush, brush->facade, real, brush->surface );
             if (brush->surface) IUnknown_Release( (IUnknown *)&brush->surface->vtbl );
@@ -4834,6 +4856,8 @@ static struct drawing_surface *brush_surface( void *brush_iface )
         }
         else if (real) IUnknown_Release( (IUnknown *)&real->vtbl );
     }
+    if (brush->surface && !brush->surface->texture && !brush->surface->swapchain)
+        TRACE_(dcompops)( "brush %p: surface %p has no texture yet.\n", brush, brush->surface );
     return brush->surface && (brush->surface->texture || brush->surface->swapchain) ? brush->surface : NULL;
 }
 
@@ -17525,13 +17549,13 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
     if (!brush) return FALSE;
     if (!brush->mask)
     {
-        TRACE( "mask brush %p: no mask.\n", brush );
+        TRACE_(dcompops)( "mask brush %p: no mask.\n", brush );
         return FALSE;
     }
     grid = nine_grid_from( brush->mask );
     if (!(mask_surface = brush_surface( grid ? grid->source : brush->mask )))
     {
-        TRACE( "mask brush %p: mask %p is not a surface brush with a texture (vtbl %p).\n", brush, brush->mask,
+        TRACE_(dcompops)( "mask brush %p: mask %p is not a surface brush with a texture (vtbl %p).\n", brush, brush->mask,
                *(void **)brush->mask );
         return FALSE;
     }
@@ -17551,14 +17575,14 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
     }
     if (!have_color && !source_surface && !gradient)
     {
-        TRACE( "mask brush %p: source %p is neither a colour nor a surface brush (vtbl %p).\n", brush,
+        TRACE_(dcompops)( "mask brush %p: source %p is neither a colour nor a surface brush (vtbl %p).\n", brush,
                brush->source, brush->source ? *(void **)brush->source : NULL );
         return FALSE;
     }
 
     if (!(mask = surface_cached_pixels( mask_surface, &mask_desc )))
     {
-        TRACE( "mask brush %p: mask surface %p unreadable (format?).\n", brush, mask_surface );
+        TRACE_(dcompops)( "mask brush %p: mask surface %p unreadable (format?).\n", brush, mask_surface );
         return FALSE;
     }
     if (source_surface && !(source = surface_cached_pixels( source_surface, &source_desc ))) return FALSE;
