@@ -111,15 +111,15 @@ that were ours; the Calculator tree is no longer involved.
   bytes were really loaded.
 - **Which patches are still load-bearing is measured, not remembered.** Findings-M4 2026-09-28 bisected all three
   patched DLLs one region at a time, and then retired them in Wine. Live today:
-  - **CoreMessaging.dll and Windows.UI.Xaml.dll are the pristine 26100.8972 files.**
-  - **Windows.UI.dll** carries one byte, the `CKeyEventArgs::Initialize` `Handled` default (Enter, Backspace,
-    Escape), because under Wine the keyboard input site at `WindowServer+0x168` is NULL; see Findings-M4.
+  - **CoreMessaging.dll, Windows.UI.dll and Windows.UI.Xaml.dll are all the pristine 26100.8972 files.**
+    `./pecheck.py --sweep uwp-bin/win11` lists only backups.
 
-  The earlier variants are kept as `.bak-minimal`, `.bak-1patch`, `.bak-full` and `.bak-18regions`. The CoreMessaging
+  The earlier variants are kept as `.bak-minimal`, `.bak-kbonly`, `.bak-1patch`, `.bak-full` and `.bak-18regions`. The CoreMessaging
   patches, the Windows.UI `ProcessMessage` trampoline, XAML's `ShouldTryLoadAppXaml` and combase's 16 ms poll were all
   one missing wake: the thread's CoreMessaging completion port waking its message wait (win32u, "CoreMessaging and
-  Windows.UI.Xaml run unmodified"). Every patch stands for a Wine-side bug, and fixing that bug is what retires the
-  patch.
+  Windows.UI.Xaml run unmodified"). The key `Handled` byte was a missing text input producer (our builtin
+  `windows.ui.core.textinput` ordinal 1500). Every patch stands for a Wine-side bug, and fixing that bug is what
+  retires the patch.
 
   **The four-app suite cannot judge a keyboard patch** - run `./regress.sh kb` too. **Nor can it judge a start-up
   race**: a 1-in-5 stall passed two suites. Count 20 Calculator starts before adopting a change to start-up.
@@ -131,8 +131,8 @@ that were ours; the Calculator tree is no longer involved.
   and a thread id at `+0x10d000..+0x10d010`, which are wil's error counters and a cached function
   pointer, so the two overwrote each other. Look an address up in the PDB `.syms` before claiming it.
   `HotPatchSpareGlobals` is the space Microsoft reserves for exactly this.
-- **Never patch the last pristine copy of a Windows DLL.** One DLL is patched today (`Windows.UI.dll`, 1 byte,
-  26100.8972). CoreMessaging and Windows.UI.Xaml were patched until 09-28, and all three originals are
+- **Never patch the last pristine copy of a Windows DLL.** None is patched today. CoreMessaging, Windows.UI and
+  Windows.UI.Xaml (26100.8972) were until 09-28, and all three originals are
   kept as `<name>.pristine-26100.8972` and **cannot be re-obtained** - the tree is a mix of builds,
   and the machine they were copied from has serviced past them. `./pecheck.py` tells a pristine
   Microsoft PE from a patched one with no reference copy. Check before patching, and never delete a
@@ -361,8 +361,8 @@ For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
 ## Mistakes already made - do not repeat them
 
 **Byte-patching a Windows DLL is fine; patching our own code is not.** We have no source for
-those binaries, so a byte patch is the only tool there is - `Windows.UI.dll` carries a load-bearing
-one today and that is a legitimate state. Our own
+those binaries, so a byte patch is the only tool there is, and a legitimate state. None is live today; the last
+three retired on 09-28. Our own
 Wine source is the opposite case: it is vendored in full under `wine/` and there is never a reason
 to represent it as a diff.
 
@@ -1113,7 +1113,9 @@ the fully-qualified name. `--grep` first, always.
   activation race fail (run.sh says so in a comment). `wineserver -k` and *verify* they are gone
   before trusting a run.
 - Wine's builtins win by module name. Pointing an `ActivatableClassId` at a native DLL is not enough;
-  it also needs a `=n` override and the file in the prefix.
+  it also needs a `=n` override and the file in the prefix. The same holds for a Microsoft DLL that native code
+  `LoadLibrary`s itself: `windows.ui.core.textinput.dll` loaded our builtin, and `GetProcAddress` for its ordinal 1500
+  returned NULL without a word. Check `+loaddll` for `builtin` before assuming Microsoft's code runs.
 - **A restarted test KWin (`kwin_wayland --virtual --xwayland`) may not take XTEST input**: on 09-27 `xdotool mousemove`
   left `getmouselocation` where it was and every click missed, although the same command had worked hours before.
   Scripted runs silently stay on Home (`shownframes.py` says `none`). Use Xvfb `:96` at 3440x1440 instead.
@@ -1130,7 +1132,7 @@ the fully-qualified name. `--grep` first, always.
 
 | App | State |
 | --- | --- |
-| Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0), and the keyboard baseline (`regress.sh kb`). Runs on the pristine CoreMessaging.dll and Windows.UI.Xaml.dll. **Windows.UI.dll keeps one byte** (key `Handled`), see the byte-patch rules above |
+| Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0), and the keyboard baseline (`regress.sh kb`). Runs on unmodified CoreMessaging.dll, Windows.UI.dll and Windows.UI.Xaml.dll (no Windows DLL is patched any more) |
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15. Regression capture: 2250 or 2242 colours, both a pass - 2242 is XAML not showing the keyboard focus rectangle on Open file(s), usual since painting left the UI thread |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |

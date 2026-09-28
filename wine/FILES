@@ -175,6 +175,8 @@ dlls/windows.ui.core.textinput/editcontext.c
 dlls/windows.ui.core.textinput/main.c
 dlls/windows.ui.core.textinput/private.h
 dlls/windows.ui.core.textinput/services.c
+dlls/windows.ui.core.textinput/producer.c
+dlls/windows.ui.core.textinput/windows.ui.core.textinput.spec
 dlls/windows.ui/inputpane.c
 dlls/windows.web/json_array.c
 dlls/windows.web/json_object.c

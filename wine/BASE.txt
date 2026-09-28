@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     9df3ccf4926dcaaf09f33a7a9b5b6327a8989ce1
-                 win32u, user32, combase, kernelbase, wineuwp: Wake the message wait on the CoreMessaging port.
+  wine HEAD:     d5a369c3abd749c892567b8ba72fd75a21796eb6
+                 windows.ui.core.textinput, wineuwp: Give the CoreWindow a text input producer.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-28T22:26:58Z
+  captured:      2026-09-28T22:50:22Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

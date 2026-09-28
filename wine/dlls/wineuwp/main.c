@@ -1251,6 +1251,47 @@ static LRESULT CALLBACK core_window_subclass_proc( HWND hwnd, UINT msg, WPARAM w
     return CallWindowProcW( core_window_proc_orig, hwnd, msg, wparam, lparam );
 }
 
+/* Give the CoreWindow its text input producer, as Windows does. Windows.UI routes a key to the producer at
+ * WindowServer+0x168 (ITextInputConsumer::put_TextInputProducer), which builds the KeyEventArgs the app sees.
+ * Without one it falls back to WindowServer::OnKeyDownEvent's own CKeyEventArgs, whose Initialize leaves
+ * Handled set, so every CoreWindow.KeyDown handler saw Enter, Backspace and Escape as already handled - the
+ * last Windows.UI byte patch. XAML does exactly this for a CoreWindow it hosts
+ * (CoreWindowWrapper::ConfigureForCoreWindowHostingMode): ITextInputConsumer from the window, then
+ * windows.ui.core.textinput.dll ordinal 1500, PrivateCreateTextInputProducer( consumer, &producer ), which our
+ * builtin implements with a message hook (dlls/windows.ui.core.textinput/producer.c).
+ * WINE_UWP_NO_TEXT_INPUT_PRODUCER=1 leaves it out. */
+static const GUID IID_ITextInputConsumer_local = {0xa9d00ab3, 0x2fef, 0x41a0, {0xb0, 0xad, 0x4b, 0x21, 0x29, 0xea, 0x26, 0x63}};
+
+static void attach_text_input_producer( IUnknown *window )
+{
+    HRESULT (WINAPI *create_producer)( IUnknown *consumer, IUnknown **producer );
+    HRESULT (WINAPI **consumer_vtbl)( IUnknown *, IUnknown * );
+    IUnknown *consumer = NULL, *producer = NULL;
+    HMODULE module;
+    HRESULT hr;
+
+    if (!(module = LoadLibraryExW( L"windows.ui.core.textinput.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32 )))
+    {
+        WARN( "no windows.ui.core.textinput.dll, error %lu\n", GetLastError() );
+        return;
+    }
+    if (!(create_producer = (void *)GetProcAddress( module, MAKEINTRESOURCEA(1500) ))) return;
+    if (FAILED( hr = IUnknown_QueryInterface( window, &IID_ITextInputConsumer_local, (void **)&consumer ) ))
+    {
+        WARN( "window has no ITextInputConsumer, hr %#lx\n", hr );
+        return;
+    }
+    if (SUCCEEDED( hr = create_producer( consumer, &producer ) ))
+    {
+        consumer_vtbl = *(void **)consumer;
+        hr = consumer_vtbl[7]( consumer, producer );   /* put_TextInputProducer */
+        IUnknown_Release( producer );
+    }
+    TRACE( "text input producer %p, hr %#lx\n", producer, hr );
+    if (FAILED( hr )) ERR( "could not attach a text input producer, hr %#lx\n", hr );
+    IUnknown_Release( consumer );
+}
+
 static void connect_dcomp_target( HWND hwnd )
 {
     typedef void (WINAPI *set_target_window_t)( HWND hwnd );
@@ -4414,6 +4455,7 @@ static HRESULT WINAPI wf_CreateCoreWindow( struct window_factory *wf, HSTRING ti
         EnumWindows( show_core_window, (LPARAM)&core_window );
         connect_dcomp_target( core_window );
     }
+    if (!GetEnvironmentVariableW( L"WINE_UWP_NO_TEXT_INPUT_PRODUCER", NULL, 0 )) attach_text_input_producer( (IUnknown *)*window );
     if (FAILED( hr = attach_navigation_client( *window ) ))
     {
         ERR( "could not attach a navigation client, hr %#lx\n", hr );

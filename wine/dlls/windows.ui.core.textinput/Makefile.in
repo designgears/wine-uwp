@@ -1,10 +1,11 @@
 MODULE  = windows.ui.core.textinput.dll
-IMPORTS = combase
+IMPORTS = combase user32
 
 SOURCES = \
 	classes.idl \
 	editcontext.c \
 	main.c \
+	producer.c \
 	services.c \
 	vector.c \
 	weakref.c

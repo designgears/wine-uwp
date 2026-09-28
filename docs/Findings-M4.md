@@ -10335,3 +10335,55 @@ One Solitaire start was blank. It was the second start after the prefix update, 
 On the way there, rebuilding `wineuwp` restamped install-overrides, which copied the old patched DLLs back over the
 test prefix. The patched XAML, with nobody loading App.xaml for it any more, left Calculator, Feedback Hub and Media
 Player blank. That run means nothing about the change.
+
+### Windows.UI.dll runs unmodified too: a text input producer for the CoreWindow (2026-09-28)
+
+The last byte patch was `CKeyEventArgs::Initialize`'s `Handled` default. What it stood for:
+
+- **Windows.UI routes keys through the CoreWindow's text input producer.** It keeps the producer at
+  `WindowServer+0x168`: the `ITextInputConsumer` view is at `+0x98`, and `put_TextInputProducer` stores the producer at
+  `iface+0xd0`.
+- **With a producer, `OnKeyDownEvent`/`OnKeyUpEvent` only ask it** `get_MessageHandled` (slot 10). Windows' producer,
+  on TSF, has already seen the key and raised `KeyDown` through the consumer's `InvokeKeyDownEventHandlers` (consumer
+  slot 9), with args of its own.
+- **With no producer, Windows.UI raises the event itself** with a `CKeyEventArgs` whose `Handled` starts TRUE. That is a
+  path Windows never takes for an app's CoreWindow.
+
+The producer comes from `windows.ui.core.textinput.dll` ordinal 1500, `PrivateCreateTextInputProducer(consumer,
+&producer)`. XAML calls it for a CoreWindow it hosts, in `CoreWindowWrapper::ConfigureForCoreWindowHostingMode`:
+`ITextInputConsumer` is `{a9d00ab3-2fef-41a0-b0ad-4b2129ea2663}` and `ICoreWindowInterop` is `{45d64a29}`. A first try
+from `wineuwp` did nothing at all, because our **builtin** `windows.ui.core.textinput` (it implements
+`CoreTextEditContext`) shadows Microsoft's and had no ordinal 1500. `trace+loaddll` said `builtin`.
+
+Layout recovered from the shipping vtables (Windows.UI and Windows.UI.Core.TextInput PDBs):
+
+| Interface | Slots |
+| --- | --- |
+| `ITextInputProducer` `{af86e2e0}` | 6/7 `IsInputEnabled`, 8/9 `HasFocus`, 10 `get_MessageHandled`, 11 `get_CurrentKeyEventType`, 12 `GetAsyncKeyState`, 13 `GetKeyState`, 14 `GetCurrentKeyEventDeviceId` |
+| `ITextInputConsumer` | 7 `put_TextInputProducer`, 8 accelerator, 9/10 `KeyDown`/`KeyUp`, 11 `CharacterReceived`, 12/13 `SystemKeyDown`/`SystemKeyUp` |
+
+`put_TextInputProducer` also QIs the producer for `{400ae3c0}`, `ITextInputProducerPhone` (every method `E_NOTIMPL` on
+the desktop), and **drops the producer again if that is refused**.
+
+What it does now:
+
+- **`dlls/windows.ui.core.textinput/producer.c`** implements ordinal 1500 for CoreWindows only, taking the window from
+  `ICoreWindowInterop`. The component input sources call it too; they failed it before and still do, and keep their
+  own path.
+- **A `WH_GETMESSAGE` hook** on the window's thread raises `KeyDown`/`KeyUp`/`SystemKeyDown`/`SystemKeyUp` for each
+  key message as it is removed from the queue. The args are `IKeyEventArgs`/`IKeyEventArgs2`/`ICoreWindowEventArgs`,
+  with the key status built the way `OnKeyDownEvent` builds it, and `Handled` FALSE.
+- **`get_MessageHandled`** reports what the handlers set.
+- **Characters** still come from `WindowServer::OnCharacterEvent` (`WM_CHAR`), which does not consult the producer.
+- **`wineuwp`** attaches the producer after `PrivateCreateCoreWindow`; `WINE_UWP_NO_TEXT_INPUT_PRODUCER=1` leaves it
+  out.
+
+**Result, with CoreMessaging.dll, Windows.UI.dll and Windows.UI.Xaml.dll all the pristine 26100.8972 files**
+(`pecheck.py --sweep uwp-bin/win11`: nothing live modified):
+
+- suite and `regress.sh kb` identical;
+- 20/20 Calculator starts and 6/6 Shapr3D starts;
+- in Shapr3D, Ctrl+F opens command search, typing filters it ("extrude"), Escape closes it and Ctrl+Alt+H toggles
+  History.
+
+Without the producer, pristine Windows.UI fails `kb` (AE 1036/983/1656), as it should.
