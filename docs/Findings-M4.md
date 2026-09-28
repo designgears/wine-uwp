@@ -10076,3 +10076,32 @@ Suite, `kb` pass. A real capture would give the drag a ghost image; it is not do
   Offset tool (Sentry dump in `LocalState/crash_report`, breadcrumbs `SKFaceOffsetTool::Initialize`, window
   deactivate/activate). Not investigated yet.
 - The blank Environment panel the user saw has not reproduced (5 drags, library drops, a clicked swatch, 2029 wide).
+
+### Header chevron fixed: XAML facade animations were never run (2026-09-28)
+
+`composition_object_statics_StartAnimationWithIAnimationObject` logged "facade animations are not run" once and did
+nothing. Shapr3D slides its operation header's chevron (Extrude - One-Sided, Offset Face ...) with
+`UIElement.StartAnimation` on the `Translation` facade: XAML's layout keeps the chevron at one place and the facade
+animation carries it to the other, so without it the chevron stayed wherever the previous state had it. On Windows
+`CompositionObjectFactory::StartAnimationWithIAnimationObject` creates an `AnimationPropertyInfo`, calls the target's
+`IAnimationObject::PopulatePropertyInfo` (XAML's `FacadeAnimationHelper::PopulatePropertyInfoImpl` forwards to its
+backing composition object, `EnsureBackingCompositionObjectForFacade`, queried for `IAnimationObject` {e7141e0a}),
+and starts the animation on the object and property named in the info. That is implemented now: property sets answer
+`IAnimationObject`, the info is a real `IAnimationPropertyInfo`/`IAnimationPropertyInfo2`, property sets run Vector3
+key frames, and expression key frames take a slot of their own - `this.StartingValue` is filled with the property's
+value when the animation starts (it used to shift every key by one and read as zero). Toggling the header both ways now
+lands the chevron correctly (`docs/screenshots/shapr3d-header-chevron-fixed.png`). Suite and `kb` pass.
+
+### History "..." button: XAML's windowless popups take the hover (2026-09-28)
+
+Found, not fixed. The row's template (`DesignHistoryStepItem`, from the `.xbf` inside `resources.pri`) shows `MoreButton`
+only in `HoveredStates.IsHovered`. When its MenuFlyout opens, XAML's own `CXcpBrowserHost::ReplayPreviousPointerUpdate`
+(right after the press, then every ~500 ms) hit-tests the last pointer position; our popups are windowless, so it lands
+on `CPopupRoot` - the light-dismiss layer over the whole window - the row loses hover and the app switches it to
+`IsNotHovered` (seen with `WINE_UWP_BP` on `VisualStateManagerFactory::GoToState`, the state name read from the reference
+HSTRING's literal in `Shapr3D.dll`). On Windows flyouts are windowed popups (their own HWND), so nothing covers the main
+window. XAML decides in `CPopup::DoesPlatformSupportWindowedPopup`: `GetSystemMetrics(0x1800)` must be nonzero, and
+Wine returns 0. Turning it on means XAML creates popup windows and asks dcomp for a target on each
+(`CreateTargetForHwnd`, a placeholder today), so dcomp's painter would have to draw several windows. Tracing aids used:
+`RaiseRoutedEvent` (`+0x111338`, event id in `rdx`, source vtable at `r8`) gives XAML's routed-event stream; `b` is
+PointerMoved, `a`/`c` Pressed/Released, `f` Tapped, `0x12` PointerCaptureLost, `0x1f/0x20/3/4` focus.

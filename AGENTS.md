@@ -266,6 +266,7 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | Open a URI or file from an app without touching the real desktop | `WINE_UWP_LAUNCHER=log` makes the Launcher shim log instead of `ShellExecute` |
 | Deliver a URI to the running app (sign-in callbacks, `scheme:` links) | `./activate-uri.sh <uri>` - a Protocol activation of the running instance, via the inbox `wineuwp` watches. `./browser-callback.sh <scheme>` does a whole browser sign-in and delivers its callback |
 | Does a drag reach its drop target? | `WINEDEBUG=+timestamp,trace+dataexchange`: every `TargetRequested`, `EnterAsync`/`OverAsync`/`DropAsync` with the position and the operation the target accepted. Drag with a move every ~15 ms (`/tmp/dodrag.sh`), and only in a project of our own |
+| Which visual state did the app switch a control to, and when? | `WINE_UWP_BP=windows.ui.xaml.dll+18c80@r8+0:6` (`VisualStateManagerFactory::GoToState`): .NET Native passes reference HSTRINGs, so dwords 4-5 are a pointer into `Shapr3D.dll` and dword 1 the length - read the literal from the DLL image. `+111338@r8+0:2` (`CEventManager::RaiseRoutedEvent`) gives the routed-event stream with each source's vtable. An app's own XAML is in `resources.pri` as `XBF` blobs with UTF-16 string tables |
 | Which methods of an interface does the app actually call? | give every slot a traced thunk returning `E_NOTIMPL` and read the log - see `shims/storecontext`, which proved the app wanted only `GetDefault` out of 26 methods |
 
 ### Unique-HRESULT tagging

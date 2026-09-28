@@ -2050,6 +2050,7 @@ struct composition_path
 static const void *path_vtbl[];
 static void paint_shape_visual( HDC hdc, struct visual *impl, float x, float y, float dest_w, float dest_h );
 enum kf_kind { KF_COLOR, KF_SCALAR, KF_BOOLEAN, KF_VECTOR2, KF_VECTOR3 };
+enum { KF_EXPR_NONE, KF_EXPR_STARTING, KF_EXPR_OTHER };
 #define KF_KEYS 96
 /* A DirectManipulation-driven position reaches a visual as an ExpressionAnimation on "TransformMatrix"
  * whose reference parameter is (or leads to) the ManipulationTransform the interop compositor made
@@ -2147,7 +2148,9 @@ struct kf_animation
     BOOL sampled_once;
     /* every key frame, for sampling at a controller's progress */
     struct kf_key { float key; union { Color color; float scalar; boolean flag; Vector2 vector2; Vector3 vector3; } u;
-                    struct kf_ease ease; } keys[KF_KEYS];   /* ease: the segment from the previous key to this one */
+                    struct kf_ease ease;    /* the segment from the previous key to this one */
+                    unsigned char expr;     /* an expression key: KF_EXPR_STARTING ("this.StartingValue"), KF_EXPR_OTHER */
+                  } keys[KF_KEYS];
     const void **partner_vtbl;  /* ICompositionKeyFrameAnimationPartner, see kf_partner_vtbl */
     float iteration_count;
     const void **kfa_vtbl;      /* IKeyFrameAnimation, see kfa_vtbl */
@@ -2161,6 +2164,10 @@ struct kf_animation
 static struct kf_animation *kf_animation_from( void *animation );
 static BOOL kf_sample( struct kf_animation *kf, float progress, struct kf_key *out );
 static HRESULT create_comp_object_vtbl( const char *kind, void **vtbl, void **out );
+static const GUID IID_IAnimationObject_local =
+    { 0xe7141e0a, 0x04b8, 0x4fc5, { 0xa4, 0xdc, 0x19, 0x53, 0x92, 0xe5, 0x78, 0x07 } };
+static HRESULT create_anim_prop_info( void **out );
+static HRESULT create_anim_object_view( IUnknown *owner, void **out );
 
 /* Soft-return target for execute-at-nullish NX faults (rip < 0x10000). The call already
  * pushed a return address; jumping here with rax=0 makes COM-style callers see S_OK and
@@ -11211,11 +11218,16 @@ static void live_anim_apply( struct live_anim *a, float progress )
 
     if (!kf_sample( a->kf, progress, &key )) return;
     for (i = 0; i < a->set->value_count; i++)
-        if (!wcsicmp( a->set->values[i].name, a->name ) && a->set->values[i].type == PROP_SCALAR)
-        {
+    {
+        if (wcsicmp( a->set->values[i].name, a->name )) continue;
+        if (a->set->values[i].type == PROP_SCALAR && a->kf->value_kind == KF_SCALAR)
             a->set->values[i].u.scalar = key.u.scalar;
-            break;
-        }
+        else if (a->set->values[i].type == PROP_VECTOR3 && a->kf->value_kind == KF_VECTOR3)
+            a->set->values[i].u.vector3 = key.u.vector3;
+        else if (a->set->values[i].type == PROP_VECTOR2 && a->kf->value_kind == KF_VECTOR2)
+            a->set->values[i].u.vector2 = key.u.vector2;
+        break;
+    }
 }
 
 static UINT paint_interval( void );
@@ -11253,6 +11265,16 @@ static void live_anims_tick( void )
     if (running) request_repaint( paint_interval() );
 }
 
+/* a key-frame animation the painter can run itself: a duration, two keys or more, and no expression key but
+ * "this.StartingValue" */
+static BOOL kf_runs_live( struct kf_animation *kf )
+{
+    unsigned int i;
+
+    if (kf->key_count < 2 || kf->key_count > KF_KEYS || kf->duration <= 0) return FALSE;
+    for (i = 0; i < kf->key_count; i++) if (kf->keys[i].expr == KF_EXPR_OTHER) return FALSE;
+    return TRUE;
+}
 static BOOL live_anim_running( LONG id )
 {
     BOOL running = FALSE;
@@ -11272,6 +11294,20 @@ static void live_anim_start( struct property_set *set, const WCHAR *name, struct
     live_anim_cancel( set, name );
     if (!(a.kf = malloc( sizeof(*a.kf) ))) return;
     *a.kf = *kf;
+    {
+        unsigned int i, n = min( a.kf->key_count, KF_KEYS );
+        struct propset_value *cur = NULL;
+
+        for (i = 0; i < set->value_count; i++) if (!wcsicmp( set->values[i].name, name )) { cur = &set->values[i]; break; }
+        for (i = 0; i < n; i++)
+        {
+            if (a.kf->keys[i].expr != KF_EXPR_STARTING) continue;
+            if (!cur) continue;
+            if (a.kf->value_kind == KF_SCALAR && cur->type == PROP_SCALAR) a.kf->keys[i].u.scalar = cur->u.scalar;
+            else if (a.kf->value_kind == KF_VECTOR3 && cur->type == PROP_VECTOR3) a.kf->keys[i].u.vector3 = cur->u.vector3;
+            else if (a.kf->value_kind == KF_VECTOR2 && cur->type == PROP_VECTOR2) a.kf->keys[i].u.vector2 = cur->u.vector2;
+        }
+    }
     if (a.kf->timeline) IUnknown_AddRef( (IUnknown *)a.kf->timeline );
     a.set = set;
     lstrcpynW( a.name, name, ARRAY_SIZE(a.name) );
@@ -11480,6 +11516,9 @@ static HRESULT WINAPI propset_QueryInterface( ICompositionPropertySet *iface, RE
         return create_propset_partner( impl, out );
     if (IsEqualGUID( iid, &IID_ICompositionPropertyChangedNotifier_local ))
         return create_change_notifier( (IUnknown *)&impl->ICompositionPropertySet_iface, out );
+    /* XAML's facade animations resolve to the element's facade property set through this */
+    if (IsEqualGUID( iid, &IID_IAnimationObject_local ))
+        return create_anim_object_view( (IUnknown *)&impl->ICompositionPropertySet_iface, out );
     WARN( "property set: no interface %s.\n", debugstr_guid( iid ) );
     *out = NULL;
     return E_NOINTERFACE;
@@ -12332,12 +12371,25 @@ static HRESULT WINAPI kfa_get_KeyFrameCount( void *iface, INT32 *value )
     *value = kf_from_kfa( iface )->key_count;
     return S_OK;
 }
-/* Expressions are not evaluated here; the key frame is counted so the count stays true. */
+/* Expression key frames take a slot of their own. "this.StartingValue" - the first key of every slide an app
+ * starts from where a property is now - is filled in with the property's value when the animation starts
+ * (live_anim_start); other expressions are not evaluated, and an animation with one only settles at its end. */
 static HRESULT WINAPI kfa_InsertExpressionKeyFrame( void *iface, float key, HSTRING expression )
 {
     struct kf_animation *impl = kf_from_kfa( iface );
-    FIXME( "key %f, expression %s: expression key frames are not evaluated.\n", key, debugstr_hstring( expression ) );
+    const WCHAR *text = WindowsGetStringRawBuffer( expression, NULL );
+    BOOL starting = text && !wcsicmp( text, L"this.StartingValue" );
+
+    if (!starting)
+        FIXME( "key %f, expression %s: expression key frames are not evaluated.\n", key, debugstr_hstring( expression ) );
     impl->key_count++;
+    if (impl->key_count <= KF_KEYS)
+    {
+        struct kf_key *k = &impl->keys[impl->key_count - 1];
+        memset( k, 0, sizeof(*k) );
+        k->key = key;
+        k->expr = starting ? KF_EXPR_STARTING : KF_EXPR_OTHER;
+    }
     return S_OK;
 }
 static HRESULT WINAPI kfa_InsertExpressionKeyFrameWithEasingFunction( void *iface, float key, HSTRING expression,
@@ -19206,6 +19258,26 @@ static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, voi
                 WindowsDeleteString( h );
             }
         }
+        /* a Vector3 one too - XAML's Translation facade, which Shapr3D animates to slide its operation header's
+         * chevron into place: without it the chevron stayed where the previous layout had it */
+        if (pkf && pkf->has_value && pkf->value_kind == KF_VECTOR3 && pprop)
+        {
+            HSTRING h;
+            struct propset_value *pv;
+            TRACE_(dcompanim)( "set %p %s settles at %g,%g,%g (%u keys).\n", set, debugstr_w( pprop ), pkf->vector3.X,
+                               pkf->vector3.Y, pkf->vector3.Z, pkf->key_count );
+            if (SUCCEEDED( WindowsCreateString( pprop, lstrlenW( pprop ), &h ) ))
+            {
+                if ((pv = propset_find( set, h, TRUE )) && pv->type != PROP_VECTOR3)
+                {
+                    pv->type = PROP_VECTOR3;
+                    memset( &pv->u.vector3, 0, sizeof(pv->u.vector3) );
+                }
+                WindowsDeleteString( h );
+                if (pv && kf_runs_live( pkf )) live_anim_start( set, pprop, pkf );
+                else if (pv) pv->u.vector3 = pkf->vector3;
+            }
+        }
         struct matrix_transform *m = manip_matrix_from_animation( animation );
         struct expr_animation *expr = expr_animation_from_any( animation );
         const WCHAR *prop = WindowsGetStringRawBuffer( name, NULL );
@@ -19296,7 +19368,7 @@ static HRESULT WINAPI compositor7_CreateAnimationPropertyInfo( void *iface, void
 {
     TRACE( "iface %p.\n", iface );
     if (!result) return E_POINTER;
-    return create_comp_object( "AnimationPropertyInfo", result );
+    return create_anim_prop_info( result );
 }
 static HRESULT create_rect_clip( float left, float top, float right, float bottom, void **out );
 static HRESULT WINAPI compositor7_CreateRectangleClip( void *iface, void **result )
@@ -20680,17 +20752,241 @@ static const IActivationFactoryVtbl composition_object_factory_vtbl =
 };
 static IActivationFactory composition_object_factory = { &composition_object_factory_vtbl };
 
+/* AnimationPropertyInfo: IAnimationPropertyInfo {f4716f05} (6 get_AccessMode, 7 put_AccessMode) and
+ * IAnimationPropertyInfo2 {591720b4} (6 GetResolvedCompositionObject, 7 GetResolvedCompositionObjectProperty).
+ * A target's IAnimationObject::PopulatePropertyInfo names in it the composition object and property that
+ * really hold an animated facade; ours record themselves through anim_prop_info_resolve. */
+struct anim_prop_info
+{
+    const void **vtbl;
+    const void **info2_vtbl;
+    LONG ref;
+    INT32 access_mode;
+    IUnknown *resolved;
+    HSTRING property;
+};
+static const GUID IID_IAnimationPropertyInfo_local =
+    { 0xf4716f05, 0xed77, 0x4e3c, { 0xb3, 0x28, 0x5c, 0x39, 0x85, 0xb3, 0x73, 0x8f } };
+static const GUID IID_IAnimationPropertyInfo2_local =
+    { 0x591720b4, 0x7472, 0x5218, { 0x8b, 0x39, 0xdf, 0xfe, 0x61, 0x5a, 0xe6, 0xda } };
+static const void *anim_prop_info_vtbl[], *anim_prop_info2_vtbl[];
+static struct anim_prop_info *anim_prop_info_from( void *iface )
+{
+    if (!iface) return NULL;
+    if (*(const void ***)iface == anim_prop_info_vtbl) return CONTAINING_RECORD( iface, struct anim_prop_info, vtbl );
+    if (*(const void ***)iface == anim_prop_info2_vtbl) return CONTAINING_RECORD( iface, struct anim_prop_info, info2_vtbl );
+    return NULL;
+}
+static HRESULT WINAPI anim_prop_info_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct anim_prop_info *impl = anim_prop_info_from( iface );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAnimationPropertyInfo_local ))
+        *out = &impl->vtbl;
+    else if (IsEqualGUID( iid, &IID_IAnimationPropertyInfo2_local ))
+        *out = &impl->info2_vtbl;
+    else if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&impl->vtbl, out );
+    else
+    {
+        TRACE( "animation property info %p: no %s.\n", impl, debugstr_guid( iid ) );
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    InterlockedIncrement( &impl->ref );
+    return S_OK;
+}
+static ULONG WINAPI anim_prop_info_AddRef( void *iface )
+{
+    return InterlockedIncrement( &anim_prop_info_from( iface )->ref );
+}
+static ULONG WINAPI anim_prop_info_Release( void *iface )
+{
+    struct anim_prop_info *impl = anim_prop_info_from( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+
+    if (!ref)
+    {
+        if (impl->resolved) IUnknown_Release( impl->resolved );
+        WindowsDeleteString( impl->property );
+        free( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI anim_prop_info_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI anim_prop_info_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.AnimationPropertyInfo";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI anim_prop_info_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI anim_prop_info_get_AccessMode( void *iface, INT32 *value )
+{
+    if (!value) return E_POINTER;
+    *value = anim_prop_info_from( iface )->access_mode;
+    return S_OK;
+}
+static HRESULT WINAPI anim_prop_info_put_AccessMode( void *iface, INT32 value )
+{
+    anim_prop_info_from( iface )->access_mode = value;
+    return S_OK;
+}
+static HRESULT WINAPI anim_prop_info_GetResolvedCompositionObject( void *iface, void **value )
+{
+    struct anim_prop_info *impl = anim_prop_info_from( iface );
+
+    if (!value) return E_POINTER;
+    *value = NULL;
+    if (!impl->resolved) return S_OK;
+    return IUnknown_QueryInterface( impl->resolved, &IID_ICompositionObject, value );
+}
+static HRESULT WINAPI anim_prop_info_GetResolvedCompositionObjectProperty( void *iface, HSTRING *value )
+{
+    if (!value) return E_POINTER;
+    return WindowsDuplicateString( anim_prop_info_from( iface )->property, value );
+}
+static const void *anim_prop_info_vtbl[] =
+{
+    anim_prop_info_QueryInterface, anim_prop_info_AddRef, anim_prop_info_Release,
+    anim_prop_info_GetIids, anim_prop_info_GetRuntimeClassName, anim_prop_info_GetTrustLevel,
+    anim_prop_info_get_AccessMode, anim_prop_info_put_AccessMode,
+};
+static const void *anim_prop_info2_vtbl[] =
+{
+    anim_prop_info_QueryInterface, anim_prop_info_AddRef, anim_prop_info_Release,
+    anim_prop_info_GetIids, anim_prop_info_GetRuntimeClassName, anim_prop_info_GetTrustLevel,
+    anim_prop_info_GetResolvedCompositionObject, anim_prop_info_GetResolvedCompositionObjectProperty,
+};
+static HRESULT create_anim_prop_info( void **out )
+{
+    struct anim_prop_info *impl;
+
+    if (!out) return E_POINTER;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->vtbl = anim_prop_info_vtbl;
+    impl->info2_vtbl = anim_prop_info2_vtbl;
+    impl->ref = 1;
+    *out = &impl->vtbl;
+    return S_OK;
+}
+
+/* IAnimationObject {e7141e0a} view of one of our composition objects: 6 PopulatePropertyInfo(name, info). As
+ * CompositionObject::PopulatePropertyInfo does, the object names itself and the property. */
+struct anim_object_view
+{
+    const void **vtbl;
+    LONG ref;
+    IUnknown *owner;
+};
+static HRESULT WINAPI anim_object_view_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct anim_object_view *impl = iface;
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAnimationObject_local ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = iface;
+        return S_OK;
+    }
+    return IUnknown_QueryInterface( impl->owner, iid, out );
+}
+static ULONG WINAPI anim_object_view_AddRef( void *iface )
+{
+    return InterlockedIncrement( &((struct anim_object_view *)iface)->ref );
+}
+static ULONG WINAPI anim_object_view_Release( void *iface )
+{
+    struct anim_object_view *impl = iface;
+    ULONG ref = InterlockedDecrement( &impl->ref );
+
+    if (!ref)
+    {
+        IUnknown_Release( impl->owner );
+        free( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI anim_object_view_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionObject";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI anim_object_view_PopulatePropertyInfo( void *iface, HSTRING name, void *info_iface )
+{
+    struct anim_object_view *impl = iface;
+    struct anim_prop_info *info = anim_prop_info_from( info_iface );
+
+    TRACE_(dcompanim)( "object %p: %s, info %p%s.\n", impl->owner, debugstr_hstring( name ), info_iface,
+                       info ? "" : " (not ours)" );
+    if (!info) return E_INVALIDARG;
+    if (info->resolved) IUnknown_Release( info->resolved );
+    IUnknown_AddRef( (info->resolved = impl->owner) );
+    WindowsDeleteString( info->property );
+    return WindowsDuplicateString( name, &info->property );
+}
+static const void *anim_object_view_vtbl[] =
+{
+    anim_object_view_QueryInterface, anim_object_view_AddRef, anim_object_view_Release,
+    anim_prop_info_GetIids, anim_object_view_GetRuntimeClassName, anim_prop_info_GetTrustLevel,
+    anim_object_view_PopulatePropertyInfo,
+};
+static HRESULT create_anim_object_view( IUnknown *owner, void **out )
+{
+    struct anim_object_view *impl;
+
+    if (!out) return E_POINTER;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->vtbl = anim_object_view_vtbl;
+    impl->ref = 1;
+    IUnknown_AddRef( (impl->owner = owner) );
+    *out = &impl->vtbl;
+    return S_OK;
+}
+
+/* Facade animations (UIElement.StartAnimation on Translation, Scale, ...): ask the target which composition object
+ * and property hold the facade - XAML answers through FacadeAnimationHelper::PopulatePropertyInfoImpl, which forwards
+ * to its backing composition object's IAnimationObject - and start the animation there. */
 static HRESULT WINAPI composition_object_statics_StartAnimationWithIAnimationObject( void *iface, IUnknown *target,
         HSTRING property, IUnknown *animation )
 {
-    static LONG once;
-    if (!InterlockedExchange( &once, 1 ))
-        FIXME( "target %p, property %s, animation %p: facade animations are not run.\n", target,
-               debugstr_hstring( property ), animation );
-    else
-        TRACE( "target %p, property %s, animation %p: not run.\n", target, debugstr_hstring( property ), animation );
+    HRESULT (WINAPI *populate)( IUnknown *, HSTRING, void * );
+    IUnknown *object = NULL, *info_iface = NULL;
+    ICompositionObject *resolved = NULL;
+    struct anim_prop_info *info;
+    HRESULT hr;
+
+    TRACE_(dcompanim)( "target %p, property %s, animation %s.\n", target, debugstr_hstring( property ),
+                       debugstr_animation( animation ) );
     if (!target || !animation) return E_INVALIDARG;
-    return S_OK;
+    if (FAILED(hr = IUnknown_QueryInterface( target, &IID_IAnimationObject_local, (void **)&object ))) return hr;
+    if (FAILED(hr = create_anim_prop_info( (void **)&info_iface )))
+    {
+        IUnknown_Release( object );
+        return hr;
+    }
+    info = anim_prop_info_from( info_iface );
+    populate = (*(void ***)object)[6];
+    hr = populate( object, property, info_iface );
+    IUnknown_Release( object );
+    if (SUCCEEDED(hr) && info->resolved &&
+        SUCCEEDED(hr = IUnknown_QueryInterface( info->resolved, &IID_ICompositionObject, (void **)&resolved )))
+    {
+        TRACE_(dcompanim)( "facade %s runs on %p %s.\n", debugstr_hstring( property ), info->resolved,
+                           debugstr_hstring( info->property ) );
+        hr = ICompositionObject_StartAnimation( resolved, info->property, (ICompositionAnimation *)animation );
+        ICompositionObject_Release( resolved );
+    }
+    else TRACE_(dcompanim)( "facade %s: not resolved, hr %#lx.\n", debugstr_hstring( property ), hr );
+    IUnknown_Release( info_iface );
+    return hr;
 }
 static HRESULT WINAPI composition_object_statics_StartAnimationGroupWithIAnimationObject( void *iface, IUnknown *target,
         IUnknown *animation )
