@@ -10232,3 +10232,10 @@ invisible there. Now:
 
 `docs/screenshots/shapr3d-settings-open-text.png`: the dialog 0.2, 0.4 and 0.6 s after opening, and settled. Suite, `kb`
 and the Calculator baseline unchanged.
+
+**And the layout jump at the end of the same animation.** With the text crisp, the rows still jumped a pixel each into
+place when the animation ended. Measured per 40-pixel band against the settled frame: mid-tail, rows sat 0-1 px off,
+each in its own direction. The painter truncated float positions (`(int)x`): at a scale of 0.9999 a row that belongs at
+313 computes as 312.9999 and stays at 312 until the scale is exactly 1. Sprite content edges are now rounded
+(`px = floor(x + 0.5)`, width from the rounded right edge). After it, from ~0.45 s on only 18 pixels differ from the
+final frame (a ComboBox chevron's outline), where ~755 did until the end before; suite and baselines unchanged.

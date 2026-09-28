@@ -8288,7 +8288,7 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
     if (v->opacity < 1.0f) paint_opacity *= v->opacity;
     paint_content_sx = csx; paint_content_sy = csy;
     if (v->opacity > 0.01f && surface_from_iface( v->content ) &&
-        blit_surface_scaled( hdc, surface_from_iface( v->content ), (int)x, (int)y, csx, csy ))
+        blit_surface_scaled( hdc, surface_from_iface( v->content ), (int)floorf( x + 0.5f ), (int)floorf( y + 0.5f ), csx, csy ))
     {
         TRACE( "painted interop visual %p from surface content %p.\n", v, v->content );
     }
@@ -10505,6 +10505,11 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
         width > 0.5f && height > 0.5f)
     {
         struct drawing_surface *surface = brush_surface( impl->brush );
+        /* Edges rounded, not truncated: while a dialog's open animation eases its scale into 1.0 a row that belongs
+         * at 313 computes as 312.9999, and truncation held it a pixel off - each row a different way - until the scale
+         * was exactly 1, then everything jumped into place at once. At rest XAML's positions are whole pixels. */
+        int px = (int)floorf( x + 0.5f ), py = (int)floorf( y + 0.5f );
+        int pw = (int)floorf( x + width + 0.5f ) - px, ph = (int)floorf( y + height + 0.5f ) - py;
         BOOL matched;
         COLORREF col;
         HBRUSH brush;
@@ -10513,26 +10518,26 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
         /* A sprite whose brush is a surface carries real drawn content; paint that instead of
          * guessing a colour. */
         paint_content_sx = csx; paint_content_sy = csy;   /* read by soft_stretch, reset at children */
-        if (surface && paint_mapped_surface( hdc, impl->brush, surface, (int)x, (int)y, (int)width, (int)height,
+        if (surface && paint_mapped_surface( hdc, impl->brush, surface, px, py, pw, ph,
                                              1.0f ))
         {
-            TRACE( "painted public sprite %p from mapped surface %p at %d,%d.\n", impl, surface, (int)x, (int)y );
+            TRACE( "painted public sprite %p from mapped surface %p at %d,%d.\n", impl, surface, px, py );
             goto children;
         }
-        if (surface && blit_surface_rect( hdc, surface, (int)x, (int)y, (int)width, (int)height ))
+        if (surface && blit_surface_rect( hdc, surface, px, py, pw, ph ))
         {
             TRACE( "painted public sprite %p from surface %p at %d,%d.\n", impl, surface,
-                   (int)x, (int)y );
+                   px, py );
             goto children;
         }
-        if (paint_mask_brush( hdc, impl->brush, (int)x, (int)y, (int)width, (int)height, 1.0f ))
+        if (paint_mask_brush( hdc, impl->brush, px, py, pw, ph, 1.0f ))
         {
-            TRACE( "painted public sprite %p with mask brush at %d,%d.\n", impl, (int)x, (int)y );
+            TRACE( "painted public sprite %p with mask brush at %d,%d.\n", impl, px, py );
             goto children;
         }
-        if (paint_gradient_sprite( hdc, impl->brush, (int)x, (int)y, (int)width, (int)height, 1.0f ))
+        if (paint_gradient_sprite( hdc, impl->brush, px, py, pw, ph, 1.0f ))
         {
-            TRACE( "painted public sprite %p with gradient brush at %d,%d.\n", impl, (int)x, (int)y );
+            TRACE( "painted public sprite %p with gradient brush at %d,%d.\n", impl, px, py );
             goto children;
         }
         matched = brush_solid_color( impl->brush, &c );
@@ -10543,23 +10548,23 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
         if (!matched || !c.A || impl->opacity <= 0.01f)
         {
             TRACE( "skipped public sprite %p %gx%g at %d,%d matched %d alpha %u.\n", impl, width, height,
-                   (int)x, (int)y, matched, matched ? c.A : 0 );
+                   px, py, matched, matched ? c.A : 0 );
             if (matched && !c.A && width > 0 && height > 0)
             {
                 /* XAML's Transparent background: invisible, but it takes the pointer */
                 struct paint_op op = { OP_HIT };
-                SetRect( &op.dest, (int)x, (int)y, (int)(x + width), (int)(y + height) );
+                SetRect( &op.dest, px, py, px + pw, py + ph );
                 op.clip = paint_clip;
                 paint_emit( &op );
             }
             goto children;
         }
-        SetRect( &rect, (int)x, (int)y, (int)(x + width), (int)(y + height) );
+        SetRect( &rect, px, py, px + pw, py + ph );
         soft_fill( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, c,
                    255 );
         (void)brush; (void)col;
         TRACE( "painted public sprite %p %gx%g at %d,%d color %02x%02x%02x%02x.\n",
-               impl, width, height, (int)x, (int)y, c.A, c.R, c.G, c.B );
+               impl, width, height, px, py, c.A, c.R, c.G, c.B );
     }
     if (impl->shape_vtbl && impl->shape_count) paint_shape_visual( hdc, impl, x, y, width, height );
 children:
