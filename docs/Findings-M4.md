@@ -9775,3 +9775,16 @@ Solitaire 6/6, twice.
 
 What is left per frame when XAML is committing (the view cube turns with every orbit frame): raster ~2-4 ms and
 blit ~1.2-2.6 ms of a 4.2 MP frame, then the flush.
+
+Checked afterwards (same build, `:96`, 3440, 175 Hz):
+
+- **Steady orbit:** 156-165 frames shown a second. A full paint is 2.5-3 ms plus a 1.2-1.4 ms blit, and the read-back
+  is 2.6 ms. What separates that from 175 is the read-back sitting in the present cycle: the next frame's read-back
+  starts only once the previous frame is swapped in. A deeper queue would take it out, at up to one frame of added
+  latency; not done.
+- **"Right after a change":** selecting a face of the drone is used in place of an edit, because it makes XAML
+  rebuild the context toolbar, the filtered History and the hint without touching the project. Orbiting 50 ms
+  after the click gave 34-44 frames per 250 ms, worst gap 15 ms (`docs/screenshots/shapr3d-select-then-orbit.png`:
+  face selected, Offset Face hint, History "Related to Selection", view turned).
+- The XAML UI thread is ~19% busy during an orbit. The one Wine cost that stands out there is `NtUserSetCursor` on
+  every pointer move (~9% of that thread's busy samples).
