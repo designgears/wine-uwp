@@ -9855,3 +9855,9 @@ Trap met on the way: **`install-overrides.sh` copies the `win11` copy over a *di
 changes**, and replacing the `win11` file changes the stamp. A variant placed only in the prefix was silently undone and
 the breakpoints armed over the patched bytes (`BP armed ... (byte 31)` where the pristine byte is `48`). Test a
 variant in both copies, and read the armed byte.
+
+**CoreMessaging.dll, same method (partial, 2026-09-28).** Regions 0-2 (the `Abandonment::Fail`, `FailWithException` and
+`FailWithHR` soft-NOPs) are not needed: with each reverted the suite passes and Shapr3D is normal. Region 3
+(`Win32EventLoopBridge::DrainSignaledWaits`) is: without it every app is blank. The first bisect run was killed by the
+session ending mid-region and **left its variant (region 4 reverted) in both copies** - the script restored only at the
+end. It now restores after every region and on exit.
