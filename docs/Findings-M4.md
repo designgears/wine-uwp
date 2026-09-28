@@ -9894,3 +9894,26 @@ over two runs.
 Left to retire, each by fixing what it compensates for in Wine: XAML's window size arriving after its first tick
 (XAML 4, 5); the dispatcher's timers and waits not reaching the UI thread (CoreMessaging 3, 4, 5; Windows.UI 1); key
 events' `Handled` state (Windows.UI 2); `ShouldTryLoadAppXaml` (XAML 11, Media Player).
+
+### XAML's two OnTick patches retired: dcomp's target and XAML's drop shadows (2026-09-28)
+
+**#4 (`OnTick` +0x8e, "no window size -> force 800x600") was a `wineuwp` bug.** Breakpoints showed XAML's frame tick
+runs on the view thread before `CreateCoreWindow` and skips (no size); `CJupiterWindow::SetCoreWindow` then delivers
+1280x800 through `OnSizeChanged` -> `OnJupiterWindowSizeChanged` -> `SetWindowSize`, and ticks carry on - yet the app
+stayed black. `+dcomp` showed why: XAML committed, but `__wine_dcomp_set_target_window` never ran.
+`connect_dcomp_target` returned early when `GetModuleHandle( "dcomp.dll" )` failed, and without the patch's forced
+first frame XAML loads dcomp only after `CreateCoreWindow`. It now loads dcomp itself.
+
+**#5 (`OnTick` +0x10f, NOP a `jne` on `CCoreServices+0x238`) was keeping XAML off its drop-shadow path.** The flag
+(set by `InitCoreWindowContentRoot`) is set only at the first tick and makes that tick skip `NWDrawTree`; the draw
+path is taken every tick after. Without the patch Shapr3D crashed as soon as its viewport appeared, in
+`HWCompTreeNodeWinRT::MakeLayerVisual` (QI of a new layer visual for `ILayerVisual2` `{98f9aeeb}`, refused) and then
+`UpdateDropShadowVisualBrush` (QI of the compositor for `ICompositorWithVisualSurface` `{cfa1658b}`) - XAML uses both
+results unchecked, its error path included. Layer visuals made by `CreateLayerVisual` now answer `ILayerVisual`
+(Effect) and `ILayerVisual2` (Shadow, through the `ISpriteVisual2` vtable, which has the same slots) and report
+`LayerVisual`; the compositor answers `ICompositorWithVisualSurface` with a recorded `CompositionVisualSurface`.
+Shadows are still not drawn.
+
+With both fixes, Windows.UI.Xaml.dll carries **one patch** (#11 `ShouldTryLoadAppXaml`, Media Player): the suite passes
+twice, Shapr3D twice (worst gaps 52/54 ms, editor normal), `regress.sh kb` identical. It is live (`.bak-1patch`;
+`.bak-3patches` kept).

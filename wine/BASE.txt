@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     634b882c5b34c778c6f73fad94e2bc93290e7c69
-                 dcomp: Answer IDCompositionDeviceDebug with a real two-method object.
+  wine HEAD:     5285bd5324d341a9801f7e0eae7e02dc1090d7e2
+                 wineuwp: Load dcomp to connect the CoreWindow; dcomp: LayerVisual interfaces and ICompositorWithVisualSurface.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-28T07:04:51Z
+  captured:      2026-09-28T08:33:15Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

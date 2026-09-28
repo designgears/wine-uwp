@@ -104,8 +104,8 @@ that were ours; the Calculator tree is no longer involved.
   bytes were really loaded.
 - **Which patches are still load-bearing is measured, not remembered.** Findings-M4 2026-09-28 bisected all three
   patched DLLs, one region reverted at a time. Live today, each the pristine file plus only these (the fuller versions
-  are kept as `.bak-full` / `.bak-18regions`): **Windows.UI.Xaml** `OnTick` x2 (XAML learns the window size after its
-  first frame tick) and `ShouldTryLoadAppXaml` (Media Player only); **CoreMessaging** `DrainSignaledWaits`,
+  are kept as `.bak-full` / `.bak-18regions`): **Windows.UI.Xaml** `ShouldTryLoadAppXaml` only (Media Player; its two `OnTick` patches
+  were retired by `wineuwp` loading dcomp for the CoreWindow and dcomp answering XAML's drop-shadow interfaces); **CoreMessaging** `DrainSignaledWaits`,
   `DrainSignaledIocpWaits` and the `SetRelative` timer cave (timers and waits not reaching the UI thread);
   **Windows.UI** the `ProcessMessage` -> `DrainCoreMessaging` trampoline and the `CKeyEventArgs` `Handled` byte (Enter,
   Backspace, Escape). Every one of these stands for a Wine-side bug; fixing that is what retires the patch, as
@@ -1093,7 +1093,7 @@ the fully-qualified name. `--grep` first, always.
 
 | App | State |
 | --- | --- |
-| Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0), and the keyboard baseline (`regress.sh kb`). **Depends on patched `CoreMessaging.dll`, `Windows.UI.dll` and `Windows.UI.Xaml.dll`**, now 3+2+3 patches - see the byte-patch rules above |
+| Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0), and the keyboard baseline (`regress.sh kb`). **Depends on patched `CoreMessaging.dll`, `Windows.UI.dll` and `Windows.UI.Xaml.dll`**, now 3+2+1 patches - see the byte-patch rules above |
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15. Regression capture: 2250 or 2242 colours, both a pass - 2242 is XAML not showing the keyboard focus rectangle on Open file(s), usual since painting left the UI thread |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |

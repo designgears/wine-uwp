@@ -1510,6 +1510,7 @@ struct compositor
     const void **compositor7_vtbl; /* ICompositor7, see compositor7_vtbl */
     const void **shadow_vtbl;      /* ICompositorWithProjectedShadow, see compositor_shadow_vtbl */
     const void **radial_vtbl;      /* ICompositorWithRadialGradient, see compositor_radial_vtbl */
+    const void **visual_surface_vtbl; /* ICompositorWithVisualSurface, see compositor_visual_surface_vtbl */
     const void **partner_device_vtbl; /* the device partner interface, see device_partner_vtbl */
     LONG ref;
 };
@@ -8196,6 +8197,9 @@ static const GUID IID_ICompositorWithProjectedShadow_local =
 static const void *compositor_radial_vtbl[];
 static const GUID IID_ICompositorWithRadialGradient_local =
     { 0x98b9c1a7, 0x8e71, 0x4b53, { 0xb4, 0xa8, 0x69, 0xba, 0x5d, 0x19, 0xdc, 0x5b } };
+static const void *compositor_visual_surface_vtbl[];
+static const GUID IID_ICompositorWithVisualSurface_local =
+    { 0xcfa1658b, 0x0123, 0x4551, { 0x88, 0x91, 0x89, 0xbd, 0xcc, 0x40, 0x32, 0x2b } };
 
 static inline struct compositor *impl_from_ICompositor( ICompositor *iface )
 {
@@ -8311,6 +8315,16 @@ static HRESULT WINAPI compositor_QueryInterface( ICompositor *iface, REFIID iid,
         InterlockedIncrement( &impl->ref );
         impl->radial_vtbl = compositor_radial_vtbl;
         *out = &impl->radial_vtbl;
+        return S_OK;
+    }
+
+    /* XAML's drop shadows (HWCompTreeNodeWinRT::UpdateDropShadowVisualBrush) ask for this and use the answer even
+     * when refused: Shapr3D crashed as soon as its viewport appeared. */
+    if (IsEqualGUID( iid, &IID_ICompositorWithVisualSurface_local ))
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->visual_surface_vtbl = compositor_visual_surface_vtbl;
+        *out = &impl->visual_surface_vtbl;
         return S_OK;
     }
 
@@ -8462,6 +8476,11 @@ struct visual
     boolean visible;
     enum visual_kind kind;
     LONG ref;
+    /* LayerVisual (CreateLayerVisual): a container that also answers ILayerVisual (Effect) and ILayerVisual2
+     * (Shadow, through sprite2_vtbl, which has the same two slots). Both are kept, not drawn. */
+    BOOL layer;
+    const void **layer_vtbl;
+    IUnknown *effect;
 };
 
 struct color_brush
@@ -9435,6 +9454,66 @@ static const void *visual_sprite2_vtbl[] =
     sprite2_get_Shadow, sprite2_put_Shadow,
 };
 
+/* ILayerVisual2 {98f9aeeb}: 6 get_Shadow, 7 put_Shadow - the same slots as ISpriteVisual2, so a layer answers it
+ * with sprite2_vtbl. XAML's HWCompTreeNodeWinRT::MakeLayerVisual (its drop shadows) queries a new layer visual for
+ * it and uses the result unchecked: refused, Shapr3D crashed as soon as its viewport appeared. A byte patch in
+ * Windows.UI.Xaml.dll (CXcpBrowserHost::OnTick, force the draw path) kept XAML off that path by accident. */
+static const GUID IID_ILayerVisual2_local =
+    { 0x98f9aeeb, 0x6f23, 0x49f1, { 0x90, 0xb1, 0x1f, 0x59, 0xa1, 0x4f, 0xbc, 0xe3 } };
+
+/* ILayerVisual {af843985}: 6 get_Effect, 7 put_Effect. */
+static struct visual *impl_from_layer( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct visual, layer_vtbl );
+}
+static HRESULT WINAPI layer_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return visual_qi( impl_from_layer( iface ), iid, out );
+}
+static ULONG WINAPI layer_AddRef( void *iface )
+{
+    return visual_addref( impl_from_layer( iface ) );
+}
+static ULONG WINAPI layer_Release( void *iface )
+{
+    return visual_release( impl_from_layer( iface ) );
+}
+static HRESULT WINAPI layer_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI layer_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return IVisual_GetRuntimeClassName( &impl_from_layer( iface )->IVisual_iface, name );
+}
+static HRESULT WINAPI layer_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI layer_get_Effect( void *iface, IUnknown **value )
+{
+    struct visual *impl = impl_from_layer( iface );
+    TRACE( "visual %p.\n", impl );
+    if (!value) return E_POINTER;
+    if ((*value = impl->effect)) IUnknown_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI layer_put_Effect( void *iface, IUnknown *value )
+{
+    struct visual *impl = impl_from_layer( iface );
+    TRACE( "visual %p, effect %p.\n", impl, value );
+    if (value) IUnknown_AddRef( value );
+    if (impl->effect) IUnknown_Release( impl->effect );
+    impl->effect = value;
+    return S_OK;
+}
+static const void *visual_layer_vtbl[] =
+{
+    layer_QueryInterface, layer_AddRef, layer_Release,
+    layer_GetIids, layer_GetRuntimeClassName, layer_GetTrustLevel,
+    layer_get_Effect, layer_put_Effect,
+};
+
 static HRESULT visual_qi( struct visual *impl, REFIID iid, void **out )
 {
     static const GUID IID_visual_private2 = { 0x3b3e3dcf, 0xf20f, 0x4a83,
@@ -9450,6 +9529,10 @@ static HRESULT visual_qi( struct visual *impl, REFIID iid, void **out )
         *out = &impl->ISpriteVisual_iface;
     else if (IsEqualGUID( iid, &IID_ISpriteVisual2_local ) && impl->kind == VISUAL_SPRITE)
         *out = &impl->sprite2_vtbl;
+    else if (IsEqualGUID( iid, &IID_ILayerVisual2_local ) && impl->layer)
+        *out = &impl->sprite2_vtbl;
+    else if (IsEqualGUID( iid, &IID_ILayerVisual_local ) && impl->layer)
+        *out = &impl->layer_vtbl;
     else if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
         return create_object4_view( (IUnknown *)&impl->IVisual_iface, out );
     else if (IsEqualGUID( iid, &IID_IShapeVisual_local ) && impl->shape_vtbl)
@@ -9503,6 +9586,7 @@ static ULONG visual_release( struct visual *impl )
         free( impl->collection.children );
         if (impl->brush) ICompositionBrush_Release( impl->brush );
         if (impl->shadow) IUnknown_Release( impl->shadow );
+        if (impl->effect) IUnknown_Release( impl->effect );
         if (impl->clip) ICompositionClip_Release( impl->clip );
         if (impl->properties) ICompositionPropertySet_Release( impl->properties );
         ICompositor_Release( impl->compositor );
@@ -9623,6 +9707,7 @@ static HRESULT WINAPI ivisual_GetRuntimeClassName( IVisual *iface, HSTRING *name
     struct visual *impl = impl_from_ivisual( iface );
     const WCHAR *class = (impl->kind == VISUAL_SPRITE)
             ? RuntimeClass_Windows_UI_Composition_SpriteVisual
+            : impl->layer ? L"Windows.UI.Composition.LayerVisual"
             : RuntimeClass_Windows_UI_Composition_ContainerVisual;
     return WindowsCreateString( class, wcslen( class ), name );
 }
@@ -18017,9 +18102,17 @@ static HRESULT WINAPI compositor2_CreateStepEasingFunction( void *iface, void **
 
 static HRESULT WINAPI compositor2_CreateLayerVisual( void *iface, void **result )
 {
+    struct visual *impl;
+    HRESULT hr;
+
     TRACE( "iface %p.\n", iface );
     if (!result) return E_POINTER;
-    return create_visual( &impl_from_compositor2( iface )->ICompositor_iface, VISUAL_CONTAINER, result );
+    if (FAILED( hr = create_visual( &impl_from_compositor2( iface )->ICompositor_iface, VISUAL_CONTAINER, result ) ))
+        return hr;
+    impl = CONTAINING_RECORD( *result, struct visual, IContainerVisual_iface );
+    impl->layer = TRUE;
+    impl->layer_vtbl = visual_layer_vtbl;
+    return S_OK;
 }
 
 static HRESULT WINAPI compositor2_CreateStepEasingFunctionWithStepCount( void *iface, INT32 count, void **result )
@@ -18482,6 +18575,37 @@ static const void *compositor_radial_vtbl[] =
     compositor_radial_QueryInterface, compositor_radial_AddRef, compositor_radial_Release,
     compositor2_GetIids, compositor2_GetRuntimeClassName, compositor2_GetTrustLevel,
     compositor_radial_CreateRadialGradientBrush,
+};
+
+/* ICompositorWithVisualSurface ({cfa1658b-...}): 6 CreateVisualSurface. A CompositionVisualSurface renders a visual
+ * subtree into a brush (XAML draws its drop shadows' masks with one); it is a recorded object, not drawn. */
+static struct compositor *impl_from_compositor_visual_surface( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct compositor, visual_surface_vtbl );
+}
+static HRESULT WINAPI compositor_visual_surface_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return compositor_QueryInterface( &impl_from_compositor_visual_surface( iface )->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI compositor_visual_surface_AddRef( void *iface )
+{
+    return compositor_AddRef( &impl_from_compositor_visual_surface( iface )->ICompositor_iface );
+}
+static ULONG WINAPI compositor_visual_surface_Release( void *iface )
+{
+    return compositor_Release( &impl_from_compositor_visual_surface( iface )->ICompositor_iface );
+}
+static HRESULT WINAPI compositor_visual_surface_CreateVisualSurface( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    return create_comp_object( "CompositionVisualSurface", result );
+}
+static const void *compositor_visual_surface_vtbl[] =
+{
+    compositor_visual_surface_QueryInterface, compositor_visual_surface_AddRef, compositor_visual_surface_Release,
+    compositor2_GetIids, compositor2_GetRuntimeClassName, compositor2_GetTrustLevel,
+    compositor_visual_surface_CreateVisualSurface,
 };
 
 /* ICompositor4 ({ae47e78a-...}). Slots from CompositorCommon's ICompositor4 vtable in dcomp.pdb:

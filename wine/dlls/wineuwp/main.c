@@ -1301,7 +1301,13 @@ static void connect_dcomp_target( HWND hwnd )
     HMODULE dcomp;
     set_target_window_t set_target_window;
 
-    if (!hwnd || !(dcomp = GetModuleHandleW( L"dcomp.dll" ))) return;
+    /* Load it rather than give up when XAML has not loaded it yet: XAML's first frames run before its window is
+     * attached and skip without a window size, so it may create its composition device only after this. The
+     * CoreWindow then never became dcomp's target and every commit painted nowhere - a byte patch in
+     * Windows.UI.Xaml.dll (CXcpBrowserHost::OnTick, force an 800x600 size) hid it by making that first frame
+     * load dcomp early. */
+    if (!hwnd) return;
+    if (!(dcomp = GetModuleHandleW( L"dcomp.dll" )) && !(dcomp = LoadLibraryW( L"dcomp.dll" ))) return;
     if (!(set_target_window = (void *)GetProcAddress( dcomp, "__wine_dcomp_set_target_window" )))
     {
         WARN( "dcomp has no hosted-window target hook\n" );
