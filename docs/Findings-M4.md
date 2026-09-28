@@ -10387,3 +10387,29 @@ What it does now:
   History.
 
 Without the producer, pristine Windows.UI fails `kb` (AE 1036/983/1656), as it should.
+
+### The idle ~100 Hz CoreMessaging timer: an input-priority dispatch answered with a timer (2026-09-28)
+
+An idle Calculator's CoreMessaging window took ~99 `WM_TIMER`s a second, in the patched build as much as the unpatched
+one. The cycle, from `WINE_UWP_BP` on `UserAdapter::WindowProc` (`coremessaging.dll+2e490`) and
+`DeferredScheduleDispatchCallback` (`+2e730@stk:10`):
+
+1. `DoWork` ends by running CoreMessaging's deferred schedule requests. There was one of type 3, an input-priority
+   dispatch.
+2. `ScheduleInputPriorityUserDispatch` calls `ScheduleCoreMessagingDispatch(hwnd, 2, 0, 0)`. That reads our answer
+   the way it reads `ScheduleDispatchNotification`'s: 2 means "use the dispatch timer", so it did `SetTimer(hwnd, 1, 0)`.
+3. The `WM_TIMER` runs `DoWork` at **timer** priority (1), below the input-priority item. The item stayed pending and
+   was scheduled again, every 10 ms, for good.
+
+The message that runs `DoWork` at input priority is `0x60` with wParam 0: its handler first pushes the backup timer out
+(`SetTimer(hwnd, 1, 0x7fffffff)`), then runs `DoWork(3)`. Priority 2 now posts that, and still answers 2. The item
+runs once, and the timer it arms is replaced before it fires.
+
+Idle Calculator after the fix: no `WM_TIMER` at all. The adapter window's `0x60`/1 messages all arrive in the first two
+seconds of start-up, and `0x60`/0 three times.
+
+A second, smaller loop, fixed on the way: the port wake posted `0x60`/1 for the queue's own notification too. The server
+posts that whenever the queue has wake bits and the notification has been re-armed, so a pending `WM_TIMER` woke the
+port, and the port woke `DoWork`, which re-armed the notification. `NtUserMsgWaitForMultipleObjectsEx` now empties the
+port itself (`drain_coremsg_port`) and posts `0x60`/1 only when it handed CoreMessaging a real wait. The queue wakes
+the wait by itself anyway.

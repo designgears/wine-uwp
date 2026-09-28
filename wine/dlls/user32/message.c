@@ -1317,15 +1317,20 @@ UINT WINAPI ScheduleCoreMessagingDispatch( HWND hwnd, DWORD priority, WPARAM wpa
      * 1  AsyncPostMessage, PostMessageW( hwnd, 0x60, wparam, lparam );
      * 2  ScheduleInputPriorityUserDispatch, which reads the result as ScheduleDispatchNotification's:
      *    1 makes it send itself 0x60/7 and ask again, 2 makes it arm its dispatch timer. Answering 1
-     *    (a plain TRUE) therefore spun 0x60/7 and 0x60/0 at tens of thousands a second; like
-     *    NtUserScheduleDispatchNotification, answer 2;
+     *    (a plain TRUE) therefore spun 0x60/7 and 0x60/0 at tens of thousands a second; answer 2, and post the
+     *    dispatch (see below);
      * 3  its backup timer, SetTimer( hwnd, wparam, lparam ).
      * The window procedure runs UserAdapter::DoWork for each. ERROR_INVALID_WINDOW_HANDLE is the one
      * failure the caller tolerates (the adapter is going away). */
     switch (priority)
     {
     case 0: ret = SendMessageCallbackW( hwnd, 0x60, wparam, lparam, NULL, 1 ); break;
-    case 2: ret = IsWindow( hwnd ) ? 2 : 0; if (!ret) SetLastError( ERROR_INVALID_WINDOW_HANDLE ); break;
+    case 2:
+        /* the input-priority dispatch itself: 0x60 with wParam 0 runs UserAdapter::DoWork at that priority (and
+         * pushes its backup timer out). Answering only 2 left it to the timer, whose WM_TIMER runs DoWork at timer
+         * priority, below the waiting item: it stayed pending and was rescheduled every 10 ms for good. */
+        ret = PostMessageW( hwnd, 0x60, 0, 0 ) ? 2 : 0;
+        break;
     case 3: ret = SetTimer( hwnd, wparam, lparam, NULL ) != 0; break;
     default: ret = PostMessageW( hwnd, 0x60, wparam, lparam ); break;
     }
