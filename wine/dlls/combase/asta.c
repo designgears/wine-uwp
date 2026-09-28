@@ -10,7 +10,10 @@
  * version 2.1 of the License, or (at your option) any later version.
  */
 
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windows.h"
+#include "winternl.h"
 #include "roapi.h"
 #include "winstring.h"
 #include "wine/debug.h"
@@ -63,48 +66,33 @@ static void dispatch_pending_messages(void)
     }
 }
 
-static BOOL CALLBACK post_wm_null( HWND hwnd, LPARAM lparam )
-{
-    PostMessageW( hwnd, WM_NULL, 0, 0 );
-    return TRUE;
-}
-
 DWORD WINAPI CoMsgWaitInProcessEvents( void *context, DWORD count, const HANDLE *handles, DWORD timeout, DWORD wake_mask )
 {
     DWORD res;
     static LONG calls;
-    static HANDLE proxy_wake;
     LONG n;
-    WCHAR pkg[4];
-    BOOL uwp = GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", pkg, ARRAY_SIZE(pkg) ) ||
-               GetLastError() == ERROR_INSUFFICIENT_BUFFER;
     HANDLE wait_buf[16];
     DWORD wait_count = count;
 
     n = InterlockedIncrement( &calls );
-    /* Hosted UWP: CoreUI RegisterWait can add timer handles after PrepareToWait already
-     * built the array for this call. An INFINITE wait then never rebuilds the set, so
-     * MessageTimer callbacks never run. Cap so the EventLoop re-prepares waits. */
-    BOOL capped = uwp && timeout == INFINITE;
-    if (capped) timeout = 16;
-    /* Add a process-local proxy wake event that SetWaitableTimerEx can pulse when a
-     * due-now MessageTimer is armed (CoreUI's own wake no-ops under Windows.UI's wait). */
-    if (uwp)
+    /* No poll and no private wake event any more: win32u adds the thread's CoreMessaging completion port to
+     * the message wait (NtUserInitThreadCoreMessagingIocp2), so a timer or wait packet firing on it wakes
+     * this wait the way it does on Windows. The 16 ms cap that stood in for that hid lost wakes as latency. */
+    if (n <= 3 || (n % 200) == 0)
+        FIXME( "%p, %lu handles, timeout %lu (call %ld): semi-stub\n", context, wait_count, timeout, n );
+    if (TRACE_ON(combase) && n <= 40)
     {
-        if (!proxy_wake)
-            proxy_wake = CreateEventW( NULL, FALSE, FALSE, L"Local\\WineUwpCoreMsgWake" );
-        if (proxy_wake && count < ARRAY_SIZE(wait_buf) - 1)
+        DWORD i;
+        for (i = 0; i < count; i++)
         {
-            if (count && handles)
-                memcpy( wait_buf, handles, count * sizeof(HANDLE) );
-            wait_buf[count] = proxy_wake;
-            wait_count = count + 1;
-            handles = wait_buf;
+            char buf[256];
+            OBJECT_TYPE_INFORMATION *info = (OBJECT_TYPE_INFORMATION *)buf;
+            ULONG len;
+            if (!NtQueryObject( handles[i], ObjectTypeInformation, info, sizeof(buf), &len ))
+                TRACE( "call %ld tid %04lx handle %lu: %p %s\n", n, GetCurrentThreadId(), i, handles[i],
+                       debugstr_wn( info->TypeName.Buffer, info->TypeName.Length / sizeof(WCHAR) ) );
         }
     }
-    if (n <= 3 || (n % 200) == 0)
-        FIXME( "%p, %lu handles, timeout %lu (uwp=%d call %ld): semi-stub\n",
-               context, wait_count, timeout, uwp, n );
     {
         HANDLE asta = apartment_asta_event();
         if (asta && wait_count < ARRAY_SIZE(wait_buf))
@@ -126,14 +114,11 @@ DWORD WINAPI CoMsgWaitInProcessEvents( void *context, DWORD count, const HANDLE 
      * handles; the caller knows only its own and expects WAIT_OBJECT_0 + count. Passing the larger
      * index through handed CoreMessaging an index past its own array. */
     else if (res == WAIT_OBJECT_0 + wait_count) res = WAIT_OBJECT_0 + count;
-    /* The caller asked to wait for ever and we poll instead: report the poll as a wake of its own
-     * handle, so CoreMessaging looks at its queues and timers. It only does on a signalled handle,
-     * and a wake it missed (the shared proxy event is auto-reset and other UI threads take it)
-     * otherwise left a queued item, a dispatcher RunAsync or a due timer, pending for good. */
-    else if (capped && res == WAIT_TIMEOUT && count) res = WAIT_OBJECT_0;
     /* Handle-ready returns do not drain posted COM (DM_EXECUTERPC). Always peek. */
     dispatch_pending_messages();
-    if (uwp) EnumThreadWindows( GetCurrentThreadId(), post_wm_null, 0 );
+    /* This used to post WM_NULL to every window of the thread on every call, to keep the dispatcher turning while
+     * nothing woke it. win32u now wakes the message wait on a CoreMessaging completion, and a queue with a message
+     * posts one to that port: the broadcast became a busy loop. */
     return res;
 }
 

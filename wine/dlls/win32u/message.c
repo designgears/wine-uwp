@@ -3528,8 +3528,8 @@ static HANDLE normalize_std_handle( HANDLE handle )
 DWORD WINAPI NtUserMsgWaitForMultipleObjectsEx( DWORD count, const HANDLE *handles,
                                                 DWORD timeout, DWORD mask, DWORD flags )
 {
-    HANDLE wait_handles[MAXIMUM_WAIT_OBJECTS];
-    DWORD i;
+    HANDLE wait_handles[MAXIMUM_WAIT_OBJECTS], iocp;
+    DWORD i, n, ret;
 
     if (count > MAXIMUM_WAIT_OBJECTS-1)
     {
@@ -3539,10 +3539,30 @@ DWORD WINAPI NtUserMsgWaitForMultipleObjectsEx( DWORD count, const HANDLE *handl
 
     /* add the queue to the handle list */
     for (i = 0; i < count; i++) wait_handles[i] = normalize_std_handle( handles[i] );
-    wait_handles[count] = get_server_queue_handle();
+    n = count;
+    /* A thread with a CoreMessaging completion port is woken by a completion on it as by input, as win32k does
+     * for the port NtUserInitThreadCoreMessagingIocp ties to the queue. CoreMessaging passes only its events to
+     * this wait (through combase's CoMsgWaitInProcessEvents), so a timer or wait packet arriving on the port - a
+     * dispatcher RunAsync, XAML's frame timer - never woke the UI thread, and three CoreMessaging byte patches, a
+     * Windows.UI trampoline and a 16 ms poll stood in for it. The port goes just before the queue, which
+     * wait_message expects last, and a wake from it reports input available. */
+    if ((iocp = get_user_thread_info()->coremsg_iocp) && !(flags & MWMO_WAITALL) && count < MAXIMUM_WAIT_OBJECTS - 1)
+        wait_handles[n++] = iocp;
+    wait_handles[n] = get_server_queue_handle();
 
-    return wait_objects( count+1, wait_handles, timeout,
-                         (flags & MWMO_INPUTAVAILABLE) ? mask : 0, mask, flags );
+    ret = wait_objects( n + 1, wait_handles, timeout, (flags & MWMO_INPUTAVAILABLE) ? mask : 0, mask, flags );
+    if (n != count && ret == WAIT_OBJECT_0 + count)
+    {
+        /* a completion on the port: have CoreMessaging's adapter window run its work, which drains the port
+         * (NtUserDrainThreadCoreMessagingCompletions2) and runs the waits and timers that fired - what win32k does
+         * for the thread. Message 0x60, kind 1, is what CoreMessaging posts itself to schedule that
+         * (UserAdapter::AsyncPostMessage). The caller sees input available and pumps it. */
+        HWND hwnd = get_user_thread_info()->coremsg_hwnd;
+        if (hwnd) NtUserPostMessage( hwnd, 0x60, 1, 0 );
+        ret = WAIT_OBJECT_0 + count;
+    }
+    else if (n != count && ret == WAIT_OBJECT_0 + n) ret = WAIT_OBJECT_0 + count;
+    return ret;
 }
 
 /***********************************************************************
@@ -4993,6 +5013,18 @@ void * WINAPI NtUserInitThreadCoreMessagingIocp2( HWND hwnd, void *params )
         NtClose( iocp );
         return NULL;
     }
+    TRACE( "thread %04x: port %p\n", (int)GetCurrentThreadId(), iocp );
+    /* our own handle for the message wait, which CoreMessaging closing its copy cannot invalidate */
+    {
+        struct user_thread_info *info = get_user_thread_info();
+        HANDLE dup;
+        if (!NtDuplicateObject( GetCurrentProcess(), iocp, GetCurrentProcess(), &dup, 0, 0, DUPLICATE_SAME_ACCESS ))
+        {
+            if (info->coremsg_iocp) NtClose( info->coremsg_iocp );
+            info->coremsg_iocp = dup;
+            info->coremsg_hwnd = hwnd;
+        }
+    }
     return iocp;
 }
 
@@ -5004,18 +5036,61 @@ void * WINAPI NtUserInitThreadCoreMessagingIocp( HWND hwnd, void *params )
     return NtUserInitThreadCoreMessagingIocp2( hwnd, params );
 }
 
+/* Hand one completion from CoreMessaging's port to CoreMessaging, as win32k's drain does. CoreMessaging associates
+ * its wait packets with the port with KeyContext = the wait's record (a singly linked node: next at +0, the wait's
+ * handle-table id at +8) and ApcContext = its per-thread slot; the queue's own notification has ApcContext bit 31
+ * set. It then reads the records from the CoreMessaging entry it keeps at TEB+0x9e8 (the last Win32ClientInfo slot:
+ * the callback at [0], a list head per slot after it), reversing each list
+ * (UserAdapter::ProcessPendingWaitsCommon) - so records are pushed on the front. Without this no timer or wait
+ * ever completed in CoreMessaging, which three byte patches worked around. */
+static void deliver_coremsg_completion( const FILE_IO_COMPLETION_INFORMATION *entry )
+{
+    ULONG_PTR slot = (ULONG_PTR)entry->CompletionValue, **teb_entry, *record = (ULONG_PTR *)entry->CompletionKey;
+
+    if (slot & 0x80000000) return;   /* the queue's own notification */
+    teb_entry = (ULONG_PTR **)((char *)NtCurrentTeb() + 0x9e8);
+    TRACE( "key %p value %#lx (record next %p id %#lx), entry %p\n", record, (long)slot,
+           record ? (void *)record[0] : NULL, record ? (long)record[1] : 0, *teb_entry );
+    if (!*teb_entry || !record || slot >= 5) return;
+    record[0] = (*teb_entry)[1 + slot];
+    (*teb_entry)[1 + slot] = (ULONG_PTR)record;
+}
+
 /***********************************************************************
  *           NtUserDrainThreadCoreMessagingCompletions2   (win32u.@)
  */
 DWORD WINAPI NtUserDrainThreadCoreMessagingCompletions2( void *cookie )
 {
+    unsigned int status;
+
     TRACE( "%p\n", cookie );
+    /* Empty the port: CoreMessaging's user-integrated wait (Win32EventLoopBridge) never waits on it itself. A
+     * completion on it - a wait completion packet firing for one of its timers or waits - wakes the thread's
+     * message wait (NtUserMsgWaitForMultipleObjectsEx), after which CoreMessaging calls this and then checks its
+     * registered waits (UserAdapter::ProcessPendingWaitsCommon). Left on the port, the completion kept the wait
+     * signalled for ever. */
+    {
+        HANDLE iocp = get_user_thread_info()->coremsg_iocp;
+        FILE_IO_COMPLETION_INFORMATION entries[16];
+        LARGE_INTEGER zero = {{0}};
+        ULONG removed;
+        unsigned int rounds = 0;
+
+        while (iocp && rounds++ < 64 &&
+               !NtRemoveIoCompletionEx( iocp, entries, ARRAY_SIZE(entries), &removed, &zero, FALSE ) && removed)
+        {
+            ULONG i;
+            for (i = 0; i < removed; i++) deliver_coremsg_completion( &entries[i] );
+        }
+    }
     SERVER_START_REQ( drain_queue_completion )
     {
-        wine_server_call( req );
+        status = wine_server_call( req );
     }
     SERVER_END_REQ;
-    return 0;
+    /* nonzero on success: CoreMessaging's DrainSignaledIocpWaits fail-fasts on 0 (FailFast::ForWin32, E_FAIL with no
+     * last error), which a CoreMessaging byte patch used to jump over */
+    return !status;
 }
 
 /***********************************************************************

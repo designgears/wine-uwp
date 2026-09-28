@@ -939,17 +939,6 @@ BOOL WINAPI DECLSPEC_HOTPATCH SetWaitableTimerEx( HANDLE handle, const LARGE_INT
     }
     else
         ret = SetWaitableTimer( handle, when, period, callback, arg, FALSE );
-    /* Hosted UWP: pulse proxy wake so CoMsgWaitInProcessEvents returns and
-     * DrainCoreMessaging can run DrainSignaledWaits. */
-    if (ret && when && when->QuadPart <= 0)
-    {
-        HANDLE wake = OpenEventW( EVENT_MODIFY_STATE, FALSE, L"Local\\WineUwpCoreMsgWake" );
-        if (wake)
-        {
-            SetEvent( wake );
-            CloseHandle( wake );
-        }
-    }
     return ret;
 }
 

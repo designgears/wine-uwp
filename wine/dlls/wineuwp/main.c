@@ -1104,50 +1104,6 @@ static void arm_twinapi_breaks(void)
         ERR( "could not arm twinapi breakpoints, err %lu\n", GetLastError() );
 }
 
-/* The patched CoreMessaging.dll hands due-now message timers (XAML's tick timer) to the UI thread
- * through one static slot that every dispatcher's DrainSignaledWaits used to take: when the main
- * thread's dispatcher got there first, the timer's dispatch item was activated on the wrong
- * dispatcher and XAML's tick never ran (about one click in five). The dequeue now only runs on the
- * thread whose id wineuwp stores at CoreMessaging+0x10dee4, in HotPatchSpareGlobals, where the
- * patch also keeps a 16-entry ring of due-now timers; zero means "any thread", which covers startup
- * before the view thread exists. Both used to live at +0x10d000..+0x10d010, which is not free BSS:
- * it is wil's error counters and its cached s_pfnRtlDllShutdownInProgress. When CoreMessaging
- * cached that pointer after this wrote the thread id, no thread ever matched, no timer was ever
- * drained again, and XAML's window stayed blank - about one Solitaire run in ten. See
- * docs/Findings-M4.md, "the lost-tick race" and "the mailbox was wil's globals". */
-/* WINE_UWP_CM_STATS=1: log the patched CoreMessaging timer ring's counters every 2 s. */
-static DWORD WINAPI cm_stats_thread( void *arg )
-{
-    const BYTE *g = (const BYTE *)arg + 0x10dee0;
-    int i;
-
-    for (i = 0; i < 20; i++)
-    {
-        ERR( "cm ring: tid %lx head %lu tail %lu enq %lu deq %lu drop %lu\n", *(const DWORD *)(g + 4),
-             *(const DWORD *)(g + 8), *(const DWORD *)(g + 12), *(const DWORD *)(g + 16),
-             *(const DWORD *)(g + 20), *(const DWORD *)(g + 24) );
-        Sleep( 2000 );
-    }
-    return 0;
-}
-
-static void publish_ui_thread_to_coremessaging( void )
-{
-    HMODULE cm = GetModuleHandleW( L"coremessaging.dll" );
-    DWORD old;
-
-    if (!cm) return;
-    if (!VirtualProtect( (char *)cm + 0x10dee4, sizeof(DWORD), PAGE_READWRITE, &old )) return;
-    *(DWORD *)((char *)cm + 0x10dee4) = GetCurrentThreadId();
-    VirtualProtect( (char *)cm + 0x10dee4, sizeof(DWORD), old, &old );
-    TRACE( "CoreMessaging timer drain bound to thread %lx\n", GetCurrentThreadId() );
-    if (GetEnvironmentVariableW( L"WINE_UWP_CM_STATS", NULL, 0 ))
-    {
-        static LONG started;
-        if (!InterlockedExchange( &started, 1 )) CloseHandle( CreateThread( NULL, 0, cm_stats_thread, cm, 0, NULL ) );
-    }
-}
-
 /* The shell shows an activated app's CoreWindow on Windows: the app itself only calls
  * Window.Current.Activate(), which tells the window server the view is ready. Nothing plays that
  * role here, so show the view's window once activation has returned. */
@@ -4174,11 +4130,11 @@ static void broadcast_load_app_xaml( void )
     THREADENTRY32 te;
     HANDLE snap, thr;
 
-    /* This load is the other half of a byte patch in Windows.UI.Xaml.dll that makes DXamlCore::ShouldTryLoadAppXaml
-     * return false. With an unpatched XAML and WINE_UWP_NO_APP_XAML=1, XAML loads App.xaml itself, as on Windows, and
-     * everything renders - but about one start in five then stalls in OnLaunched (Calculator 17/20, against 20/20
-     * this way), most likely a CoreMessaging wake lost in the different timing. Keep this until that is fixed. */
-    if (GetEnvironmentVariableW( L"WINE_UWP_NO_APP_XAML", NULL, 0 )) return;
+    /* This load was the other half of a byte patch in Windows.UI.Xaml.dll that made DXamlCore::ShouldTryLoadAppXaml
+     * return false. The unmodified XAML loads App.xaml itself, as on Windows; it used to stall about one start in
+     * five doing so, which was the CoreMessaging wake win32u now delivers (Findings-M4, 2026-09-28). Only a patched
+     * XAML needs this: WINE_UWP_APP_XAML=1. */
+    if (!GetEnvironmentVariableW( L"WINE_UWP_APP_XAML", NULL, 0 )) return;
     if (SUCCEEDED( load_application_xaml() ) && app_xaml_loaded) return;
     if ((snap = CreateToolhelp32Snapshot( TH32CS_SNAPTHREAD, 0 )) == INVALID_HANDLE_VALUE) return;
     te.dwSize = sizeof(te);
@@ -4457,7 +4413,6 @@ static HRESULT WINAPI wf_CreateCoreWindow( struct window_factory *wf, HSTRING ti
         HWND core_window = NULL;
         EnumWindows( show_core_window, (LPARAM)&core_window );
         connect_dcomp_target( core_window );
-        publish_ui_thread_to_coremessaging();
     }
     if (FAILED( hr = attach_navigation_client( *window ) ))
     {

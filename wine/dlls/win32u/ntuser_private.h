@@ -135,6 +135,8 @@ struct user_thread_info
     struct mouse_tracking_info   *mouse_tracking_info;    /* NtUserTrackMouseEvent handling */
     struct opengl_thread_data    *opengl_data;            /* OpenGL private thread data */
     struct list                   known_pointers;         /* list of known pointers */
+    HANDLE                        coremsg_iocp;           /* our duplicate of CoreMessaging's completion port */
+    HWND                          coremsg_hwnd;           /* CoreMessaging's adapter window, which runs its work on 0x60 */
 };
 
 extern struct user_thread_info *get_user_thread_info(void);

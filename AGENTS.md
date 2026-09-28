@@ -110,22 +110,29 @@ that were ours; the Calculator tree is no longer involved.
   variant written only to the prefix was silently replaced; `WINE_UWP_BP`'s `BP armed ... (byte xx)` line shows which
   bytes were really loaded.
 - **Which patches are still load-bearing is measured, not remembered.** Findings-M4 2026-09-28 bisected all three
-  patched DLLs, one region reverted at a time. Live today, each the pristine file plus only these (the fuller versions
-  are kept as `.bak-full` / `.bak-18regions`): **Windows.UI.Xaml** only `ShouldTryLoadAppXaml` (the other half of `wineuwp` loading App.xaml
-  itself; the pristine DLL renders but stalls ~1 start in 5 until the CoreMessaging wake below is fixed - its other
-  twelve patches were dead weight or Wine bugs now fixed); **CoreMessaging** `DrainSignaledWaits`,
-  `DrainSignaledIocpWaits` and the `SetRelative` timer cave (timers and waits not reaching the UI thread);
-  **Windows.UI** the `ProcessMessage` -> `DrainCoreMessaging` trampoline and the `CKeyEventArgs` `Handled` byte (Enter,
-  Backspace, Escape). Every one of these stands for a Wine-side bug; fixing that is what retires the patch, as
-  `IDCompositionDeviceDebug` in dcomp retired XAML's `UpdateDebugSettings` patch. **The four-app suite cannot judge a
-  keyboard patch** - run `./regress.sh kb` too - **nor a start-up race**: a 1-in-5 stall passed two suites; count 20
-  Calculator starts before adopting a change to start-up.
+  patched DLLs one region at a time, and then retired them in Wine. Live today:
+  - **CoreMessaging.dll and Windows.UI.Xaml.dll are the pristine 26100.8972 files.**
+  - **Windows.UI.dll** carries one byte, the `CKeyEventArgs::Initialize` `Handled` default (Enter, Backspace,
+    Escape), because under Wine the keyboard input site at `WindowServer+0x168` is NULL; see Findings-M4.
+
+  The earlier variants are kept as `.bak-minimal`, `.bak-1patch`, `.bak-full` and `.bak-18regions`. The CoreMessaging
+  patches, the Windows.UI `ProcessMessage` trampoline, XAML's `ShouldTryLoadAppXaml` and combase's 16 ms poll were all
+  one missing wake: the thread's CoreMessaging completion port waking its message wait (win32u, "CoreMessaging and
+  Windows.UI.Xaml run unmodified"). Every patch stands for a Wine-side bug, and fixing that bug is what retires the
+  patch.
+
+  **The four-app suite cannot judge a keyboard patch** - run `./regress.sh kb` too. **Nor can it judge a start-up
+  race**: a 1-in-5 stall passed two suites. Count 20 Calculator starts before adopting a change to start-up.
+- **Rebuilding `wineuwp` (or anything install-overrides stamps) copies the `win11` DLLs back over the prefix.** A test
+  with a variant only in the prefix silently reverts the moment you rebuild. On 09-28 that turned a passing run into
+  blank Calculator, Feedback Hub and Media Player: the patched XAML came back, and `wineuwp` no longer loads App.xaml
+  for it. Adopt a variant into `win11` before rebuilding, or re-copy it after, and `cmp` the prefix copy after the run.
 - **A byte patch's "free BSS" may not be free.** The CoreMessaging timer patch kept its mailbox
   and a thread id at `+0x10d000..+0x10d010`, which are wil's error counters and a cached function
   pointer, so the two overwrote each other. Look an address up in the PDB `.syms` before claiming it.
   `HotPatchSpareGlobals` is the space Microsoft reserves for exactly this.
-- **Never patch the last pristine copy of a Windows DLL.** Three DLLs are patched today
-  (`CoreMessaging.dll` 3, `Windows.UI.dll` 2, `Windows.UI.Xaml.dll` 1 patch, all 26100.8972); their originals are
+- **Never patch the last pristine copy of a Windows DLL.** One DLL is patched today (`Windows.UI.dll`, 1 byte,
+  26100.8972). CoreMessaging and Windows.UI.Xaml were patched until 09-28, and all three originals are
   kept as `<name>.pristine-26100.8972` and **cannot be re-obtained** - the tree is a mix of builds,
   and the machine they were copied from has serviced past them. `./pecheck.py` tells a pristine
   Microsoft PE from a patched one with no reference copy. Check before patching, and never delete a
@@ -354,8 +361,8 @@ For interfaces that are in no `.winmd` and unnamed in `HKCR\Interface`:
 ## Mistakes already made - do not repeat them
 
 **Byte-patching a Windows DLL is fine; patching our own code is not.** We have no source for
-those binaries, so a byte patch is the only tool there is - `CoreMessaging.dll` and
-`Windows.UI.dll` carry load-bearing ones today and that is a legitimate, permanent state. Our own
+those binaries, so a byte patch is the only tool there is - `Windows.UI.dll` carries a load-bearing
+one today and that is a legitimate state. Our own
 Wine source is the opposite case: it is vendored in full under `wine/` and there is never a reason
 to represent it as a diff.
 
@@ -363,8 +370,8 @@ What *is* true of a DLL patch is that it **cannot be shipped or re-applied as a 
 the exact base binary, and Microsoft serves only current revisions. So the thing that matters is
 keeping the pristine original (see the byte-patch ground rule) and recording what each patch does
 in Findings, not converting it into something else. Re-home one into Wine when the Wine-side fix is
-worth having on its own merits - most of the CoreMessaging patches are IOCP/message-pump behaviour
-that Wine arguably should get right anyway - but that is an improvement, not a debt. See
+worth having on its own merits, as the CoreMessaging patches were on 09-28 (IOCP/message-pump
+behaviour Wine should get right anyway) - but that is an improvement, not a debt. See
 Findings-M4.
 
 **There is no "other session", and this file said there was for months.** Every one of the 116
@@ -447,12 +454,18 @@ vtables and GUIDs, not frames.
 added to a wait "just to see" made 12/12 runs pass and looked exactly like a fix. Restoring the
 `INFINITE` wait and keeping only the logging reproduced the bug in 3 runs.
 
-**Our `CoMsgWaitInProcessEvents` turns an INFINITE wait into a 16 ms poll, so its return values
-must still mean what the caller expects.** CoreMessaging looks at its queues only when its own wake
-handle is reported signalled. A `WAIT_TIMEOUT` from the poll therefore left any item whose wake had
-been missed pending for good: a blank Solitaire, a Shapr3D import that never navigated back, a
-half-loaded panel. And the index for "messages available" has to be translated back past the
-handles we append. A poll that reports nothing is not a wait.
+**A poll that reports nothing is not a wait, and a poll is not a wake.** Our `CoMsgWaitInProcessEvents`
+turned INFINITE into a 16 ms poll for months, and it hid the real bug as latency. CoreMessaging looks at its queues
+only when its own wake handle is reported signalled. So a `WAIT_TIMEOUT` from the poll left any item whose wake had
+been missed pending for good: a blank Solitaire, a Shapr3D import that never navigated back, a half-loaded panel. The
+real fix was win32u waking the message wait on the thread's CoreMessaging completion port, and the poll is gone. The
+index for "messages available" still has to be translated back past any handles we append.
+
+**A private export's contract is in its caller's fallback.** CoreMessaging checks `ApiSetQueryApiSetPresence` and,
+without `ScheduleCoreMessagingDispatch`, does the job itself with `SendMessageCallbackW`/`PostMessageW`/`SetTimer`. That
+code is the specification, down to a return value read as a tri-state. Our export posted `WM_NULL` for months, and
+then got the priorities wrong twice (a fail-fast, then a 35,000/s ping-pong). Disassemble the fallback before
+implementing the export.
 
 **Wine block-buffers its debug output inside its own process**, so a log line can appear seconds
 after the process that wrote it has exited - `stdbuf` on `run.sh` does not help. A poller that must
@@ -1113,17 +1126,17 @@ the fully-qualified name. `--grep` first, always.
 - The unhandled-error text an app reports is often a *consequence*. `Delegate to an instance method
   cannot have null 'this'` was the second exception; the first, further up, was the real one.
 
-## Current state (2026-09-25)
+## Current state (2026-09-28)
 
 | App | State |
 | --- | --- |
-| Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0), and the keyboard baseline (`regress.sh kb`). **Depends on patched `CoreMessaging.dll`, `Windows.UI.dll` and `Windows.UI.Xaml.dll`**, now 3+2+1 patches - see the byte-patch rules above |
+| Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0), and the keyboard baseline (`regress.sh kb`). Runs on the pristine CoreMessaging.dll and Windows.UI.Xaml.dll. **Windows.UI.dll keeps one byte** (key `Handled`), see the byte-patch rules above |
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |
 | Media Player | **Plays audio from its own UI** - Open file(s) -> pick -> Play decodes WAV and MP3 through MF to `waveOut`. Needs `WINE_UWP_DRIVE_VIEW=run WINE_UWP_DRIVE_FIRST_VIEW=1 WINE_UWP_MANUAL_CONFIGURE=1`. Starts clean 15/15. Regression capture: 2250 or 2242 colours, both a pass - 2242 is XAML not showing the keyboard focus rectangle on Open file(s), usual since painting left the UI thread |
 | Camera | Renders, but paints its own crash page: a `NotImplementedException` in a static constructor. Next target is `ITitleBarClientAdapter` `{ba5e7927-...}`, which our `wineuwp` navigation client refuses and `CoreApplicationViewTitleBar::_TryGetTitleBarClientAdapter` wants |
 | Solitaire | **Playable on the unpatched `Solitaire.exe`** (`docs/screenshots/solitaire-unpatched-menu-game.png`): main menu -> Klondike -> game, and clicks move cards. No exe byte patch is needed any more: `wineuwp` delivers `CoreWindow.VisibilityChanged`. The Sign In Error popup shows on top of the menu; Cancel is at about (813,549). The blank-window start-up flake (about 1 in 6 through 09-24) is gone again, 0/20, after two fixes to combase's `CoMsgWaitInProcessEvents` (Findings-M4, 2026-09-24). Shapr3D's rarer UI stall is fixed too (Findings-M4: a dcomp object written into ntdll's futex bucket, and unserialised painting) |
 | Windows Security | Blank; needs the Defender SecurityHealth service |
-| Shapr3D | **Models, syncs and exports** (`docs/screenshots/shapr3d-extruded-body.png`): sketch -> extrude -> Visualization, toolbar and menus, cloud upload of revisions and thumbnails, **File > Export to > STL** and **Drawings -> Create Drawing -> Export drawing (PDF)** both write correct files (`docs/screenshots/shapr3d-drawing-pdf.png`). The file pickers show Wine's common Open/Save/folder dialogs (starting in Documents). For scripted runs, `WINE_UWP_PICKER_FILE` / `WINE_UWP_PICKER_SAVE_FILE` still bypass them, and `WINE_UWP_PICKER_NODIALOG=1` makes an unstaged pick report a cancel. On `:98` the dialog is its own top-level window ("Open" / "Save As"), captured with `xwd -id`. Type into it with plain `xdotool type` after a click, not `--window`. The colon needs `xdotool key colon`, and Ctrl+A does not select the combo box text. Signs in once (Log In -> `./browser-callback.sh shapr3d`, a human solves the reCAPTCHA, run with `WINE_UWP_LAUNCHER=log`) and stays signed in. Project thumbnails and material swatches show (`docs/screenshots/shapr3d-project-thumbnails.png`, `shapr3d-used-material-swatches.png`). The save dialog offers the app's `FileTypeChoices` (Screenshot -> Capture: JPEG, PNG; `docs/screenshots/shapr3d-capture-output.png`). **The prefix's `Documents`, `Desktop` and `Pictures` are symlinks to the user's real home folders**, which is where the dialogs start - save test output to `C:\users\Public\` instead. Share -> copy link puts the project URL on the clipboard (`docs/screenshots/shapr3d-share-copy-link.png`); the share-sheet button does nothing (there is no share host). Typed dimensions work while sketching (`docs/screenshots/shapr3d-dimension-entry.png`); drive them with `xdotool type --delay 250`, because at the default 12 ms the key after the one that opens the field is lost. Start -> Visualization -> import Drone passes **30/30** (`docs/screenshots/shapr3d-import-soak-30of30.png`); it was about 3 in 4 before 09-24. Leaving the editor no longer kills it: 30 leaves in 10 runs, against 6 deaths in 10 runs before (`docs/screenshots/shapr3d-home-after-leaving.png`). Extrude/offset drags on the drone at the user's 3440x1366 no longer starve the UI thread (it used 1.95 s of CPU in a 2 s drag, now ~0.3 s; the result lands ~0.3-0.8 s after release instead of 1-2 s); with continuous input the drone's preview refreshes every ~78 ms, bound by Parasolid (Wine ~11% of it), see Findings-M4 2026-09-25. Menus open with Windows' own animation now (key frames run live, with their easing, and the reveal clip slides with them): the first frame ~45 ms after the press, mostly out by ~60-90 ms, settled ~300 ms (`docs/screenshots/shapr3d-file-menu-reveal.png`). History chevrons turn > to v and back (`docs/screenshots/shapr3d-chevron-turn.png`). Wheel over a panel no longer reaches the viewport (it did ~1 in 15 at 175 Hz before 09-25's hit-test fix; 0 in 600 since). History moving after Edit... -> Cancel is the app re-creating its uncached page and scrolling the selected row into view (Findings-M4, 2026-09-26). The view cube popup lays its page out below its tabs from the first frame (`docs/screenshots/shapr3d-viewcube-open.png`). The viewport keeps moving while the editor is built after a project opens (worst gap ~60 ms, was 250-350) and runs at 166-176 frames a second on the user's own 175 Hz display, measured there (`docs/screenshots/viewport-after-open-round2.png`; the X server keeps up, `trace+x11perf`). Cloud sync no longer kills it: `CoWaitForMultipleObjects`, called by Windows.Web.Http, is implemented. Materials drag and drop onto the model with the dragged row following the pointer (`docs/screenshots/shapr3d-drag-visual.png`; `dlls/dataexchange/dragoperation.c`, an in-process drag loop), XAML keeps repainting afterwards, and the swatches no longer flicker grey. Flyouts, menus and dropdowns can be windows of their own (`WINE_UWP_WINDOWED_POPUPS=1`, painted by dcomp's `hwnd_target`s), opt-in because they raised blank start-ups to about 1 in 8. Selecting a folder no longer draws the rebuilt toolbar at the window origin, and Settings sections cross-fade instead of overlapping (`docs/screenshots/shapr3d-settings-crossfade.png`). |
+| Shapr3D | **Models, syncs and exports** (`docs/screenshots/shapr3d-extruded-body.png`): sketch -> extrude -> Visualization, toolbar and menus, cloud upload of revisions and thumbnails, **File > Export to > STL** and **Drawings -> Create Drawing -> Export drawing (PDF)** both write correct files (`docs/screenshots/shapr3d-drawing-pdf.png`). The file pickers show Wine's common Open/Save/folder dialogs (starting in Documents). For scripted runs, `WINE_UWP_PICKER_FILE` / `WINE_UWP_PICKER_SAVE_FILE` still bypass them, and `WINE_UWP_PICKER_NODIALOG=1` makes an unstaged pick report a cancel. On `:98` the dialog is its own top-level window ("Open" / "Save As"), captured with `xwd -id`. Type into it with plain `xdotool type` after a click, not `--window`. The colon needs `xdotool key colon`, and Ctrl+A does not select the combo box text. Signs in once (Log In -> `./browser-callback.sh shapr3d`, a human solves the reCAPTCHA, run with `WINE_UWP_LAUNCHER=log`) and stays signed in. Project thumbnails and material swatches show (`docs/screenshots/shapr3d-project-thumbnails.png`, `shapr3d-used-material-swatches.png`). The save dialog offers the app's `FileTypeChoices` (Screenshot -> Capture: JPEG, PNG; `docs/screenshots/shapr3d-capture-output.png`). **The prefix's `Documents`, `Desktop` and `Pictures` are symlinks to the user's real home folders**, which is where the dialogs start - save test output to `C:\users\Public\` instead. Share -> copy link puts the project URL on the clipboard (`docs/screenshots/shapr3d-share-copy-link.png`); the share-sheet button does nothing (there is no share host). Typed dimensions work while sketching (`docs/screenshots/shapr3d-dimension-entry.png`); drive them with `xdotool type --delay 250`, because at the default 12 ms the key after the one that opens the field is lost. Start -> Visualization -> import Drone passes **30/30** (`docs/screenshots/shapr3d-import-soak-30of30.png`); it was about 3 in 4 before 09-24. Leaving the editor no longer kills it: 30 leaves in 10 runs, against 6 deaths in 10 runs before (`docs/screenshots/shapr3d-home-after-leaving.png`). Extrude/offset drags on the drone at the user's 3440x1366 no longer starve the UI thread (it used 1.95 s of CPU in a 2 s drag, now ~0.3 s; the result lands ~0.3-0.8 s after release instead of 1-2 s); with continuous input the drone's preview refreshes every ~78 ms, bound by Parasolid (Wine ~11% of it), see Findings-M4 2026-09-25. Menus open with Windows' own animation now (key frames run live, with their easing, and the reveal clip slides with them): the first frame ~45 ms after the press, mostly out by ~60-90 ms, settled ~300 ms (`docs/screenshots/shapr3d-file-menu-reveal.png`). History chevrons turn > to v and back (`docs/screenshots/shapr3d-chevron-turn.png`). Wheel over a panel no longer reaches the viewport (it did ~1 in 15 at 175 Hz before 09-25's hit-test fix; 0 in 600 since). History moving after Edit... -> Cancel is the app re-creating its uncached page and scrolling the selected row into view (Findings-M4, 2026-09-26). The view cube popup lays its page out below its tabs from the first frame (`docs/screenshots/shapr3d-viewcube-open.png`). The viewport keeps moving while the editor is built after a project opens (worst gap ~60 ms, was 250-350) and runs at 166-176 frames a second on the user's own 175 Hz display, measured there (`docs/screenshots/viewport-after-open-round2.png`; the X server keeps up, `trace+x11perf`). Cloud sync no longer kills it: `CoWaitForMultipleObjects`, called by Windows.Web.Http, is implemented. Materials drag and drop onto the model with the dragged row following the pointer (`docs/screenshots/shapr3d-drag-visual.png`; `dlls/dataexchange/dragoperation.c`, an in-process drag loop), XAML keeps repainting afterwards, and the swatches no longer flicker grey. Flyouts, menus and dropdowns can be windows of their own (`WINE_UWP_WINDOWED_POPUPS=1`, painted by dcomp's `hwnd_target`s), still opt-in. They used to cause a blank start-up about 1 time in 8; that has not recurred in 13 starts since the CoreMessaging wake fix (09-28), so making them the default is next. Selecting a folder no longer draws the rebuilt toolbar at the window origin, and Settings sections cross-fade instead of overlapping (`docs/screenshots/shapr3d-settings-crossfade.png`). |
 
 The three Media Player switches are opt-in only because the other apps have not been tested against
 them. **Testing that, and making them the default if it holds, is a standing job** - they change the

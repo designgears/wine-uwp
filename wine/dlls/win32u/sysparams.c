@@ -7589,6 +7589,7 @@ static void thread_detach(void)
     cleanup_opengl_thread();
     NtClose( thread_info->server_queue );
     if (thread_info->idle_event) NtClose( thread_info->idle_event );
+    if (thread_info->coremsg_iocp) NtClose( thread_info->coremsg_iocp );
     free( thread_info->session_data );
     free( thread_info->mouse_tracking_info );
     free( thread_info );

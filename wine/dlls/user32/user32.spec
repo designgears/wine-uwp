@@ -1233,7 +1233,7 @@
 @ stdcall wvsprintfW(ptr wstr ptr)
 # Private, reached through ext-ms-win-rtcore-minuser-private-ext (CoreMessaging)
 @ stdcall GetQueueStatusForCoreMessaging(long)
-@ stdcall ScheduleCoreMessagingDispatch(ptr long long ptr ptr)
+@ stdcall ScheduleCoreMessagingDispatch(ptr long long long ptr)
 @ stdcall SetClassScope(long long)
 @ stdcall CallModalExperience(long ptr)
 @ stdcall IsEnhancedWindowingEnabled()

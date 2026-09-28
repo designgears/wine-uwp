@@ -1306,20 +1306,31 @@ static void arm_uwp_watchpoint(void)
     if (!SetThreadContext( GetCurrentThread(), &ctx )) ERR( "could not arm breakpoints\n" );
 }
 
-BOOL WINAPI ScheduleCoreMessagingDispatch( void *adapter, DWORD kind, DWORD flags, void *arg, DWORD *result )
+UINT WINAPI ScheduleCoreMessagingDispatch( HWND hwnd, DWORD priority, WPARAM wparam, LPARAM lparam, UINT *error )
 {
-    HWND hwnd = (HWND)adapter;
-    static int once;
+    UINT ret;
 
-    if (!once++) FIXME( "%p %lu %#lx %p %p: semi-stub\n", adapter, kind, flags, arg, result );
+    TRACE( "%p %lu %#Ix %#Ix %p\n", hwnd, priority, wparam, lparam, error );
     arm_uwp_watchpoint();
-    if (result) *result = 0;
-    /* Wake the dispatcher window's queue (not necessarily this thread). */
-    if (hwnd && IsWindow( hwnd ))
-        PostMessageW( hwnd, WM_NULL, 0, 0 );
-    else
-        NtUserPostThreadMessage( GetCurrentThreadId(), WM_NULL, 0, 0 );
-    return TRUE;
+    /* CoreMessaging's UserAdapter falls back to exactly these when the export is missing:
+     * 0  AsyncSendMessage, SendMessageCallbackW( hwnd, 0x60, wparam, lparam );
+     * 1  AsyncPostMessage, PostMessageW( hwnd, 0x60, wparam, lparam );
+     * 2  ScheduleInputPriorityUserDispatch, which reads the result as ScheduleDispatchNotification's:
+     *    1 makes it send itself 0x60/7 and ask again, 2 makes it arm its dispatch timer. Answering 1
+     *    (a plain TRUE) therefore spun 0x60/7 and 0x60/0 at tens of thousands a second; like
+     *    NtUserScheduleDispatchNotification, answer 2;
+     * 3  its backup timer, SetTimer( hwnd, wparam, lparam ).
+     * The window procedure runs UserAdapter::DoWork for each. ERROR_INVALID_WINDOW_HANDLE is the one
+     * failure the caller tolerates (the adapter is going away). */
+    switch (priority)
+    {
+    case 0: ret = SendMessageCallbackW( hwnd, 0x60, wparam, lparam, NULL, 1 ); break;
+    case 2: ret = IsWindow( hwnd ) ? 2 : 0; if (!ret) SetLastError( ERROR_INVALID_WINDOW_HANDLE ); break;
+    case 3: ret = SetTimer( hwnd, wparam, lparam, NULL ) != 0; break;
+    default: ret = PostMessageW( hwnd, 0x60, wparam, lparam ); break;
+    }
+    if (error) *error = ret ? 0 : GetLastError();
+    return ret;
 }
 
 /***********************************************************************

@@ -10251,3 +10251,87 @@ WinUI used the missing map. Reproduced: opening and closing Settings crashed the
 earlier ones and start-up had used up the rest), at the same address. The map is now a real tear-off: its references
 are its owner's, it is freed with the owner (`comp_map_owner_gone`, from `comp_object_Release`, and when a new object
 reuses the address), and the table grows. 80 Settings open/close cycles later the app is fine; suite unchanged.
+
+### CoreMessaging and Windows.UI.Xaml run unmodified: the thread's completion port wakes its message wait (2026-09-28)
+
+The three CoreMessaging patches (`DrainSignaledWaits` hook, `DrainSignaledIocpWaits` byte, `SetRelative` timer cave),
+Windows.UI's `ProcessMessage` -> `DrainCoreMessaging` trampoline, XAML's `ShouldTryLoadAppXaml`, combase's 16 ms poll in
+`CoMsgWaitInProcessEvents` and kernelbase's proxy wake event all stood in for one missing piece of win32k: **a
+completion on the thread's CoreMessaging port wakes the thread's message wait.** CoreMessaging in user-integrated mode
+never waits on its port itself. It associates its timers' and waits' completion packets with the port that
+`NtUserInitThreadCoreMessagingIocp2` returned, and waits (through Windows.UI's dispatcher and
+`CoMsgWaitInProcessEvents`) only on Windows.UI's two events plus the queue. On Windows the kernel ties the port to that
+wait. In Wine nothing did, so a timer firing (XAML's frame tick) or a `RunAsync` never reached the UI thread.
+
+What win32u does now:
+
+- **`NtUserInitThreadCoreMessagingIocp2`** keeps its own duplicate of the port and the adapter window
+  (`user_thread_info`, closed at thread exit).
+- **`NtUserMsgWaitForMultipleObjectsEx`** adds the port just before the queue handle. A wake from it posts `0x60`,
+  wParam 1, to the adapter window, which is what `UserAdapter::AsyncPostMessage` posts to run `UserAdapter::DoWork`,
+  and reports input available.
+- **`NtUserDrainThreadCoreMessagingCompletions2`** empties the port. For each wait packet it pushes the record
+  (KeyContext: next at +0, the wait's id at +8) onto the list CoreMessaging keeps in the last Win32ClientInfo slot,
+  TEB+0x9e8, per slot (ApcContext). The queue's own notification (ApcContext bit 31) is skipped. It returns nonzero:
+  a 0 was the E_FAIL fail-fast that the `DrainSignaledIocpWaits` byte patch jumped over.
+
+**`ScheduleCoreMessagingDispatch` is a priority switch, not a wake.** It has to be read from CoreMessaging's own
+fallbacks (`UserAdapter::AsyncSendMessage` / `AsyncPostMessage` / `ScheduleInputPriorityUserDispatch` /
+`SetBackupTimer`). Those run when `ext-ms-win-rtcore-minuser-private-ext-l1-1-1` is absent (`ApiSetQueryApiSetPresence`):
+
+| priority | fallback |
+| --- | --- |
+| 0 | `SendMessageCallbackW(hwnd, 0x60, wp, lp)` |
+| 1 | `PostMessageW(hwnd, 0x60, wp, lp)` |
+| 2 | `ScheduleDispatchNotification`, result read as a tri-state: 1 = send yourself `0x60`/7 and ask again, 2 = arm the dispatch timer |
+| 3 | `SetTimer(hwnd, wp, lp)` |
+
+Our old export posted `WM_NULL` and did nothing. A first version posted `0x60` with wParam = priority, and priority 3
+landed on WindowProc's `UseOfInvalidatedExportAdapter` fail-fast (jump table entries 3, 4 and 8). Returning TRUE for
+priority 2 made it spin `0x60`/7 and `0x60`/0 at ~35,000 a second, with Calculator's keypad frozen mid-animation (AE 778).
+It now does exactly what each fallback does, and answers 2 for priority 2 like `NtUserScheduleDispatchNotification`.
+`WINE_UWP_BP` on `coremessaging.dll+2e490` (`UserAdapter::WindowProc`, rdx = message, r8 = wParam) is how the loop
+showed itself.
+
+**Result, in `prefix-test`, with pristine CoreMessaging.dll and Windows.UI.Xaml.dll and Windows.UI.dll carrying only
+the `Handled` byte:**
+
+- the suite passes: Calculator AE 0, Feedback Hub 899 / 0, Media Player 2242, Solitaire 3/3, `kb` identical;
+- 20/20 Calculator starts, three times: after the port wake, after pristine XAML with XAML loading App.xaml itself,
+  and after removing the poll;
+- Shapr3D 16/16 and then 10/10 starts paint, half of them with `WINE_UWP_WINDOWED_POPUPS=1`, which was about 1 blank
+  start in 8;
+- Shapr3D's editor, File menu and Visualization tab all work. The File menu's first frame comes 34 ms after the press.
+
+Removed with it:
+
+- combase's 16 ms cap, its `WAIT_TIMEOUT` -> wake rewrite and its proxy event;
+- kernelbase's `SetEvent` on that event;
+- `wineuwp`'s thread-id write into the patched CoreMessaging's mailbox.
+
+`wineuwp`'s own App.xaml load is now opt-in (`WINE_UWP_APP_XAML=1`, for a patched XAML only); `WINE_UWP_NO_APP_XAML`
+is gone.
+
+**Pre-existing, not changed:** the idle adapter window gets ~99 WM_TIMERs a second. `DeferredScheduleDispatchCallback`
+re-arms a 0 ms timer-priority dispatch each time. The fully patched build does the same.
+
+**Still patched: Windows.UI's `CKeyEventArgs::Initialize` `Handled` byte.** `WindowServer::OnKeyDownEvent` forwards to
+the object at `WindowServer+0x168` when there is one, which is what happens on Windows. Only without it does it build
+`CKeyEventArgs` itself, and `Initialize` leaves `Handled` = 1. Under Wine that object is NULL, so the app's handlers
+see every key already handled. Retiring the byte means supplying that site.
+
+**Adopted in `win11` (2026-09-28).** CoreMessaging.dll and Windows.UI.Xaml.dll are the `.pristine-26100.8972` files
+again. Windows.UI.dll is pristine plus the `Handled` byte (`.bak-kbonly`); the previous minimal variants are
+`.bak-minimal`, and XAML's is `.bak-1patch`.
+
+Once install-overrides had carried them into the test prefix, a start count gave:
+
+- the suite passed; Calculator AE 0, `kb` identical;
+- Solitaire 21 of 21 and then 9 of 9 reached the front end;
+- Calculator 20 of 20.
+
+One Solitaire start was blank. It was the second start after the prefix update, and it did not recur.
+
+On the way there, rebuilding `wineuwp` restamped install-overrides, which copied the old patched DLLs back over the
+test prefix. The patched XAML, with nobody loading App.xaml for it any more, left Calculator, Feedback Hub and Media
+Player blank. That run means nothing about the change.
