@@ -10036,3 +10036,23 @@ from `+timestamp,trace+dcompgate`; the new `frame done` line gives each frame's 
   reached its baseline in 18/20 starts with it against 20/20 without; two Shapr3D starts in a row came up blank with it.
 - Still there: a 15-20 ms batch-gate stall where XAML takes the finished transition down (motion is under a pixel by then),
   and the painter keeps walking the tree with nothing damaged every ~5 ms for a while after an animation.
+
+### Correction: the 0x200BD quirk froze XAML after every drag (2026-09-28)
+
+The user dragged a material onto the model and XAML stopped repainting: the viewport (the app's own swap chain) kept
+moving and clicks still acted, but menus, tabs and highlights stayed as they were. Reproduced on `:96`: XAML's last
+`commit` came just before the drag started and there were none after it. The drag entry above only checked the model,
+which is drawn by the swap chain, so it missed this.
+
+Cause: with quirk 0x200BD on, XAML's RenderTargetBitmap for the drag visual took `RenderTargetBitmapImplUsingPrimitives`,
+which calls `DCompTreeHost::CreatePrimitiveGroup`. dcomp answers that with `E_NOTIMPL` (a stowed exception from
+`HWWalk::RenderForRenderTargetElement` inside `CXcpBrowserHost::OnTick`), the tick fails, and XAML's frame loop never
+runs again. **The quirk is gone.** On the sprite-visual path, interop visuals now answer `IVisualInternal` {92179cc0}
+with a real view (6/7 `RasterizationScaleOverride`, 8 `CaptureAsync`, 9-11 input sink and transform reference; the
+catch-all used to hand out the IDCompositionVisual vtable, and Calculator queries it too). `CaptureAsync` returns an
+operation that is already complete, with a surface whose `ICompositionDrawingSurfaceInteropPrivate::HasValidPixels`
+(slot 12, from dcomp.pdb's `CompositionDrawingSurface::Interop` vtable) says no. XAML's
+`ProcessCaptureThreaded` then returns `E_PENDING` for that one bitmap, the only exit on that path that is not a
+fail-fast followed by a NULL dereference. XAML now commits during and after a drag; two drops (ABS, Clear Glass) each
+followed by Environment, Camera and the File menu all repaint (`docs/screenshots/shapr3d-after-drop-environment.png`).
+Suite, `kb` pass. A real capture would give the drag a ghost image; it is not done.

@@ -470,12 +470,6 @@ BOOL WINAPI QuirkIsEnabled(void *arg)
     /* 0x20046: Windows.UI.Xaml subclasses the CoreWindow and reads WM_POINTER* itself instead of
      * relying on the OneCore input pipeline (CJupiterWindow::UseCoreWindowSubclassedEvents). */
     if ((ULONG_PTR)arg == 0x20046) return TRUE;
-    /* 0x200BD: CRenderTargetBitmap::RequestRender renders with XAML's own primitives instead of
-     * RenderTargetBitmapImplUsingSpriteVisuals, which captures through Windows.UI.Composition's
-     * IVisualInternal::CaptureAsync and reads the result back through private surface interfaces
-     * that dcomp does not have. XAML asks for it nowhere else. Drag and drop renders its drag visual
-     * this way, and crashed without it. */
-    if ((ULONG_PTR)arg == 0x200bd) return TRUE;
     {   /* XAML asks for a few ids tens of thousands of times */
         static void *seen[128];
         static unsigned int seen_count;

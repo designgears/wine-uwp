@@ -5663,6 +5663,8 @@ struct dcomp_visual
     const void **object2_vtbl;   /* ICompositionObject2 view, see dcv_object2_vtbl */
     const void **closable_vtbl;  /* Windows.Foundation.IClosable view, see dcv_closable_vtbl */
     const void **partner_vtbl;   /* IVisualPartner view, see dcv_partner_vtbl */
+    const void **internal_vtbl;  /* IVisualInternal view, see dcv_internal_vtbl */
+    float rasterization_scale;   /* IVisualInternal::put_RasterizationScaleOverride, kept for the getter */
     HSTRING comment;
     BOOL hidden;                 /* IVisual::put_IsVisible(FALSE) */
     IUnknown *clip_object;       /* IVisual::put_Clip, kept for get_Clip, not applied */
@@ -5730,6 +5732,9 @@ static const GUID IID_ILayerVisual_local =
 static const GUID IID_ICompositionObject2_local =
     { 0xef874ea1, 0x5cff, 0x4b68, { 0x9e, 0x30, 0xa1, 0x51, 0x9d, 0x08, 0xba, 0x03 } };
 
+/* IVisualInternal, see dcv_internal_vtbl */
+static const GUID IID_IVisualInternal_local =
+    { 0x92179cc0, 0xae1f, 0x48bc, { 0xa3, 0x54, 0x8f, 0x7a, 0x88, 0x00, 0xf2, 0xfb } };
 /* IVisualPartner, see dcv_partner_vtbl */
 static const GUID IID_IVisualPartner_local =
     { 0x01dc794b, 0x4ff5, 0x4491, { 0x99, 0x42, 0xb9, 0xe7, 0xb8, 0x89, 0x3b, 0xe4 } };
@@ -5808,6 +5813,14 @@ static HRESULT WINAPI dcv_QueryInterface( void *iface, REFIID iid, void **out )
 
         InterlockedIncrement( &v->ref );
         *out = &v->partner_vtbl;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IVisualInternal_local ))
+    {
+        struct dcomp_visual *v = dcomp_visual_from( iface );
+
+        InterlockedIncrement( &v->ref );
+        *out = &v->internal_vtbl;
         return S_OK;
     }
     /* Accept any other IID: the old recording stub did this, and rejecting partner IIDs
@@ -6946,6 +6959,314 @@ static const void *dcv_partner_vtbl[] =
     dcv_partner_get_router,
 };
 
+static HRESULT WINAPI dcv_ivisual_GetIids( void *iface, ULONG *count, IID **iids );
+static HRESULT WINAPI dcv_ivisual_GetRuntimeClassName( void *iface, HSTRING *name );
+static HRESULT WINAPI dcv_ivisual_GetTrustLevel( void *iface, TrustLevel *level );
+/* The result of IVisualInternal::CaptureAsync: nothing is captured. XAML's RenderTargetBitmap (drag and drop renders
+ * the dragged element through one) reads a capture back in RenderTargetBitmapImplUsingSpriteVisuals::
+ * ProcessCaptureThreaded: it queries the surface for ICompositionDrawingSurfaceInteropPrivate {fd175946} and asks
+ * HasValidPixels (slot 12, in the Interop vtable of dcomp.pdb's CompositionDrawingSurface); "no" makes it return
+ * E_PENDING, which fails that one bitmap and nothing else. Every other failure on that path is a fail-fast followed
+ * by a NULL dereference, and XAML's other RenderTargetBitmap (quirk 0x200BD) needs dcomp's primitive groups and
+ * stopped XAML's frame loop for good the first time its tick failed. */
+struct capture_surface
+{
+    const void **vtbl;          /* IInspectable, ICompositionSurface */
+    const void **interop_vtbl;  /* ICompositionDrawingSurfaceInterop(2)/InteropPrivate layout */
+    LONG ref;
+};
+static const GUID IID_ICompositionSurface_local =
+    { 0x1527540d, 0x42c7, 0x47a6, { 0xa4, 0x08, 0x66, 0x8f, 0x79, 0xa9, 0x0d, 0xfb } };
+static const GUID IID_ICompositionDrawingSurfaceInteropPrivate_local =
+    { 0xfd175946, 0xf5f6, 0x446f, { 0xad, 0x1e, 0x51, 0xe1, 0x16, 0x07, 0x14, 0x02 } };
+static const GUID IID_ICompositionDrawingSurfaceInterop_local =
+    { 0xfd04e6e3, 0xfe0c, 0x4c3c, { 0xab, 0x19, 0xa0, 0x76, 0x01, 0xa5, 0x76, 0xee } };
+static const GUID IID_ICompositionDrawingSurfaceInterop2_local =
+    { 0x41e64aae, 0x98c0, 0x4239, { 0x8e, 0x95, 0xa3, 0x30, 0xdd, 0x6a, 0xa1, 0x8b } };
+static const void *capture_surface_vtbl[], *capture_interop_vtbl[];
+static HRESULT WINAPI capture_surface_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct capture_surface *impl = CONTAINING_RECORD( iface, struct capture_surface, vtbl );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ICompositionSurface_local ))
+        *out = &impl->vtbl;
+    else if (IsEqualGUID( iid, &IID_ICompositionDrawingSurfaceInteropPrivate_local ) ||
+             IsEqualGUID( iid, &IID_ICompositionDrawingSurfaceInterop_local ) ||
+             IsEqualGUID( iid, &IID_ICompositionDrawingSurfaceInterop2_local ))
+        *out = &impl->interop_vtbl;
+    else
+    {
+        TRACE( "capture surface %p: no %s.\n", impl, debugstr_guid( iid ) );
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    InterlockedIncrement( &impl->ref );
+    return S_OK;
+}
+static ULONG WINAPI capture_surface_AddRef( void *iface )
+{
+    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct capture_surface, vtbl )->ref );
+}
+static ULONG WINAPI capture_surface_Release( void *iface )
+{
+    struct capture_surface *impl = CONTAINING_RECORD( iface, struct capture_surface, vtbl );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref) (free)( impl );
+    return ref;
+}
+static HRESULT WINAPI capture_surface_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI capture_surface_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionDrawingSurface";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI capture_surface_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static const void *capture_surface_vtbl[] =
+{
+    capture_surface_QueryInterface, capture_surface_AddRef, capture_surface_Release,
+    capture_surface_GetIids, capture_surface_GetRuntimeClassName, capture_surface_GetTrustLevel,
+};
+static HRESULT WINAPI capture_interop_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return capture_surface_QueryInterface( &CONTAINING_RECORD( iface, struct capture_surface, interop_vtbl )->vtbl, iid, out );
+}
+static ULONG WINAPI capture_interop_AddRef( void *iface )
+{
+    return capture_surface_AddRef( &CONTAINING_RECORD( iface, struct capture_surface, interop_vtbl )->vtbl );
+}
+static ULONG WINAPI capture_interop_Release( void *iface )
+{
+    return capture_surface_Release( &CONTAINING_RECORD( iface, struct capture_surface, interop_vtbl )->vtbl );
+}
+static HRESULT WINAPI capture_interop_notimpl( void *iface )
+{
+    TRACE( "capture surface %p.\n", iface );
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI capture_interop_HasValidPixels( void *iface, int *valid )
+{
+    TRACE( "capture surface %p: no pixels.\n", iface );
+    if (!valid) return E_POINTER;
+    *valid = FALSE;
+    return S_OK;
+}
+/* slots from CompositionDrawingSurface::Interop: 3 BeginDraw, 4 EndDraw, 5 Resize, 6 Scroll, 7 ResumeDraw,
+ * 8 SuspendDraw, 9 CopySurface(to), 10 CopySurface(rect, IDXGISurface **), 11 BeginDrawWithGutters, 12 HasValidPixels */
+static const void *capture_interop_vtbl[] =
+{
+    capture_interop_QueryInterface, capture_interop_AddRef, capture_interop_Release,
+    capture_interop_notimpl, capture_interop_notimpl, capture_interop_notimpl, capture_interop_notimpl,
+    capture_interop_notimpl, capture_interop_notimpl, capture_interop_notimpl, capture_interop_notimpl,
+    capture_interop_notimpl, capture_interop_HasValidPixels,
+};
+
+/* IAsyncOperation<ICompositionSurface*> {66613cdd-5076-50d6-ab32-ba76df49c410}, created completed */
+struct capture_op
+{
+    const void **vtbl;
+    const void **info_vtbl;     /* IAsyncInfo */
+    LONG ref;
+    IUnknown *surface;
+    IUnknown *handler;
+};
+static const GUID IID_IAsyncOperation_ICompositionSurface_local =
+    { 0x66613cdd, 0x5076, 0x50d6, { 0xab, 0x32, 0xba, 0x76, 0xdf, 0x49, 0xc4, 0x10 } };
+static HRESULT WINAPI capture_op_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct capture_op *impl = CONTAINING_RECORD( iface, struct capture_op, vtbl );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAsyncOperation_ICompositionSurface_local ))
+        *out = &impl->vtbl;
+    else if (IsEqualGUID( iid, &IID_IAsyncInfo ))
+        *out = &impl->info_vtbl;
+    else
+    {
+        TRACE( "capture operation %p: no %s.\n", impl, debugstr_guid( iid ) );
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    InterlockedIncrement( &impl->ref );
+    return S_OK;
+}
+static ULONG WINAPI capture_op_AddRef( void *iface )
+{
+    return InterlockedIncrement( &CONTAINING_RECORD( iface, struct capture_op, vtbl )->ref );
+}
+static ULONG WINAPI capture_op_Release( void *iface )
+{
+    struct capture_op *impl = CONTAINING_RECORD( iface, struct capture_op, vtbl );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref)
+    {
+        if (impl->surface) IUnknown_Release( impl->surface );
+        if (impl->handler) IUnknown_Release( impl->handler );
+        (free)( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI capture_op_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.Foundation.IAsyncOperation`1<Windows.UI.Composition.ICompositionSurface>";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+/* the handler is an IAsyncOperationCompletedHandler<ICompositionSurface*>: IUnknown, then Invoke(op, status) */
+static HRESULT WINAPI capture_op_put_Completed( void *iface, IUnknown *handler )
+{
+    struct capture_op *impl = CONTAINING_RECORD( iface, struct capture_op, vtbl );
+    HRESULT (WINAPI *invoke)( IUnknown *, void *, AsyncStatus );
+
+    TRACE( "capture operation %p, handler %p.\n", impl, handler );
+    if (!handler) return E_POINTER;
+    IUnknown_AddRef( handler );
+    if (impl->handler) IUnknown_Release( impl->handler );
+    impl->handler = handler;
+    invoke = (*(void ***)handler)[3];
+    invoke( handler, iface, Completed );
+    return S_OK;
+}
+static HRESULT WINAPI capture_op_get_Completed( void *iface, IUnknown **handler )
+{
+    struct capture_op *impl = CONTAINING_RECORD( iface, struct capture_op, vtbl );
+    if (!handler) return E_POINTER;
+    if ((*handler = impl->handler)) IUnknown_AddRef( *handler );
+    return S_OK;
+}
+static HRESULT WINAPI capture_op_GetResults( void *iface, IUnknown **surface )
+{
+    struct capture_op *impl = CONTAINING_RECORD( iface, struct capture_op, vtbl );
+    if (!surface) return E_POINTER;
+    if ((*surface = impl->surface)) IUnknown_AddRef( *surface );
+    return S_OK;
+}
+static const void *capture_op_vtbl[] =
+{
+    capture_op_QueryInterface, capture_op_AddRef, capture_op_Release,
+    capture_surface_GetIids, capture_op_GetRuntimeClassName, capture_surface_GetTrustLevel,
+    capture_op_put_Completed, capture_op_get_Completed, capture_op_GetResults,
+};
+static HRESULT WINAPI capture_info_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return capture_op_QueryInterface( &CONTAINING_RECORD( iface, struct capture_op, info_vtbl )->vtbl, iid, out );
+}
+static ULONG WINAPI capture_info_AddRef( void *iface )
+{
+    return capture_op_AddRef( &CONTAINING_RECORD( iface, struct capture_op, info_vtbl )->vtbl );
+}
+static ULONG WINAPI capture_info_Release( void *iface )
+{
+    return capture_op_Release( &CONTAINING_RECORD( iface, struct capture_op, info_vtbl )->vtbl );
+}
+static HRESULT WINAPI capture_info_get_Id( void *iface, UINT32 *id )
+{
+    *id = 1;
+    return S_OK;
+}
+static HRESULT WINAPI capture_info_get_Status( void *iface, AsyncStatus *status )
+{
+    *status = Completed;
+    return S_OK;
+}
+static HRESULT WINAPI capture_info_get_ErrorCode( void *iface, HRESULT *error )
+{
+    *error = S_OK;
+    return S_OK;
+}
+static HRESULT WINAPI capture_info_ok( void *iface )
+{
+    return S_OK;
+}
+static const void *capture_info_vtbl[] =
+{
+    capture_info_QueryInterface, capture_info_AddRef, capture_info_Release,
+    capture_surface_GetIids, capture_op_GetRuntimeClassName, capture_surface_GetTrustLevel,
+    capture_info_get_Id, capture_info_get_Status, capture_info_get_ErrorCode, capture_info_ok, capture_info_ok,
+};
+
+/* IVisualInternal {92179cc0-ae1f-48bc-a354-8f7a8800f2fb}, an IInspectable. Slots from VisualCommon::Partner's
+ * vtable for it in dcomp.pdb: 6 get_RasterizationScaleOverride, 7 put_RasterizationScaleOverride, 8 CaptureAsync,
+ * 9 GetInputSinkHandle, 10 SetInputSinkHandle, 11 SetParentForTransformFromReference. The catch-all used to answer
+ * it with the IDCompositionVisual vtable, whose slot 8 returned S_OK and no operation to CaptureAsync. */
+static struct dcomp_visual *dcomp_visual_from_internal( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct dcomp_visual, internal_vtbl );
+}
+static HRESULT WINAPI dcv_internal_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return dcv_QueryInterface( &dcomp_visual_from_internal( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI dcv_internal_AddRef( void *iface )
+{
+    return dcv_AddRef( &dcomp_visual_from_internal( iface )->vtbl );
+}
+static ULONG WINAPI dcv_internal_Release( void *iface )
+{
+    return dcv_Release( &dcomp_visual_from_internal( iface )->vtbl );
+}
+static HRESULT WINAPI dcv_internal_get_RasterizationScaleOverride( void *iface, float *value )
+{
+    if (!value) return E_POINTER;
+    *value = dcomp_visual_from_internal( iface )->rasterization_scale;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_internal_put_RasterizationScaleOverride( void *iface, float value )
+{
+    TRACE( "visual %p: %f.\n", dcomp_visual_from_internal( iface ), value );
+    dcomp_visual_from_internal( iface )->rasterization_scale = value;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_internal_CaptureAsync( void *iface, IUnknown *visual, IUnknown *device, int width, int height,
+                                                 int format, int alpha, void **operation )
+{
+    struct capture_surface *surface;
+    struct capture_op *op;
+
+    TRACE( "visual %p: capture of %p, %dx%d format %d alpha %d: not captured.\n", dcomp_visual_from_internal( iface ),
+           visual, width, height, format, alpha );
+    if (!operation) return E_POINTER;
+    *operation = NULL;
+    if (!(surface = calloc( 1, sizeof(*surface) ))) return E_OUTOFMEMORY;
+    if (!(op = calloc( 1, sizeof(*op) )))
+    {
+        (free)( surface );
+        return E_OUTOFMEMORY;
+    }
+    surface->vtbl = capture_surface_vtbl;
+    surface->interop_vtbl = capture_interop_vtbl;
+    surface->ref = 1;
+    op->vtbl = capture_op_vtbl;
+    op->info_vtbl = capture_info_vtbl;
+    op->ref = 1;
+    op->surface = (IUnknown *)&surface->vtbl;
+    *operation = &op->vtbl;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_internal_GetInputSinkHandle( void *iface, INT64 *handle )
+{
+    if (!handle) return E_POINTER;
+    *handle = 0;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_internal_ok( void *iface, void *arg )
+{
+    TRACE( "visual %p, %p: ignored.\n", dcomp_visual_from_internal( iface ), arg );
+    return S_OK;
+}
+static const void *dcv_internal_vtbl[] =
+{
+    dcv_internal_QueryInterface, dcv_internal_AddRef, dcv_internal_Release,
+    dcv_ivisual_GetIids, dcv_ivisual_GetRuntimeClassName, dcv_ivisual_GetTrustLevel,
+    dcv_internal_get_RasterizationScaleOverride, dcv_internal_put_RasterizationScaleOverride,
+    dcv_internal_CaptureAsync, dcv_internal_GetInputSinkHandle, dcv_internal_ok, dcv_internal_ok,
+};
+
 /* Windows.UI.Composition.IVisual view of an interop visual. Slots 6-38 in IDL order: AnchorPoint,
  * BackfaceVisibility, BorderMode, CenterPoint, Clip (14/15), CompositeMode, IsVisible (18/19), Offset (20/21),
  * Opacity (22/23), Orientation, Parent (26), RotationAngle, RotationAngleInDegrees, RotationAxis, Scale,
@@ -7525,6 +7846,7 @@ static HRESULT WINAPI device_CreateVisual( void *iface, void **out )
     v->object2_vtbl = dcv_object2_vtbl;
     v->closable_vtbl = dcv_closable_vtbl;
     v->partner_vtbl = dcv_partner_vtbl;
+    v->internal_vtbl = dcv_internal_vtbl;
     v->scale3.X = v->scale3.Y = v->scale3.Z = 1.0f;
     v->rotation_axis.Z = 1.0f;
     v->orientation.W = 1.0f;
