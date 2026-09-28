@@ -10239,3 +10239,15 @@ each in its own direction. The painter truncated float positions (`(int)x`): at 
 313 computes as 312.9999 and stays at 312 until the scale is exactly 1. Sprite content edges are now rounded
 (`px = floor(x + 0.5)`, width from the rounded right edge). After it, from ~0.45 s on only 18 pixels differ from the
 final frame (a ComboBox chevron's outline), where ~755 did until the end before; suite and baselines unchanged.
+
+### Crash after a while: implicit-animation maps ran out at 64 (2026-09-28)
+
+The user's session died with an access violation in WinUI 2's `NavigationView::CreateAndAttachHeaderAnimation`
+(`Microsoft.UI.Xaml.dll+0xbead3`, `rax 0x8007000E`, NULL `rcx`), inside `IMap::Insert` on a fresh
+`ImplicitAnimationCollection`. dcomp serves that collection's `IMap` from a table of maps keyed by owner
+(`comp_map_for_owner`), which was a fixed 64 entries that were never removed ("small, bounded", said the comment).
+Every NavigationView template makes one - Settings does - so the 65th request in a session returned E_OUTOFMEMORY and
+WinUI used the missing map. Reproduced: opening and closing Settings crashed the old build on the 9th open (the
+earlier ones and start-up had used up the rest), at the same address. The map is now a real tear-off: its references
+are its owner's, it is freed with the owner (`comp_map_owner_gone`, from `comp_object_Release`, and when a new object
+reuses the address), and the table grows. 80 Settings open/close cycles later the app is fine; suite unchanged.

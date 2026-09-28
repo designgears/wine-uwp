@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     ed9275a2bfb7b69d971b5f88ddd7bfdb2ee44a85
-                 dcomp: Round sprite content edges, so easing animations converge instead of jumping at the end.
+  wine HEAD:     b044f41ba9f4d729465cff922056ca45a7282a90
+                 dcomp: Free implicit-animation maps with their collection; the 64-entry table ran out and crashed NavigationView.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-28T20:46:30Z
+  captured:      2026-09-28T20:59:09Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

@@ -2423,12 +2423,17 @@ static ULONG WINAPI comp_object_AddRef( void *iface )
     return InterlockedIncrement( &object->ref );
 }
 
+static void comp_map_owner_gone( void *owner );
 static ULONG WINAPI comp_object_Release( void *iface )
 {
     struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
     ULONG ref = InterlockedDecrement( &object->ref );
 
-    if (!ref) free( object );
+    if (!ref)
+    {
+        comp_map_owner_gone( &object->vtbl );
+        free( object );
+    }
     return ref;
 }
 
@@ -2450,10 +2455,14 @@ struct comp_map
     struct comp_map_entry entries[COMP_MAP_ENTRIES];
 };
 
-/* Owner -> map. A handful of implicit-animation collections exist at a time; the owner cannot hold
- * the pointer itself because its struct prefix is shared (see struct comp_object). */
-#define COMP_MAPS 64
-static struct comp_map *comp_maps[COMP_MAPS];
+/* Owner -> map; the owner cannot hold the pointer itself because its struct prefix is shared (see struct
+ * comp_object). The map is a tear-off: its references are the owner's, and it goes when the owner does
+ * (comp_map_owner_gone). It used to be a fixed table of 64 that was never emptied, on the belief that only a handful
+ * of implicit-animation collections exist; every NavigationView template makes one, and after 64 in a session the
+ * next QueryInterface failed with E_OUTOFMEMORY and WinUI's NavigationView::CreateAndAttachHeaderAnimation crashed
+ * Shapr3D on a NULL map. */
+static struct comp_map **comp_maps;
+static unsigned int comp_map_count, comp_map_capacity;
 static CRITICAL_SECTION comp_maps_cs = { NULL, -1, 0, 0, 0, 0 };
 
 static struct comp_map_entry *comp_map_find( struct comp_map *map, HSTRING key )
@@ -2482,13 +2491,12 @@ static HRESULT WINAPI comp_map_QueryInterface( void *iface, REFIID iid, void **o
 }
 static ULONG WINAPI comp_map_AddRef( void *iface )
 {
-    return InterlockedIncrement( &comp_from_map( iface )->ref );
+    return IUnknown_AddRef( comp_from_map( iface )->owner );
 }
 static ULONG WINAPI comp_map_Release( void *iface )
 {
-    /* The map stays in the owner table for the life of the process: it is small, bounded, and the
-     * app asks for it again every time it touches the collection. */
-    return InterlockedDecrement( &comp_from_map( iface )->ref );
+    /* may destroy the owner, and with it this map */
+    return IUnknown_Release( comp_from_map( iface )->owner );
 }
 static HRESULT WINAPI comp_map_GetIids( void *iface, ULONG *count, IID **iids )
 {
@@ -2540,7 +2548,7 @@ static HRESULT WINAPI comp_map_GetView( void *iface, void **view )
     struct comp_map *map = comp_from_map( iface );
 
     if (!view) return E_POINTER;
-    InterlockedIncrement( &map->ref );
+    IUnknown_AddRef( map->owner );
     *view = &map->view_vtbl;
     return S_OK;
 }
@@ -2598,11 +2606,11 @@ static HRESULT WINAPI comp_mapview_QueryInterface( void *iface, REFIID iid, void
 }
 static ULONG WINAPI comp_mapview_AddRef( void *iface )
 {
-    return InterlockedIncrement( &comp_from_mapview( iface )->ref );
+    return IUnknown_AddRef( comp_from_mapview( iface )->owner );
 }
 static ULONG WINAPI comp_mapview_Release( void *iface )
 {
-    return InterlockedDecrement( &comp_from_mapview( iface )->ref );
+    return IUnknown_Release( comp_from_mapview( iface )->owner );
 }
 static HRESULT WINAPI comp_mapview_Lookup( void *iface, HSTRING key, IUnknown **value )
 {
@@ -2635,21 +2643,52 @@ static HRESULT comp_map_for_owner( IUnknown *owner, void **out )
     unsigned int i;
 
     EnterCriticalSection( &comp_maps_cs );
-    for (i = 0; i < COMP_MAPS && comp_maps[i]; i++)
+    for (i = 0; i < comp_map_count; i++)
         if (comp_maps[i]->owner == owner) { map = comp_maps[i]; break; }
-    if (!map && i < COMP_MAPS && (map = calloc( 1, sizeof(*map) )))
+    if (!map && comp_map_count == comp_map_capacity)
+    {
+        unsigned int capacity = max( 64, comp_map_capacity * 2 );
+        struct comp_map **grown = (realloc)( comp_maps, capacity * sizeof(*grown) );
+        if (grown)
+        {
+            comp_maps = grown;
+            comp_map_capacity = capacity;
+        }
+    }
+    if (!map && comp_map_count < comp_map_capacity && (map = calloc( 1, sizeof(*map) )))
     {
         map->vtbl = comp_map_vtbl;
         map->view_vtbl = comp_mapview_vtbl;
         map->owner = owner;
-        comp_maps[i] = map;
+        comp_maps[comp_map_count++] = map;
     }
     LeaveCriticalSection( &comp_maps_cs );
 
     if (!map) return E_OUTOFMEMORY;
-    InterlockedIncrement( &map->ref );
+    IUnknown_AddRef( owner );
     *out = &map->vtbl;
     return S_OK;
+}
+
+/* The owner is being destroyed (or its address reused by a new object): its map goes with it. */
+static void comp_map_owner_gone( void *owner )
+{
+    struct comp_map *map = NULL;
+    unsigned int i;
+
+    if (!comp_map_count) return;
+    EnterCriticalSection( &comp_maps_cs );
+    for (i = 0; i < comp_map_count; i++)
+        if (comp_maps[i]->owner == owner)
+        {
+            map = comp_maps[i];
+            comp_maps[i] = comp_maps[--comp_map_count];
+            break;
+        }
+    LeaveCriticalSection( &comp_maps_cs );
+    if (!map) return;
+    for (i = 0; i < map->entry_count; i++) if (map->entries[i].value) IUnknown_Release( map->entries[i].value );
+    free( map );
 }
 
 /* Many island-site / partner slots are Create* or getters. Returning S_OK without filling a real
@@ -3478,6 +3517,7 @@ static HRESULT create_comp_object( const char *kind, void **out )
     if (!out) return E_POINTER;
     ensure_comp_object_vtbl();
     if (!(object = calloc( 1, sizeof(*object) ))) return E_OUTOFMEMORY;
+    comp_map_owner_gone( &object->vtbl );   /* a map left by a dead object of another kind at this address */
     object->vtbl = (const void **)comp_object_vtbl;
     object->kind = kind;
     object->ref = 1;
