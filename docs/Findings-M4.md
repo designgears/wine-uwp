@@ -10168,3 +10168,14 @@ Four links were missing between XAML's `DragVisual` and a picture on screen:
 
 `docs/screenshots/shapr3d-drag-visual.png`: the ABS material row dragged over the drone (its transparent background is
 black on Xvfb). The drop still applies and the panels still repaint afterwards; suite and `kb` pass.
+
+### Face Offset render-thread abort: the app's own assertion, not reproduced (2026-09-28)
+
+The user's Sentry dump (`9f972df1-...dmp`, thread 0x280, `0x40000015`) is `abort()` from an assertion inside
+`Shapr::RenderableBuffersPage::GetVertexStrideFor(VertexStream) noexcept` (`Shapr.Native.dll+0x867470`, named by the
+function's own strings): the function finds the lowest set bit of a vertex-stream mask and switches on it, and a mask
+it does not know asserts. The dump does not pin the mask down (the frame is below the assertion's own frames), and the
+crashed run's breadcrumbs were overwritten by the next session's. Not reproduced: a new body, Offset Face with twelve
+focus-away-and-back cycles (a Wine notepad as the other window) and drags in between, then three History edits of
+the Face Offset with focus cycles and header toggles - no abort. The blank Environment panel has not come back either
+(it rendered after the drag-visual drags above).
