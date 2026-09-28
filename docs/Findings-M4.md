@@ -10189,3 +10189,27 @@ continuation, not a missed wake of the UI thread. Wine's `ThreadPool.RunAsync` h
 `put_Completed`, `Status` and `GetResults` were all `E_NOTIMPL`; it is a real one now (status, error, a handler that
 fires on completion or at once when already done, Cancel/Close). That was not the cause: 2 blanks in 24 starts
 with popups on after it. Why windowed popups raise the rate is still open; they stay opt-in.
+
+### Windowed popups flashed black, white and old content when opening (2026-09-28)
+
+The user, on KWin, saw each windowed menu flash a black/white/blue rectangle the size of its window (the drop-shadow
+margins and the space its reveal slides through) before the menu appeared. Measured on Xvfb with `probes/popwatch.c`,
+which grabs the window's own pixels, alpha included, every ~3 ms after it maps - what a compositor shows. Three
+separate causes:
+
+- **The first window was mapped opaque.** XAML's popup window is visible and 0x0 when dcomp makes it `WS_EX_LAYERED`,
+  and winex11 delays mapping a layered window until it has content *unless its rect is empty*. So a 24-bit X window
+  was mapped at 1x1, resized to the menu's 244x535 and shown solid black, then solid white, for ~13 ms, until the first
+  `UpdateLayeredWindow` re-created it with an ARGB visual. winex11 now delays the map whatever the size.
+- **A reopened menu showed its previous open.** XAML hides a closed popup's window and shows the same window for the
+  next open; Wine keeps a hidden layered window's bits and copied them into the resized surface, so the fully open old
+  menu showed for a frame before the new reveal. dcomp now clears a popup window to transparent when its root goes
+  away and when a target is made for a window that already has a size (`clear_popup_window`).
+- **New surfaces start opaque white.** `window_surface_create` fills every surface with 0xff; a layered popup resized
+  while shown (the File menu grows 244 -> 301 on its second open) showed a 12-pixel white strip of the new surface.
+  winex11 zeroes a new ARGB surface.
+
+After: every map and resize of File (first and second open), Edit and View starts fully transparent, and no frame has
+an opaque pixel outside where the settled menu is (10 antialiasing pixels mid-slide on View). Closing is a plain unmap.
+The main window repaints once in full when a popup maps (an expose) with unchanged content. Suite and `kb` pass;
+Calculator starts 19/20 with the change and 19/20 without it (the existing start-up flake, not this).

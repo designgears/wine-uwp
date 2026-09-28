@@ -2036,6 +2036,11 @@ static struct window_surface *create_surface( HWND hwnd, Window window, const XV
         surface->window = window;
         surface->gc = XCreateGC( gdi_display, window, 0, NULL );
         XSetSubwindowMode( gdi_display, surface->gc, IncludeInferiors );
+        /* window_surface_create fills new surfaces with opaque white. An ARGB (layered) window has to start out
+         * transparent instead: until UpdateLayeredWindow draws into it, nothing of it is visible on Windows, and a
+         * layered popup resized while shown (XAML's windowed menus, on their second open) showed a white strip of
+         * the new surface on a compositing desktop. With the surface drawn in place, its bits are the image's. */
+        if (use_alpha && bitmap) memset( image->ximage->data, 0, info->bmiHeader.biSizeImage );
     }
 
     return window_surface;

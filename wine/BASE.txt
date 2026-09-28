@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     f27489d2affd596367ccae832aaca548dd402801
-                 threadpoolwinrt: Implement the IAsyncAction returned by RunAsync.
+  wine HEAD:     f97a052a49ea40be4707d6903adc938ab9910101
+                 winex11: Keep empty layered windows unmapped and start ARGB surfaces transparent; dcomp: Clear reused popup windows.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-28T14:36:10Z
+  captured:      2026-09-28T20:19:38Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

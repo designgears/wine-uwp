@@ -8430,6 +8430,41 @@ static void hwnd_target_unlist( struct hwnd_target *t )
             break;
         }
 }
+/* Empty a popup window's layered bitmap. XAML hides a closed popup's window and shows the same window again for the
+ * next open, and Wine keeps a hidden layered window's bits: the reopened menu flashed fully open (its last frame,
+ * copied into the resized surface) for a frame before its open animation started over. Called when a popup's root
+ * goes away and when a target is made for a window that already has a size. */
+static void clear_popup_window( HWND hwnd )
+{
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    POINT src = { 0, 0 };
+    HBITMAP dib, old;
+    SIZE size;
+    RECT rc;
+    HDC dc;
+    void *bits;
+
+    if (!IsWindow( hwnd ) || !(GetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED)) return;
+    if (!GetWindowRect( hwnd, &rc ) || rc.right - rc.left <= 0 || rc.bottom - rc.top <= 0) return;
+    size.cx = rc.right - rc.left;
+    size.cy = rc.bottom - rc.top;
+    if (size.cx > 8192 || size.cy > 8192) return;
+    if (!(dc = CreateCompatibleDC( NULL ))) return;
+    {
+        BITMAPINFO info = { { sizeof(info.bmiHeader), size.cx, -size.cy, 1, 32, BI_RGB } };
+        dib = CreateDIBSection( dc, &info, DIB_RGB_COLORS, &bits, NULL, 0 );   /* zeroed: transparent */
+    }
+    if (dib)
+    {
+        old = SelectObject( dc, dib );
+        UpdateLayeredWindow( hwnd, NULL, NULL, &size, dc, &src, 0, &blend, ULW_ALPHA );
+        SelectObject( dc, old );
+        DeleteObject( dib );
+    }
+    DeleteDC( dc );
+    TRACE_(dcompgate)( "cleared popup window %p (%ldx%ld)\n", hwnd, size.cx, size.cy );
+}
+
 static ULONG WINAPI hwnd_target_Release( void *iface )
 {
     struct hwnd_target *t = hwnd_target_from( iface );
@@ -8471,6 +8506,7 @@ static HRESULT WINAPI hwnd_target_SetRoot( void *iface, void *visual )
         if (old) dcv_Release( &old->vtbl );
         return S_OK;
     }
+    if (!root) clear_popup_window( t->hwnd );
     EnterCriticalSection( &dcomp_visual_cs );
     if (root) dcv_AddRef( visual );
     old = t->root;
@@ -8509,6 +8545,7 @@ static HRESULT WINAPI device_CreateTargetForHwnd( void *iface, void *hwnd, void 
         /* per-pixel alpha: a popup's window is larger than its content by the drop shadow and its rounded corners */
         LONG ex = GetWindowLongW( hwnd, GWL_EXSTYLE );
         if (!(ex & WS_EX_LAYERED)) SetWindowLongW( hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED );
+        else clear_popup_window( hwnd );   /* a reused window: whatever it showed last time must not come back */
     }
     *out = &t->vtbl;
     return S_OK;

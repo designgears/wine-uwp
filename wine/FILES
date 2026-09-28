@@ -283,6 +283,7 @@ dlls/ntdll/heap.c
 dlls/d3d11/d3d11_main.c
 dlls/wined3d/adapter_vk.c
 dlls/winex11.drv/bitblt.c
+dlls/winex11.drv/window.c
 dlls/dataexchange/classes.idl
 dlls/dataexchange/dragoperation.c
 dlls/dataexchange/Makefile.in
