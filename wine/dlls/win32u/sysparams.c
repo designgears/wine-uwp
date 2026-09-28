@@ -7272,14 +7272,14 @@ int get_system_metrics( int index )
         /* Undocumented; XAML's CPopup::DoesPlatformSupportWindowedPopup asks it whether popups may be
          * windows of their own, which is what every desktop Windows answers. Windowless popups put a
          * light-dismiss layer over the whole CoreWindow, and XAML's pointer replay then takes the hover
-         * away from whatever opened the flyout. Opt-in with WINE_UWP_WINDOWED_POPUPS=1: with it Shapr3D stalled
-         * blank at start-up about one start in eight (0 in 24 without) - each windowed popup hooks a CoreWindow
-         * position event, one more chance for the CoreMessaging lost wake. */
+         * away from whatever opened the flyout. On by default; WINE_UWP_WINDOWED_POPUPS=0 turns it off. It was
+         * opt-in while Shapr3D stalled blank at start-up about one start in eight with it: each windowed popup hooks
+         * a CoreWindow position event, one more chance for the CoreMessaging wake win32u did not deliver then. */
         static int enabled = -1;
         if (enabled < 0)
         {
             const char *env = getenv( "WINE_UWP_WINDOWED_POPUPS" );
-            enabled = env && atoi( env );
+            enabled = !env || atoi( env );
         }
         return enabled;
     }

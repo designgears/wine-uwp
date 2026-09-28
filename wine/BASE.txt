@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     cf506702a929ede6514d86fa79361cfb3ad380f4
-                 user32, win32u: Stop the idle CoreMessaging timer loop.
+  wine HEAD:     59ed2bfa3655be94b016125fdf2aa5fd8eee43a5
+                 win32u: Let XAML's popups be windows of their own by default.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-28T22:59:10Z
+  captured:      2026-09-28T23:02:37Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

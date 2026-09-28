@@ -10413,3 +10413,15 @@ posts that whenever the queue has wake bits and the notification has been re-arm
 port, and the port woke `DoWork`, which re-armed the notification. `NtUserMsgWaitForMultipleObjectsEx` now empties the
 port itself (`drain_coremsg_port`) and posts `0x60`/1 only when it handed CoreMessaging a real wait. The queue wakes
 the wait by itself anyway.
+
+### Windowed popups are the default (2026-09-28)
+
+Windowed popups were opt-in because they raised Shapr3D's blank start-ups to about 1 in 8. Each windowed popup hooks a
+CoreWindow position event, one more chance for the CoreMessaging wake that win32u now delivers. With the wake fixed:
+
+- 13/13 starts with `WINE_UWP_WINDOWED_POPUPS=1` earlier today;
+- 12/12 more with the variable unset, once `win32u` answered metric `0x1800` TRUE by default;
+- the suite and `kb` identical with every app on windowed popups;
+- a default Shapr3D start opens File as a second top-level window.
+
+`WINE_UWP_WINDOWED_POPUPS=0` turns them off.
