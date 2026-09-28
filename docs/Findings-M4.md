@@ -9930,3 +9930,22 @@ the old load), and the live `Windows.UI.Xaml.dll` is the pristine 26100.8972 fil
 Of the 13 functional XAML patches: 9 were dead weight, 4 were Wine bugs - dcomp's `IDCompositionDeviceDebug`, `wineuwp`
 not connecting dcomp when XAML loaded it late, dcomp's missing `ILayerVisual2`/`ICompositorWithVisualSurface`, and
 `wineuwp`'s own `App.xaml` load.
+
+### CoreMessaging unpatched: still blank; what the patches stand in for (2026-09-28)
+
+With a pristine CoreMessaging.dll (Windows.UI still patched) every app is blank again - Calculator partly drawn,
+Feedback Hub and Media Player 1 colour, Solitaire and Shapr3D nothing - so its three load-bearing patches
+(`DrainSignaledWaits` hook, `DrainSignaledIocpWaits` byte, `SetRelative` timer cave) still matter.
+
+First suspect, and a real bug: our `NtAssociateWaitCompletionPacket` (dlls/ntdll/sync.c, our own emulation on
+`RtlRegisterWait`) refused to associate a packet whose wait had already fired (`packet->wait` was never cleared), which
+Windows allows. Fixed - but a `trace+sync` run shows it was not the cause here: CoreMessaging creates and associates
+three packets during start-up, one fires, and it never re-associates any in 15 s.
+
+What the patches do instead is wake the UI thread and make it drain CoreMessaging: the `SetRelative` cave hands a timer
+armed on another thread to the UI thread through a mailbox, and Windows.UI's `ProcessMessage` trampoline calls
+`DrainCoreMessaging` on every message. On Windows the kernel's window manager ties CoreMessaging's completion port to
+the thread's message wait (`NtUserInitThreadCoreMessagingIocp`); our win32u does only the other direction (queued
+messages post a completion to the port). A completion on the port - a timer's wait packet firing - does not wake a
+thread sleeping in its message wait (Windows.UI's dispatcher waits in `CoMsgWaitInProcessEvents`). That is the
+Wine-side work that retires these patches.
