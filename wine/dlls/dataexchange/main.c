@@ -16,6 +16,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include "initguid.h"
 #include "private.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dataexchange);
@@ -104,11 +105,12 @@ static HRESULT STDMETHODCALLTYPE dataexchange_GetTrustLevel(IActivationFactory *
     return E_NOTIMPL;
 }
 
+/* The factory is shared by every class of this module, and CoreDragOperation is the only activatable one. */
 static HRESULT STDMETHODCALLTYPE dataexchange_ActivateInstance(IActivationFactory *iface,
                                                                IInspectable **instance)
 {
-    FIXME("iface %p, instance %p stub!\n", iface, instance);
-    return E_NOTIMPL;
+    TRACE("iface %p, instance %p\n", iface, instance);
+    return create_drag_operation(instance);
 }
 
 static const struct IActivationFactoryVtbl activation_factory_vtbl =
@@ -201,16 +203,17 @@ static HRESULT STDMETHODCALLTYPE core_dragdrop_manager_add_TargetRequested(ICore
                                                                            ITypedEventHandler_CoreDragDropManager_CoreDropOperationTargetRequestedEventArgs *value,
                                                                            EventRegistrationToken *return_value)
 {
-    FIXME("iface %p, value %p, return_value %p stub!\n", iface, value, return_value);
-    return_value->value = 0xdeadbeef;
-    return S_OK;
+    struct core_dragdrop_manager *impl = impl_from_ICoreDragDropManager(iface);
+
+    TRACE("iface %p, value %p, return_value %p\n", iface, value, return_value);
+    return register_drop_target(impl->hwnd, iface, value, return_value);
 }
 
 static HRESULT STDMETHODCALLTYPE core_dragdrop_manager_remove_TargetRequested(ICoreDragDropManager *iface,
                                                                               EventRegistrationToken value)
 {
-    FIXME("iface %p, value %#I64x stub!\n", iface, value.value);
-    return E_NOTIMPL;
+    TRACE("iface %p, value %#I64x\n", iface, value.value);
+    return unregister_drop_target(value);
 }
 
 static HRESULT STDMETHODCALLTYPE core_dragdrop_manager_get_AreConcurrentOperationsEnabled(ICoreDragDropManager *iface,

@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     cb23a7287a740a46aee74abb46d8b3a02cba7e37
-                 dcomp: Keep a facade brush's surface when the facade answers RPC_E_WRONG_THREAD.
+  wine HEAD:     88aceeced869b1a0293ab59416ee70fa76e12d3c
+                 dataexchange: Implement CoreDragOperation with an in-process drag loop.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-28T10:15:36Z
+  captured:      2026-09-28T10:31:49Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

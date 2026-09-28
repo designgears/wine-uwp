@@ -9970,3 +9970,38 @@ drew grey, until the next UI-thread paint put it back. Not the upload-retry back
 too), and not `ILayerVisual` (tested). `surface_from_facade` now reports "unknown" for a wrong-thread answer and the
 brush keeps its last surface (`docs/screenshots/shapr3d-material-swatches-fixed.png`; a 50-frame burst has no grey
 frame). The facade failure paths trace under `trace+dcompops`.
+
+### Material drag and drop: CoreDragOperation, and XAML's RenderTargetBitmap quirk (2026-09-28)
+
+Dragging a material swatch onto the model did nothing: XAML's `UIElement::StartDragAsync` activates
+`Windows.ApplicationModel.DataTransfer.DragDrop.Core.CoreDragOperation`, and Wine's `dataexchange` factory answered
+`ActivateInstance` with `E_NOTIMPL`. On Windows that class is `DataExchange.dll`'s `DragOperation`, which hands the drag to
+the shell's drag host; the host calls the `ICoreDropOperationTarget` of whichever window the pointer is over, found through
+that window's `CoreDragDropManager.TargetRequested` (XAML's `CJupiterWindow::OnDropTargetRequested`).
+
+`dlls/dataexchange/dragoperation.c` now does the host's job in-process. `StartAsync` starts a thread that follows
+`GetCursorPos` and the mouse button, raises `TargetRequested` for the window under the pointer, and calls the target's
+`EnterAsync`/`OverAsync`/`LeaveAsync`/`DropAsync` on that window's UI thread through the `CoreDispatcher` captured when the
+handler was registered, waiting on each returned operation. What was learned on the way:
+
+- XAML starts the drag through a **cloaked** interface, `ICoreDragOperationInternal` `{9e5d3a5a-fe96-4f97-84ae-89e12476b66f}`:
+  slot 6 `StartAsync(IInspectable *, Point, IAsyncOperation<DataPackageOperation> **)`. The IID came from the WRL `AsIID`
+  compare chain behind `DragOperation`'s QueryInterface in `DataExchange.dll` (in template order: ICoreDragOperation,
+  ICoreDragOperation2, Internal, then `IDragOperationPriv` `{3e344f25}`, which only the broker uses). The `IInspectable` is the
+  source window's `CoreDragDropManager`, the point the press position.
+- The drag's own completion handler must run on the **UI thread that started it**. Invoked from the drag thread, XAML read
+  through a NULL per-thread core (`windows.ui.xaml+0x8ceeb7`); Sentry turned that into a silent exit with a minidump.
+- XAML renders the drag visual with a `RenderTargetBitmap` first, and that crashed: in sprite-visuals mode
+  `RenderTargetBitmapImplUsingSpriteVisuals::PreCommit` calls `IVisualInternal` `{92179cc0}` slot 8
+  `CaptureAsync(visual, device, w, h, format, alpha, IAsyncOperation<ICompositionSurface> **)` - dcomp's catch-all QI
+  answered with another vtable whose slot 8 returned S_OK and no operation - and would then read the capture back through
+  `ICompositionDrawingSurfaceInteropPrivate` and `...InternalDebug`. `CRenderTargetBitmap::RequestRender` falls back to
+  `RenderTargetBitmapImplUsingPrimitives` when quirk **0x200BD** is on (its only use in XAML), so kernelbase's
+  `QuirkIsEnabled` now says yes to it, as it does for 0x20046. Any app's `RenderTargetBitmap` would have hit the same crash.
+- With `DragUIContentMode` Deferred (what XAML sets) no bitmap is handed over; the host is expected to pull a composition
+  visual through `IDragOperationPriv::GetDragUIContent`. So there is **no drag ghost** under the cursor yet; the drop target's
+  own hover preview (Shapr3D tints the face under the pointer) is the feedback.
+
+Result: dragging ABS onto the sample drone's top cover and Clear Glass onto its side body applies them, with the live hover
+preview while dragging (`docs/screenshots/shapr3d-material-drop-abs.png`, `shapr3d-material-drop-glass.png`: before, mid-drag,
+after), in two fresh projects of our own. `trace+dataexchange` logs every target call with its position and result.
