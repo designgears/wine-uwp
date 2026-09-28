@@ -59,6 +59,11 @@ that were ours; the Calculator tree is no longer involved.
     ```
 
   Then `Read` the PNG, describe what is actually on it, and embed it in the reply.
+- **Every test run kills the user's own session.** The `/tmp` start scripts (`s3cycle.sh`, `s3open.sh`, `regress.sh`)
+  run `wineserver -k` on the one shared prefix, so the Shapr3D the user has open on `:0` dies with it - twice in one
+  day, the second time while it was the broken state the user had left running for me to inspect. When the user says
+  "it's open, check it out", inspect it in place (`xwd -id`, the log, `probe-threads.exe`) and **say before** running
+  anything that restarts Wine.
 - **Run on Xvfb `:98`, never the user's `:0`.** `DISPLAY=:98 ./run.sh`. **Check that `:98` is yours before
   trusting a capture**: another program took it over on 09-24 with a full-screen window, and every
   Shapr3D capture came back black (1 colour) while the app was fine. `xdotool search --onlyvisible
