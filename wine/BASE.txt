@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     f97a052a49ea40be4707d6903adc938ab9910101
-                 winex11: Keep empty layered windows unmapped and start ARGB surfaces transparent; dcomp: Clear reused popup windows.
+  wine HEAD:     68122eff9e74d72564f68d2a8b5644d1687940e5
+                 dcomp: Keep text crisp through open animations: snap near-unit scales, bilinear for small scales.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-28T20:19:38Z
+  captured:      2026-09-28T20:40:47Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

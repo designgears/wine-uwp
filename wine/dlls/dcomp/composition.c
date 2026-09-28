@@ -323,6 +323,7 @@ struct paint_op
     BOOL affine;            /* OP_BLEND/OP_FILL under a rotation that is not a quarter turn: odest mapped by xf */
     RECT odest;             /* the op's rectangle before the rotation */
     float xf[6];            /* m11 m12 m21 m22 dx dy, as struct paint_xform (row vectors) */
+    BOOL snap;              /* OP_STRETCH: sized only by a scale near 1 (an easing animation), drawn 1:1 */
 };
 struct paint_list
 {
@@ -826,12 +827,23 @@ static BOOL soft_fill( HDC hdc, int x, int y, int w, int h, Color color, BYTE co
     return TRUE;
 }
 
+/* the accumulated scale of the visual whose content is being painted (paint_public_visual, paint_dcomp_visual) */
+static float paint_content_sx = 1.0f, paint_content_sy = 1.0f;
+
 static void soft_stretch( int x, int y, int dest_w, int dest_h, HBITMAP bmp, int src_w, int src_h, BYTE constant_alpha,
                           const void *key, ULONG gen, BOOL swapchain )
 {
     struct paint_op op = { OP_STRETCH };
+    float sx = paint_content_sx, sy = paint_content_sy;
 
     op.swapchain = swapchain;
+    /* Resampling text at a scale of 0.99 softens it, and nearest-neighbour sampling dropped whole glyph columns
+     * (Settings read "Languagc" for the half second its open animation eased into 1.0). A stretch whose size comes
+     * only from a scale within 2% of 1 - undoing the scale gives back the bitmap's own size - is drawn 1:1. A brush
+     * stretched to a different size on purpose (Calculator's title-bar icon) keeps its scale. */
+    if (!swapchain && fabsf( sx - 1.0f ) <= 0.02f && fabsf( sy - 1.0f ) <= 0.02f && sx > 0.0f && sy > 0.0f &&
+        fabsf( dest_w / sx - src_w ) < 1.0f && fabsf( dest_h / sy - src_h ) < 1.0f)
+        op.snap = TRUE;
     if (dest_w <= 0 || dest_h <= 0) return;
     SetRect( &op.dest, x, y, x + dest_w, y + dest_h );
     op.clip = paint_clip;
@@ -881,7 +893,8 @@ static BOOL paint_op_equal( const struct paint_op *a, const struct paint_op *b )
            a->alpha == b->alpha && a->key == b->key && a->gen == b->gen && a->bits == b->bits && a->bmp == b->bmp &&
            a->src_w == b->src_w && a->src_h == b->src_h && a->opaque == b->opaque && a->quarter == b->quarter &&
            !memcmp( &a->color, &b->color, sizeof(a->color) ) && a->affine == b->affine &&
-           (!a->affine || (EqualRect( &a->odest, &b->odest ) && !memcmp( a->xf, b->xf, sizeof(a->xf) )));
+           (!a->affine || (EqualRect( &a->odest, &b->odest ) && !memcmp( a->xf, b->xf, sizeof(a->xf) ))) &&
+           a->snap == b->snap;
 }
 
 #define PAINT_DAMAGE_RECTS 16
@@ -998,6 +1011,42 @@ static void raster_ops( HDC dc, BYTE *target, int target_w, const struct paint_l
                 else TRACE_(dcompops)( "turned stretch of %p (%ux%u) not drawn: %d bpp, height %d, %dx%d\n", op->bmp,
                                        op->src_w, op->src_h, dib.dsBm.bmBitsPixel, (int)dib.dsBmih.biHeight,
                                        (int)dib.dsBm.bmWidth, (int)dib.dsBm.bmHeight );
+                break;
+            }
+            /* A real scale is sampled bilinearly, as DWM does: GdiAlphaBlend picks the nearest pixel, and text drawn at
+             * a scale near 1 lost whole columns of its glyphs - Settings' labels read "Languagc" and "Shaor3D" for the
+             * half second its open animation eased from 0.99 to 1. Swap chain frames keep the fast path. */
+            if (!op->swapchain && (op->dest.right - op->dest.left != op->src_w || op->dest.bottom - op->dest.top != op->src_h) &&
+                /* only the scales an open or close animation passes through; real resizes (icons, thumbnails) keep
+                 * the sampling they have always had */
+                (op->snap || (op->dest.right - op->dest.left >= op->src_w * 9 / 10 && op->dest.right - op->dest.left <= op->src_w * 11 / 10 &&
+                              op->dest.bottom - op->dest.top >= op->src_h * 9 / 10 && op->dest.bottom - op->dest.top <= op->src_h * 11 / 10)) &&
+                GetObjectW( op->bmp, sizeof(dib), &dib ) == sizeof(dib) && dib.dsBm.bmBits && dib.dsBm.bmBitsPixel == 32 &&
+                dib.dsBm.bmWidth >= op->src_w && dib.dsBm.bmHeight >= op->src_h)
+            {
+                struct paint_op blend_op = *op;
+                int dw = op->dest.right - op->dest.left, dh = op->dest.bottom - op->dest.top;
+
+                /* sized only by a scale near 1 (see soft_stretch): drawn 1:1 about the same centre */
+                if (op->snap)
+                {
+                    RECT unscaled, clip;
+                    unscaled.left = op->dest.left + (dw - op->src_w) / 2;
+                    unscaled.top = op->dest.top + (dh - op->src_h) / 2;
+                    unscaled.right = unscaled.left + op->src_w;
+                    unscaled.bottom = unscaled.top + op->src_h;
+                    IntersectRect( &clip, &r, &unscaled );   /* r: dest, clip and area; damage knows only dest */
+                    if (!IsRectEmpty( &clip ))
+                        raster_blend( target, target_w, unscaled.left, unscaled.top, dib.dsBm.bmBits,
+                                      dib.dsBm.bmWidthBytes, &clip, op->alpha, FALSE );
+                    break;
+                }
+                blend_op.kind = OP_BLEND;
+                blend_op.bits = dib.dsBm.bmBits;
+                blend_op.odest = op->dest;
+                blend_op.xf[0] = 1.0f; blend_op.xf[1] = 0.0f; blend_op.xf[2] = 0.0f;
+                blend_op.xf[3] = 1.0f; blend_op.xf[4] = 0.0f; blend_op.xf[5] = 0.0f;
+                raster_blend_affine( target, target_w, &blend_op, &r, dib.dsBm.bmWidthBytes );
                 break;
             }
             mem = scratch_dc( dc );
@@ -8237,11 +8286,13 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
      * these visuals often have none. */
     saved_opacity = paint_opacity;
     if (v->opacity < 1.0f) paint_opacity *= v->opacity;
+    paint_content_sx = csx; paint_content_sy = csy;
     if (v->opacity > 0.01f && surface_from_iface( v->content ) &&
         blit_surface_scaled( hdc, surface_from_iface( v->content ), (int)x, (int)y, csx, csy ))
     {
         TRACE( "painted interop visual %p from surface content %p.\n", v, v->content );
     }
+    paint_content_sx = paint_content_sy = 1.0f;
     /* No debug fill for visuals without drawable content: now that XAML's IVisual sizes reach these
      * visuals, the blue placeholder covered the real UI underneath. */
     (void)rc; (void)brush;
@@ -10461,6 +10512,7 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
 
         /* A sprite whose brush is a surface carries real drawn content; paint that instead of
          * guessing a colour. */
+        paint_content_sx = csx; paint_content_sy = csy;   /* read by soft_stretch, reset at children */
         if (surface && paint_mapped_surface( hdc, impl->brush, surface, (int)x, (int)y, (int)width, (int)height,
                                              1.0f ))
         {
@@ -10511,6 +10563,7 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
     }
     if (impl->shape_vtbl && impl->shape_count) paint_shape_visual( hdc, impl, x, y, width, height );
 children:
+    paint_content_sx = paint_content_sy = 1.0f;
     for (i = 0; i < impl->collection.count; i++)
     {
         void *child = NULL;

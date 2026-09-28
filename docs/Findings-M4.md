@@ -10213,3 +10213,22 @@ After: every map and resize of File (first and second open), Edit and View start
 an opaque pixel outside where the settled menu is (10 antialiasing pixels mid-slide on View). Closing is a plain unmap.
 The main window repaints once in full when a popup maps (an expose) with unchanged content. Suite and `kb` pass;
 Calculator starts 19/20 with the change and 19/20 without it (the existing start-up flake, not this).
+
+### Settings text looked "wonky" while the dialog opened (2026-09-28)
+
+The dialog opens with a scale animation, `0.94 -> 1.0` over ~0.78 s with easing `(0.1, 0.9, 0.2, 1)`: it is within 1% of
+full size after ~0.3 s and creeps the rest. Our painter drew each scaled text bitmap with `GdiAlphaBlend`, which picks
+the nearest pixel, so at a scale of 0.99 whole glyph columns dropped out ("Languagc", "Shaor3D") until the animation
+ended and the text snapped crisp. Measured by capturing the window every 40 ms after Ctrl+, and diffing against the
+settled frame: stable but wrong from ~0.35 to 0.85 s. Windows' compositor filters bilinearly, so the same tail is
+invisible there. Now:
+
+- a stretch whose size comes only from a scale within 2% of 1 (undoing the visual's accumulated scale,
+  `paint_content_sx/sy`, gives back the bitmap's own size) is drawn 1:1 about the same centre (`paint_op.snap`) -
+  text stays pixel-exact through the tail;
+- other stretches between 0.9x and 1.1x are sampled bilinearly (`raster_blend_affine` with an identity transform);
+- real resizes (Calculator's title-bar icon, thumbnails) and swap chains keep `GdiAlphaBlend`. Bilinear on the icon
+  moved Calculator's baseline by 49 pixels, so it stays out of this change.
+
+`docs/screenshots/shapr3d-settings-open-text.png`: the dialog 0.2, 0.4 and 0.6 s after opening, and settled. Suite, `kb`
+and the Calculator baseline unchanged.
