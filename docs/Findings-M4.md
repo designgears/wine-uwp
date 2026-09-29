@@ -10563,3 +10563,6 @@ and released on the release, before the menu opens.
 Every step is unmodified Microsoft code acting on correct input. This is also the documented behaviour: since Windows
 8.1, `PointerExited` fires whenever a UI change leaves the pointer outside an element, and a light-dismiss layer is
 such a change. I found nothing in Wine that differs from Windows here, so this is not fixed.
+
+**Confirmed on Windows (2026-09-29).** The user checked: on Windows the `...` also goes away on the first pointer move
+while the menu is open. So what we do is correct. Nothing to fix.
