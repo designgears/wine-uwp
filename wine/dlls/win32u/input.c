@@ -3174,6 +3174,13 @@ BOOL WINAPI NtUserGetPointerInfoList( UINT32 id, POINTER_INPUT_TYPE type, UINT_P
         RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
         return FALSE;
     }
+    /* only for the current message's pointer (see note_retrieved_message) */
+    if (get_user_thread_info()->current_pointer_id != id)
+    {
+        TRACE( "pointer id %d is not the current message's (%u)\n", id, get_user_thread_info()->current_pointer_id );
+        RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
 
     if (type != PT_POINTER) FIXME( "Pointer type %#x not implemented\n", type );
 

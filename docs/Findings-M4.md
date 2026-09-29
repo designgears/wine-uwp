@@ -10448,3 +10448,37 @@ frame holds the caption buttons here, so 10 px is a margin, chosen so Share line
 One wrong turn: I first called slot 6 of `ICoreApplicationView3` for `get_TitleBar`. Slot 6 is `get_IsComponent`, which
 wrote a zero boolean into the pointer. That looked exactly like "no title bar yet". Suite and `kb` unchanged.
 `docs/screenshots/shapr3d-share-inset.png` shows the result.
+
+### History "..." button: fixed - GetPointerInfo answered outside the current message (2026-09-28)
+
+This closes the open question in the two History "..." entries above. `CXcpBrowserHost::IsPreviousPointerUpdateMessageValid`
+(`windows.ui.xaml.dll+2ecd6c`) lets the replay run when three things hold:
+
+- no newer pointer message arrived (`+0x120`);
+- `GetPointerInfo(stored id)` succeeds;
+- the stored `POINTER_INFO.hwndTarget` (`+0x118`) is the host's input window or an open popup's.
+
+Measured with `WINE_UWP_BP` on `+2ecdaf` (the result) and `+2ecdc6@rbx+118`: all three held here, on every replay
+after the click and every 500 ms after that.
+
+The second check is the one that differs. `HandleInputMessage` records the message and calls `GetPointerInfo` while it
+is handling it, and fail-fasts if that fails, so the call must succeed then. The replay calls it from XAML's frame tick,
+where Windows' documented rule applies: pointer information belongs to the current message, the pointer message the
+thread retrieved last, until it retrieves another. Our win32u answered from the last-known state at any time.
+
+It now tracks `current_pointer_id` in `user_thread_info`:
+
+- `note_retrieved_message` sets it when `GetMessage`/`PeekMessage(PM_REMOVE)` hand out a message: the pointer id for
+  `WM_POINTER*`, 0 for anything else;
+- it is also set around the synchronous send of a mouse-in-pointer `WM_POINTER*`. Wine sends those inside
+  `process_mouse_message`, before the mouse message itself is handed out. A first version missed that and broke every
+  click.
+- `NtUserGetPointerInfoList` refuses any other id with `ERROR_INVALID_PARAMETER`.
+
+With it, the only refusals are the replays. The `...` stays while the menu is open
+(`docs/screenshots/shapr3d-history-more-button-kept.png`: hovered, then clicked with Insert Breakpoint / Suppress open).
+Also checked:
+
+- menu hover highlight and viewport selection and right-drag orbit (the independent input thread);
+- Calculator mouse clicks ("78") and Solitaire's Cancel;
+- the suite and `kb` identical.

@@ -2739,6 +2739,9 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
             update_pointer_from_msg( PT_MOUSE, &pointer_msg );
             TRACE_(ptrdisp)( "sending %#x to %p at %d,%d, input at %u (now %u)\n", message, msg->hwnd,
                              (int)msg->pt.x, (int)msg->pt.y, (unsigned)msg->time, (unsigned)NtGetTickCount() );
+            /* this is the thread's current message while it is handled (see note_retrieved_message); the mouse
+             * message that follows replaces it when it is handed out */
+            get_user_thread_info()->current_pointer_id = LOWORD( pointer_msg.wParam );
             send_message( msg->hwnd, message, pointer_msg.wParam, pointer_msg.lParam );
             forward_pointer_to_independent_input( msg->hwnd, message, pointer_msg.wParam, pointer_msg.lParam );
         }
@@ -3662,6 +3665,20 @@ BOOL WINAPI NtUserWaitMessage(void)
     return NtUserMsgWaitForMultipleObjectsEx( 0, NULL, INFINITE, QS_ALLINPUT, 0 ) != WAIT_FAILED;
 }
 
+/* GetPointerInfo answers for "the current message": the pointer message the thread retrieved last, until it retrieves
+ * another message. XAML depends on that. Its CXcpBrowserHost::ReplayPreviousPointerUpdate re-hit-tests the last pointer
+ * update from its frame tick, and it only does so when GetPointerInfo still answers for the recorded pointer. When a
+ * MenuFlyout opened, the replay hit the popup light-dismiss layer, the row under the pointer got PointerExited, and
+ * Shapr3D's History row dropped its "..." button although the pointer had not moved. */
+static void note_retrieved_message( const MSG *msg )
+{
+    UINT message = msg->message;
+    BOOL pointer = (message >= WM_POINTERUPDATE && message <= WM_POINTERLEAVE) ||
+                   message == WM_POINTERWHEEL || message == WM_POINTERHWHEEL;
+
+    get_user_thread_info()->current_pointer_id = pointer ? LOWORD( msg->wParam ) : 0;
+}
+
 /***********************************************************************
  *           NtUserPeekMessage  (win32u.@)
  */
@@ -3708,6 +3725,7 @@ BOOL WINAPI NtUserPeekMessage( MSG *msg_out, HWND hwnd, UINT first, UINT last, U
         return FALSE;
     }
     *msg_out = msg;
+    if (flags & PM_REMOVE) note_retrieved_message( &msg );
     if ((msg.message >= WM_POINTERUPDATE && msg.message <= WM_POINTERUP) || msg.message == WM_MOUSEWHEEL)
         TRACE_(ptrdisp)( "peeked %#x for %p flags %#x, posted at %u (now %u)\n", msg.message, msg.hwnd, flags,
                          (unsigned)msg.time, (unsigned)NtGetTickCount() );
@@ -3747,6 +3765,7 @@ BOOL WINAPI NtUserGetMessage( MSG *msg, HWND hwnd, UINT first, UINT last )
     if (ret < 0) return -1;
 
     check_for_driver_events();
+    note_retrieved_message( msg );
     if ((msg->message >= WM_POINTERUPDATE && msg->message <= WM_POINTERUP) || msg->message == WM_MOUSEWHEEL)
         TRACE_(ptrdisp)( "got %#x for %p, posted at %u (now %u)\n", msg->message, msg->hwnd,
                          (unsigned)msg->time, (unsigned)NtGetTickCount() );

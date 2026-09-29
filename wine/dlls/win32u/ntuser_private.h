@@ -137,6 +137,7 @@ struct user_thread_info
     struct list                   known_pointers;         /* list of known pointers */
     HANDLE                        coremsg_iocp;           /* our duplicate of CoreMessaging's completion port */
     HWND                          coremsg_hwnd;           /* CoreMessaging's adapter window, which runs its work on 0x60 */
+    UINT32                        current_pointer_id;     /* pointer of the message last retrieved, 0 if not a pointer message */
 };
 
 extern struct user_thread_info *get_user_thread_info(void);
