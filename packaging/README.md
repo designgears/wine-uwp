@@ -70,7 +70,7 @@ file by file on 09-29.
 The shims are built on the host (they need the Windows SDK headers) and go in as files. The runner and the AppImage
 are both made from the Flatpak's `/app`, so they link against the freedesktop runtime rather than the host's newer
 glibc. That lets the runner work inside Bottles' sandbox, and the AppImage run on distributions with glibc 2.38 or
-newer. The AppImage bundles only what hosts do not reliably have, and hands URLs back to the host's browser with the
+newer. The AppImage (109 MB) bundles only what hosts do not reliably have: GnuTLS, libusb, Python's OpenSSL and the like. Wine's media modules use the host's GStreamer and ffmpeg, if present, and hands URLs back to the host's browser with the
 host's own environment (`host-run`).
 
 ## Bottles

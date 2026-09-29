@@ -21,7 +21,7 @@ EXCLUDE = re.compile(
     r"libGL.*|libEGL.*|libGLX.*|libGLdispatch|libOpenGL|libGLES.*|libdrm.*|libgbm|libvulkan|"
     r"libX.*|libxcb.*|libxkbcommon.*|libxkbregistry|libxshmfence|libwayland.*|"
     r"libfontconfig|libfreetype|libasound|libpulse.*|libdbus-1|libudev|libsystemd|"
-    r"libstdc\+\+|libgcc_s)\.so")
+    r"libstdc\+\+|libgcc_s|ntdll|win32u)\.so")
 
 
 def needed(path):

@@ -38,10 +38,12 @@ find "$app/usr/lib/python$ver" -name __pycache__ -prune -exec rm -rf {} +
 
 echo "STAGE Bundling libraries"
 elves=("$app/usr/bin/python3" "$app/usr/bin/7zz" "$app/usr/bin/wine-uwp-installer" "$app/usr/bin/wine" "$app/usr/bin/wineserver")
-while IFS= read -r f; do elves+=("$f"); done < <(find "$app/usr/lib/wine/x86_64-unix" "$app/usr/lib/python$ver/lib-dynload" -name '*.so')
+# Wine's media modules (winegstreamer: GStreamer, winedmo: ffmpeg) are left to the host's libraries: bundling them
+# was ~100 MB of codecs, and Shapr3D plays no media. Where the host has them they load; where not, only media fails.
+while IFS= read -r f; do elves+=("$f"); done < <(find "$app/usr/lib/wine/x86_64-unix" "$app/usr/lib/python$ver/lib-dynload" \
+                                                   -name '*.so' ! -name winegstreamer.so ! -name winedmo.so)
 python3 "$here/bundle_libs.py" "$rt/lib/x86_64-linux-gnu" "$app/usr/lib/bundled" \
-  --also libgnutls.so.30 --also libusb-1.0.so.0 --also libavcodec.so.61 --also libavformat.so.61 \
-  --also libavutil.so.59 --also libgssapi_krb5.so.2 "${elves[@]}"
+  --also libgnutls.so.30 --also libusb-1.0.so.0 "${elves[@]}"
 
 echo "STAGE Desktop integration"
 install -m755 "$here/AppRun" "$app/AppRun"
