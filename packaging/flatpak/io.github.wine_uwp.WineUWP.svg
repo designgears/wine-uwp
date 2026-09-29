@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5b8def"/>
+      <stop offset="1" stop-color="#2748b8"/>
+    </linearGradient>
+    <linearGradient id="top" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dfe7fb"/>
+    </linearGradient>
+  </defs>
+  <!-- rounded tile -->
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#bg)"/>
+  <!-- four window panes, the lower right one lifted into a cube: a Windows app, in 3D -->
+  <rect x="26" y="26" width="34" height="34" rx="4" fill="#ffffff" opacity="0.92"/>
+  <rect x="68" y="26" width="34" height="34" rx="4" fill="#ffffff" opacity="0.55"/>
+  <rect x="26" y="68" width="34" height="34" rx="4" fill="#ffffff" opacity="0.55"/>
+  <g transform="translate(85 86)">
+    <path d="M0 -22 L19 -11 L0 0 L-19 -11 Z" fill="url(#top)"/>
+    <path d="M-19 -11 L0 0 L0 22 L-19 11 Z" fill="#c4d3f7"/>
+    <path d="M19 -11 L0 0 L0 22 L19 11 Z" fill="#9db4ee"/>
+  </g>
+</svg>

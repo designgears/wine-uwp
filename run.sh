@@ -13,17 +13,16 @@ unset WAYLAND_DISPLAY
 # Wine's normal channels by default: the +loaddll,+combase,+winrt tracing that debugging needs costs
 # about 6 s of the 10 s startup (4 s without it). Set WINEDEBUG to get it back.
 export WINEDEBUG=${WINEDEBUG:-fixme+all,err+all}
-# wined3d's OpenGL path stalls XAML's first frame on the NVIDIA desktop (Mesa EGL cannot open the DRI
-# device, the CS thread falls back to a "compatible pixel format"); the Vulkan renderer works on both
-# the desktop and the Xvfb test display.
-# Skip DLL_THREAD_ATTACH/DETACH into native DLLs: see Findings-M4.md, loader-lock deadlocks.
-export WINE_SKIP_NATIVE_THREAD_CALLS=${WINE_SKIP_NATIVE_THREAD_CALLS:-1}
-export WINE_D3D_CONFIG=${WINE_D3D_CONFIG:-renderer=vulkan}
+# The launch settings every app gets (loader switches, renderer, DLL overrides, window size) are in
+# launch-defaults.env, shared with wineuwp-launch.exe; anything already in the environment wins.
+while IFS= read -r line; do
+  case $line in export\ *=*) ;; *) continue ;; esac
+  line=${line#export }; name=${line%%=*}; value=${line#*=}; value=${value#\'}; value=${value%\'}
+  [ -n "${!name:-}" ] || export "$name=$value"
+done < "$(dirname "$0")/launch-defaults.env"
 # Patched Wine build (see docs/LinuxPort/Findings-M1.md), falls back to system wine.
 # WINE_BUILD comes from env.sh, which reconciles it with WINE_BIN_DIR.
 if [ -x "$WINE_BUILD/wine" ]; then export PATH="$WINE_BUILD:$PATH"; fi
-# DLLs where Wine's builtin must yield to the extracted Windows copy. Wine also ships these names.
-export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-windows.ui.xaml=n;windows.ui=n;twinapi.appcore=n;coremessaging=n;windows.applicationmodel=n;wintypes=n;threadpoolwinrt=n;msvcp_win=n;bcp47mrm=n;bcp47langs=n;profapi=n;rometadata=n;windows.globalization=n;msftedit=n;msxml6=n;cryptowinrt=n}"
 # A run killed by a timeout leaves this prefix's explorer.exe /desktop and the svchost.exe hosting
 # CoreMessagingRegistrar behind; they accumulate across runs and quietly wreck every later
 # measurement, because the activation is a race and a loaded machine loses it. Clear them with
@@ -60,10 +59,8 @@ export WINE_UWP_PACKAGE_FAMILY_NAME=${WINE_UWP_PACKAGE_FAMILY_NAME:-Microsoft.Wi
 # just after CoreWindow with nothing but an RtlReportException to show for it.
 export WINE_UWP_PACKAGE_PATH="Z:$(echo "$S" | sed 's|/|\\|g')"
 export WINE_UWP_AUMID=${WINE_UWP_AUMID:-Microsoft.WindowsCalculator.Dev_8wekyb3d8bbwe!App}
-# Frame title for the hosted CoreWindow (its own text is the entry id, "App"), and the launch size;
-# a window covering the whole screen cannot be resized through the frame.
+# Frame title for the hosted CoreWindow (its own text is the entry id, "App").
 export WINE_UWP_WINDOW_TITLE=${WINE_UWP_WINDOW_TITLE:-Calculator}
-export WINE_UWP_WINDOW_SIZE=${WINE_UWP_WINDOW_SIZE:-1280x800}
 # Framework dependencies: "fullname|family|path;..." (GetCurrentPackageInfo returns them after the main package)
 if [ -z "${WINE_UWP_PACKAGE_DEPENDENCIES:-}" ] && [ -d "${UWP_BIN}/stage/frameworks" ]; then
   deps=""

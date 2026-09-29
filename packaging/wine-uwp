@@ -36,6 +36,8 @@ installed() { for d in "$data"/stage/*/identity.env; do [ -f "$d" ] && basename 
 
 cmd=${1:-}
 [ $# -gt 0 ] && shift
+# a desktop scheme handler passes the URI itself ("wine-uwp %u")
+case $cmd in *:*) set -- "$cmd"; cmd=activate ;; esac
 if [ -z "$cmd" ]; then
   if [ -f "$data/prefix/.wine-uwp-ready" ] && [ -n "$(installed)" ]; then cmd=run; else cmd=setup; fi
 fi

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.wine_uwp.WineUWP</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LGPL-2.1-or-later</project_license>
+  <name>Shapr3D (wine-uwp)</name>
+  <summary>Run the Windows version of Shapr3D</summary>
+  <description>
+    <p>
+      wine-uwp runs packaged Windows (UWP) apps under a patched Wine. This build is set up for Shapr3D.
+    </p>
+    <p>
+      On first start a setup wizard downloads Microsoft's Windows 11 evaluation image from Microsoft, keeps the
+      Windows components Shapr3D needs, builds a private Wine environment and installs the Shapr3D package you
+      choose. No Windows licence key is needed and nothing of Microsoft's is shipped in this package.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.wine_uwp.WineUWP.desktop</launchable>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-09-29"/>
+  </releases>
+</component>

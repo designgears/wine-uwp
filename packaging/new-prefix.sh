@@ -43,6 +43,10 @@ wine reg add 'HKLM\Software\Microsoft\Windows NT\CurrentVersion\Svchost' /v Loca
     /t REG_MULTI_SZ /d CoreMessagingRegistrar /f >/dev/null   # the svchost group named in ImagePath
 wine reg add "$svc\\Parameters" /v ServiceDll /t REG_EXPAND_SZ /d '%SystemRoot%\system32\CoreMessaging.dll' /f >/dev/null
 
+# Wine picks its graphics driver from this key only; pin X11 (Xwayland on a Wayland desktop), as run.sh does on
+# every launch, for launchers that do not go through run.sh (wineuwp-launch.exe)
+wine reg add 'HKCU\Software\Wine\Drivers' /v Graphics /d x11 /f >/dev/null
+
 echo "STAGE Registering Windows Runtime classes"
 "$PY" "$here/gen-classes-reg.py" "$tree/Windows/System32/config/SOFTWARE" "$tree/Windows/System32" \
       "$tree/wine-uwp-classes.reg" | tail -1

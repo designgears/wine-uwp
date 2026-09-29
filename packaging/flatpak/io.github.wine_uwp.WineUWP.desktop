@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=Shapr3D (wine-uwp)
+GenericName=3D CAD
+Comment=Run the Windows version of Shapr3D; sets itself up on first start
+Exec=wine-uwp %u
+Icon=io.github.wine_uwp.WineUWP
+Terminal=false
+Categories=Graphics;3DGraphics;Engineering;
+Keywords=CAD;3D;modeling;Shapr3D;Windows;
+# Shapr3D's sign-in comes back from the browser through its own URI scheme
+MimeType=x-scheme-handler/shapr3d;
+StartupWMClass=shapr3d.exe
+Actions=setup;
+
+[Desktop Action setup]
+Name=Setup
+Exec=wine-uwp setup

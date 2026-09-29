@@ -310,6 +310,27 @@ def main():
     if mrt:
         shutil.copy2(os.path.join(sys32, mrt), dest)
 
+    # launch.env and wineuwp-launch.exe: what lets a plain `wine wineuwp-launch.exe` start the app (Bottles, desktop
+    # entries); run.sh computes the same from the stage directory
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(here)
+    defaults = os.path.join(root, "launch-defaults.env")
+    winpath = lambda p: "Z:" + os.path.abspath(p).replace("/", "\\")
+    with open(os.path.join(dest, "launch.env"), "w") as f:
+        if os.path.exists(defaults):
+            f.write(open(defaults).read())
+        deps = "".join(f"{d}|{d.split('_')[0]}_{d.rsplit('__', 1)[1]}|{winpath(os.path.join(fw_root, d))};"
+                       for d in frameworks)
+        f.write(f"export WINE_UWP_PACKAGE_DEPENDENCIES='{deps}'\n")
+        f.write("export WINEPATH='" + ":".join(os.path.abspath(os.path.join(fw_root, d)) for d in frameworks) + "'\n")
+    shim_dir = os.environ.get("SHIM_DIR") or os.path.join(os.environ.get("UWP_BIN", os.path.join(root, "uwp-bin")),
+                                                          "build-probes")
+    launcher = os.path.join(shim_dir, "wineuwp-launch.exe")
+    if os.path.exists(launcher):
+        shutil.copy2(launcher, dest)
+    else:
+        say(f"warning: no {launcher}; the app starts through run.sh only")
+
     title = (info["title"] or info["name"].rsplit(".", 1)[-1]).replace("'", "")
     with open(os.path.join(dest, "identity.env"), "w") as f:
         f.write(f"export WINE_UWP_PACKAGE_FULL_NAME={full}\n")

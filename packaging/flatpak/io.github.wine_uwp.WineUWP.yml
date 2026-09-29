@@ -1,0 +1,96 @@
+# Flatpak for wine-uwp, set up for Shapr3D. Build it with packaging/flatpak/build.sh, which prepares .build/ first.
+#
+# Wine is built here from the upstream release tarball with our Wine source (wine/ in this repo, every file we
+# changed, in full) laid over it; configure is regenerated because configure.ac is one of those files. Nothing of
+# Microsoft's is in the Flatpak: the setup wizard downloads Windows components on the user's machine.
+app-id: io.github.wine_uwp.WineUWP
+runtime: org.gnome.Platform
+runtime-version: '48'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.mingw-w64
+command: wine-uwp
+finish-args:
+  - --share=ipc
+  - --share=network
+  # Wine draws through X11 (run.sh pins the x11 driver); on Wayland desktops this is Xwayland
+  - --socket=x11
+  - --socket=pulseaudio
+  - --device=dri
+  # where Shapr3D's open/save dialogs start (the prefix's Documents/Desktop/Pictures/Downloads point here)
+  - --filesystem=xdg-documents
+  - --filesystem=xdg-download
+  - --filesystem=xdg-desktop
+  - --filesystem=xdg-pictures
+  - --env=WINEDEBUG=-all,err+all
+cleanup:
+  - /include
+  - /share/man
+  - /share/applications/wine.desktop
+  - /bin/function_grep.pl
+  - /bin/widl
+  - /bin/winebuild
+  - /bin/winecpp
+  - /bin/winedump
+  - /bin/wineg++
+  - /bin/winegcc
+  - /bin/winemaker
+  - /bin/wmc
+  - /bin/wrc
+  - '*.a'
+modules:
+  # 7-Zip reads the Windows ISO (UDF) and its install.wim for the harvest
+  - name: 7zip
+    buildsystem: simple
+    build-commands:
+      - make -C CPP/7zip/Bundles/Alone2 -f makefile.gcc -j${FLATPAK_BUILDER_N_JOBS}
+      - install -Dm755 CPP/7zip/Bundles/Alone2/_o/7zz /app/bin/7zz
+    sources:
+      - type: archive
+        url: https://github.com/ip7z/7zip/releases/download/26.03/7z2603-src.tar.xz
+        sha256: 9cbde5099c6deb73691b0579063da5827522ccbbcba3f0020fd04e8c8c16c0d4
+        strip-components: 0
+
+  - name: wine
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/mingw-w64/bin
+      no-debuginfo: true
+      env:
+        # the PE side (mingw); no debug info keeps the 2,000-odd modules small
+        CROSSCFLAGS: -O2
+    build-commands:
+      - rm -f FILES BASE.txt
+      - autoreconf -f
+      - >-
+        ./configure --prefix=/app --enable-archs=x86_64 --disable-tests
+        --without-oss --without-pcap --without-opencl --without-cups --without-sane --without-gphoto
+        --without-capi --without-v4l2 --without-netapi --without-pcsclite
+      - make -j${FLATPAK_BUILDER_N_JOBS}
+      - make install
+    sources:
+      - type: archive
+        url: https://dl.winehq.org/wine/source/11.x/wine-11.17.tar.xz
+        sha256: 8e752e29bba2901ad9f915139345c6ee67184b099d425704d915971ca5c055fc
+      # our Wine source over it (wine/FILES lists every file; wine/BASE.txt names the base)
+      - type: dir
+        path: ../../wine
+
+  - name: wine-uwp
+    buildsystem: simple
+    build-commands:
+      - cp -r share/wine-uwp /app/share/
+      - install -Dm755 bin/wine-uwp /app/bin/wine-uwp
+      - install -Dm644 io.github.wine_uwp.WineUWP.desktop /app/share/applications/io.github.wine_uwp.WineUWP.desktop
+      - install -Dm644 io.github.wine_uwp.WineUWP.metainfo.xml /app/share/metainfo/io.github.wine_uwp.WineUWP.metainfo.xml
+      - install -Dm644 io.github.wine_uwp.WineUWP.svg /app/share/icons/hicolor/scalable/apps/io.github.wine_uwp.WineUWP.svg
+    sources:
+      # packaging/build-dist.sh --no-wine: the scripts, the setup wizard and our shim DLLs
+      - type: dir
+        path: .build/dist
+      - type: file
+        path: io.github.wine_uwp.WineUWP.desktop
+      - type: file
+        path: io.github.wine_uwp.WineUWP.metainfo.xml
+      - type: file
+        path: io.github.wine_uwp.WineUWP.svg
