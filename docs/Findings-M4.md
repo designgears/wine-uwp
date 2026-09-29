@@ -10590,3 +10590,44 @@ and says so on stderr if it still fails. Results:
 The same run found a second first-run bug. `install-overrides.sh` tested `[ -x "$PY" ]`, which is false for a bare
 `python3`, so outside the dev venv the CLSID registrations (`WindowServerFactory` and friends) were skipped without a
 word. The CoreWindow then closed immediately. It uses `command -v` now.
+
+### Packaging: a Flatpak and a Bottles runner, both tested from nothing (2026-09-29)
+
+`packaging/README.md` has the design; `docs/screenshots/setup/` shows every screen. How each was tested:
+
+- **The Flatpak** (`io.github.wine_uwp.WineUWP`, GNOME 50). Wine 11.17 is built from the release tarball with our
+  `wine/` laid over it (checked equal to `~/src/wine` file by file). Run on `:95` from an empty data directory, the
+  wizard resumed a partial download from Microsoft and checked it against the pinned SHA-256. It then extracted the
+  components, built the prefix, installed a `.msixbundle` and launched Shapr3D to its first-run screen, inside the
+  sandbox.
+- **Bottles** (67.3, Flatpak). The runner is the Flatpak's `/app`. `wine-uwp bottles PACKAGE` creates a bottle with
+  DXVK/VKD3D off, sets it up inside Bottles' sandbox and registers the app. `bottles-cli run` reaches the same
+  first-run screen.
+- **`wineuwp-launch.exe`**: starts an installed app from a bare `wine` command, which is all Bottles or a desktop
+  entry does (identity, AppContainer key, CoreMessagingRegistrar, then the app).
+
+Starting from nothing found six bugs that the long-lived dev prefixes had hidden:
+
+1. `run.sh`'s AppContainer `reg add` failed silently from the app's environment. This was the fresh-prefix
+   `0x80070032` above.
+2. `[ -x "$PY" ]` is false for a bare `python3`, so the CLSID registrations were skipped outside the venv.
+3. `install-overrides.sh` imported `wineuwp.reg` *before* the CLSID map generated from the Windows hive, which
+   overwrote `{02844640-...}`. Prefixes only came out right after a second `run.sh` launch.
+4. The "already imported" markers lived in the Windows tree, not the prefix, so a copied tree skipped its
+   registrations.
+5. `wineuwp.reg` hard-coded `UWP_BIN\win11`.
+6. In Bottles, Windows.Storage could not resolve the app's own package folder through `Z:\...\bottles\NAME\...`,
+   the prefix directory: an unhandled `0x80070002`. The app now lives in the bottle's `drive_c`, and
+   `install-app.py` writes `C:` paths for anything there.
+
+Two things turned out not to matter:
+
+- **Mono.** The first working Flatpak prefix had wine-mono only because a dialog click hit Install. Shapr3D runs
+  without it, and `new-prefix.sh` now skips the Mono and Gecko prompts (the Flatpak's `wineboot` otherwise stops
+  at the download dialog).
+- **Bottles' environment.** Its variables, profile folders and Windows version were ruled out one by one. The
+  same bottle failed identically under plain `wine`, and under our own Flatpak's sandbox.
+
+Along the way, `gen-classes-reg.py` moved from `regipy` to `fasthive`: identical output, 0.15 s instead of 3
+minutes. The whole Wine tree builds again: `cpsf.c` fixed, a `wow64win` thunk added, stale `libc++`/`icu`
+objects cleared.
