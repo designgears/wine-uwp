@@ -2,6 +2,7 @@
 """Install a UWP app package (.msixbundle, .appxbundle, .msix or .appx) for wine-uwp.
 
     install-app.py PACKAGE DATADIR --windows TREE [--stage NAME]
+    install-app.py PACKAGE --info [--icon OUT.png] [--windows TREE]
 
 This is the registration step Windows' deployment service does, reduced to what wine-uwp needs:
 
@@ -13,17 +14,23 @@ This is the registration step Windows' deployment service does, reduced to what 
      puts it on the package graph;
   4. copy the framework DLLs the app loads by bare name next to it, as stage-app.sh does;
   5. write DATADIR/stage/NAME/identity.env, which run.sh sources: package full and family name, AUMID, entry exe
-     and window title.
+     and window title; and DATADIR/stage/NAME/.wine-uwp-icon.png, the app's logo, for a desktop entry.
+
+--info reads the package without installing it and prints one JSON object: name, title, publisher, version,
+architecture, frameworks (with "available" when --windows is given), and the logo if --icon names a file.
 
 Progress goes to stdout as "STAGE <what>" and "PROGRESS <done> <total>" lines for the setup wizard. The last line
 is "INSTALLED <stage name>". Only the standard library is used.
 """
 
 import argparse
+import json
 import hashlib
+import io
 import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import urllib.parse
@@ -59,8 +66,40 @@ def version_tuple(v):
     return tuple(int(x) for x in v.split("."))
 
 
-def pick_from_bundle(bundle, tmp):
-    """The x64 application package inside a bundle, extracted to tmp. Its path, or None if not a bundle."""
+class Slice(io.RawIOBase):
+    """A read-only window onto part of a file: a package stored uncompressed inside a bundle, read in place."""
+
+    def __init__(self, path, start, size):
+        self.f, self.start, self.size, self.pos = open(path, "rb"), start, size, 0
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.pos
+
+    def seek(self, off, whence=0):
+        self.pos = {0: off, 1: self.pos + off, 2: self.size + off}[whence]
+        return self.pos
+
+    def readinto(self, buf):
+        n = max(0, min(len(buf), self.size - self.pos))
+        self.f.seek(self.start + self.pos)
+        got = self.f.readinto(memoryview(buf)[:n])
+        self.pos += got
+        return got
+
+    def close(self):
+        self.f.close()
+        super().close()
+
+
+def pick_from_bundle(path, bundle, tmp):
+    """The x64 application package inside a bundle: read in place when it is stored uncompressed (bundles store
+    their packages that way), extracted to tmp otherwise. A file-like object or path, or None if not a bundle."""
     names = bundle.namelist()
     manifest = next((n for n in names if n.lower() == "appxmetadata/appxbundlemanifest.xml"), None)
     if not manifest:
@@ -74,7 +113,13 @@ def pick_from_bundle(bundle, tmp):
         archs = sorted({p.get("Architecture", "?") for p in children(root, "Package")})
         raise SystemExit(f"this bundle has no {ARCH} application package (it has: {', '.join(archs)})")
     inner = candidates[0]
-    member = next(n for n in names if urllib.parse.unquote(n) == inner or n == inner)
+    member = bundle.getinfo(next(n for n in names if urllib.parse.unquote(n) == inner or n == inner))
+    if member.compress_type == zipfile.ZIP_STORED:
+        with open(path, "rb") as f:
+            f.seek(member.header_offset)
+            local = f.read(30)
+            name_len, extra_len = struct.unpack_from("<HH", local, 26)
+        return Slice(path, member.header_offset + 30 + name_len + extra_len, member.file_size)
     out = os.path.join(tmp, os.path.basename(inner))
     with bundle.open(member) as src, open(out, "wb") as dst:
         shutil.copyfileobj(src, dst, 1 << 20)
@@ -87,6 +132,9 @@ def read_manifest(pkg):
     ident = children(root, "Identity")[0]
     app = children(root, "Application")[0]
     names = [e.text for e in children(root, "DisplayName") if e.text]
+    pubnames = [e.text for e in children(root, "PublisherDisplayName") if e.text]
+    visual = next(iter(children(app, "VisualElements")), None)
+    logo = (visual.get("Square44x44Logo") or visual.get("Square150x150Logo")) if visual is not None else None
     deps = [(d.get("Name"), d.get("MinVersion", "0.0.0.0"), d.get("Publisher", ""))
             for d in children(root, "PackageDependency")]
     return {
@@ -98,8 +146,30 @@ def read_manifest(pkg):
         "app_id": app.get("Id"),
         "exe": app.get("Executable", "").replace("\\", "/"),
         "title": next((n for n in names if not n.startswith("ms-resource:")), None),
+        "publisher_name": next((n for n in pubnames if not n.startswith("ms-resource:")), None),
+        "logo": logo.replace("\\", "/") if logo else None,
         "deps": deps,
     }
+
+
+def pick_logo(names, logo):
+    """The best file for a manifest logo path: the plain unplated 256 px variant if there is one, then the largest
+    target size or scale. MRT stores qualified names (Logo.targetsize-256.png) next to the unqualified path."""
+    if not logo:
+        return None
+    base, ext = os.path.splitext(logo.lower())
+    best = None
+    for n in names:
+        rel = urllib.parse.unquote(n)
+        low = rel.lower()
+        if not (low.startswith(base) and low.endswith(ext)):
+            continue
+        quals = low[len(base):-len(ext)].lstrip(".")
+        size = max([int(x) for x in re.findall(r"(?:targetsize|scale)-(\d+)", quals)] or [0])
+        score = (size >= 256 and "unplated" in quals and "lightunplated" not in quals, size, quals == "")
+        if best is None or score > best[0]:
+            best = (score, n)
+    return best[1] if best else None
 
 
 def extract(pkg, dest):
@@ -134,25 +204,56 @@ def find_framework(apps_dir, name, min_version, publisher):
     return best[1] if best else None
 
 
+def open_package(path, tmp):
+    try:
+        outer = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, FileNotFoundError, IsADirectoryError):
+        raise SystemExit(f"{path} is not an app package")
+    with outer:
+        inner = pick_from_bundle(path, outer, tmp)
+    return zipfile.ZipFile(inner or path)
+
+
+def info_only(args):
+    with tempfile.TemporaryDirectory(prefix="wine-uwp-info-") as tmp:
+        with open_package(args.package, tmp) as pkg:
+            info = read_manifest(pkg)
+            member = pick_logo(pkg.namelist(), info["logo"])
+            if args.icon and member:
+                with pkg.open(member) as src, open(args.icon, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+    apps_dir = os.path.join(args.windows, "Program Files", "WindowsApps") if args.windows else None
+    out = {
+        "name": info["name"], "title": info["title"] or info["name"], "publisher": info["publisher_name"],
+        "version": info["version"], "architecture": info["arch"],
+        "icon": args.icon if args.icon and member else None,
+        "frameworks": [{"name": n, "min_version": v,
+                        "available": bool(find_framework(apps_dir, n, v, p)) if apps_dir else None}
+                       for n, v, p in info["deps"]],
+    }
+    print(json.dumps(out, indent=1))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("package")
-    ap.add_argument("datadir")
-    ap.add_argument("--windows", required=True, help="the harvested Windows tree (WIN11)")
+    ap.add_argument("datadir", nargs="?")
+    ap.add_argument("--windows", help="the harvested Windows tree (WIN11)")
+    ap.add_argument("--info", action="store_true", help="describe the package as JSON, install nothing")
+    ap.add_argument("--icon", help="with --info: write the app's logo here")
     ap.add_argument("--stage", help="stage directory name (default: the package name's last part, lowercased)")
     args = ap.parse_args()
+    if args.info:
+        return info_only(args)
+    if not args.datadir or not args.windows:
+        ap.error("installing needs DATADIR and --windows")
 
     apps_dir = os.path.join(args.windows, "Program Files", "WindowsApps")
     sys32 = os.path.join(args.windows, "Windows", "System32")
     with tempfile.TemporaryDirectory(prefix="wine-uwp-install-", dir=args.datadir) as tmp:
         say("STAGE Reading the package")
-        try:
-            outer = zipfile.ZipFile(args.package)
-        except zipfile.BadZipFile:
-            raise SystemExit(f"{args.package} is not an app package (not a zip archive)")
-        with outer:
-            inner = pick_from_bundle(outer, tmp)
-        pkg = zipfile.ZipFile(inner or args.package)
+        pkg = open_package(args.package, tmp)
         info = read_manifest(pkg)
         if info["arch"].lower() not in (ARCH, "neutral"):
             raise SystemExit(f"{info['name']} is built for {info['arch']}, not {ARCH}")
@@ -173,12 +274,15 @@ def main():
         if missing:
             raise SystemExit("these frameworks are not in the Windows files: " + ", ".join(missing))
 
+        icon_member = pick_logo(pkg.namelist(), info["logo"])
         dest = os.path.join(args.datadir, "stage", stage)
         say(f"STAGE Unpacking {info['title'] or info['name']} {info['version']}")
         if os.path.exists(dest):
             shutil.rmtree(dest)
         os.makedirs(dest)
         extract(pkg, dest)
+        if icon_member:
+            shutil.copy2(os.path.join(dest, urllib.parse.unquote(icon_member)), os.path.join(dest, ".wine-uwp-icon.png"))
         pkg.close()
 
     say("STAGE Installing frameworks")
