@@ -570,6 +570,8 @@ frame, 120 times, until it had pixels. XAML's A8 nine-grid masks are mostly empt
 readback ... single: N, M upload retries` shows it; retries now back off. Before adding anything that repeats until
 something appears, bound it in time and in cost.
 
+**A hover test with a perfectly still mouse proves nothing.** A real hand always moves the pointer a pixel or two. I called the History `...` fixed after a still-mouse test, and the user saw it vanish on the first move. After any click that should keep hover state, `xdotool mousemove_relative 1 0`, then capture. `/tmp/jitter.sh` in the 09-29 session does exactly this.
+
 **After any interaction, check that XAML itself still repaints, not just the picture.** Shapr3D's viewport is the app's
 own swap chain and keeps moving when XAML's frame loop has died; a drag-and-drop fix looked perfect on the model while
 every menu and tab had frozen. Click a tab or open a menu afterwards, or count `dcompgate` `commit` lines. One failed
