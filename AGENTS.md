@@ -152,7 +152,7 @@ silently break if it moves again. All of these bit me during the move out of the
 - **The prefix registry holds ~2,500 absolute paths.** Rewrite them with wineserver **down**, or
   the server flushes its in-memory copy back over your edit.
 - **`.reg` files cannot expand variables**, so any path in one is baked to whoever generated it.
-  `wineuwp.reg` now carries an `@UWP_BIN_WINPATH@` placeholder that `install-overrides.sh`
+  `wineuwp.reg` now carries an `@WIN11_WINPATH@` placeholder (the Windows tree) that `install-overrides.sh`
   substitutes at import time.
 - **`build.sh` fails with a stale CMake cache after a move.** `uwp-bin/build-probes/CMakeCache.txt`
   records the *old* source and binary directories (`/home/bobby/Projects/calculator/tools/wine-uwp`,

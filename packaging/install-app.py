@@ -315,7 +315,13 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.dirname(here)
     defaults = os.path.join(root, "launch-defaults.env")
-    winpath = lambda p: "Z:" + os.path.abspath(p).replace("/", "\\")
+    def winpath(p):
+        # inside a prefix's drive_c, the C: path: Windows.Storage cannot resolve a Z: path that runs through the
+        # prefix directory itself (a Bottles bottle keeps the app there)
+        p = os.path.abspath(p)
+        if "/drive_c/" in p:
+            return "C:\\" + p.split("/drive_c/", 1)[1].replace("/", "\\")
+        return "Z:" + p.replace("/", "\\")
     with open(os.path.join(dest, "launch.env"), "w") as f:
         if os.path.exists(defaults):
             f.write(open(defaults).read())

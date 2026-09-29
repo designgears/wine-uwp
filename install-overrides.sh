@@ -119,19 +119,6 @@ done
 
 # Per-user language profile: bcp47mrm throws a C++ exception when it is missing (Findings-M4.md).
 "${WINE_BIN}wine" reg import "$(dirname "$0")/globalization.reg" >/dev/null 2>&1
-# wineuwp.reg carries one absolute host path (threadpoolwinrt.dll in the Windows image). A .reg
-# file cannot expand a variable, so the placeholder is substituted at import time - otherwise the
-# path is baked to whoever generated it, which is exactly what broke every app when this tree moved
-# out of the home directory.
-UWP_BIN_WINPATH="Z:$(echo "$UWP_BIN" | sed 's|/|\\\\|g')"
-# The replacement has to be escaped *again* for sed, which eats a backslash pair in a replacement.
-# Without this the imported value came out as "Z:homebobbyProjects..." - reg import then dropped
-# every unrecognised \<letter> escape - and the app died with "couldn't load in-process dll",
-# "no apartment found for ipid" and do_activate hr 0x80004005, which looks nothing like a path bug.
-UWP_BIN_WINPATH_SED=$(printf '%s' "$UWP_BIN_WINPATH" | sed 's|\\|\\\\|g')
-sed "s|@UWP_BIN_WINPATH@|${UWP_BIN_WINPATH_SED}|g" "$(dirname "$0")/wineuwp.reg" > "$WINEPREFIX/.wineuwp.reg.tmp"
-"${WINE_BIN}wine" reg import "$WINEPREFIX/.wineuwp.reg.tmp" >/dev/null 2>&1
-rm -f "$WINEPREFIX/.wineuwp.reg.tmp"
 
 # MRT shares process resource state between its COM and WinRT entry points. Loading a second
 # physical copy through an absolute extraction path breaks that state (see Findings-M4.md).
@@ -148,18 +135,35 @@ PY=${PY:-$( [ -x "${UWP_BIN}/venv/bin/python" ] && echo "${UWP_BIN}/venv/bin/pyt
 CLSID_REG=${WIN11}/wine-uwp-clsid.reg
 if command -v "$PY" >/dev/null; then
   "$PY" "$(dirname "$0")/gen-clsid-reg.py" "$SRC/config/SOFTWARE" "$SRC" "$CLSID_REG" | tail -1
-  if ! cmp -s "$CLSID_REG" "$CLSID_REG.imported"; then
-    "${WINE_BIN}wine" reg import "$CLSID_REG" >/dev/null 2>&1 && cp -f "$CLSID_REG" "$CLSID_REG.imported"
+  # the marker is per prefix: one Windows tree can serve several prefixes (a bottle gets a copy of it)
+  if ! cmp -s "$CLSID_REG" "$WINEPREFIX/.wine-uwp-clsid.reg.imported"; then
+    "${WINE_BIN}wine" reg import "$CLSID_REG" >/dev/null 2>&1 && cp -f "$CLSID_REG" "$WINEPREFIX/.wine-uwp-clsid.reg.imported"
   fi
 fi
 CLASSES_REG=${CLASSES_REG:-${WIN11}/wine-uwp-classes.reg}
 SINGLE_REG=${WIN11}/wine-uwp-single-module.reg
 if [ -f "$CLASSES_REG" ] && command -v "$PY" >/dev/null; then
   "$PY" "$(dirname "$0")/gen-single-module-reg.py" "$CLASSES_REG" "$SRC" "$SYS32" "$SINGLE_REG" | tail -1
-  if ! cmp -s "$SINGLE_REG" "$SINGLE_REG.imported"; then
-    "${WINE_BIN}wine" reg import "$SINGLE_REG" >/dev/null 2>&1 && cp -f "$SINGLE_REG" "$SINGLE_REG.imported"
+  if ! cmp -s "$SINGLE_REG" "$WINEPREFIX/.wine-uwp-single-module.reg.imported"; then
+    "${WINE_BIN}wine" reg import "$SINGLE_REG" >/dev/null 2>&1 &&
+      cp -f "$SINGLE_REG" "$WINEPREFIX/.wine-uwp-single-module.reg.imported"
   fi
 fi
+
+# wineuwp.reg carries one absolute host path (threadpoolwinrt.dll in the Windows image, $WIN11). A
+# .reg file cannot expand a variable, so the placeholder is substituted at import time - otherwise
+# the path is baked to whoever generated it, which is exactly what broke every app when this tree
+# moved out of the home directory. It is imported after the registrations generated from the
+# Windows hive, because it overrides some of them ({02844640-...} is wineuwp's, not twinapi's).
+WIN11_WINPATH="Z:$(echo "$WIN11" | sed 's|/|\\\\|g')"
+# The replacement has to be escaped *again* for sed, which eats a backslash pair in a replacement.
+# Without this the imported value came out as "Z:homebobbyProjects..." - reg import then dropped
+# every unrecognised \<letter> escape - and the app died with "couldn't load in-process dll",
+# "no apartment found for ipid" and do_activate hr 0x80004005, which looks nothing like a path bug.
+WIN11_WINPATH_SED=$(printf '%s' "$WIN11_WINPATH" | sed 's|\\|\\\\|g')
+sed "s|@WIN11_WINPATH@|${WIN11_WINPATH_SED}|g" "$(dirname "$0")/wineuwp.reg" > "$WINEPREFIX/.wineuwp.reg.tmp"
+"${WINE_BIN}wine" reg import "$WINEPREFIX/.wineuwp.reg.tmp" >/dev/null 2>&1
+rm -f "$WINEPREFIX/.wineuwp.reg.tmp"
 
 # Windows.Internal.StateRepository.* stand-in. Those classes are service-activated in the Windows
 # hive (ActivationType=1, Server=StateRepository) with no DllPath, so gen-classes-reg.py skips them

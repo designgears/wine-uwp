@@ -9,8 +9,10 @@
 #   1. copy this wine-uwp tree into Bottles' runners/ as wine-uwp-<version> (Bottles lists any directory there)
 #   2. bottles-cli new: a bottle on that runner, from a recipe that keeps DXVK, VKD3D and the rest off - they
 #      replace d3d11/dxgi, which wine-uwp's composition depends on
-#   3. copy the Windows components into the bottle: Bottles' Flatpak sandbox sees nothing outside its own data, and
-#      the registry refers to those files by path at run time
+#   3. copy the Windows components into the bottle's C:\wine-uwp: Bottles' Flatpak sandbox sees nothing outside its
+#      own data, and the registry refers to those files by path at run time. Inside drive_c, because a path through
+#      the prefix directory itself (Z:\...\bottles\NAME\...) does not resolve for Windows.Storage: the app died on
+#      an unhandled 0x80070002 walking to its own package folder
 #   4. inside Bottles' sandbox, so only one wineserver ever drives the bottle: new-prefix.sh on the bottle, then
 #      install-app.py into it
 #   5. bottles-cli add: the program is the app's wineuwp-launch.exe, which sets up the package identity itself
@@ -57,22 +59,24 @@ fi
 [ -f "$bottle/bottle.yml" ] || { echo "Bottles did not create $bottle" >&2; exit 1; }
 
 echo "STAGE Copying the Windows components into the bottle"
-mkdir -p "$bottle/wine-uwp"
-cp -a --reflink=auto "$windows"/. "$bottle/wine-uwp/windows"/
+W=$bottle/drive_c/wine-uwp
+mkdir -p "$W"
+cp -a --reflink=auto "$windows"/. "$W/windows"/
+rm -f "$W"/windows/*.imported
 
 echo "STAGE Setting up Windows components in the bottle"
 q() { printf '%q' "$1"; }
 inside "export WINEPREFIX=$(q "$bottle") WINE_BUILD=$(q "$R/bin") SHIM_DIR=$(q "$R/share/wine-uwp/shims") PY=python3 \
-               UWP_BIN=$(q "$bottle/wine-uwp") WINEDEBUG=-all
-        $(q "$R/share/wine-uwp/packaging/new-prefix.sh") $(q "$bottle/wine-uwp/windows") $(q "$bottle") &&
-        python3 $(q "$R/share/wine-uwp/packaging/install-app.py") $(q "$package") $(q "$bottle/wine-uwp") \
-                --windows $(q "$bottle/wine-uwp/windows")" | tee "$bottle/wine-uwp/setup.log" | grep -E '^(STAGE|INSTALLED)'
-app=$(grep -a '^INSTALLED ' "$bottle/wine-uwp/setup.log" | tail -1 | cut -d' ' -f2)
-[ -n "$app" ] || { echo "the app did not install; see $bottle/wine-uwp/setup.log" >&2; exit 1; }
-title=$(sed -n "s/^export WINE_UWP_WINDOW_TITLE='\(.*\)'/\1/p" "$bottle/wine-uwp/stage/$app/identity.env")
+               UWP_BIN=$(q "$W") WINEDEBUG=-all
+        $(q "$R/share/wine-uwp/packaging/new-prefix.sh") $(q "$W/windows") $(q "$bottle") &&
+        python3 $(q "$R/share/wine-uwp/packaging/install-app.py") $(q "$package") $(q "$W") \
+                --windows $(q "$W/windows")" | tee "$W/setup.log" | grep -E '^(STAGE|INSTALLED)'
+app=$(grep -a '^INSTALLED ' "$W/setup.log" | tail -1 | cut -d' ' -f2)
+[ -n "$app" ] || { echo "the app did not install; see $W/setup.log" >&2; exit 1; }
+title=$(sed -n "s/^export WINE_UWP_WINDOW_TITLE='\(.*\)'/\1/p" "$W/stage/$app/identity.env")
 
 echo "STAGE Adding $title to the bottle"
-cli add -b "$name" -n "$title" -p "$bottle/wine-uwp/stage/$app/wineuwp-launch.exe" --no-d7vk --no-dxvk --no-vkd3d \
+cli add -b "$name" -n "$title" -p "$W/stage/$app/wineuwp-launch.exe" --no-d7vk --no-dxvk --no-vkd3d \
     --no-dxvk-nvapi
 echo
 echo "STAGE Done: open Bottles, bottle \"$name\", and run \"$title\""
