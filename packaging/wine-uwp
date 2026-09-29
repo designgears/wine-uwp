@@ -5,6 +5,7 @@
 #   wine-uwp setup            the setup wizard
 #   wine-uwp run [APP]        run an installed app (default: the first one installed)
 #   wine-uwp list             installed apps
+#   wine-uwp activate URI     hand a URI (a browser sign-in's callback) to the app that owns its scheme
 #   wine-uwp harvest ISO      extract the Windows files from an ISO     (command-line setup, step 1)
 #   wine-uwp new-prefix       build the Wine prefix from them            (step 2)
 #   wine-uwp install PACKAGE  install an .msixbundle/.msix/.appx         (step 3)
@@ -22,6 +23,15 @@ export WINE_UWP_ROOT=$root UWP_BIN=$data WIN11=$data/windows WINEPREFIX=$data/pr
 export WINE_BUILD=$bin SHIM_DIR=$root/shims PY=${PY:-python3}
 export WINEDEBUG=${WINEDEBUG:--all,err+all}
 
+# is APP running from this data directory? (its processes carry UWP_STAGE and WINEPREFIX from "run")
+running() {
+  local e
+  for e in /proc/[0-9]*/environ; do
+    tr '\0' '\n' < "$e" 2>/dev/null | grep -qx "UWP_STAGE=$1" &&
+      tr '\0' '\n' < "$e" 2>/dev/null | grep -qxF "WINEPREFIX=$data/prefix" && return 0
+  done
+  return 1
+}
 installed() { for d in "$data"/stage/*/identity.env; do [ -f "$d" ] && basename "$(dirname "$d")"; done; true; }
 
 cmd=${1:-}
@@ -38,6 +48,18 @@ case $cmd in
     UWP_STAGE=$app UWP_TIMEOUT=0 UWP_LOG="$data/logs/$app.log" exec "$root/run.sh" ;;
   harvest)    exec python3 "$root/packaging/harvest/harvest.py" "$1" "$data/windows" ;;
   new-prefix) "$root/packaging/new-prefix.sh" "$data/windows" "$data/prefix"; touch "$data/prefix/.wine-uwp-ready" ;;
+  activate)
+    # the desktop's handler for an app's URI scheme: wineuwp in the running app watches this inbox and
+    # delivers it as a Protocol activation (activate-uri.sh in the checkout does the same)
+    uri=${1:?usage: wine-uwp activate URI}
+    scheme=${uri%%:*}
+    app=""
+    for a in $(installed); do grep -qxi "$scheme" "$data/stage/$a/.wine-uwp-protocols" 2>/dev/null && app=$a; done
+    [ -n "$app" ] || { echo "no installed app owns $scheme:" >&2; exit 1; }
+    inbox="$data/prefix/drive_c/users/Public/wineuwp-activate.uri"
+    printf '%s' "$uri" > "$inbox.tmp" && mv -f "$inbox.tmp" "$inbox"
+    # not running: start it, and it picks the inbox up when it starts watching
+    running "$app" || (setsid "$0" run "$app" >/dev/null 2>&1 &) ;;
   install)    exec python3 "$root/packaging/install-app.py" "$1" "$data" --windows "$data/windows" ;;
   *)          sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac

@@ -14,7 +14,8 @@ This is the registration step Windows' deployment service does, reduced to what 
      puts it on the package graph;
   4. copy the framework DLLs the app loads by bare name next to it, as stage-app.sh does;
   5. write DATADIR/stage/NAME/identity.env, which run.sh sources: package full and family name, AUMID, entry exe
-     and window title; and DATADIR/stage/NAME/.wine-uwp-icon.png, the app's logo, for a desktop entry.
+     and window title; DATADIR/stage/NAME/.wine-uwp-icon.png, the app's logo, for a desktop entry; and
+     .wine-uwp-protocols, the URI schemes it owns, one per line, for the desktop's scheme handlers.
 
 --info reads the package without installing it and prints one JSON object: name, title, publisher, version,
 architecture, frameworks (with "available" when --windows is given), and the logo if --icon names a file.
@@ -149,6 +150,8 @@ def read_manifest(pkg):
         "publisher_name": next((n for n in pubnames if not n.startswith("ms-resource:")), None),
         "logo": logo.replace("\\", "/") if logo else None,
         "deps": deps,
+        # URI schemes the app owns (a browser sign-in comes back through one)
+        "protocols": sorted({e.get("Name").lower() for e in children(root, "Protocol") if e.get("Name")}),
     }
 
 
@@ -227,6 +230,7 @@ def info_only(args):
         "name": info["name"], "title": info["title"] or info["name"], "publisher": info["publisher_name"],
         "version": info["version"], "architecture": info["arch"],
         "icon": args.icon if args.icon and member else None,
+        "protocols": info["protocols"],
         "frameworks": [{"name": n, "min_version": v,
                         "available": bool(find_framework(apps_dir, n, v, p)) if apps_dir else None}
                        for n, v, p in info["deps"]],
@@ -314,6 +318,8 @@ def main():
         f.write(f"export WINE_UWP_AUMID={family}!{info['app_id']}\n")
         f.write(f"export WINE_UWP_WINDOW_TITLE='{title}'\n")
         f.write(f"export UWP_EXE='{info['exe']}'\n")
+    with open(os.path.join(dest, ".wine-uwp-protocols"), "w") as f:
+        f.writelines(p + "\n" for p in info["protocols"])
     say(f"STAGE Installed {title} {info['version']}")
     say(f"INSTALLED {stage}")
 
