@@ -45,10 +45,16 @@ share=$out/share/wine-uwp
 mkdir -p "$share/shims" "$share/packaging"
 cp "$here"/{env.sh,run.sh,install-overrides.sh,launch-defaults.env,globalization.reg,wineuwp.reg,mrt-single-module.reg} "$share"/
 cp "$here"/{gen-classes-reg.py,gen-clsid-reg.py,gen-interfaces-reg.py,gen-single-module-reg.py,fasthive.py,uwppaths.py} "$share"/
-cp -r "$here"/packaging/{harvest,new-prefix.sh,install-app.py,setup,bottles} "$share/packaging"/
+cp -r "$here"/packaging/{harvest,new-prefix.sh,install-app.py,bottles} "$share/packaging"/
 find "$share" -name __pycache__ -prune -exec rm -rf {} +
 shims=$(grep -ohE '\$\{SHIM_DIR\}/[A-Za-z0-9_.-]+\.dll' "$here/install-overrides.sh" | sed 's|${SHIM_DIR}/||' | sort -u)
 for s in $shims wineuwp-launch.exe; do cp "$UWP_BIN/build-probes/$s" "$share/shims/"; done
 install -m755 "$here/packaging/wine-uwp" "$out/bin/wine-uwp"
+# the setup (Rust + Slint); the Flatpak compiles it in its own SDK instead
+if [ -n "$with_wine" ]; then
+  echo "STAGE Building the installer"
+  cargo build --release --quiet --manifest-path "$here/packaging/installer/Cargo.toml"
+  install -m755 "$here/packaging/installer/target/release/wine-uwp-installer" "$out/bin/"
+fi
 git -C "$here" rev-parse --short HEAD > "$share/VERSION"
 echo "STAGE Done: $out ($(du -sh "$out" | cut -f1))"

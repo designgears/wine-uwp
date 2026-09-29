@@ -1,0 +1,908 @@
+// The wine-uwp installer. Styled after Shapr3D's own UI: #202020 window, #2C2C2C panels, #383838 controls,
+// the #6EA1FF accent with dark text on it, small radii, flat surfaces, grey secondary text.
+import { ScrollView } from "std-widgets.slint";
+// Inter (SIL OFL, fonts/Inter-LICENSE.txt), embedded so the installer looks the same on every system; it is the
+// closest open font to the Segoe UI Shapr3D uses on Windows.
+import "fonts/Inter-Regular.ttf";
+import "fonts/Inter-Medium.ttf";
+import "fonts/Inter-SemiBold.ttf";
+import "fonts/Inter-Bold.ttf";
+
+export struct Step {
+    title: string,
+    detail: string,
+    state: int, // 0 pending, 1 running, 2 done, 3 failed
+}
+
+export struct Framework {
+    name: string,
+    version: string,
+    ok: bool,
+}
+
+global Theme {
+    out property <color> window: #202020;
+    out property <color> panel: #2c2c2c;
+    out property <color> control: #383838;
+    out property <color> control-hover: #414141;
+    out property <color> border: #3a3a3a;
+    out property <color> accent: #6ea1ff;
+    out property <color> accent-hover: #86b1ff;
+    out property <color> accent-pressed: #5a8def;
+    out property <color> on-accent: #141414;
+    out property <color> text: #f2f2f2;
+    out property <color> text-2: #a8a8a8;
+    out property <color> text-3: #767676;
+    out property <color> success: #5cc88a;
+    out property <color> danger: #ff6b6b;
+    out property <length> radius: 6px;
+    out property <length> radius-small: 4px;
+}
+
+component Icon inherits Image {
+    in property <color> tint: Theme.text;
+    colorize: tint;
+    image-fit: contain;
+}
+
+component PrimaryButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <image> icon;
+    in property <bool> has-icon: false;
+    callback clicked;
+    height: 36px;
+    min-width: 132px;
+    border-radius: Theme.radius-small;
+    background: !enabled ? #3a4a66 : touch.pressed ? Theme.accent-pressed : touch.has-hover ? Theme.accent-hover : Theme.accent;
+    animate background { duration: 120ms; }
+    HorizontalLayout {
+        padding-left: 18px;
+        padding-right: 18px;
+        spacing: 8px;
+        alignment: center;
+        Text {
+            text: root.text;
+            color: enabled ? Theme.on-accent : #7d8aa3;
+            font-size: 14px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+        if has-icon: Icon {
+            source: root.icon;
+            width: 16px;
+            tint: enabled ? Theme.on-accent : #7d8aa3;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component SecondaryButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> danger: false;
+    callback clicked;
+    height: 36px;
+    min-width: 100px;
+    border-radius: Theme.radius-small;
+    background: touch.pressed ? #4a4a4a : touch.has-hover ? Theme.control-hover : Theme.control;
+    animate background { duration: 120ms; }
+    Text {
+        text: root.text;
+        color: !enabled ? Theme.text-3 : danger ? Theme.danger : Theme.text;
+        font-size: 14px;
+        font-weight: 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component LinkText inherits Text {
+    callback clicked;
+    color: touch.has-hover ? Theme.accent-hover : Theme.accent;
+    font-weight: 600;
+    font-size: 13px;
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Toggle inherits Rectangle {
+    in-out property <bool> checked;
+    callback toggled(bool);
+    width: 38px;
+    height: 22px;
+    border-radius: 11px;
+    background: checked ? Theme.accent : #4a4a4a;
+    animate background { duration: 150ms; }
+    knob := Rectangle {
+        width: 16px;
+        height: 16px;
+        y: 3px;
+        x: root.checked ? root.width - 19px : 3px;
+        border-radius: 8px;
+        background: root.checked ? Theme.on-accent : #d8d8d8;
+        animate x { duration: 150ms; easing: ease-out; }
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+}
+
+// the card a choice lives on: a panel with a subtle border that turns accent when selected
+component ChoiceCard inherits Rectangle {
+    in property <bool> selected;
+    in property <string> title;
+    in property <string> subtitle;
+    in property <string> badge;
+    in property <image> icon;
+    callback picked;
+    border-radius: Theme.radius;
+    background: touch.has-hover && !selected ? #303030 : Theme.panel;
+    border-width: 1px;
+    border-color: selected ? Theme.accent : Theme.border;
+    animate border-color, background { duration: 150ms; }
+    min-height: 76px;
+    HorizontalLayout {
+        padding: 16px;
+        spacing: 14px;
+        Rectangle {
+            width: 20px;
+            height: 20px;
+            y: (parent.height - self.height) / 2 - 16px;
+            border-radius: 10px;
+            border-width: selected ? 6px : 1.5px;
+            border-color: selected ? Theme.accent : #6a6a6a;
+            animate border-width { duration: 150ms; }
+        }
+        Rectangle {
+            width: 36px;
+            height: 36px;
+            border-radius: Theme.radius-small;
+            background: Theme.control;
+            Icon {
+                source: root.icon;
+                width: 20px;
+                tint: Theme.text-2;
+            }
+        }
+        VerticalLayout {
+            spacing: 4px;
+            alignment: center;
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: root.title;
+                    color: Theme.text;
+                    font-size: 15px;
+                    font-weight: 600;
+                }
+                if root.badge != "": Rectangle {
+                    border-radius: 3px;
+                    background: #2d3d5c;
+                    height: 18px;
+                    width: badge-text.preferred-width + 12px;
+                    badge-text := Text {
+                        text: root.badge;
+                        color: Theme.accent;
+                        font-size: 11px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle { }
+            }
+            Text {
+                text: root.subtitle;
+                color: Theme.text-2;
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+            @children
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.picked(); }
+    }
+}
+
+component StepStateIcon inherits Rectangle {
+    in property <int> state;
+    width: 22px;
+    height: 22px;
+    border-radius: 11px;
+    background: state == 2 ? Theme.success : state == 3 ? Theme.danger : state == 1 ? transparent : Theme.control;
+    animate background { duration: 200ms; }
+    if state == 1: Icon {
+        source: @image-url("icons/spinner.svg");
+        width: 22px;
+        tint: Theme.accent;
+        transform-rotation: animation-tick() / 2.4ms * 1deg;
+    }
+    if state == 2: Icon {
+        source: @image-url("icons/check.svg");
+        width: 14px;
+        tint: #102015;
+    }
+    if state == 3: Icon {
+        source: @image-url("icons/cross.svg");
+        width: 12px;
+        tint: #2a0f0f;
+    }
+    if state == 0: Rectangle {
+        width: 6px;
+        height: 6px;
+        border-radius: 3px;
+        background: #6a6a6a;
+    }
+}
+
+component StepList inherits Rectangle {
+    in property <[Step]> steps;
+    border-radius: Theme.radius;
+    background: Theme.panel;
+    border-width: 1px;
+    border-color: Theme.border;
+    VerticalLayout {
+        padding-top: 6px;
+        padding-bottom: 6px;
+        for step[i] in root.steps: Rectangle {
+            height: 52px;
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                spacing: 14px;
+                StepStateIcon {
+                    state: step.state;
+                    y: (parent.height - self.height) / 2;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    Text {
+                        text: step.title;
+                        color: step.state == 0 ? Theme.text-3 : Theme.text;
+                        font-size: 14px;
+                        font-weight: step.state == 1 ? 600 : 400;
+                        animate color { duration: 200ms; }
+                    }
+                    if step.detail != "": Text {
+                        text: step.detail;
+                        color: step.state == 3 ? Theme.danger : Theme.text-2;
+                        font-size: 12px;
+                        overflow: elide;
+                    }
+                }
+            }
+            if i < root.steps.length - 1: Rectangle {
+                x: 52px;
+                y: parent.height - 1px;
+                height: 1px;
+                width: parent.width - 68px;
+                background: #353535;
+            }
+        }
+    }
+}
+
+component ProgressBar inherits Rectangle {
+    in property <float> value; // 0..1; negative = indeterminate
+    height: 4px;
+    border-radius: 2px;
+    background: #3a3a3a;
+    clip: true;
+    if value >= 0: Rectangle {
+        x: 0;
+        width: parent.width * max(0, min(1, root.value));
+        border-radius: 2px;
+        background: Theme.accent;
+        animate width { duration: 300ms; easing: ease-out; }
+    }
+    if value < 0: Rectangle {
+        width: parent.width * 0.3;
+        border-radius: 2px;
+        background: Theme.accent;
+        x: mod(animation-tick() / 1.6ms, 1000) / 1000 * (parent.width * 1.3) - self.width;
+    }
+}
+
+component PageTitle inherits VerticalLayout {
+    in property <string> title;
+    in property <string> subtitle;
+    spacing: 8px;
+    Text {
+        text: root.title;
+        color: Theme.text;
+        font-size: 24px;
+        font-weight: 700;
+    }
+    if root.subtitle != "": Text {
+        text: root.subtitle;
+        color: Theme.text-2;
+        font-size: 14px;
+        wrap: word-wrap;
+    }
+}
+
+// fades and slides in when shown
+component Page inherits Rectangle {
+    property <bool> shown: false;
+    opacity: shown ? 1 : 0;
+    animate opacity { duration: 220ms; easing: ease-out; }
+    init => { shown = true; }
+    VerticalLayout {
+        y: root.shown ? 0 : 10px;
+        animate y { duration: 260ms; easing: ease-out; }
+        height: root.height;
+        @children
+    }
+}
+
+component LogView inherits Rectangle {
+    in property <string> text;
+    border-radius: Theme.radius-small;
+    background: #181818;
+    border-width: 1px;
+    border-color: Theme.border;
+    ScrollView {
+        content-y: min(0px, self.visible-height - self.content-height);
+        log-text := Text {
+            x: 10px;
+            width: parent.width - 20px;
+            text: root.text;
+            color: #b8b8b8;
+            font-family: "monospace";
+            font-size: 11px;
+            wrap: char-wrap;
+        }
+    }
+}
+
+component RailStep inherits Rectangle {
+    in property <string> label;
+    in property <int> index;
+    in property <int> current;
+    height: 36px;
+    border-radius: Theme.radius-small;
+    background: index == current ? Theme.control : transparent;
+    animate background { duration: 180ms; }
+    HorizontalLayout {
+        padding-left: 12px;
+        spacing: 12px;
+        Rectangle {
+            width: 20px;
+            height: 20px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 10px;
+            background: root.index < root.current ? Theme.accent : transparent;
+            border-width: root.index < root.current ? 0 : 1.5px;
+            border-color: root.index == root.current ? Theme.accent : #5a5a5a;
+            animate background, border-color { duration: 180ms; }
+            if root.index < root.current: Icon {
+                source: @image-url("icons/check.svg");
+                width: 12px;
+                tint: Theme.on-accent;
+            }
+            if root.index >= root.current: Text {
+                text: root.index + 1;
+                font-size: 11px;
+                font-weight: 600;
+                color: root.index == root.current ? Theme.accent : Theme.text-3;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        Text {
+            text: root.label;
+            vertical-alignment: center;
+            font-size: 13px;
+            font-weight: root.index == root.current ? 600 : 400;
+            color: root.index == root.current ? Theme.text : root.index < root.current ? Theme.text-2 : Theme.text-3;
+        }
+    }
+}
+
+export component Installer inherits Window {
+    title: "Shapr3D for Linux — Setup";
+    icon: @image-url("icons/logo.svg");
+    preferred-width: 960px;
+    preferred-height: 660px;
+    min-width: 820px;
+    min-height: 600px;
+    background: Theme.window;
+    default-font-size: 14px;
+    default-font-family: "Inter";
+
+    // 0 welcome, 1 windows components, 2 preparing, 3 package, 4 installing, 5 done, 6 error
+    in-out property <int> page: 0;
+    in property <string> app-name: "Shapr3D";
+
+    // windows components
+    in-out property <bool> use-download: true;
+    in property <string> iso-name;
+    in-out property <bool> keep-iso: false;
+    in property <string> space-text;
+    in property <bool> space-ok: true;
+
+    // progress pages
+    in property <[Step]> steps;
+    in property <float> progress: 0;
+    in property <string> progress-text;
+    in property <string> log-text;
+    in-out property <bool> show-log: false;
+
+    // package
+    in property <bool> has-package: false;
+    in property <image> package-icon;
+    in property <string> package-title;
+    in property <string> package-meta;
+    in property <[Framework]> frameworks;
+    in property <string> package-error;
+    in property <bool> package-ok: false;
+
+    // done / error
+    in property <image> done-icon;
+    in property <bool> can-add-menu: true;
+    in-out property <bool> add-menu: true;
+    in property <bool> launching: false;
+    in property <string> error-title;
+    in property <string> error-text;
+
+    callback get-started();
+    callback choose-iso();
+    callback prepare();
+    callback cancel();
+    callback choose-package();
+    callback install();
+    callback launch();
+    callback retry();
+    callback close-window();
+    callback open-url(string);
+
+    property <int> rail-step: page == 0 ? 0 : page == 1 ? 1 : page == 2 ? 2 : page == 3 ? 3 : page == 4 ? 3 : page == 5 ? 4 : 2;
+
+    HorizontalLayout {
+        // side rail, like Shapr3D's item panels
+        Rectangle {
+            width: 248px;
+            background: Theme.panel;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 12px;
+                    padding-bottom: 22px;
+                    Image {
+                        source: @image-url("icons/logo.svg");
+                        width: 36px;
+                        height: 36px;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: root.app-name;
+                            color: Theme.text;
+                            font-size: 16px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: "for Linux";
+                            color: Theme.text-2;
+                            font-size: 12px;
+                        }
+                    }
+                }
+                RailStep { label: "Welcome"; index: 0; current: root.rail-step; }
+                RailStep { label: "Windows components"; index: 1; current: root.rail-step; }
+                RailStep { label: "Preparing"; index: 2; current: root.rail-step; }
+                RailStep { label: "Install " + root.app-name; index: 3; current: root.rail-step; }
+                RailStep { label: "Ready"; index: 4; current: root.rail-step; }
+                Rectangle { }
+                Text {
+                    text: "Runs with wine-uwp";
+                    color: Theme.text-3;
+                    font-size: 11px;
+                }
+            }
+        }
+
+        Rectangle {
+            // content area
+            VerticalLayout {
+                padding-left: 40px;
+                padding-right: 40px;
+                padding-top: 36px;
+                padding-bottom: 24px;
+                spacing: 20px;
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    if root.page == 0: Page {
+                        PageTitle {
+                            title: "Set up " + root.app-name + " on Linux";
+                            subtitle: "The Windows version of " + root.app-name + ", running on wine-uwp. Setup takes three steps and needs no Windows licence key.";
+                        }
+                        Rectangle { height: 28px; }
+                        VerticalLayout {
+                            spacing: 12px;
+                            for item in [
+                                { icon: @image-url("icons/download.svg"), t: "Windows components", s: "Microsoft's Windows 11 evaluation image, 7.1 GB, downloaded from Microsoft. About 2,700 files are kept." },
+                                { icon: @image-url("icons/layers.svg"), t: "A private Wine environment", s: "Windows' own UI frameworks and fonts in a sandbox of their own, about 3 GB. Nothing is installed system-wide." },
+                                { icon: @image-url("icons/cube.svg"), t: root.app-name, s: "Installed from the " + root.app-name + " for Windows package (.msixbundle) you choose." },
+                            ]: Rectangle {
+                                border-radius: Theme.radius;
+                                background: Theme.panel;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                HorizontalLayout {
+                                    padding: 16px;
+                                    spacing: 16px;
+                                    Rectangle {
+                                        width: 40px;
+                                        height: 40px;
+                                        border-radius: Theme.radius-small;
+                                        background: #2d3d5c;
+                                        Icon {
+                                            source: item.icon;
+                                            width: 22px;
+                                            tint: Theme.accent;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        spacing: 3px;
+                                        alignment: center;
+                                        Text {
+                                            text: item.t;
+                                            color: Theme.text;
+                                            font-size: 15px;
+                                            font-weight: 600;
+                                        }
+                                        Text {
+                                            text: item.s;
+                                            color: Theme.text-2;
+                                            font-size: 13px;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Rectangle { }
+                    }
+
+                    if root.page == 1: Page {
+                        PageTitle {
+                            title: "Windows components";
+                            subtitle: root.app-name + " needs parts of Windows that Wine does not provide: the XAML UI framework, its fonts, and the .NET Native and C++ runtimes. They come from Microsoft's own Windows 11 image.";
+                        }
+                        Rectangle { height: 24px; }
+                        VerticalLayout {
+                            spacing: 12px;
+                            ChoiceCard {
+                                selected: root.use-download;
+                                icon: @image-url("icons/download.svg");
+                                title: "Download from Microsoft";
+                                badge: "RECOMMENDED";
+                                subtitle: "Windows 11 Enterprise evaluation, 7.1 GB from microsoft.com. Resumes if interrupted.";
+                                picked => { root.use-download = true; }
+                            }
+                            ChoiceCard {
+                                selected: !root.use-download;
+                                icon: @image-url("icons/disc.svg");
+                                title: "Use an ISO I already have";
+                                subtitle: root.iso-name == "" ? "Any Windows 11 x64 ISO" : root.iso-name;
+                                picked => {
+                                    root.use-download = false;
+                                    if root.iso-name == "" { root.choose-iso(); }
+                                }
+                                HorizontalLayout {
+                                    alignment: start;
+                                    LinkText {
+                                        text: root.iso-name == "" ? "Choose file…" : "Choose another…";
+                                        clicked => { root.use-download = false; root.choose-iso(); }
+                                    }
+                                }
+                            }
+                        }
+                        Rectangle { height: 18px; }
+                        Rectangle {
+                            height: 56px;
+                            border-radius: Theme.radius;
+                            background: Theme.panel;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            opacity: root.use-download ? 1 : 0.45;
+                            HorizontalLayout {
+                                padding-left: 16px;
+                                padding-right: 16px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Text { text: "Keep the downloaded image"; color: Theme.text; font-size: 14px; }
+                                    Text { text: "Frees 7.1 GB when off. Only needed to set up again."; color: Theme.text-2; font-size: 12px; }
+                                }
+                                Toggle {
+                                    y: (parent.height - self.height) / 2;
+                                    checked <=> root.keep-iso;
+                                }
+                            }
+                        }
+                        Rectangle { height: 14px; }
+                        Text {
+                            text: root.space-text;
+                            color: root.space-ok ? Theme.text-2 : Theme.danger;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { }
+                    }
+
+                    if root.page == 2 || root.page == 4: Page {
+                        PageTitle {
+                            title: root.page == 2 ? "Preparing Windows components" : "Installing " + root.app-name;
+                            subtitle: root.page == 2 ? "Downloading Windows 11 from Microsoft and taking out the parts " + root.app-name + " needs. This happens once." : "Unpacking the app and the frameworks it uses.";
+                        }
+                        Rectangle { height: 22px; }
+                        StepList { steps: root.steps; }
+                        Rectangle { height: 18px; }
+                        ProgressBar { value: root.progress; }
+                        Rectangle { height: 8px; }
+                        HorizontalLayout {
+                            Text {
+                                text: root.progress-text;
+                                color: Theme.text-2;
+                                font-size: 12px;
+                                overflow: elide;
+                            }
+                            LinkText {
+                                text: root.show-log ? "Hide details" : "Show details";
+                                font-size: 12px;
+                                horizontal-alignment: right;
+                                clicked => { root.show-log = !root.show-log; }
+                            }
+                        }
+                        if root.show-log: LogView {
+                            text: root.log-text;
+                            min-height: 120px;
+                            vertical-stretch: 1;
+                        }
+                        if !root.show-log: Rectangle { }
+                    }
+
+                    if root.page == 3: Page {
+                        PageTitle {
+                            title: "Choose the " + root.app-name + " package";
+                            subtitle: "Pick the " + root.app-name + " for Windows package, an .msixbundle or .msix file. The frameworks it needs come from the Windows components just prepared.";
+                        }
+                        Rectangle { height: 24px; }
+                        if !root.has-package: Rectangle {
+                            height: 150px;
+                            vertical-stretch: 0;
+                            border-radius: Theme.radius;
+                            background: drop-touch.has-hover ? #303030 : Theme.panel;
+                            border-width: 1px;
+                            border-color: drop-touch.has-hover ? Theme.accent : #4a4a4a;
+                            animate background, border-color { duration: 150ms; }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 10px;
+                                HorizontalLayout {
+                                    alignment: center;
+                                    Icon { source: @image-url("icons/cube.svg"); width: 34px; height: 34px; tint: Theme.accent; }
+                                }
+                                Text { text: "Choose package…"; color: Theme.text; font-size: 15px; font-weight: 600; horizontal-alignment: center; }
+                                Text { text: ".msixbundle, .msix, .appxbundle or .appx"; color: Theme.text-3; font-size: 12px; horizontal-alignment: center; }
+                            }
+                            drop-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.choose-package(); }
+                            }
+                        }
+                        if root.has-package: Rectangle {
+                            vertical-stretch: 0;
+                            border-radius: Theme.radius;
+                            background: Theme.panel;
+                            border-width: 1px;
+                            border-color: root.package-ok ? Theme.border : Theme.danger;
+                            VerticalLayout {
+                                padding: 18px;
+                                spacing: 16px;
+                                HorizontalLayout {
+                                    spacing: 16px;
+                                    Image {
+                                        source: root.package-icon;
+                                        width: 56px;
+                                        height: 56px;
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 4px;
+                                        Text { text: root.package-title; color: Theme.text; font-size: 18px; font-weight: 700; }
+                                        Text { text: root.package-meta; color: Theme.text-2; font-size: 13px; }
+                                    }
+                                    Rectangle { }
+                                    LinkText {
+                                        text: "Change…";
+                                        vertical-alignment: center;
+                                        clicked => { root.choose-package(); }
+                                    }
+                                }
+                                Rectangle { height: 1px; background: #353535; }
+                                Text { text: "FRAMEWORKS"; color: Theme.text-3; font-size: 11px; font-weight: 600; letter-spacing: 0.6px; }
+                                VerticalLayout {
+                                    spacing: 8px;
+                                    for fw in root.frameworks: HorizontalLayout {
+                                        spacing: 10px;
+                                        Rectangle {
+                                            width: 16px;
+                                            height: 16px;
+                                            y: 1px;
+                                            border-radius: 8px;
+                                            background: fw.ok ? Theme.success : Theme.danger;
+                                            Icon {
+                                                source: fw.ok ? @image-url("icons/check.svg") : @image-url("icons/cross.svg");
+                                                width: 10px;
+                                                tint: #111;
+                                            }
+                                        }
+                                        Text { text: fw.name; color: Theme.text; font-size: 13px; }
+                                        Text { text: fw.version; color: Theme.text-3; font-size: 12px; }
+                                        Rectangle { }
+                                    }
+                                }
+                            }
+                        }
+                        Rectangle { height: 12px; }
+                        if root.package-error != "": Text {
+                            text: root.package-error;
+                            color: Theme.danger;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { }
+                    }
+
+                    if root.page == 5: Page {
+                        Rectangle { vertical-stretch: 1; }
+                        HorizontalLayout {
+                            alignment: center;
+                            Image {
+                                source: root.done-icon;
+                                width: 112px;
+                                height: 112px;
+                            }
+                        }
+                        Rectangle { height: 22px; }
+                        Text {
+                            text: root.app-name + " is ready";
+                            color: Theme.text;
+                            font-size: 26px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                        }
+                        Rectangle { height: 8px; }
+                        Text {
+                            text: "Setup is complete. Signing in opens your browser; when it asks to open the link, allow it, and the sign-in comes back to " + root.app-name + ".";
+                            color: Theme.text-2;
+                            font-size: 14px;
+                            wrap: word-wrap;
+                            horizontal-alignment: center;
+                        }
+                        Rectangle { height: 26px; }
+                        if root.can-add-menu: HorizontalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 420px;
+                                height: 56px;
+                                border-radius: Theme.radius;
+                                background: Theme.panel;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                HorizontalLayout {
+                                    padding-left: 16px;
+                                    padding-right: 16px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Text { text: "Add to the applications menu"; color: Theme.text; font-size: 14px; }
+                                        Text { text: "Also lets your browser hand sign-ins back"; color: Theme.text-2; font-size: 12px; }
+                                    }
+                                    Toggle {
+                                        y: (parent.height - self.height) / 2;
+                                        checked <=> root.add-menu;
+                                    }
+                                }
+                            }
+                        }
+                        Rectangle { vertical-stretch: 1; }
+                    }
+
+                    if root.page == 6: Page {
+                        HorizontalLayout {
+                            spacing: 14px;
+                            Rectangle {
+                                width: 40px;
+                                height: 40px;
+                                border-radius: 20px;
+                                background: #4a2323;
+                                Icon { source: @image-url("icons/cross.svg"); width: 18px; tint: Theme.danger; }
+                            }
+                            PageTitle { title: root.error-title; }
+                        }
+                        Rectangle { height: 12px; }
+                        Text {
+                            text: root.error-text;
+                            color: Theme.text-2;
+                            font-size: 14px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { height: 16px; }
+                        LogView {
+                            text: root.log-text;
+                            vertical-stretch: 1;
+                        }
+                    }
+                }
+
+                // bottom bar
+                HorizontalLayout {
+                    spacing: 12px;
+                    height: 36px;
+                    Rectangle { }
+                    if root.page == 1 || root.page == 3: SecondaryButton {
+                        text: "Back";
+                        clicked => { root.page = root.page == 1 ? 0 : 1; }
+                    }
+                    if root.page == 2 || root.page == 4: SecondaryButton {
+                        text: "Cancel";
+                        danger: true;
+                        clicked => { root.cancel(); }
+                    }
+                    if root.page == 5 || root.page == 6: SecondaryButton {
+                        text: "Close";
+                        clicked => { root.close-window(); }
+                    }
+                    if root.page == 0: PrimaryButton {
+                        text: "Get started";
+                        has-icon: true;
+                        icon: @image-url("icons/arrow.svg");
+                        clicked => { root.get-started(); }
+                    }
+                    if root.page == 1: PrimaryButton {
+                        text: "Continue";
+                        enabled: root.space-ok && (root.use-download || root.iso-name != "");
+                        clicked => { root.prepare(); }
+                    }
+                    if root.page == 3: PrimaryButton {
+                        text: "Install";
+                        enabled: root.has-package && root.package-ok;
+                        clicked => { root.install(); }
+                    }
+                    if root.page == 5: PrimaryButton {
+                        text: root.launching ? "Starting…" : "Launch " + root.app-name;
+                        enabled: !root.launching;
+                        clicked => { root.launch(); }
+                    }
+                    if root.page == 6: PrimaryButton {
+                        text: "Try again";
+                        clicked => { root.retry(); }
+                    }
+                }
+            }
+        }
+    }
+}

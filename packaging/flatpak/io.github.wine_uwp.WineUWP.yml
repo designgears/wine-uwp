@@ -4,11 +4,13 @@
 # changed, in full) laid over it; configure is regenerated because configure.ac is one of those files. Nothing of
 # Microsoft's is in the Flatpak: the setup wizard downloads Windows components on the user's machine.
 app-id: io.github.wine_uwp.WineUWP
-runtime: org.gnome.Platform
-runtime-version: '50'
-sdk: org.gnome.Sdk
+# the plain freedesktop runtime: the installer draws its own UI (Slint), so no GNOME/GTK
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.mingw-w64
+  - org.freedesktop.Sdk.Extension.rust-stable
 command: wine-uwp
 finish-args:
   - --share=ipc
@@ -75,6 +77,24 @@ modules:
       # our Wine source over it (wine/FILES lists every file; wine/BASE.txt names the base)
       - type: dir
         path: ../../wine
+
+  # the setup: Rust + Slint (packaging/installer). Crates come from crates.io at build time, pinned by Cargo.lock.
+  - name: installer
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      build-args:
+        - --share=network
+      env:
+        CARGO_HOME: /run/build/installer/cargo
+    build-commands:
+      - cargo build --release --locked
+      - install -Dm755 target/release/wine-uwp-installer /app/bin/wine-uwp-installer
+    sources:
+      - type: dir
+        path: ../installer
+        skip:
+          - target
 
   - name: wine-uwp
     buildsystem: simple

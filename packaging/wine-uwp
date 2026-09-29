@@ -43,7 +43,7 @@ if [ -z "$cmd" ]; then
   if [ -f "$data/prefix/.wine-uwp-ready" ] && [ -n "$(installed)" ]; then cmd=run; else cmd=setup; fi
 fi
 case $cmd in
-  setup)      exec python3 "$root/packaging/setup/wine_uwp_setup.py" "$@" ;;
+  setup)      exec "$bin/wine-uwp-installer" "$@" ;;
   list)       installed ;;
   run)
     app=${1:-$(installed | head -1)}
@@ -62,7 +62,8 @@ case $cmd in
     inbox="$data/prefix/drive_c/users/Public/wineuwp-activate.uri"
     printf '%s' "$uri" > "$inbox.tmp" && mv -f "$inbox.tmp" "$inbox"
     # not running: start it, and it picks the inbox up when it starts watching
-    running "$app" || (setsid "$0" run "$app" >/dev/null 2>&1 &) ;;
+    # from an AppImage, start a new instance of it: this one's mount goes away when it exits
+    running "$app" || (setsid "${APPIMAGE:-$0}" run "$app" >/dev/null 2>&1 &) ;;
   bottles)    exec "$root/packaging/bottles/install-in-bottles.sh" "$@" ;;
   install)    exec python3 "$root/packaging/install-app.py" "$1" "$data" --windows "$data/windows" ;;
   *)          sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;

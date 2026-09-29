@@ -1,0 +1,23 @@
+#!/bin/bash
+# AppRun for the wine-uwp AppImage: the bundled Wine, installer, 7-Zip and Python under $APPDIR/usr.
+#
+# The environment below points everything at the bundle. The host's values are kept in WINE_UWP_HOST_* first, so
+# that whatever is handed back to the host (a browser via xdg-open, xdg-mime) runs with its own libraries again:
+# usr/bin/host-run restores them.
+here=$(dirname "$(readlink -f "$0")")
+export APPDIR=${APPDIR:-$here}
+for v in LD_LIBRARY_PATH PYTHONHOME PYTHONPATH PATH SSL_CERT_FILE; do
+  if [ -n "${!v+x}" ]; then export "WINE_UWP_HOST_$v=${!v}"; else export "WINE_UWP_HOST_$v=__unset__"; fi
+done
+export LD_LIBRARY_PATH=$APPDIR/usr/lib/bundled${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export PYTHONHOME=$APPDIR/usr
+unset PYTHONPATH
+export PATH=$APPDIR/usr/bin:$PATH
+# the bundled OpenSSL looks for CA certificates where the freedesktop runtime keeps them; use the host's bundle
+if [ -z "${SSL_CERT_FILE:-}" ]; then
+  for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem \
+           /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/ssl/cert.pem; do
+    [ -f "$f" ] && { export SSL_CERT_FILE=$f; break; }
+  done
+fi
+exec "$APPDIR/usr/bin/wine-uwp" "$@"

@@ -1,29 +1,35 @@
 # Packaging wine-uwp
 
-Two ways to hand wine-uwp to someone: a **Flatpak** with a setup wizard, and a **Bottles runner** with a script that
+Three ways to hand wine-uwp to someone: a **Flatpak**, an **AppImage**, and a **Bottles runner** with a script that
 sets up a bottle. Both carry the same pieces and neither contains anything of Microsoft's. The Windows components
 come from Microsoft's own Windows 11 evaluation image, which the setup downloads on the user's machine.
 
 ## What the user sees
 
-The wizard (`setup/wine_uwp_setup.py`, GTK 4 + libadwaita; screenshots in `docs/screenshots/setup/`) walks through:
+The installer (`installer/`, Rust + [Slint](https://slint.dev), styled after Shapr3D's own UI; screenshots in
+`docs/screenshots/installer/`) walks through:
 
 1. **Welcome**: what the three steps are.
-2. **Windows components**: download from Microsoft (7.1 GB, resumable), or use an ISO already at hand. It checks free
-   space and can keep or delete the image afterwards.
+2. **Windows components**: download from Microsoft (7.1 GB, resumable), or use an ISO already at hand. It checks
+   free space, and can keep or delete the image afterwards.
 3. **Preparing**:
    - download and SHA-256 check;
    - extraction of about 2,700 files, plus the five framework packages Shapr3D declares;
    - the Wine prefix, component registration, and Microsoft's public symbols for the private addresses `wineuwp`
      looks up.
 
-   Each step shows its state, with a progress bar and the tools' full output under Details.
-4. **Package**: the user picks Shapr3D's `.msixbundle`. The wizard shows the app's icon, version, publisher and
-   whether every framework it needs is present.
+   Each step shows its state and progress (speed, time left), with the tools' output behind "Show details".
+4. **Package**: the user picks Shapr3D's `.msixbundle` in their desktop's own file dialog (the portal). The
+   installer shows the app's icon, version, publisher and whether every framework it needs is present.
 5. **Installing**, then **ready**: Launch, and (outside the Flatpak) a menu entry plus the `shapr3d:` link handler,
    which is how the browser sign-in comes back to the app.
 
-Every finished step leaves a marker, so a closed or failed setup resumes where it stopped.
+`wine-uwp setup [--iso FILE] [PACKAGE]` pre-fills the choices; scripted tests use that instead of the dialog. Every
+finished step leaves a marker, so a closed or failed setup resumes where it stopped.
+
+The installer draws its own UI (Slint's OpenGL renderer, with software as a fallback), so it needs no GTK or Qt.
+The theme is Shapr3D's measured palette: `#202020` window, `#2C2C2C` panels, `#383838` controls, and the `#6EA1FF`
+accent with dark text on it.
 
 ## Pieces
 
@@ -35,10 +41,12 @@ Every finished step leaves a marker, so a closed or failed setup resumes where i
 | `new-prefix.sh` | a working prefix from a harvested tree |
 | `install-app.py` | an `.msixbundle`/`.msix` into `stage/<app>`, with frameworks, `identity.env`, `launch.env`, icon, URI schemes; `--info` previews one |
 | `../shims/launch/wineuwp-launch.cpp` | `wineuwp-launch.exe`: starts an installed app from a plain `wine` command |
+| `installer/` | the setup (Rust + Slint): `ui/app.slint` is the whole UI, `src/main.rs` runs the tools |
 | `wine-uwp` | the command: `setup`, `run`, `install`, `harvest`, `new-prefix`, `activate URI`, `bottles` |
 | `build-dist.sh` | an installed tree from this checkout (host Wine build + everything above) |
 | `flatpak/` | the manifest (`io.github.wine_uwp.WineUWP`), desktop file, metainfo, icon, `build.sh` |
 | `bottles/` | `make-runner.sh` (runner tarball from the Flatpak build), `install-in-bottles.sh`, the bottle recipe |
+| `appimage/` | `build.sh` (the AppImage from the Flatpak build plus Python), `bundle_libs.py`, `AppRun`, `host-run` |
 
 All user data lives in one directory: `$XDG_DATA_HOME/wine-uwp`. Inside the Flatpak that is
 `~/.var/app/io.github.wine_uwp.WineUWP/data/wine-uwp`. It holds `windows/` (the harvested components), `prefix/`,
@@ -48,18 +56,22 @@ All user data lives in one directory: `$XDG_DATA_HOME/wine-uwp`. Inside the Flat
 
 ```
 ./build.sh                                  # shims and wineuwp-launch.exe (clang-cl, xwin SDK)
-packaging/flatpak/build.sh --install        # Flatpak: builds Wine 11.17 + wine/ in the GNOME 50 SDK
+packaging/flatpak/build.sh --install        # Flatpak: Wine 11.17 + wine/ and the installer, freedesktop 25.08 SDK
 packaging/bottles/make-runner.sh            # uwp-bin/bottles/wine-uwp-11.17.tar.xz from that build
+packaging/appimage/build.sh                 # uwp-bin/appimage/wine-uwp-x86_64.AppImage from that build
 ```
 
-The Flatpak build needs `org.flatpak.Builder`, `org.gnome.Sdk//50` and
-`org.freedesktop.Sdk.Extension.mingw-w64//25.08` from Flathub (user installation). Wine comes from the upstream
+The Flatpak build needs `org.flatpak.Builder`, `org.freedesktop.Sdk//25.08` and its `mingw-w64` and
+`rust-stable` extensions from Flathub (user installation). The installer's crates are fetched at build time, pinned
+by `Cargo.lock`. Wine comes from the upstream
 tarball with `wine/` laid over it and `configure` regenerated. Tarball plus overlay equals `~/src/wine`, checked
 file by file on 09-29.
 
-The shims are built on the host (they need the Windows SDK headers) and go in as files. The runner is the
-Flatpak's `/app`, so it links against the GNOME runtime rather than the host's newer glibc, and runs inside Bottles'
-sandbox.
+The shims are built on the host (they need the Windows SDK headers) and go in as files. The runner and the AppImage
+are both made from the Flatpak's `/app`, so they link against the freedesktop runtime rather than the host's newer
+glibc. That lets the runner work inside Bottles' sandbox, and the AppImage run on distributions with glibc 2.38 or
+newer. The AppImage bundles only what hosts do not reliably have, and hands URLs back to the host's browser with the
+host's own environment (`host-run`).
 
 ## Bottles
 

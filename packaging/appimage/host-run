@@ -1,0 +1,13 @@
+#!/bin/bash
+# Run a host program with the host's environment, as it was before AppRun pointed everything at the AppImage.
+#   host-run COMMAND [ARGS...]
+# Also installed as usr/bin/xdg-open (a link), so that Wine opening a URL (winebrowser, the Launcher shim) starts
+# the user's browser with the user's libraries rather than the bundled ones.
+for v in LD_LIBRARY_PATH PYTHONHOME PYTHONPATH PATH SSL_CERT_FILE; do
+  saved=WINE_UWP_HOST_$v
+  [ -n "${!saved+x}" ] || continue
+  if [ "${!saved}" = __unset__ ]; then unset "$v"; else export "$v=${!saved}"; fi
+  unset "$saved"
+done
+if [ "$(basename "$0")" = xdg-open ]; then exec xdg-open "$@"; fi
+exec "$@"

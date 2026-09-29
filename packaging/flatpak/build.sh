@@ -3,7 +3,7 @@
 #
 #   packaging/flatpak/build.sh [--install]
 #
-# Needs org.flatpak.Builder, org.gnome.Sdk//50 and org.freedesktop.Sdk.Extension.mingw-w64//25.08 from Flathub
+# Needs org.flatpak.Builder, org.freedesktop.Sdk//25.08 with its mingw-w64 and rust-stable extensions from Flathub
 # (flatpak install --user flathub ...). Output: uwp-bin/flatpak/repo (an OSTree repo) and
 # uwp-bin/flatpak/wine-uwp.flatpak (flatpak install --user wine-uwp.flatpak). --install also installs it for this
 # user. The first build compiles Wine and takes a while; later ones reuse flatpak-builder's cache.

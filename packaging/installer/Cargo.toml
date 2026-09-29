@@ -1,0 +1,20 @@
+[package]
+name = "wine-uwp-installer"
+version = "0.1.0"
+edition = "2021"
+description = "Setup for wine-uwp: Windows components, the Wine prefix and the app, one screen at a time"
+license = "LGPL-2.1-or-later"
+
+[dependencies]
+slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg", "renderer-software"] }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+serde_json = "1"
+libc = "0.2"
+
+[build-dependencies]
+slint-build = "1.18"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
