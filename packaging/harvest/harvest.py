@@ -5,7 +5,9 @@
 
 OUTDIR ends up shaped like uwp-bin/win11: OUTDIR/Windows/System32/..., Windows/Fonts/..., and so on. The files
 listed in the manifest (paths relative to the Windows image root) are extracted from sources/install.wim (or
-install.esd) with 7-Zip, matched case-insensitively. Progress goes to stdout as "STAGE <name>" and "PROGRESS <done>
+install.esd) with 7-Zip, matched case-insensitively. A line with a '*' is a pattern (fnmatch, '*' crosses '/'), and a
+line ending in '/' takes the whole directory: that is how the framework packages are named, whose versions differ
+from image to image. Progress goes to stdout as "STAGE <name>" and "PROGRESS <done>
 <total>" lines, which is what the setup wizard reads; everything else is plain text.
 
 Nothing here is Microsoft's: the ISO comes from Microsoft's own server on the user's machine, and only the listed
@@ -13,6 +15,7 @@ files are taken out of it.
 """
 
 import argparse
+import fnmatch
 import os
 import shutil
 import subprocess
@@ -35,13 +38,16 @@ def seven_zip():
 
 
 def list_archive(sz, archive):
-    """Paths in an archive, from 7z's technical listing."""
+    """File paths in an archive (directories left out), from 7z's technical listing."""
     out = subprocess.run([sz, "l", "-slt", "-ba", archive], check=True, capture_output=True, text=True,
                          errors="replace").stdout
-    paths = []
+    paths, path = [], None
     for line in out.splitlines():
         if line.startswith("Path = "):
-            paths.append(line[7:].replace("\\", "/"))
+            path = line[7:].replace("\\", "/")
+            paths.append(path)
+        elif line == "Folder = +" and path is not None and paths and paths[-1] == path:
+            paths.pop()
     return paths
 
 
@@ -88,9 +94,17 @@ def main():
                 by_lower.setdefault(n[len(prefix):].lower(), n)
         found, missing = [], []
         for w in wanted:
+            if "*" in w or w.endswith("/"):
+                pat = w.lower() + ("*" if w.endswith("/") else "")
+                hits = [n for n in by_lower if fnmatch.fnmatchcase(n, pat)]
+                # a pattern keeps the image's own casing
+                found += [(by_lower[n][len(prefix):], by_lower[n]) for n in hits]
+                if not hits:
+                    missing.append((w, None))
+                continue
             src = by_lower.get(w.lower())
             (found if src else missing).append((w, src))
-        say(f"{len(found)} of {len(wanted)} files are in the image")
+        say(f"{len(found)} files in the image for {len(wanted)} manifest lines")
 
         say("STAGE Extracting files")
         listfile = os.path.join(tmp, "list.txt")

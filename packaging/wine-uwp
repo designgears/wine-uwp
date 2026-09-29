@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# wine-uwp: set up and run UWP apps in an installed wine-uwp (a Flatpak, a Bottles runner or a plain tree).
+#
+#   wine-uwp                  the app if one is installed, the setup otherwise
+#   wine-uwp setup            the setup wizard
+#   wine-uwp run [APP]        run an installed app (default: the first one installed)
+#   wine-uwp list             installed apps
+#   wine-uwp harvest ISO      extract the Windows files from an ISO     (command-line setup, step 1)
+#   wine-uwp new-prefix       build the Wine prefix from them            (step 2)
+#   wine-uwp install PACKAGE  install an .msixbundle/.msix/.appx         (step 3)
+#
+# Everything the user owns lives in one data directory, $WINE_UWP_DATA, by default
+# $XDG_DATA_HOME/wine-uwp (inside a Flatpak that is ~/.var/app/<id>/data/wine-uwp):
+#   windows/  the files harvested from the Windows ISO     prefix/  the Wine prefix
+#   stage/    installed apps and their frameworks          logs/    one log per app
+set -euo pipefail
+bin=$(dirname "$(readlink -f "$0")")
+root=$(cd "$bin/../share/wine-uwp" && pwd)
+data=${WINE_UWP_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/wine-uwp}
+mkdir -p "$data/logs"
+export WINE_UWP_ROOT=$root UWP_BIN=$data WIN11=$data/windows WINEPREFIX=$data/prefix
+export WINE_BUILD=$bin SHIM_DIR=$root/shims PY=${PY:-python3}
+export WINEDEBUG=${WINEDEBUG:--all,err+all}
+
+installed() { for d in "$data"/stage/*/identity.env; do [ -f "$d" ] && basename "$(dirname "$d")"; done; true; }
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+if [ -z "$cmd" ]; then
+  if [ -f "$data/prefix/.wine-uwp-ready" ] && [ -n "$(installed)" ]; then cmd=run; else cmd=setup; fi
+fi
+case $cmd in
+  setup)      exec python3 "$root/packaging/setup/wine_uwp_setup.py" "$@" ;;
+  list)       installed ;;
+  run)
+    app=${1:-$(installed | head -1)}
+    [ -n "$app" ] && [ -f "$data/stage/$app/identity.env" ] || { echo "no installed app ${app:+named $app}" >&2; exit 1; }
+    UWP_STAGE=$app UWP_TIMEOUT=0 UWP_LOG="$data/logs/$app.log" exec "$root/run.sh" ;;
+  harvest)    exec python3 "$root/packaging/harvest/harvest.py" "$1" "$data/windows" ;;
+  new-prefix) "$root/packaging/new-prefix.sh" "$data/windows" "$data/prefix"; touch "$data/prefix/.wine-uwp-ready" ;;
+  install)    exec python3 "$root/packaging/install-app.py" "$1" "$data" --windows "$data/windows" ;;
+  *)          sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+esac

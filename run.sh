@@ -84,10 +84,14 @@ fi
 # registered, and that is where Windows.Globalization writes ApplicationLanguages.PrimaryLanguageOverride:
 # without it the setter fails with 0x80070032 and Feedback Hub dies on the unhandled error (Findings-M4).
 # Staging a package is our registration step, so create it here - grep user.reg rather than shelling out
-# to reg.exe on every launch.
+# to reg.exe on every launch. reg.exe must not run in the app's environment set up above: from the stage
+# directory with the frameworks on WINEPATH it exits with 5 and writes nothing, which is why every fresh
+# prefix failed its first launch (Feedback Hub, and Shapr3D from the packaged setup; Findings-M4 09-29).
 APPC='Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Storage'
 if ! grep -qF "[$APPC\\\\$WINE_UWP_PACKAGE_FAMILY_NAME\\\\ResourcesConfig]" "$WINEPREFIX/user.reg" 2>/dev/null; then
-  wine reg add "HKCU\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Storage\\$WINE_UWP_PACKAGE_FAMILY_NAME\\ResourcesConfig" /f >/dev/null 2>&1
+  (cd "$WINEPREFIX" && env -u WINEPATH -u WINEDLLOVERRIDES -u WINE_UWP_PACKAGE_FULL_NAME -u WINE_UWP_PACKAGE_FAMILY_NAME \
+      -u WINE_UWP_PACKAGE_PATH -u WINE_UWP_AUMID -u WINE_UWP_PACKAGE_DEPENDENCIES wine reg add "HKCU\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Storage\\$WINE_UWP_PACKAGE_FAMILY_NAME\\ResourcesConfig" /f >/dev/null 2>&1) ||
+    echo "run.sh: could not create the AppContainer storage key for $WINE_UWP_PACKAGE_FAMILY_NAME" >&2
 fi
 
 exe=${1:-${UWP_EXE:-CalculatorApp.exe}}; shift || true

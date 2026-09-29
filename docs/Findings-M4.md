@@ -10566,3 +10566,27 @@ such a change. I found nothing in Wine that differs from Windows here, so this i
 
 **Confirmed on Windows (2026-09-29).** The user checked: on Windows the `...` also goes away on the first pointer move
 while the menu is open. So what we do is correct. Nothing to fix.
+
+### Fresh prefixes: the first-launch 0x80070032 was reg.exe failing inside run.sh (2026-09-29)
+
+This closes the Feedback Hub item above, and it was blocking every new install of the packaged setup too. Shapr3D,
+freshly installed, died right after its CoreWindow with the same unhandled `0x80070032` "Request not supported".
+
+The cause: `run.sh` creates the per-package `HKCU\...\AppContainer\Storage\<family>\ResourcesConfig` key (the fix for
+`PrimaryLanguageOverride`, above), but that `wine reg add` never worked on a fresh prefix. It runs after `cd "$S"` and
+after the framework directories go on `WINEPATH`. With both, `reg.exe` exits with 5 and writes nothing, and the
+`>/dev/null 2>&1` hid it. Bisected variable by variable (`/tmp/regbisect.sh`): identity variables,
+`WINEDLLOVERRIDES` and the working directory alone do not matter; `WINEPATH` plus the stage directory does. The
+working prefixes had the key from before `WINEPATH` was added, so nothing showed there.
+
+It now runs in a subshell from `$WINEPREFIX`, with `WINEPATH`, `WINEDLLOVERRIDES` and the package variables unset,
+and says so on stderr if it still fails. Results:
+
+- Feedback Hub on the ISO-built prefix reaches its Home page, 899 colours
+  (`docs/screenshots/feedbackhub-fresh-iso-prefix.png`).
+- Shapr3D, installed by `packaging/install-app.py` into a data directory built from nothing, reaches its first-run
+  screen: Sign Up / Log In / language (`docs/screenshots/packaged-shapr3d-first-run.png`).
+
+The same run found a second first-run bug. `install-overrides.sh` tested `[ -x "$PY" ]`, which is false for a bare
+`python3`, so outside the dev venv the CLSID registrations (`WindowServerFactory` and friends) were skipped without a
+word. The CoreWindow then closed immediately. It uses `command -v` now.

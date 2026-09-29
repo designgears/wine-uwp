@@ -2683,3 +2683,8 @@ Windows/System32/wpnclient.dll
 Windows/System32/WwaApi.dll
 Windows/System32/XamlTileRender.dll
 Windows/System32/XblAuthTokenBrokerExt.dll
+Program Files/WindowsApps/Microsoft.VCLibs.140.00_*_x64__8wekyb3d8bbwe/
+Program Files/WindowsApps/Microsoft.VCLibs.140.00.UWPDesktop_*_x64__8wekyb3d8bbwe/
+Program Files/WindowsApps/Microsoft.UI.Xaml.2.8_*_x64__8wekyb3d8bbwe/
+Program Files/WindowsApps/Microsoft.NET.Native.Framework.2.2_*_x64__8wekyb3d8bbwe/
+Program Files/WindowsApps/Microsoft.NET.Native.Runtime.2.2_*_x64__8wekyb3d8bbwe/
