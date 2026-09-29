@@ -5,7 +5,7 @@
 # Microsoft's is in the Flatpak: the setup wizard downloads Windows components on the user's machine.
 app-id: io.github.wine_uwp.WineUWP
 runtime: org.gnome.Platform
-runtime-version: '48'
+runtime-version: '50'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.mingw-w64

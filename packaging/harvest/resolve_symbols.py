@@ -148,7 +148,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("system32")
     ap.add_argument("out")
-    ap.add_argument("--cache", default=os.path.join(os.path.expanduser("~"), ".cache", "wine-uwp", "pdb"))
+    # XDG_CACHE_HOME: inside a Flatpak that is the app's own cache, the only one it may write
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    ap.add_argument("--cache", default=os.path.join(cache, "wine-uwp", "pdb"))
     args = ap.parse_args()
     listing = {n.lower(): n for n in os.listdir(args.system32)}
     lines, failed = [], 0

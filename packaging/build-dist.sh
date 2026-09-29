@@ -45,7 +45,7 @@ share=$out/share/wine-uwp
 mkdir -p "$share/shims" "$share/packaging"
 cp "$here"/{env.sh,run.sh,install-overrides.sh,launch-defaults.env,globalization.reg,wineuwp.reg,mrt-single-module.reg} "$share"/
 cp "$here"/{gen-classes-reg.py,gen-clsid-reg.py,gen-interfaces-reg.py,gen-single-module-reg.py,fasthive.py,uwppaths.py} "$share"/
-cp -r "$here"/packaging/{harvest,new-prefix.sh,install-app.py,setup} "$share/packaging"/
+cp -r "$here"/packaging/{harvest,new-prefix.sh,install-app.py,setup,bottles} "$share/packaging"/
 find "$share" -name __pycache__ -prune -exec rm -rf {} +
 shims=$(grep -ohE '\$\{SHIM_DIR\}/[A-Za-z0-9_.-]+\.dll' "$here/install-overrides.sh" | sed 's|${SHIM_DIR}/||' | sort -u)
 for s in $shims wineuwp-launch.exe; do cp "$UWP_BIN/build-probes/$s" "$share/shims/"; done

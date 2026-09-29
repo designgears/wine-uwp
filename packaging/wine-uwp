@@ -9,6 +9,7 @@
 #   wine-uwp harvest ISO      extract the Windows files from an ISO     (command-line setup, step 1)
 #   wine-uwp new-prefix       build the Wine prefix from them            (step 2)
 #   wine-uwp install PACKAGE  install an .msixbundle/.msix/.appx         (step 3)
+#   wine-uwp bottles PACKAGE [BOTTLE]   install it into a Bottles bottle on this wine-uwp as runner
 #
 # Everything the user owns lives in one data directory, $WINE_UWP_DATA, by default
 # $XDG_DATA_HOME/wine-uwp (inside a Flatpak that is ~/.var/app/<id>/data/wine-uwp):
@@ -62,6 +63,7 @@ case $cmd in
     printf '%s' "$uri" > "$inbox.tmp" && mv -f "$inbox.tmp" "$inbox"
     # not running: start it, and it picks the inbox up when it starts watching
     running "$app" || (setsid "$0" run "$app" >/dev/null 2>&1 &) ;;
+  bottles)    exec "$root/packaging/bottles/install-in-bottles.sh" "$@" ;;
   install)    exec python3 "$root/packaging/install-app.py" "$1" "$data" --windows "$data/windows" ;;
-  *)          sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+  *)          sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac
