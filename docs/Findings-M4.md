@@ -10449,7 +10449,7 @@ One wrong turn: I first called slot 6 of `ICoreApplicationView3` for `get_TitleB
 wrote a zero boolean into the pointer. That looked exactly like "no title bar yet". Suite and `kb` unchanged.
 `docs/screenshots/shapr3d-share-inset.png` shows the result.
 
-### History "..." button: fixed - GetPointerInfo answered outside the current message (2026-09-28)
+### History "..." button: kept on a still pointer - GetPointerInfo answered outside the current message (2026-09-28)
 
 This closes the open question in the two History "..." entries above. `CXcpBrowserHost::IsPreviousPointerUpdateMessageValid`
 (`windows.ui.xaml.dll+2ecd6c`) lets the replay run when three things hold:
@@ -10534,3 +10534,32 @@ The goal is a setup that needs no Windows installation. Findings so far:
   gets `0x80070032` from a one-string WinRT call made right after `ApplicationLanguages` is activated. It is not
   `PrimaryLanguageOverride` (a breakpoint there never fires) and not the saved settings (copying them changes nothing).
   It is a first-run issue, separate from the ISO.
+
+### History "..." button: the first pointer move still hides it, and that is XAML's own code (2026-09-29)
+
+The user reported the 09-28 fix as incomplete: the `...` stays for a moment after the click, then goes. The test had
+kept the mouse perfectly still. `/tmp/jitter.sh` clicks, waits 1.5 s and moves the pointer by 1 px, which a hand on a
+real mouse always does. The `...` is gone in 3 of 3 runs, and with no move it stays for 6 s.
+
+The chain, measured with `WINE_UWP_BP`:
+
+1. The move is a `WM_POINTERUPDATE` to the main CoreWindow. The pointer (1214,203) is over the `...`, 13 px above the
+   menu's `PopupHost` window at (1131,216), so no other window takes it.
+2. `PointerInputProcessor::ProcessPointerInput` hit-tests it. `CPopupRoot::HitTestLocalInternalImpl` claims every hit
+   while an open, non-closing popup is in its list (`+0x1f0`), windowed or not.
+3. `HitTestWithLightDismissAwareness` (`+b6204`) is where the hit could still go through, and it does not:
+   - the topmost popup `IsFlyout` (`+b63a2`: 1);
+   - `ShouldEventAlwaysPassThroughPopupLightDismissLayer` says 0. For a move it passes only a pointer whose right
+     button went down to open a context menu (`PointerInfo+0x2d`, and the id recorded at `+0x6c`);
+   - `GetOverlayInputPassThroughElementNoRef` gives NULL (`+b63dc`). Shapr3D sets no `OverlayInputPassThroughElement`.
+4. `ProcessPointerEnterLeave` (`+2dd30`, called from `+b4f32` for `0x1b`) moves pointer-over to `CPopupRoot`. The row's
+   `ListViewItem` (sender vtable `+d06ef8`) raises `PointerExited`.
+5. The app's handler (`Shapr3D.dll+28d1a70`) calls its `SetHovered(sender, false)` (`+28a7bf0`) unconditionally, and the
+   template shows `MoreButton` only in `IsHovered`.
+
+No capture is involved. XAML's only `SetCapture` (`CXcpBrowserHost::SetMouseCapture`, `+6bf8d0`) is taken on the press
+and released on the release, before the menu opens.
+
+Every step is unmodified Microsoft code acting on correct input. This is also the documented behaviour: since Windows
+8.1, `PointerExited` fires whenever a UI change leaves the pointer outside an element, and a light-dismiss layer is
+such a change. I found nothing in Wine that differs from Windows here, so this is not fixed.
