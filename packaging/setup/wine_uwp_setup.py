@@ -140,7 +140,7 @@ class StepList(Gtk.ListBox):
             status = Gtk.Stack()
             status.add_named(Gtk.Image.new_from_icon_name("content-loading-symbolic"), "pending")
             status.add_named(Gtk.Spinner(spinning=True), "running")
-            status.add_named(Gtk.Image.new_from_icon_name("emblem-ok-symbolic"), "done")
+            status.add_named(Gtk.Image.new_from_icon_name("object-select-symbolic"), "done")
             err = Gtk.Image.new_from_icon_name("dialog-error-symbolic")
             err.add_css_class("error")
             status.add_named(err, "failed")
@@ -388,7 +388,7 @@ class SetupWindow(Adw.ApplicationWindow):
 
     def build_done(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
-        self.done_status = Adw.StatusPage(title="Shapr3D is ready", icon_name="emblem-ok-symbolic")
+        self.done_status = Adw.StatusPage(title="Shapr3D is ready", icon_name="object-select-symbolic")
         box.append(self.done_status)
         group = Adw.PreferencesGroup()
         self.menu_row = Adw.SwitchRow(title="Add to the applications menu", active=True,
@@ -759,7 +759,7 @@ class SetupWindow(Adw.ApplicationWindow):
         for fw in info["frameworks"]:
             row = Adw.ActionRow(title=fw["name"], subtitle=f"{fw['min_version']} or later")
             ok = fw["available"]
-            img = Gtk.Image.new_from_icon_name("emblem-ok-symbolic" if ok else "dialog-error-symbolic")
+            img = Gtk.Image.new_from_icon_name("object-select-symbolic" if ok else "dialog-error-symbolic")
             img.add_css_class("success" if ok else "error")
             row.add_suffix(img)
             self.card_deps.append(row)
