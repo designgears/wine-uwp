@@ -9,11 +9,11 @@ import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import uwppaths
 import sys, os, json
-from regipy.registry import RegistryHive
+from fasthive import Hive
 hive, sysdir, outreg = sys.argv[1:4]
 jsonout = sys.argv[5] if len(sys.argv) > 5 and sys.argv[4] == "--json" else None
-h = RegistryHive(hive)
-k = h.get_key(r"\Microsoft\WindowsRuntime\ActivatableClassId")
+h = Hive(hive)
+k = h.key(r"\Microsoft\WindowsRuntime\ActivatableClassId")
 present = {f.lower(): f for f in os.listdir(sysdir)}
 prefix_sys32 = uwppaths.SYSTEM32
 in_prefix = {f.lower() for f in os.listdir(prefix_sys32)} if os.path.isdir(prefix_sys32) else set()
@@ -22,16 +22,17 @@ lines = ["Windows Registry Editor Version 5.00", ""]
 allmap, nreg, nskip_server, nskip_missing = {}, 0, 0, 0
 def clean(v):
     return v.hex() if isinstance(v, bytes) else v
-for s in k.iter_subkeys():
-    d = {v.name: clean(v.value) for v in s.get_values()}
-    allmap[s.name] = d
+for sp in h.subkeys(k):
+    name = h.name(sp)
+    d = {n: clean(v) for n, v in h.values(sp).items()}
+    allmap[name] = d
     dll = d.get("DllPath")
     if not dll:
         nskip_server += 1; continue
     base = dll.replace("\\", "/").rsplit("/", 1)[-1].lower()
     if base not in present:
         nskip_missing += 1; continue
-    lines.append(r"[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\%s]" % s.name)
+    lines.append(r"[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\%s]" % name)
     # A DLL that also lives in the prefix must be registered by its prefix path, or the process
     # loads it twice and the two copies get separate data and lifetimes (Findings-M4.md).
     target = r"C:\windows\system32\%s" % base if base in in_prefix else winpath + "\\" + present[base]

@@ -3,7 +3,6 @@
 #
 #   python3 -m venv "$UWP_BIN/venv" && "$UWP_BIN/venv/bin/pip" install -r requirements.txt
 #
-# Six tools import these and fail under a bare `python3`: disas.py, import-audit.py,
-# ordinal-audit.py, pdbsyms.py, xrefs.py (pefile) and gen-classes-reg.py (regipy).
+# Five tools import pefile and fail under a bare `python3`: disas.py, import-audit.py,
+# ordinal-audit.py, pdbsyms.py and xrefs.py. The prefix builders need only the standard library.
 pefile
-regipy
