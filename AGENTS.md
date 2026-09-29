@@ -275,6 +275,9 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | Does a drag reach its drop target? | `WINEDEBUG=+timestamp,trace+dataexchange`: every `TargetRequested`, `EnterAsync`/`OverAsync`/`DropAsync` with the position and the operation the target accepted. Drag with a move every ~15 ms (`/tmp/dodrag.sh`), and only in a project of our own |
 | Which visual state did the app switch a control to, and when? | `WINE_UWP_BP=windows.ui.xaml.dll+18c80@r8+0:6` (`VisualStateManagerFactory::GoToState`): .NET Native passes reference HSTRINGs, so dwords 4-5 are a pointer into `Shapr3D.dll` and dword 1 the length - read the literal from the DLL image. `+111338@r8+0:2` (`CEventManager::RaiseRoutedEvent`) gives the routed-event stream with each source's vtable. An app's own XAML is in `resources.pri` as `XBF` blobs with UTF-16 string tables |
 | Does a window flash anything before its real content? | `probes/popwatch.c` (host X11 tool, `gcc -O2 -o popwatch probes/popwatch.c -lX11`): logs every top-level create/map/configure/unmap with its depth, and after each map or resize grabs the window's pixels every ~3 ms, counting transparent, opaque-black, opaque-white and other pixels and saving the frames raw (`/tmp/popwatch/w<id>_NNN.bgra`). Alpha is what a compositor shows, so this sees on Xvfb what KWin would. It found XAML's windowed menus mapped as an opaque 24-bit window for 13 ms, and a reopened menu flashing its last frame |
+| Build a prefix with no Windows install | `packaging/harvest/harvest.py ISO OUT` extracts `packaging/harvest/manifest.txt` from a Windows ISO's `install.wim` with `7z` (no root). Microsoft's Evaluation Center ISO downloads without a fraud check: `go.microsoft.com/fwlink/?linkid=2334167` (the consumer download page rejects scripts). `packaging/new-prefix.sh TREE PREFIX` builds a prefix from nothing out of a `win11`-shaped tree: services, registrations, symbols, overrides. Run apps on it with `WIN11=TREE` exported, or `install-overrides.sh` copies `uwp-bin/win11` back in |
+| Which Windows DLL of a build breaks an app? | swap the differing DLLs between two trees and bisect: `/tmp/bisectdlls.sh` in the 09-28 session, 447 DLLs in nine runs. It found `twinapi.appcore.dll` (our hard-coded RVAs) and `Windows.UI.Xaml.dll` (a latent dcomp bug) |
+| Private addresses inside a Microsoft DLL, for any build | `packaging/harvest/resolve_symbols.py SYSTEM32 OUT` reads each DLL's CodeView record, fetches its PDB from `msdl.microsoft.com` and parses the publics itself, writing `C:\windows\wineuwp-symbols.txt`. In `wineuwp`, use `uwp_symbol(dll, name)`: **never a fixed RVA** |
 | Which methods of an interface does the app actually call? | give every slot a traced thunk returning `E_NOTIMPL` and read the log - see `shims/storecontext`, which proved the app wanted only `GetDefault` out of 26 methods |
 
 ### Unique-HRESULT tagging
@@ -615,6 +618,13 @@ happened with the radial gradient brush: WinUI closed it, `get_EllipseCenter` wr
 through rdx, and the editor crashed on every open. Any new typed object needs a real IClosable
 view (`dcv_closable_vtbl`, `visual_closable_vtbl` and `gradient_closable_vtbl` are the patterns).
 To find which IID a caller got, log the IID and `__builtin_return_address(0)` in that object's QI.
+
+**A fixed RVA into a Microsoft DLL is a bug waiting for the next Windows build.** ntdll and `wineuwp` knew twinapi and XAML
+by 26100.8972 addresses, and a prefix from the ISO's 26100.5074 files came up blank in every app. The only clue was that
+wineuwp's window factory was never called. A leftover write into XAML's `HotPatchSpareGlobals` would have corrupted
+other builds' data. Look addresses up by symbol (`uwp_symbol`, `resolve_symbols.py`). The same run found a latent bug
+in our own code that only an older XAML exercised, so **testing against a second Windows build finds bugs in us, not
+just in it.**
 
 **`addr2mod.py` cannot see Wine builtins, and will misattribute confidently.** `+loaddll` traces
 only `native` modules (a full Media Player run: 23 `Loaded ... : native`, zero `builtin`), and

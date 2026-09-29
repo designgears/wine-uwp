@@ -10482,3 +10482,55 @@ Also checked:
 - menu hover highlight and viewport selection and right-drag orbit (the independent input thread);
 - Calculator mouse clicks ("78") and Solitaire's Cancel;
 - the suite and `kb` identical.
+
+### Building a prefix from an official Windows ISO (2026-09-28)
+
+The goal is a setup that needs no Windows installation. Findings so far:
+
+- **Getting the ISO.** Microsoft's consumer download page (`software-download/windows11`) refuses scripted
+  requests: its link API answers `SentinelReject`, and its CDN serves a "high demand" page to non-browsers. The
+  **Evaluation Center** is different. `go.microsoft.com/fwlink/?linkid=2334167` (Windows 11 Enterprise, en-US) redirects
+  via `aka.ms/Win11E-ISO-25H2-en-us` to a static file on `software-static.download.prss.microsoft.com`. That is
+  build 26200.6584 (25H2), 7.1 GB, with no session and no fraud check.
+- **Harvesting.** `packaging/harvest/harvest.py` pulls `sources/install.wim` out of the ISO with `7z`, needing no root
+  and no wimlib, then extracts the files in `packaging/harvest/manifest.txt`. That manifest lists the 2,685 files of
+  `uwp-bin/win11` minus backups. 2,598 are in the image; the 87 missing are 63 `.mui`, the VC++ redistributable DLLs,
+  a few components newer than this build, and fonts that did not come from Windows. `pecheck.py`: the DLLs are
+  pristine. Its `Windows.UI.Xaml.dll` is **10.0.26100.5074**, older than our 8972.
+- **A prefix from nothing.** No prefix had ever been built by a script: ours accumulated manual steps since M1.
+  `packaging/new-prefix.sh TREE PREFIX` does `wineboot`, then registers the CoreMessagingRegistrar service *and its
+  svchost group*. Without the service CoreMessaging fail-fasts with `0x80070424`; without the group svchost logs
+  "Failed to load requested group". It then generates and imports the classes and interfaces registrations from the
+  tree's SOFTWARE hive, then runs `install-overrides.sh`, which now reads its tree from `WIN11`. A prefix built this way
+  from our own 8972 tree (reflinked to `win11-control`) gives Calculator AE 0.
+- **The ISO's own DLLs: every app blank.** A bisect swapped each differing DLL between the ISO tree and 8972, 447 DLLs
+  in 9 Calculator runs. It named **`twinapi.appcore.dll`**, alone. The cause is ours: our code knew twinapi and XAML
+  by 8972 addresses:
+  - ntdll's `gPsmRegistered` check at RVA `0x225dc0`;
+  - wineuwp's four CoreApplicationView vtable RVAs;
+  - four DXamlCore / FrameworkApplication function RVAs;
+  - a leftover write into XAML's `HotPatchSpareGlobals`, the "CoreWindow mailbox" of the retired XAML patch.
+
+  Now `packaging/harvest/resolve_symbols.py` reads each DLL's CodeView record, fetches its PDB from
+  `msdl.microsoft.com` and parses the public symbols itself (MSF 7.00, `S_PUB32`; no pefile or llvm-pdbutil). It writes
+  `C:\windows\wineuwp-symbols.txt` as `dll stamp size rva name`. For 8972 it gives exactly the old constants; for the
+  ISO build every address differs. `wineuwp`'s `uwp_symbol()` uses a line only when the stamp and size match the loaded
+  module, and falls back to built-in 8972 values only for that exact build. `wineuwp` sets `gPsmRegistered` itself
+  before activating (`mark_psm_registered`). The mailbox is gone.
+
+  With that, on the untouched ISO DLLs: **Calculator AE 0, `kb` identical, Solitaire 3/3.**
+- **Media Player on the ISO build: a latent dcomp bug.** A second bisect named `Windows.UI.Xaml.dll`. The older XAML
+  animates a colour brush through the `{83112a11}` partner's `StartAnimation` at start-up.
+  `CTimeManager::StartWUCAnimation` passes the property name there as a raw `const wchar_t *` (`PEBG` in its decorated
+  name), and our `brush_partner_StartAnimation` read it as an `HSTRING`. That made `wcsicmp` on garbage, then a
+  fail-fast. The property-set partner (`propset_partner_CreateAnimatorPartner`) already took a raw string. The brush now
+  shares `brush_start_animation(impl, const WCHAR *, ...)` between its `HSTRING` entry and the partner. After the fix
+  Media Player shows its Home page on the ISO DLLs.
+- **Shapr3D on the ISO build works**, signed in by copying its package data from our test prefix. The editor opens the
+  drone, History works, File opens as its own window, and Ctrl+F search filters as you type.
+- **ntdll no longer knows twinapi.** The `gPsmRegistered` special case in `RtlWaitOnAddress` is gone. `wineuwp`'s
+  `mark_psm_registered()` sets the flag, found through the symbol table, before each activation.
+- **Still open:** Feedback Hub fails on *any* freshly built prefix, 8972 too: `App.RegisterBaseRuntimeServices`
+  gets `0x80070032` from a one-string WinRT call made right after `ApplicationLanguages` is activated. It is not
+  `PrimaryLanguageOverride` (a breakpoint there never fires) and not the saved settings (copying them changes nothing).
+  It is a first-run issue, separate from the ISO.

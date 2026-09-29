@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     726c2e42ca562ed30be5840a398b7a179fe8862c
-                 win32u: GetPointerInfo answers only for the current message's pointer.
+  wine HEAD:     da39d0df71b7b73ca2a720da2d2e9e40bf7806c4
+                 wineuwp, ntdll, dcomp: No fixed addresses into Windows DLLs; fix the brush partner's name type.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-09-29T00:06:53Z
+  captured:      2026-09-29T02:25:51Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

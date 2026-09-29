@@ -12390,13 +12390,13 @@ static HRESULT WINAPI brush_obj_get_Properties( ICompositionObject *iface, IComp
 {
     return create_property_set( value );
 }
-static HRESULT WINAPI brush_obj_StartAnimation( ICompositionObject *iface, HSTRING name, ICompositionAnimation *animation )
+/* shared by ICompositionObject::StartAnimation (an HSTRING name) and the {83112a11} partner's StartAnimation, which
+ * XAML's CTimeManager::StartWUCAnimation calls with a raw wide string */
+static HRESULT brush_start_animation( struct color_brush *impl, const WCHAR *prop, ICompositionAnimation *animation )
 {
-    scene_changed();
-    struct color_brush *impl = CONTAINING_RECORD( iface, struct color_brush, ICompositionObject_iface );
     struct kf_animation *kf = kf_animation_from( animation );
-    const WCHAR *prop = WindowsGetStringRawBuffer( name, NULL );
 
+    scene_changed();
     TRACE( "brush %p, %s, animation %p.\n", impl, debugstr_w( prop ), animation );
     if (kf && kf->has_value && kf->value_kind == KF_COLOR && prop && !wcsicmp( prop, L"Color" ))
         impl->color = kf->color;
@@ -12414,6 +12414,11 @@ static HRESULT WINAPI brush_obj_StartAnimation( ICompositionObject *iface, HSTRI
         TRACE( "brush %p colour from expression: %02x%02x%02x%02x\n", impl, impl->color.A, impl->color.R, impl->color.G, impl->color.B );
     }
     return S_OK;
+}
+static HRESULT WINAPI brush_obj_StartAnimation( ICompositionObject *iface, HSTRING name, ICompositionAnimation *animation )
+{
+    return brush_start_animation( CONTAINING_RECORD( iface, struct color_brush, ICompositionObject_iface ),
+                                  WindowsGetStringRawBuffer( name, NULL ), animation );
 }
 static HRESULT WINAPI brush_obj_StopAnimation( ICompositionObject *iface, HSTRING name ) { return S_OK; }
 
@@ -12438,15 +12443,15 @@ static ULONG WINAPI brush_partner_Release( void *iface )
 {
     return color_brush_Release( &brush_from_partner( iface )->ICompositionColorBrush_iface );
 }
-static HRESULT WINAPI brush_partner_StartAnimation( void *iface, HSTRING name, ICompositionAnimation *animation, void **controller )
+/* the name is a raw wide string here, not an HSTRING (CTimeManager::StartWUCAnimation's const wchar_t *): reading it
+ * as one crashed Media Player with the 26100.5074 XAML, which animates a colour brush through this at start-up */
+static HRESULT WINAPI brush_partner_StartAnimation( void *iface, const WCHAR *name, ICompositionAnimation *animation, void **controller )
 {
-    scene_changed();
     struct color_brush *impl = brush_from_partner( iface );
     HRESULT hr;
 
-    TRACE( "brush %p, %s, animation %p, controller %p.\n", impl, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ),
-           animation, controller );
-    hr = brush_obj_StartAnimation( &impl->ICompositionObject_iface, name, animation );
+    TRACE( "brush %p, %s, animation %p, controller %p.\n", impl, debugstr_w( name ), animation, controller );
+    hr = brush_start_animation( impl, name, animation );
     if (controller) create_comp_object( "AnimationController", controller );
     return hr;
 }

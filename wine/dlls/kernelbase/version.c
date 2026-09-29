@@ -2669,8 +2669,8 @@ HRESULT WINAPI PsmQueryBackgroundActivationType( HANDLE app, DWORD *type )
 {
     TRACE( "%p %p\n", app, type );
     /* *type >= 2 skips RegisterWithPSM (no PSM service here). Activate still
-     * WaitOnAddress's gPsmRegistered; ntdll RtlWaitOnAddress pretends that wait
-     * is already satisfied in a hosted UWP process (see sync.c). */
+     * WaitOnAddress's gPsmRegistered, which wineuwp sets before it activates
+     * (mark_psm_registered, found through the symbol table). */
     if (type) *type = 2;
     return S_OK;
 }

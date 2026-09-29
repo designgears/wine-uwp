@@ -34,6 +34,8 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(wineuwp);
 
+static void mark_psm_registered( void );
+
 static void maybe_start_stack_dumper(void);
 
 DEFINE_GUID(CLSID_ActivatableApplicationRegistrar, 0xdea794e0, 0x1c1d, 0x4363, 0xb1, 0x71, 0x98, 0xd0, 0xb1, 0x70, 0x35, 0x86);
@@ -1430,6 +1432,7 @@ static HRESULT do_activate(struct registrar *reg)
 
     TRACE("activating %s with contract Windows.Launch\n", debugstr_w(aumid_buf));
     arm_twinapi_breaks();
+    mark_psm_registered();
     hr = app->lpVtbl->Activate(app, aumid, contract, activation_id, extra, args, 0, 0);
     if (FAILED(hr)) ERR("Activate failed, hr %#lx\n", hr);
     else
@@ -1691,7 +1694,7 @@ static void start_activation_inbox( struct registrar *reg )
  * with no OnActivateWindow in between, and Application::OnLaunched never runs.
  *
  * The three calls live on CoreApplicationView's private ICoreApplicationViewInternal, whose
- * vtable is at twinapi.appcore RVA 0x1a4ce8 in the pinned Windows 11 build:
+ * vtable ("vtbl.ICoreApplicationViewInternal" in the symbol table, see uwp_symbol):
  *
  *   slot 7  SetWindowAndGetDispatcher( ICoreWindowFactory *, ICoreWindow **, ICoreDispatcher ** )
  *   slot 8  Load( HSTRING entryPoint )
@@ -1700,14 +1703,11 @@ static void start_activation_inbox( struct registrar *reg )
  * The interface subobject sits at +0x28 in the class (CoreApplicationView::Activate starts with
  * lea r15,[rsi-0x28]), but rather than trust that offset we look for the vtable pointer itself.
  */
-#define TWINAPI_VIEW_VTBL          0x1a4b60   /* ??_7CoreApplicationView...6BICoreApplicationView@ */
-#define TWINAPI_VIEW_INTERNAL_VTBL 0x1a4ce8   /* ...6B...ICoreApplicationViewInternal... */
 /* ICoreApplicationViewInternal3: IInspectable plus CreateCoreWindow( ICoreWindowFactory * ).
  * This is what fills the view's CoreWindow slot. SetWindowAndGetDispatcher only creates the window
  * itself when IsApplicationActivationWatcherEnabled() is false, and on the desktop device family
  * it is true - so with the family we report, the window has to be made through here first or
  * SetWindowAndGetDispatcher reads the empty slot and faults. */
-#define TWINAPI_VIEW_INTERNAL3_VTBL 0x1a4e68
 struct view_internal3_vtbl
 {
     void *inspectable[6];
@@ -1715,7 +1715,6 @@ struct view_internal3_vtbl
 };
 struct view_internal3 { const struct view_internal3_vtbl *vtbl; };
 
-#define TWINAPI_VIEW_ACTIVATION_VTBL 0x1a4cb0 /* ...6B...ICoreApplicationView_Activation... */
 #define VIEW_INTERNAL_SEARCH       0x100
 
 /* ICoreApplicationView_Activation: slot 6 is PrepareToActivateAsync, which is how the shell tells
@@ -1741,11 +1740,109 @@ struct view_internal_vtbl
 };
 struct view_internal { const struct view_internal_vtbl *vtbl; };
 
+/* Build-specific addresses inside Microsoft's DLLs (private vtables, gPsmRegistered, a few DXamlCore functions)
+ * come from C:\windows\wineuwp-symbols.txt, which packaging/harvest/resolve_symbols.py writes from Microsoft's
+ * public PDBs for the DLLs actually installed: "<dll> <timedatestamp> <sizeofimage> <rva> <name>" per line. A line
+ * is only used when its stamp and size match the loaded module. With no matching line, the addresses of the
+ * 26100.8972 build this was developed against are used, but only for that exact build. */
+struct uwp_known_symbol { const char *dll; DWORD stamp, size; const char *name; ULONG_PTR rva; };
+static const struct uwp_known_symbol known_8972[] =
+{
+    { "twinapi.appcore.dll", 0x4716493d, 0x250000, "?gPsmRegistered@CoreApplication@Core@ApplicationModel@Windows@@0KC", 0x225dc0 },
+    { "twinapi.appcore.dll", 0x4716493d, 0x250000, "??_7CoreApplicationView@Core@ApplicationModel@Windows@@6BICoreApplicationView@123@@", 0x1a4b60 },
+    { "twinapi.appcore.dll", 0x4716493d, 0x250000, "vtbl.ICoreApplicationViewInternal", 0x1a4ce8 },
+    { "twinapi.appcore.dll", 0x4716493d, 0x250000, "vtbl.ICoreApplicationViewInternal3", 0x1a4e68 },
+    { "twinapi.appcore.dll", 0x4716493d, 0x250000, "vtbl.ICoreApplicationView_Activation", 0x1a4cb0 },
+    { "windows.ui.xaml.dll", 0x7451281f, 0x110e000, "?GetCurrent@DXamlCore@DirectUI@@SAPEAV12@XZ", 0x1134d4 },
+    { "windows.ui.xaml.dll", 0x7451281f, 0x110e000, "?ConfigureCoreWindow@DXamlCore@DirectUI@@QEAAJPEAUICoreWindow@Core@UI@Windows@@_N@Z", 0x3bd0b4 },
+    { "windows.ui.xaml.dll", 0x7451281f, 0x110e000, "?GetCurrentNoRef@FrameworkApplication@DirectUI@@SAPEAV12@XZ", 0x19cb14 },
+    { "windows.ui.xaml.dll", 0x7451281f, 0x110e000, "?InvokeOnWindowCreated@FrameworkApplication@DirectUI@@QEAAJXZ", 0x58f9f8 },
+};
+#define SYM_GPSM      "?gPsmRegistered@CoreApplication@Core@ApplicationModel@Windows@@0KC"
+#define SYM_VIEW_VTBL "??_7CoreApplicationView@Core@ApplicationModel@Windows@@6BICoreApplicationView@123@@"
+#define SYM_DXAML_GETCURRENT "?GetCurrent@DXamlCore@DirectUI@@SAPEAV12@XZ"
+#define SYM_DXAML_CONFIGURE  "?ConfigureCoreWindow@DXamlCore@DirectUI@@QEAAJPEAUICoreWindow@Core@UI@Windows@@_N@Z"
+#define SYM_FA_GETCURRENT    "?GetCurrentNoRef@FrameworkApplication@DirectUI@@SAPEAV12@XZ"
+#define SYM_FA_INVOKECREATED "?InvokeOnWindowCreated@FrameworkApplication@DirectUI@@QEAAJXZ"
+
+static char *uwp_symbol_table;   /* the file's contents, read once */
+
+static void load_symbol_table( void )
+{
+    static LONG loaded;
+    WCHAR path[MAX_PATH];
+    HANDLE file;
+    DWORD size, got;
+    char *buf;
+
+    if (InterlockedExchange( &loaded, 1 )) return;
+    GetWindowsDirectoryW( path, MAX_PATH );
+    lstrcatW( path, L"\\wineuwp-symbols.txt" );
+    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+    if (file == INVALID_HANDLE_VALUE) return;
+    size = GetFileSize( file, NULL );
+    if (size != INVALID_FILE_SIZE && (buf = malloc( size + 1 )) && ReadFile( file, buf, size, &got, NULL ))
+    {
+        buf[got] = 0;
+        uwp_symbol_table = buf;
+    }
+    CloseHandle( file );
+}
+
+/* address of a symbol in a loaded Microsoft DLL, or NULL (with an ERR once) when the build is unknown */
+static void *uwp_symbol( const char *dll, const char *name )
+{
+    const IMAGE_NT_HEADERS *nt;
+    WCHAR wdll[64];
+    HMODULE mod;
+    DWORD stamp, size;
+    const char *line;
+    unsigned int i;
+
+    MultiByteToWideChar( CP_ACP, 0, dll, -1, wdll, ARRAY_SIZE(wdll) );
+    if (!(mod = GetModuleHandleW( wdll ))) return NULL;
+    nt = (const IMAGE_NT_HEADERS *)((const char *)mod + ((const IMAGE_DOS_HEADER *)mod)->e_lfanew);
+    stamp = nt->FileHeader.TimeDateStamp;
+    size = nt->OptionalHeader.SizeOfImage;
+
+    load_symbol_table();
+    for (line = uwp_symbol_table; line && *line; line = strchr( line, '\n' ) ? strchr( line, '\n' ) + 1 : NULL)
+    {
+        char ldll[64], lname[512];
+        unsigned int lstamp, lsize;
+        unsigned long long rva;
+
+        if (sscanf( line, "%63s %x %x %llx %511s", ldll, &lstamp, &lsize, &rva, lname ) != 5) continue;
+        if (!_stricmp( ldll, dll ) && lstamp == stamp && lsize == size && !strcmp( lname, name ))
+            return (char *)mod + rva;
+    }
+    for (i = 0; i < ARRAY_SIZE(known_8972); i++)
+        if (!_stricmp( known_8972[i].dll, dll ) && known_8972[i].stamp == stamp && known_8972[i].size == size &&
+            !strcmp( known_8972[i].name, name ))
+            return (char *)mod + known_8972[i].rva;
+    ERR( "no address for %s!%s in this build (stamp %08lx size %lx); run packaging/harvest/resolve_symbols.py\n",
+         dll, name, stamp, size );
+    return NULL;
+}
+
+/* CoreApplication::Activate waits on gPsmRegistered until RegisterWithPSM - the process state manager, a service
+ * this host does not have - has run. Stand in for it before any activation. */
+static void mark_psm_registered( void )
+{
+    LONG *psm = uwp_symbol( "twinapi.appcore.dll", SYM_GPSM );
+
+    if (psm && !*psm)
+    {
+        InterlockedIncrement( psm );
+        TRACE( "set gPsmRegistered\n" );
+    }
+}
+
 /* The private interface is cloaked, so QueryInterface cannot reach it without its IID. Find the
  * subobject by its vtable pointer instead: it is a fixed address in the loaded twinapi image. */
 /* Find one of the view's interface subobjects by the vtable it points at, which is a fixed
  * address in the loaded twinapi image. QueryInterface cannot reach the cloaked ones. */
-static void *find_view_subobject( void *view, ULONG_PTR vtbl_rva, const char *name )
+static void *find_view_subobject( void *view, const char *vtbl_symbol, const char *name )
 {
     const void *want, *primary;
     HMODULE twinapi;
@@ -1757,8 +1854,8 @@ static void *find_view_subobject( void *view, ULONG_PTR vtbl_rva, const char *na
         ERR( "twinapi.appcore.dll not loaded\n" );
         return NULL;
     }
-    want = (const char *)twinapi + vtbl_rva;
-    primary = (const char *)twinapi + TWINAPI_VIEW_VTBL;
+    if (!(want = uwp_symbol( "twinapi.appcore.dll", vtbl_symbol ))) return NULL;
+    primary = uwp_symbol( "twinapi.appcore.dll", SYM_VIEW_VTBL );
     /* Off the view's own thread, CoreApplication hands back a marshalled proxy, whose vtable is
      * built on the heap rather than being in twinapi's image - and none of the subobjects this
      * scans for are in it. A vtable that is merely a *different* twinapi one is fine and must
@@ -1793,7 +1890,7 @@ static void *find_view_subobject( void *view, ULONG_PTR vtbl_rva, const char *na
 
 static struct view_internal *find_view_internal( void *view )
 {
-    return find_view_subobject( view, TWINAPI_VIEW_INTERNAL_VTBL, "ICoreApplicationViewInternal" );
+    return find_view_subobject( view, "vtbl.ICoreApplicationViewInternal", "ICoreApplicationViewInternal" );
 }
 
 /* The shell passes CoreApplicationView::Activate a callback it uses to report that the app
@@ -1980,7 +2077,7 @@ static HRESULT drive_view_startup( IInspectable *args )
         if (SUCCEEDED( hr2 ))
         {
             {
-                struct view_internal3 *i3 = find_view_subobject( view, TWINAPI_VIEW_INTERNAL3_VTBL,
+                struct view_internal3 *i3 = find_view_subobject( view, "vtbl.ICoreApplicationViewInternal3",
                                                                  "ICoreApplicationViewInternal3" );
                 if (i3)
                 {
@@ -2039,7 +2136,8 @@ static HRESULT drive_view_startup( IInspectable *args )
 
         if (SUCCEEDED( hr = create_activation_callback( &callback ) ))
         {
-            hr = internal->vtbl->Activate( internal, callback, args, NULL );
+            mark_psm_registered();
+        hr = internal->vtbl->Activate( internal, callback, args, NULL );
             ERR( "view Activate(callback %p, args %p), hr %#lx\n", callback, args, hr );
             IUnknown_Release( (IUnknown *)callback );
         }
@@ -2065,6 +2163,7 @@ static HRESULT activate_existing_view( IInspectable *args )
     }
     if (SUCCEEDED( hr = create_activation_callback( &callback ) ))
     {
+        mark_psm_registered();
         hr = internal->vtbl->Activate( internal, callback, args, NULL );
         IUnknown_Release( (IUnknown *)callback );
     }
@@ -2093,8 +2192,6 @@ static LONG activate_apc_done;
  * anywhere else, and nothing pumps that apartment until FrameworkView::Run - which only starts
  * after the activation. On Windows the shell's activation arrives on the view thread, so these
  * are direct calls. */
-#define XAML_DXAMLCORE_GETCURRENT_RVA 0x1134d4
-
 static void *xaml_dxaml_core_current( void )
 {
     void * (WINAPI *get_current)( void );
@@ -2102,8 +2199,7 @@ static void *xaml_dxaml_core_current( void )
 
     xaml = GetModuleHandleW( L"Windows.UI.Xaml.dll" );
     if (!xaml) xaml = GetModuleHandleW( L"windows.ui.xaml.dll" );
-    if (!xaml) return NULL;
-    get_current = (void *)((char *)xaml + XAML_DXAMLCORE_GETCURRENT_RVA);
+    if (!xaml || !(get_current = uwp_symbol( "windows.ui.xaml.dll", SYM_DXAML_GETCURRENT ))) return NULL;
     return get_current();
 }
 
@@ -2123,7 +2219,7 @@ static void prepare_view_for_activation( void )
     HRESULT hr;
 
     if (FAILED( get_current_core_application_view( &view ) ) || !view) return;
-    if ((activation = find_view_subobject( view, TWINAPI_VIEW_ACTIVATION_VTBL,
+    if ((activation = find_view_subobject( view, "vtbl.ICoreApplicationView_Activation",
                                            "ICoreApplicationView_Activation" )))
     {
         hr = activation->vtbl->PrepareToActivateAsync( activation, 0, &action );
@@ -3972,10 +4068,11 @@ static void try_configure_core_window( void *window )
         ERR( "Windows.UI.Xaml.dll not loaded; cannot ConfigureCoreWindow\n" );
         return;
     }
-    get_current = (void *)((char *)xaml + 0x1134d4);      /* DXamlCore::GetCurrent */
-    configure = (void *)((char *)xaml + 0x3bd0b4);        /* DXamlCore::ConfigureCoreWindow */
-    get_fa = (void *)((char *)xaml + 0x19cb14);           /* FrameworkApplication::GetCurrentNoRef */
-    invoke_created = (void *)((char *)xaml + 0x58f9f8);   /* FrameworkApplication::InvokeOnWindowCreated */
+    get_current = uwp_symbol( "windows.ui.xaml.dll", SYM_DXAML_GETCURRENT );
+    configure = uwp_symbol( "windows.ui.xaml.dll", SYM_DXAML_CONFIGURE );
+    get_fa = uwp_symbol( "windows.ui.xaml.dll", SYM_FA_GETCURRENT );
+    invoke_created = uwp_symbol( "windows.ui.xaml.dll", SYM_FA_INVOKECREATED );
+    if (!get_current || !configure || !get_fa || !invoke_created) return;
 
     core = get_current();
     if (!core)
@@ -4011,7 +4108,6 @@ static void CALLBACK configure_core_window_apc( ULONG_PTR param )
     IUnknown_Release( (IUnknown *)window );
 }
 
-static void publish_core_window_mailbox( void *window );
 static void broadcast_configure_from_get_for_current_thread( void );
 
 /* On the main UI thread a CoreWindow already exists (GetForCurrentThread) before
@@ -4041,7 +4137,6 @@ static void try_configure_from_get_for_current_thread( void )
         return;
     }
     ERR( "GetForCurrentThread -> %p on tid %lu; configuring\n", window, GetCurrentThreadId() );
-    publish_core_window_mailbox( window );
     try_configure_core_window( window );
     IUnknown_Release( (IUnknown *)window );
 }
@@ -4083,24 +4178,6 @@ static void broadcast_configure_from_get_for_current_thread( void )
     ERR( "queued %u GetForCurrentThread configure APCs\n", queued );
 }
 
-/* XAML GetCurrentCoreWindowNoRef cave reads this BSS mailbox when DXamlCore's
- * CoreWindow slot is empty, ConfigureCoreWindow's it, and returns it. */
-#define XAML_COREWINDOW_MAILBOX_RVA 0xfd3450
-
-static void publish_core_window_mailbox( void *window )
-{
-    HMODULE xaml;
-    void **mailbox;
-
-    xaml = GetModuleHandleW( L"Windows.UI.Xaml.dll" );
-    if (!xaml) xaml = GetModuleHandleW( L"windows.ui.xaml.dll" );
-    if (!xaml || !window) return;
-    mailbox = (void **)((char *)xaml + XAML_COREWINDOW_MAILBOX_RVA);
-    if (*mailbox) IUnknown_Release( (IUnknown *)*mailbox );
-    IUnknown_AddRef( (IUnknown *)window );
-    *mailbox = window;
-    ERR( "published CoreWindow %p to XAML mailbox\n", window );
-}
 
 /* Calling DXamlCore::ConfigureCoreWindow by hand stood in for a SetWindow that never arrived.
  * The activation now reaches CoreApplicationView::SetWindowAndGetDispatcher and XAML does it
@@ -4114,7 +4191,6 @@ static void broadcast_configure_core_window( void *window )
     THREADENTRY32 te;
     unsigned queued = 0, skipped = 0;
 
-    publish_core_window_mailbox( window );
 
     if (!GetEnvironmentVariableW( L"WINE_UWP_MANUAL_CONFIGURE", NULL, 0 ))
     {

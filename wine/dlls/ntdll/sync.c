@@ -893,23 +893,6 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
     if (size != 1 && size != 2 && size != 4 && size != 8)
         return STATUS_INVALID_PARAMETER;
 
-    /* CoreApplication::Activate waits on twinapi!gPsmRegistered (RVA 0x225dc0).
-     * RegisterWithPSM is skipped in this host, so wake that wait as if PSM had registered. */
-    if (size == 4 && !timeout)
-    {
-        void *base;
-
-        if (RtlPcToFileHeader( (void *)addr, &base ) && (ULONG_PTR)addr - (ULONG_PTR)base == 0x225dc0)
-        {
-            if (!*(volatile LONG *)addr)
-            {
-                LONG val = InterlockedIncrement( (LONG *)addr );
-                ERR( "hosted UWP, set gPsmRegistered to %ld\n", val );
-            }
-            return STATUS_SUCCESS;
-        }
-    }
-
     entry.addr = addr;
     entry.tid = GetCurrentThreadId();
 

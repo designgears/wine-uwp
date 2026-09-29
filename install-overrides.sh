@@ -9,7 +9,10 @@ set -euo pipefail
 export WINEPREFIX=${WINEPREFIX}
 SYS32=$WINEPREFIX/drive_c/windows/system32
 WINE_BIN=$WINE_BIN_DIR   # from env.sh, sourced above; always ends in a slash
-SRC=${UWP_BIN}/win11/Windows/System32
+# The Windows file tree: uwp-bin/win11 (copied from an installation) or one harvested from an ISO
+# (packaging/harvest/harvest.py). WIN11 picks it; everything below reads from it.
+WIN11=${WIN11:-${UWP_BIN}/win11}
+SRC=${WIN11}/Windows/System32
 # Nothing to do when neither the source tree, the Wine build, this script nor the prefix's system32
 # listing changed since the last run: the file-by-file comparison below costs about three seconds
 # of every launch. WINE_UWP_FORCE_OVERRIDES=1 skips the check.
@@ -134,15 +137,15 @@ rm -f "$WINEPREFIX/.wineuwp.reg.tmp"
 PY=${PY:-${UWP_BIN}/venv/bin/python}
 # Classic in-process COM classes the UWP stack CoCreates by CLSID (WindowServerFactory and friends).
 # Needed once combase really marshals: a custom marshaler names its unmarshal class by CLSID.
-CLSID_REG=${UWP_BIN}/win11/wine-uwp-clsid.reg
+CLSID_REG=${WIN11}/wine-uwp-clsid.reg
 if [ -x "$PY" ]; then
   "$PY" "$(dirname "$0")/gen-clsid-reg.py" "$SRC/config/SOFTWARE" "$SRC" "$CLSID_REG" | tail -1
   if ! cmp -s "$CLSID_REG" "$CLSID_REG.imported"; then
     "${WINE_BIN}wine" reg import "$CLSID_REG" >/dev/null 2>&1 && cp -f "$CLSID_REG" "$CLSID_REG.imported"
   fi
 fi
-CLASSES_REG=${CLASSES_REG:-${UWP_BIN}/win11/wine-uwp-classes.reg}
-SINGLE_REG=${UWP_BIN}/win11/wine-uwp-single-module.reg
+CLASSES_REG=${CLASSES_REG:-${WIN11}/wine-uwp-classes.reg}
+SINGLE_REG=${WIN11}/wine-uwp-single-module.reg
 if [ -f "$CLASSES_REG" ] && [ -x "$PY" ]; then
   "$PY" "$(dirname "$0")/gen-single-module-reg.py" "$CLASSES_REG" "$SRC" "$SYS32" "$SINGLE_REG" | tail -1
   if ! cmp -s "$SINGLE_REG" "$SINGLE_REG.imported"; then
@@ -431,7 +434,7 @@ fi
 # ICU data: the genuine icu.dll (used by the native windows.globalization.dll) loads
 # Windows\Globalization\ICU\icudtl.dat and the time-zone .res files next to it, and fails with
 # E_FAIL without them.
-GLOB_SRC=${UWP_BIN}/win11/Windows/Globalization
+GLOB_SRC=${WIN11}/Windows/Globalization
 if [ -d "$GLOB_SRC/ICU" ]; then
   for sub in ICU "Time Zone"; do
     lsub=$(echo "$sub" | tr "A-Z" "a-z"); mkdir -p "$WINEPREFIX/drive_c/windows/globalization/$lsub"
