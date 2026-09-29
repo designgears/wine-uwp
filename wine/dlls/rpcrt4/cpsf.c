@@ -314,7 +314,8 @@ const CInterfaceStubVtbl *get_stub_vtbl( const ProxyFileInfo *info, int index )
                 PRPC_STUB_FUNCTION *table = (PRPC_STUB_FUNCTION *)(copy + 1);
                 const unsigned short *offsets = copy->header.pServerInfo ? copy->header.pServerInfo->FmtStringOffset : NULL;
                 for (k = 0; k < count; k++)
-                    table[k] = (delegating && method_is_inherited( offsets, k )) ? NdrStubForwardingFunction : NdrStubCall2;
+                    table[k] = (delegating && method_is_inherited( offsets, k )) ? (PRPC_STUB_FUNCTION)NdrStubForwardingFunction
+                                                                         : (PRPC_STUB_FUNCTION)NdrStubCall2;
                 copy->header.pDispatchTable = table;
             }
             if (!add_shadow_copy( orig, copy )) { HeapFree( GetProcessHeap(), 0, copy ); copy = NULL; }

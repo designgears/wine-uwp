@@ -769,6 +769,14 @@ skips it. When input arrives that nothing you wrote posted, `WINEDEBUG=trace+msg
 Build one DLL with `make -j16 dlls/dcomp/all`, and check the DLL's timestamp before trusting a run:
 three runs this session tested a build that had never been made.
 
+**We build one DLL at a time, so the rest of the build tree goes stale, and a full `make` is a different Wine.**
+The first `make install` for packaging on 09-29 rebuilt ~500 modules. It also turned up three build breaks nobody had
+seen: our `rpcrt4/cpsf.c` no longer compiled, `wow64win` lacked a thunk for our `NtQueryCompositionInputSinkLuid`, and
+`icu.dll` failed to link. The icu failure came from `libs/c++` and `libs/icu*` archives mixing objects from an older
+compiler setup (MSVC-mangled names) with new mingw gcc ones. `rm -rf libs/<lib>/x86_64-windows`, recreate the object
+directories (`grep -oE '^libs/[^/]+/x86_64-windows/[^:]*\.o' Makefile | xargs -n1 dirname | sort -u | xargs mkdir -p`)
+and rebuild. After a full rebuild, run the suite and `kb` as for any other change.
+
 **`tools/make_makefiles` builds `SOURCES` from `git ls-files`.** A new `.c` file that is not yet
 `git add`ed is silently dropped from its `Makefile.in` and the link fails with an undefined
 reference. `git add` first, then `make_makefiles`, then `./config.status` in the build tree. Check

@@ -2917,6 +2917,16 @@ static void pointer_info_list_64to32( UINT size, UINT count, void *out, const vo
     }
 }
 
+extern NTSTATUS WINAPI NtQueryCompositionInputSinkLuid( HANDLE sink, LUID *luid );
+
+NTSTATUS WINAPI wow64_NtQueryCompositionInputSinkLuid( UINT *args )
+{
+    HANDLE sink = get_handle( &args );
+    LUID *luid = get_ptr( &args );
+
+    return NtQueryCompositionInputSinkLuid( sink, luid );
+}
+
 NTSTATUS WINAPI wow64_NtUserGetPointerInfoList( UINT *args )
 {
     NTSTATUS ret;
