@@ -1123,6 +1123,10 @@ the fully-qualified name. `--grep` first, always.
   `/tmp` test script drives the apps with it. If it is missing, find a window with
   `xprop -root _NET_CLIENT_LIST` plus `xprop -id <w> WM_NAME`, capture with `xwd -id`, and ask - it needs sudo.
   A `2>/dev/null` on an `xdotool search` hides the "command not found" and looks like "no such window".
+- **Wine *sends* mouse-in-pointer `WM_POINTER*` from inside `peek_message`, while it processes the mouse message; Windows
+  posts them as messages of their own.** So a CoreWindow's `WM_POINTER*` is never "retrieved": trace `ptrdisp` `sending`,
+  not `got`/`peeked`. `GetPointerInfo` answers only for the current message's pointer (`current_pointer_id`), which
+  that send sets. Anything new that keys off "the current message" must handle both routes.
 - Wine's `GetObject( dib, sizeof(DIBSECTION) )` reports `dsBmih.biHeight` **positive** for a top-down DIB,
   so it cannot tell you the row order. Every DIB `dcomp/composition.c` creates is top-down.
 - The unhandled-error text an app reports is often a *consequence*. `Delegate to an instance method
