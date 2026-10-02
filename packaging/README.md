@@ -42,6 +42,7 @@ accent with dark text on it.
 | `install-app.py` | an `.msixbundle`/`.msix` into `stage/<app>`, with frameworks, `identity.env`, `launch.env`, icon, URI schemes; `--info` previews one |
 | `../shims/launch/wineuwp-launch.cpp` | `wineuwp-launch.exe`: starts an installed app from a plain `wine` command |
 | `installer/` | the setup (Rust + Slint): `ui/app.slint` is the whole UI, `src/main.rs` runs the tools |
+| `make-test-bundle.py` | rebuilds an `.msixbundle` from a staged package, to test installs without the real download |
 | `wine-uwp` | the command: `setup`, `run`, `install`, `harvest`, `new-prefix`, `activate URI`, `bottles` |
 | `build-dist.sh` | an installed tree from this checkout (host Wine build + everything above) |
 | `flatpak/` | the manifest (`io.github.wine_uwp.WineUWP`), desktop file, metainfo, icon, `build.sh` |
