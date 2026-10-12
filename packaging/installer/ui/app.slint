@@ -160,24 +160,29 @@ component ChoiceCard inherits Rectangle {
     HorizontalLayout {
         padding: 16px;
         spacing: 14px;
-        Rectangle {
-            width: 20px;
-            height: 20px;
-            y: (parent.height - self.height) / 2 - 16px;
-            border-radius: 10px;
-            border-width: selected ? 6px : 1.5px;
-            border-color: selected ? Theme.accent : #6a6a6a;
-            animate border-width { duration: 150ms; }
-        }
-        Rectangle {
-            width: 36px;
-            height: 36px;
-            border-radius: Theme.radius-small;
-            background: Theme.control;
-            Icon {
-                source: root.icon;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
                 width: 20px;
-                tint: Theme.text-2;
+                height: 20px;
+                border-radius: 10px;
+                border-width: selected ? 6px : 1.5px;
+                border-color: selected ? Theme.accent : #6a6a6a;
+                animate border-width { duration: 150ms; }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 36px;
+                height: 36px;
+                border-radius: Theme.radius-small;
+                background: Theme.control;
+                Icon {
+                    source: root.icon;
+                    width: 20px;
+                    tint: Theme.text-2;
+                }
             }
         }
         VerticalLayout {
@@ -207,7 +212,7 @@ component ChoiceCard inherits Rectangle {
                 }
                 Rectangle { }
             }
-            Text {
+            if root.subtitle != "": Text {
                 text: root.subtitle;
                 color: Theme.text-2;
                 font-size: 13px;
@@ -501,11 +506,6 @@ export component Installer inherits Window {
                             font-size: 16px;
                             font-weight: 700;
                         }
-                        Text {
-                            text: "for Linux";
-                            color: Theme.text-2;
-                            font-size: 12px;
-                        }
                     }
                 }
                 RailStep { label: "Welcome"; index: 0; current: root.rail-step; }
@@ -514,11 +514,6 @@ export component Installer inherits Window {
                 RailStep { label: "Install " + root.app-name; index: 3; current: root.rail-step; }
                 RailStep { label: "Ready"; index: 4; current: root.rail-step; }
                 Rectangle { }
-                Text {
-                    text: "Runs with wine-uwp";
-                    color: Theme.text-3;
-                    font-size: 11px;
-                }
             }
         }
 
@@ -536,15 +531,14 @@ export component Installer inherits Window {
                     if root.page == 0: Page {
                         PageTitle {
                             title: "Set up " + root.app-name + " on Linux";
-                            subtitle: "The Windows version of " + root.app-name + ", running on wine-uwp. Setup takes three steps and needs no Windows licence key.";
                         }
                         Rectangle { height: 28px; }
                         VerticalLayout {
                             spacing: 12px;
                             for item in [
-                                { icon: @image-url("icons/download.svg"), t: "Windows components", s: "Microsoft's Windows 11 evaluation image, 7.1 GB, downloaded from Microsoft. About 2,700 files are kept." },
-                                { icon: @image-url("icons/layers.svg"), t: "A private Wine environment", s: "Windows' own UI frameworks and fonts in a sandbox of their own, about 3 GB. Nothing is installed system-wide." },
-                                { icon: @image-url("icons/cube.svg"), t: root.app-name, s: "Installed from the " + root.app-name + " for Windows package (.msixbundle) you choose." },
+                                { icon: @image-url("icons/download.svg"), t: "Windows components" },
+                                { icon: @image-url("icons/layers.svg"), t: "A private Wine environment" },
+                                { icon: @image-url("icons/cube.svg"), t: root.app-name },
                             ]: Rectangle {
                                 border-radius: Theme.radius;
                                 background: Theme.panel;
@@ -573,12 +567,6 @@ export component Installer inherits Window {
                                             font-size: 15px;
                                             font-weight: 600;
                                         }
-                                        Text {
-                                            text: item.s;
-                                            color: Theme.text-2;
-                                            font-size: 13px;
-                                            wrap: word-wrap;
-                                        }
                                     }
                                 }
                             }
@@ -589,7 +577,6 @@ export component Installer inherits Window {
                     if root.page == 1: Page {
                         PageTitle {
                             title: "Windows components";
-                            subtitle: root.app-name + " needs parts of Windows that Wine does not provide: the XAML UI framework, its fonts, and the .NET Native and C++ runtimes. They come from Microsoft's own Windows 11 image.";
                         }
                         Rectangle { height: 24px; }
                         VerticalLayout {
@@ -599,14 +586,14 @@ export component Installer inherits Window {
                                 icon: @image-url("icons/download.svg");
                                 title: "Download from Microsoft";
                                 badge: "RECOMMENDED";
-                                subtitle: "Windows 11 Enterprise evaluation, 7.1 GB from microsoft.com. Resumes if interrupted.";
+                                subtitle: "";
                                 picked => { root.use-download = true; }
                             }
                             ChoiceCard {
                                 selected: !root.use-download;
                                 icon: @image-url("icons/disc.svg");
                                 title: "Use an ISO I already have";
-                                subtitle: root.iso-name == "" ? "Any Windows 11 x64 ISO" : root.iso-name;
+                                subtitle: root.iso-name;
                                 picked => {
                                     root.use-download = false;
                                     if root.iso-name == "" { root.choose-iso(); }
@@ -634,7 +621,6 @@ export component Installer inherits Window {
                                 VerticalLayout {
                                     alignment: center;
                                     Text { text: "Keep the downloaded image"; color: Theme.text; font-size: 14px; }
-                                    Text { text: "Frees 7.1 GB when off. Only needed to set up again."; color: Theme.text-2; font-size: 12px; }
                                 }
                                 Toggle {
                                     y: (parent.height - self.height) / 2;
@@ -643,9 +629,9 @@ export component Installer inherits Window {
                             }
                         }
                         Rectangle { height: 14px; }
-                        Text {
+                        if !root.space-ok: Text {
                             text: root.space-text;
-                            color: root.space-ok ? Theme.text-2 : Theme.danger;
+                            color: Theme.danger;
                             font-size: 12px;
                             wrap: word-wrap;
                         }
@@ -655,7 +641,6 @@ export component Installer inherits Window {
                     if root.page == 2 || root.page == 4: Page {
                         PageTitle {
                             title: root.page == 2 ? "Preparing Windows components" : "Installing " + root.app-name;
-                            subtitle: root.page == 2 ? "Downloading Windows 11 from Microsoft and taking out the parts " + root.app-name + " needs. This happens once." : "Unpacking the app and the frameworks it uses.";
                         }
                         Rectangle { height: 22px; }
                         StepList { steps: root.steps; }
@@ -687,7 +672,6 @@ export component Installer inherits Window {
                     if root.page == 3: Page {
                         PageTitle {
                             title: "Choose the " + root.app-name + " package";
-                            subtitle: "Pick the " + root.app-name + " for Windows package, an .msixbundle or .msix file. The frameworks it needs come from the Windows components just prepared.";
                         }
                         Rectangle { height: 24px; }
                         if !root.has-package: Rectangle {
@@ -706,7 +690,6 @@ export component Installer inherits Window {
                                     Icon { source: @image-url("icons/cube.svg"); width: 34px; height: 34px; tint: Theme.accent; }
                                 }
                                 Text { text: "Choose package…"; color: Theme.text; font-size: 15px; font-weight: 600; horizontal-alignment: center; }
-                                Text { text: ".msixbundle, .msix, .appxbundle or .appx"; color: Theme.text-3; font-size: 12px; horizontal-alignment: center; }
                             }
                             drop-touch := TouchArea {
                                 mouse-cursor: pointer;
@@ -795,14 +778,6 @@ export component Installer inherits Window {
                             font-weight: 700;
                             horizontal-alignment: center;
                         }
-                        Rectangle { height: 8px; }
-                        Text {
-                            text: "Setup is complete. Signing in opens your browser; when it asks to open the link, allow it, and the sign-in comes back to " + root.app-name + ".";
-                            color: Theme.text-2;
-                            font-size: 14px;
-                            wrap: word-wrap;
-                            horizontal-alignment: center;
-                        }
                         Rectangle { height: 26px; }
                         if root.can-add-menu: HorizontalLayout {
                             alignment: center;
@@ -819,7 +794,6 @@ export component Installer inherits Window {
                                     VerticalLayout {
                                         alignment: center;
                                         Text { text: "Add to the applications menu"; color: Theme.text; font-size: 14px; }
-                                        Text { text: "Also lets your browser hand sign-ins back"; color: Theme.text-2; font-size: 12px; }
                                     }
                                     Toggle {
                                         y: (parent.height - self.height) / 2;
