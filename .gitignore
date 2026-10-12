@@ -11,3 +11,5 @@ __pycache__/
 *.pyc
 *.xwd
 tools/browser-callback/node_modules/
+# built by perf/bench.sh from winresize.c
+perf/*.exe

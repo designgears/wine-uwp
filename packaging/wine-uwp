@@ -2,7 +2,7 @@
 # wine-uwp: set up and run UWP apps in an installed wine-uwp (a Flatpak, a Bottles runner or a plain tree).
 #
 #   wine-uwp                  the app if one is installed, the setup otherwise
-#   wine-uwp setup            the setup wizard
+#   wine-uwp setup            the setup UI (when the build ships one)
 #   wine-uwp run [APP]        run an installed app (default: the first one installed)
 #   wine-uwp list             installed apps
 #   wine-uwp activate URI     hand a URI (a browser sign-in's callback) to the app that owns its scheme
@@ -43,7 +43,12 @@ if [ -z "$cmd" ]; then
   if [ -f "$data/prefix/.wine-uwp-ready" ] && [ -n "$(installed)" ]; then cmd=run; else cmd=setup; fi
 fi
 case $cmd in
-  setup)      exec "$bin/wine-uwp-installer" "$@" ;;
+  setup)
+    # a product's setup UI, when it ships one; otherwise the three command-line steps
+    [ -x "$bin/wine-uwp-installer" ] && exec "$bin/wine-uwp-installer" "$@"
+    echo "no setup UI in this build; set up from the command line:" >&2
+    echo "  wine-uwp harvest ISO; wine-uwp new-prefix; wine-uwp install PACKAGE" >&2
+    exit 2 ;;
   list)       installed ;;
   run)
     app=${1:-$(installed | head -1)}

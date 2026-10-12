@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Assemble an installable wine-uwp tree from this checkout: our Wine build, installed, plus the shims and the
-# scripts that set up and run apps. The Flatpak and the Bottles runner are both made from it.
+# scripts that set up and run apps. A product built on wine-uwp adds its own setup UI to it (bin/wine-uwp-installer;
+# shapr3d-linux does), and `wine-uwp setup` runs that UI when there is one.
 #
 #   packaging/build-dist.sh OUT            everything
 #   packaging/build-dist.sh --no-wine OUT  only share/wine-uwp and bin/wine-uwp (the Flatpak builds Wine itself)
@@ -50,11 +51,5 @@ find "$share" -name __pycache__ -prune -exec rm -rf {} +
 shims=$(grep -ohE '\$\{SHIM_DIR\}/[A-Za-z0-9_.-]+\.dll' "$here/install-overrides.sh" | sed 's|${SHIM_DIR}/||' | sort -u)
 for s in $shims wineuwp-launch.exe; do cp "$UWP_BIN/build-probes/$s" "$share/shims/"; done
 install -m755 "$here/packaging/wine-uwp" "$out/bin/wine-uwp"
-# the setup (Rust + Slint); the Flatpak compiles it in its own SDK instead
-if [ -n "$with_wine" ]; then
-  echo "STAGE Building the installer"
-  cargo build --release --quiet --manifest-path "$here/packaging/installer/Cargo.toml"
-  install -m755 "$here/packaging/installer/target/release/wine-uwp-installer" "$out/bin/"
-fi
 git -C "$here" rev-parse --short HEAD > "$share/VERSION"
 echo "STAGE Done: $out ($(du -sh "$out" | cut -f1))"
