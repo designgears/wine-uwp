@@ -768,5 +768,7 @@ fn write_desktop_entry(paths: &Paths, app: &str) -> std::io::Result<()> {
         }
     }
     host(&["update-desktop-database", &apps.to_string_lossy()]);
+    // KDE resolves handlers from its own cache; until it is rebuilt a sign-in link opens a "Choose Application" dialog
+    host(&["kbuildsycoca6"]);
     Ok(())
 }
