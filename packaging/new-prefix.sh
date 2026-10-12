@@ -26,7 +26,7 @@ PY=${PY:-$UWP_BIN/venv/bin/python}
 echo "STAGE Creating the Wine prefix"
 mkdir -p "$prefix"
 # no wine-mono or wine-gecko: .NET Native apps are native code, and without an installed copy wineboot would stop
-# at a download dialog (the Flatpak has none; the host usually has them system-wide)
+# at a download dialog (the AppImage has none; the host usually has them system-wide)
 WINEDLLOVERRIDES="mscoree=;mshtml=" wineboot -i >/dev/null 2>&1
 wineserver -w
 
