@@ -23,15 +23,10 @@ export WINE_UWP_ROOT=$root UWP_BIN=$data WIN11=$data/windows WINEPREFIX=$data/pr
 export WINE_BUILD=$bin SHIM_DIR=$root/shims PY=${PY:-python3}
 export WINEDEBUG=${WINEDEBUG:--all,err+all}
 
-# is APP running from this data directory? (its processes carry UWP_STAGE and WINEPREFIX from "run")
-running() {
-  local e
-  for e in /proc/[0-9]*/environ; do
-    tr '\0' '\n' < "$e" 2>/dev/null | grep -qx "UWP_STAGE=$1" &&
-      tr '\0' '\n' < "$e" 2>/dev/null | grep -qxF "WINEPREFIX=$data/prefix" && return 0
-  done
-  return 1
-}
+# is APP running from this data directory? "run" holds a lock on logs/.APP.running for as long as the app lives. A
+# lock in the shared data directory is seen from every sandbox: each Flatpak instance has its own process namespace,
+# so the app is invisible in another instance's /proc, and a sign-in link would start a second copy.
+running() { ! flock -n "$data/logs/.$1.running" true 2>/dev/null; }
 installed() { for d in "$data"/stage/*/identity.env; do [ -f "$d" ] && basename "$(dirname "$d")"; done; true; }
 
 cmd=${1:-}
@@ -52,6 +47,9 @@ case $cmd in
   run)
     app=${1:-$(installed | head -1)}
     [ -n "$app" ] && [ -f "$data/stage/$app/identity.env" ] || { echo "no installed app ${app:+named $app}" >&2; exit 1; }
+    # one copy per data directory: the lock is held by run.sh and everything it starts (they inherit fd 9)
+    exec 9> "$data/logs/.$app.running"
+    flock -n 9 || { echo "$app is already running" >&2; exit 0; }
     UWP_STAGE=$app UWP_TIMEOUT=0 UWP_LOG="$data/logs/$app.log" exec "$root/run.sh" ;;
   harvest)    exec python3 "$root/packaging/harvest/harvest.py" "$1" "$data/windows" ;;
   new-prefix) "$root/packaging/new-prefix.sh" "$data/windows" "$data/prefix"; touch "$data/prefix/.wine-uwp-ready" ;;
