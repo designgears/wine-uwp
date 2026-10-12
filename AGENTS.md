@@ -1112,6 +1112,11 @@ the fully-qualified name. `--grep` first, always.
 
 ## Environment facts worth knowing
 
+- **Every app blank with `ignoring FailFast 0x887a0004` (`DXGI_ERROR_UNSUPPORTED`) is the host's GPU stack, not us.**
+  On 10-11 pacman had upgraded the kernel and NVIDIA without a reboot: `err:vulkan:init_physical_devices ... res -3`,
+  `vulkaninfo --summary` finds no GPU (Intel included), `nvidia-smi` reports a version mismatch. Check `vulkaninfo`
+  first; until a reboot, `WINE_D3D_CONFIG=renderer=gl` (llvmpipe on Xvfb) still gives Calculator AE 0.
+
 - **A bare `wine` is the *system* Wine (11.17 in `/usr/bin`), not ours - and running it on our
   prefix rewrites it.** `env.sh` exports `WINE_BUILD`/`WINE_BIN_DIR` but does **not** put the build
   on `PATH` (`run.sh` does that itself), and `WINE_BIN` is empty, so `${WINE_BIN}wine` outside
