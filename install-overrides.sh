@@ -42,7 +42,7 @@ for n in $LIST; do
   for dup in $(ls "$SYS32" | grep -i "^$n\.dll$"); do
     if [ "$dup" != "$lower" ] || ! cmp -s "$SRC/$f" "$SYS32/$dup"; then rm -f "$SYS32/$dup"; fi
   done
-  [ -f "$SYS32/$lower" ] || cp -f "$SRC/$f" "$SYS32/$lower"
+  [ -f "$SYS32/$lower" ] || cp -f --reflink=auto "$SRC/$f" "$SYS32/$lower"
 done
 echo "installed: $LIST"
 
@@ -53,7 +53,7 @@ RESOURCE_LIST=${RESOURCE_LIST:-MrmDeploy.dll Windows.UI.Xaml.Controls.dll Window
 for f in $RESOURCE_LIST; do
   [ -f "$SRC/$f" ] || { echo "missing $f"; continue; }
   lower=$(echo "$f" | tr 'A-Z' 'a-z')
-  [ -f "$SYS32/$lower" ] && cmp -s "$SRC/$f" "$SYS32/$lower" || cp -f "$SRC/$f" "$SYS32/$lower"
+  [ -f "$SYS32/$lower" ] && cmp -s "$SRC/$f" "$SYS32/$lower" || cp -f --reflink=auto "$SRC/$f" "$SYS32/$lower"
 done
 echo "installed: $(echo $RESOURCE_LIST | wc -w) resource modules"
 
@@ -63,7 +63,7 @@ NATIVE_ONLY=${NATIVE_ONLY:-WindowManagementAPI.dll CoreUIComponents.dll}
 for f in $NATIVE_ONLY; do
   [ -f "$SRC/$f" ] || { echo "missing $f"; continue; }
   lower=$(echo "$f" | tr 'A-Z' 'a-z')
-  [ -f "$SYS32/$lower" ] && cmp -s "$SRC/$f" "$SYS32/$lower" || cp -f "$SRC/$f" "$SYS32/$lower"
+  [ -f "$SYS32/$lower" ] && cmp -s "$SRC/$f" "$SYS32/$lower" || cp -f --reflink=auto "$SRC/$f" "$SYS32/$lower"
 done
 echo "installed: $(echo $NATIVE_ONLY | wc -w) native-only modules"
 
@@ -78,7 +78,7 @@ if [ -d "$FONT_SRC" ]; then
   n=0
   for f in "$FONT_SRC"/*; do
     b=$(basename "$f")
-    cmp -s "$f" "$FONT_DST/$b" || { cp -f "$f" "$FONT_DST/$b"; n=$((n + 1)); }
+    cmp -s "$f" "$FONT_DST/$b" || { cp -f --reflink=auto "$f" "$FONT_DST/$b"; n=$((n + 1)); }
   done
   echo "installed: $(ls "$FONT_SRC" | wc -l) Windows fonts ($n copied)"
 fi
@@ -96,7 +96,7 @@ for dll in "$SYS32"/*.dll; do
   src_dll=$(ls "$SRC" | grep -i "^$b$" | head -1) || true
   [ -n "$src_dll" ] && cmp -s "$SRC/$src_dll" "$dll" || continue
   lower=$(echo "$b" | tr 'A-Z' 'a-z').mui
-  [ -f "$MUI_DIR/$lower" ] && cmp -s "$SRC/en-US/$m" "$MUI_DIR/$lower" || cp -f "$SRC/en-US/$m" "$MUI_DIR/$lower"
+  [ -f "$MUI_DIR/$lower" ] && cmp -s "$SRC/en-US/$m" "$MUI_DIR/$lower" || cp -f --reflink=auto "$SRC/en-US/$m" "$MUI_DIR/$lower"
   n_mui=$((n_mui + 1))
 done
 echo "installed: $n_mui MUI files"
@@ -108,7 +108,7 @@ for f in "$SRC"/WinMetadata/*.winmd; do
   for dup in $(ls "$WM" | grep -i "^$lower$"); do
     if [ "$dup" != "$lower" ] || ! cmp -s "$f" "$WM/$dup"; then rm -f "$WM/$dup"; fi
   done
-  [ -f "$WM/$lower" ] || cp -f "$f" "$WM/$lower"
+  [ -f "$WM/$lower" ] || cp -f --reflink=auto "$f" "$WM/$lower"
 done
 echo "installed: $(ls "$WM" | wc -l) winmd files"
 # Prefix-wide native overrides: services hosted by svchost do not inherit WINEDLLOVERRIDES from run.sh,
@@ -137,7 +137,7 @@ if command -v "$PY" >/dev/null; then
   "$PY" "$(dirname "$0")/gen-clsid-reg.py" "$SRC/config/SOFTWARE" "$SRC" "$CLSID_REG" | tail -1
   # the marker is per prefix: one Windows tree can serve several prefixes (a bottle gets a copy of it)
   if ! cmp -s "$CLSID_REG" "$WINEPREFIX/.wine-uwp-clsid.reg.imported"; then
-    "${WINE_BIN}wine" reg import "$CLSID_REG" >/dev/null 2>&1 && cp -f "$CLSID_REG" "$WINEPREFIX/.wine-uwp-clsid.reg.imported"
+    "${WINE_BIN}wine" reg import "$CLSID_REG" >/dev/null 2>&1 && cp -f --reflink=auto "$CLSID_REG" "$WINEPREFIX/.wine-uwp-clsid.reg.imported"
   fi
 fi
 CLASSES_REG=${CLASSES_REG:-${WIN11}/wine-uwp-classes.reg}
@@ -146,7 +146,7 @@ if [ -f "$CLASSES_REG" ] && command -v "$PY" >/dev/null; then
   "$PY" "$(dirname "$0")/gen-single-module-reg.py" "$CLASSES_REG" "$SRC" "$SYS32" "$SINGLE_REG" | tail -1
   if ! cmp -s "$SINGLE_REG" "$WINEPREFIX/.wine-uwp-single-module.reg.imported"; then
     "${WINE_BIN}wine" reg import "$SINGLE_REG" >/dev/null 2>&1 &&
-      cp -f "$SINGLE_REG" "$WINEPREFIX/.wine-uwp-single-module.reg.imported"
+      cp -f --reflink=auto "$SINGLE_REG" "$WINEPREFIX/.wine-uwp-single-module.reg.imported"
   fi
 fi
 
@@ -171,7 +171,7 @@ rm -f "$WINEPREFIX/.wineuwp.reg.tmp"
 SR_SHIM=${SHIM_DIR}/wineuwp_staterepository.dll
 if [ -f "$SR_SHIM" ]; then
   SR_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_staterepository.dll
-  if ! cmp -s "$SR_SHIM" "$SR_DST"; then cp -f "$SR_SHIM" "$SR_DST"; fi
+  if ! cmp -s "$SR_SHIM" "$SR_DST"; then cp -f --reflink=auto "$SR_SHIM" "$SR_DST"; fi
   for cls in User Application MrtApplication Package PackageFamily MrtPackage PackageUser; do
     K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Internal.StateRepository.$cls"
     "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_staterepository.dll' /f >/dev/null 2>&1
@@ -189,7 +189,7 @@ fi
 AC_SHIM=${SHIM_DIR}/wineuwp_appcapability.dll
 if [ -f "$AC_SHIM" ]; then
   AC_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_appcapability.dll
-  if ! cmp -s "$AC_SHIM" "$AC_DST"; then cp -f "$AC_SHIM" "$AC_DST"; fi
+  if ! cmp -s "$AC_SHIM" "$AC_DST"; then cp -f --reflink=auto "$AC_SHIM" "$AC_DST"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Security.Authorization.AppCapabilityAccess.AppCapability"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_appcapability.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -205,7 +205,7 @@ fi
 SL_SHIM=${SHIM_DIR}/wineuwp_storagelibrary.dll
 if [ -f "$SL_SHIM" ]; then
   SL_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_storagelibrary.dll
-  if ! cmp -s "$SL_SHIM" "$SL_DST"; then cp -f "$SL_SHIM" "$SL_DST"; fi
+  if ! cmp -s "$SL_SHIM" "$SL_DST"; then cp -f --reflink=auto "$SL_SHIM" "$SL_DST"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Storage.StorageLibrary"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_storagelibrary.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -221,7 +221,7 @@ fi
 FP_SHIM=${SHIM_DIR}/wineuwp_filepicker.dll
 if [ -f "$FP_SHIM" ]; then
   FP_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_filepicker.dll
-  if ! cmp -s "$FP_SHIM" "$FP_DST"; then cp -f "$FP_SHIM" "$FP_DST"; fi
+  if ! cmp -s "$FP_SHIM" "$FP_DST"; then cp -f --reflink=auto "$FP_SHIM" "$FP_DST"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Storage.Pickers.FileOpenPicker"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_filepicker.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -237,7 +237,7 @@ fi
 UP_SHIM=${SHIM_DIR}/wineuwp_userpicker.dll
 if [ -f "$UP_SHIM" ]; then
   UP_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_userpicker.dll
-  if ! cmp -s "$UP_SHIM" "$UP_DST"; then cp -f "$UP_SHIM" "$UP_DST"; fi
+  if ! cmp -s "$UP_SHIM" "$UP_DST"; then cp -f --reflink=auto "$UP_SHIM" "$UP_DST"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.System.UserPicker"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_userpicker.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -251,7 +251,7 @@ fi
 MM_SHIM=${SHIM_DIR}/wineuwp_memorymanager.dll
 if [ -f "$MM_SHIM" ]; then
   MM_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_memorymanager.dll
-  if ! cmp -s "$MM_SHIM" "$MM_DST"; then cp -f "$MM_SHIM" "$MM_DST"; fi
+  if ! cmp -s "$MM_SHIM" "$MM_DST"; then cp -f --reflink=auto "$MM_SHIM" "$MM_DST"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.System.MemoryManager"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_memorymanager.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -267,7 +267,7 @@ fi
 DI_SHIM=${SHIM_DIR}/wineuwp_deviceinformation.dll
 if [ -f "$DI_SHIM" ]; then
   DI_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_deviceinformation.dll
-  if ! cmp -s "$DI_SHIM" "$DI_DST"; then cp -f "$DI_SHIM" "$DI_DST"; fi
+  if ! cmp -s "$DI_SHIM" "$DI_DST"; then cp -f --reflink=auto "$DI_SHIM" "$DI_DST"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Devices.Enumeration.DeviceInformation"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_deviceinformation.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -307,7 +307,7 @@ fi
 # build. Keep it in step.
 UWPDLL=$(wine_pe wineuwp)
 if [ -f "$UWPDLL" ] && [ -f "$SYS32/wineuwp.dll" ] && ! cmp -s "$UWPDLL" "$SYS32/wineuwp.dll"; then
-  cp -f "$UWPDLL" "$SYS32/wineuwp.dll"
+  cp -f --reflink=auto "$UWPDLL" "$SYS32/wineuwp.dll"
   echo "refreshed: stale wineuwp.dll in the prefix"
 fi
 
@@ -316,14 +316,14 @@ fi
 AMR=${SHIM_DIR}/api-ms-win-appmodel-runtime-l1-1-1.dll
 if [ -f "$AMR" ]; then
   AMR_DST=$SYS32/api-ms-win-appmodel-runtime-l1-1-1.dll
-  if ! cmp -s "$AMR" "$AMR_DST"; then cp -f "$AMR" "$AMR_DST"; fi
+  if ! cmp -s "$AMR" "$AMR_DST"; then cp -f --reflink=auto "$AMR" "$AMR_DST"; fi
   echo "installed: appmodel-runtime apiset stand-in"
 fi
 
 # NetworkInformation stand-in (see shims/networkstatus): fires NetworkStatusChanged once.
 NS=${SHIM_DIR}/wineuwp_networkstatus.dll
 if [ -f "$NS" ]; then
-  if ! cmp -s "$NS" "$SYS32/wineuwp_networkstatus.dll"; then cp -f "$NS" "$SYS32/wineuwp_networkstatus.dll"; fi
+  if ! cmp -s "$NS" "$SYS32/wineuwp_networkstatus.dll"; then cp -f --reflink=auto "$NS" "$SYS32/wineuwp_networkstatus.dll"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Networking.Connectivity.NetworkInformation"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_networkstatus.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -335,7 +335,7 @@ fi
 # SpatialAudioDeviceConfiguration stand-in (see shims/spatialaudio).
 SA=${SHIM_DIR}/wineuwp_spatialaudio.dll
 if [ -f "$SA" ]; then
-  if ! cmp -s "$SA" "$SYS32/wineuwp_spatialaudio.dll"; then cp -f "$SA" "$SYS32/wineuwp_spatialaudio.dll"; fi
+  if ! cmp -s "$SA" "$SYS32/wineuwp_spatialaudio.dll"; then cp -f --reflink=auto "$SA" "$SYS32/wineuwp_spatialaudio.dll"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Media.Audio.SpatialAudioDeviceConfiguration"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_spatialaudio.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -352,7 +352,7 @@ fi
 # WebAuthenticationCoreManager stand-in (see shims/webauthcore).
 WAC=${SHIM_DIR}/wineuwp_webauthcore.dll
 if [ -f "$WAC" ]; then
-  if ! cmp -s "$WAC" "$SYS32/wineuwp_webauthcore.dll"; then cp -f "$WAC" "$SYS32/wineuwp_webauthcore.dll"; fi
+  if ! cmp -s "$WAC" "$SYS32/wineuwp_webauthcore.dll"; then cp -f --reflink=auto "$WAC" "$SYS32/wineuwp_webauthcore.dll"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_webauthcore.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -366,7 +366,7 @@ fi
 UA_SHIM=${SHIM_DIR}/wineuwp_useractivitychannel.dll
 if [ -f "$UA_SHIM" ]; then
   UA_DST=$SYS32/wineuwp_useractivitychannel.dll
-  if ! cmp -s "$UA_SHIM" "$UA_DST"; then cp -f "$UA_SHIM" "$UA_DST"; fi
+  if ! cmp -s "$UA_SHIM" "$UA_DST"; then cp -f --reflink=auto "$UA_SHIM" "$UA_DST"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.ApplicationModel.UserActivities.UserActivityChannel"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_useractivitychannel.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -379,7 +379,7 @@ fi
 TN_SHIM=${SHIM_DIR}/wineuwp_toastnotifier.dll
 if [ -f "$TN_SHIM" ]; then
   TN_DST=$SYS32/wineuwp_toastnotifier.dll
-  if ! cmp -s "$TN_SHIM" "$TN_DST"; then cp -f "$TN_SHIM" "$TN_DST"; fi
+  if ! cmp -s "$TN_SHIM" "$TN_DST"; then cp -f --reflink=auto "$TN_SHIM" "$TN_DST"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.UI.Notifications.ToastNotificationManager"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_toastnotifier.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -393,7 +393,7 @@ fi
 SC_SHIM=${SHIM_DIR}/wineuwp_storecontext.dll
 if [ -f "$SC_SHIM" ]; then
   SC_DST=$SYS32/wineuwp_storecontext.dll
-  if ! cmp -s "$SC_SHIM" "$SC_DST"; then cp -f "$SC_SHIM" "$SC_DST"; fi
+  if ! cmp -s "$SC_SHIM" "$SC_DST"; then cp -f --reflink=auto "$SC_SHIM" "$SC_DST"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Services.Store.StoreContext"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_storecontext.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -408,7 +408,7 @@ fi
 ADID=${SHIM_DIR}/api-ms-win-appmodel-advertisingid-l1-1-0.dll
 if [ -f "$ADID" ]; then
   ADID_DST=$SYS32/api-ms-win-appmodel-advertisingid-l1-1-0.dll
-  if ! cmp -s "$ADID" "$ADID_DST"; then cp -f "$ADID" "$ADID_DST"; fi
+  if ! cmp -s "$ADID" "$ADID_DST"; then cp -f --reflink=auto "$ADID" "$ADID_DST"; fi
   echo "installed: advertising-id apiset stand-in"
 fi
 
@@ -419,7 +419,7 @@ fi
 TB_SHIM=${SHIM_DIR}/wineuwp_taskbarmanager.dll
 if [ -f "$TB_SHIM" ]; then
   TB_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_taskbarmanager.dll
-  if ! cmp -s "$TB_SHIM" "$TB_DST"; then cp -f "$TB_SHIM" "$TB_DST"; fi
+  if ! cmp -s "$TB_SHIM" "$TB_DST"; then cp -f --reflink=auto "$TB_SHIM" "$TB_DST"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.UI.Shell.TaskbarManager"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_taskbarmanager.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -434,7 +434,7 @@ fi
 AC2_SHIM=${SHIM_DIR}/wineuwp_accesscache.dll
 if [ -f "$AC2_SHIM" ]; then
   AC2_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_accesscache.dll
-  if ! cmp -s "$AC2_SHIM" "$AC2_DST"; then cp -f "$AC2_SHIM" "$AC2_DST"; fi
+  if ! cmp -s "$AC2_SHIM" "$AC2_DST"; then cp -f --reflink=auto "$AC2_SHIM" "$AC2_DST"; fi
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Storage.AccessCache.StorageApplicationPermissions"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_accesscache.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -452,7 +452,7 @@ if [ -d "$GLOB_SRC/ICU" ]; then
     lsub=$(echo "$sub" | tr "A-Z" "a-z"); mkdir -p "$WINEPREFIX/drive_c/windows/globalization/$lsub"
     for f in "$GLOB_SRC/$sub"/*; do
       b=$(basename "$f"); d="$WINEPREFIX/drive_c/windows/globalization/$lsub/$b"
-      [ -f "$d" ] && cmp -s "$f" "$d" || cp -f "$f" "$d"
+      [ -f "$d" ] && cmp -s "$f" "$d" || cp -f --reflink=auto "$f" "$d"
     done
   done
   echo "installed: Globalization data"
@@ -517,11 +517,11 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_toastnotifier.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Notifications.ToastNotificationManager:wineuwp_toastnotifier.dll"
 # ext-ms-win-devmgmt-policy-l1-1-1 (see shims/devmgmtpolicy): the ink stack delay-loads it.
 DP=${SHIM_DIR}/ext-ms-win-devmgmt-policy-l1-1-1.dll
-[ -f "$DP" ] && { cmp -s "$DP" "$SYS32/ext-ms-win-devmgmt-policy-l1-1-1.dll" || cp -f "$DP" "$SYS32/ext-ms-win-devmgmt-policy-l1-1-1.dll"; }
+[ -f "$DP" ] && { cmp -s "$DP" "$SYS32/ext-ms-win-devmgmt-policy-l1-1-1.dll" || cp -f --reflink=auto "$DP" "$SYS32/ext-ms-win-devmgmt-policy-l1-1-1.dll"; }
 # api-ms-win-net-isolation-l1-1-1 (see shims/netisolation): not in Wine's apiset schema, so the file
 # in system32 under that name is what the delay-load finds.
 NI=${SHIM_DIR}/api-ms-win-net-isolation-l1-1-1.dll
-[ -f "$NI" ] && { cmp -s "$NI" "$SYS32/api-ms-win-net-isolation-l1-1-1.dll" || cp -f "$NI" "$SYS32/api-ms-win-net-isolation-l1-1-1.dll"; }
+[ -f "$NI" ] && { cmp -s "$NI" "$SYS32/api-ms-win-net-isolation-l1-1-1.dll" || cp -f --reflink=auto "$NI" "$SYS32/api-ms-win-net-isolation-l1-1-1.dll"; }
 # Windows.Storage.Pickers.FileSavePicker (see shims/filepicker): the native constructor fails
 # without the shell broker, and Shapr3D builds one with its dashboard, straight after sign-in.
 if [ -f "$SYS32/wineuwp_filepicker.dll" ]; then
@@ -534,7 +534,7 @@ fi
 # missing, and without the class Windows.Web.Http abandons every HTTPS request.
 CERT_SHIM=${SHIM_DIR}/wineuwp_certificate.dll
 if [ -f "$CERT_SHIM" ]; then
-  cmp -s "$CERT_SHIM" "$SYS32/wineuwp_certificate.dll" || cp -f "$CERT_SHIM" "$SYS32/wineuwp_certificate.dll"
+  cmp -s "$CERT_SHIM" "$SYS32/wineuwp_certificate.dll" || cp -f --reflink=auto "$CERT_SHIM" "$SYS32/wineuwp_certificate.dll"
   reassert_activatable Windows.Security.Cryptography.Certificates.Certificate wineuwp_certificate.dll 0
   SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Cryptography.Certificates.Certificate:wineuwp_certificate.dll:0"
 fi
@@ -542,7 +542,7 @@ fi
 # fail-fasts the app; this one hands the URI to ShellExecute, i.e. the host's browser.
 LAUNCHER_SHIM=${SHIM_DIR}/wineuwp_launcher.dll
 if [ -f "$LAUNCHER_SHIM" ]; then
-  cmp -s "$LAUNCHER_SHIM" "$SYS32/wineuwp_launcher.dll" || cp -f "$LAUNCHER_SHIM" "$SYS32/wineuwp_launcher.dll"
+  cmp -s "$LAUNCHER_SHIM" "$SYS32/wineuwp_launcher.dll" || cp -f --reflink=auto "$LAUNCHER_SHIM" "$SYS32/wineuwp_launcher.dll"
   reassert_activatable Windows.System.Launcher wineuwp_launcher.dll 0
   SHIM_CLASSES="$SHIM_CLASSES Windows.System.Launcher:wineuwp_launcher.dll:0"
 fi
@@ -554,7 +554,7 @@ fi
 # BitmapTransform cannot be activated. Threading is Both (0), as the Windows registry has it.
 WG_SRC=$(ls "$SRC" | grep -i '^windows.graphics.dll$' | head -1)
 if [ -n "$WG_SRC" ]; then
-  cmp -s "$SRC/$WG_SRC" "$SYS32/windows.graphics.native.dll" || cp -f "$SRC/$WG_SRC" "$SYS32/windows.graphics.native.dll"
+  cmp -s "$SRC/$WG_SRC" "$SYS32/windows.graphics.native.dll" || cp -f --reflink=auto "$SRC/$WG_SRC" "$SYS32/windows.graphics.native.dll"
   for cls in Windows.Graphics.Imaging.BitmapDecoder Windows.Graphics.Imaging.BitmapEncoder \
              Windows.Graphics.Imaging.BitmapPropertySet Windows.Graphics.Imaging.BitmapTransform \
              Windows.Graphics.Imaging.BitmapTypedValue Windows.Devices.Display.DisplayMonitor \
