@@ -1118,6 +1118,11 @@ the fully-qualified name. `--grep` first, always.
 
 ## Environment facts worth knowing
 
+- **`flatpak kill io.github.wine_uwp.WineUWP` also kills the AppImage build.** shapr3d-linux's `appimage/build-env.yml`
+  still has that app id, and flatpak-builder's build sandbox runs under it: on 10-11 a kill meant for the old installed
+  Flatpak's Shapr3D ended a `release.sh` run with `module installer: Child process exited with code 137`. Kill a stray
+  app by pid instead.
+
 - **Every app blank with `ignoring FailFast 0x887a0004` (`DXGI_ERROR_UNSUPPORTED`) is the host's GPU stack, not us.**
   On 10-11 pacman had upgraded the kernel and NVIDIA without a reboot: `err:vulkan:init_physical_devices ... res -3`,
   `vulkaninfo --summary` finds no GPU (the other GPU is AMD, with no `vulkan-radeon` installed), and `/proc/driver/nvidia/version` (loaded module) differs from `pacman -Q nvidia-utils`. The desktop looks fine because it started before the upgrade. Check `vulkaninfo`
