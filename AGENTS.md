@@ -1114,7 +1114,7 @@ the fully-qualified name. `--grep` first, always.
 
 - **Every app blank with `ignoring FailFast 0x887a0004` (`DXGI_ERROR_UNSUPPORTED`) is the host's GPU stack, not us.**
   On 10-11 pacman had upgraded the kernel and NVIDIA without a reboot: `err:vulkan:init_physical_devices ... res -3`,
-  `vulkaninfo --summary` finds no GPU (Intel included), `nvidia-smi` reports a version mismatch. Check `vulkaninfo`
+  `vulkaninfo --summary` finds no GPU (the other GPU is AMD, with no `vulkan-radeon` installed), and `/proc/driver/nvidia/version` (loaded module) differs from `pacman -Q nvidia-utils`. The desktop looks fine because it started before the upgrade. Check `vulkaninfo`
   first; until a reboot, `WINE_D3D_CONFIG=renderer=gl` (llvmpipe on Xvfb) still gives Calculator AE 0.
 
 - **A bare `wine` is the *system* Wine (11.17 in `/usr/bin`), not ours - and running it on our
