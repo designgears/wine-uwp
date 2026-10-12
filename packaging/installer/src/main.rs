@@ -732,12 +732,17 @@ fn write_desktop_entry(paths: &Paths, app: &str) -> std::io::Result<()> {
     fs::create_dir_all(&apps)?;
     let stage = paths.data.join("stage").join(app);
     let title = app_title(paths, app);
-    let launcher = paths.launcher();
+    // a data directory chosen with WINE_UWP_DATA has to travel with the entries, or a sign-in link would look for the
+    // app in the default one and start a second copy from there
+    let launcher = match std::env::var_os("WINE_UWP_DATA") {
+        Some(d) => format!("env \"WINE_UWP_DATA={}\" \"{}\"", d.to_string_lossy(), paths.launcher()),
+        None => format!("\"{}\"", paths.launcher()),
+    };
     let icon = stage.join(".wine-uwp-icon.png");
     let icon = if icon.exists() { icon.to_string_lossy().into_owned() } else { "application-x-executable".into() };
     fs::write(
         apps.join(format!("wine-uwp-{app}.desktop")),
-        format!("[Desktop Entry]\nType=Application\nName={title}\nComment=Runs with wine-uwp\nExec=\"{launcher}\" run {app}\nIcon={icon}\nCategories=Graphics;Engineering;\nStartupWMClass={}.exe\n", title.to_lowercase()),
+        format!("[Desktop Entry]\nType=Application\nName={title}\nComment=Runs with wine-uwp\nExec={launcher} run {app}\nIcon={icon}\nCategories=Graphics;Engineering;\nStartupWMClass={}.exe\n", title.to_lowercase()),
     )?;
     let schemes: Vec<String> = fs::read_to_string(stage.join(".wine-uwp-protocols")).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(String::from).collect();
     let host = |args: &[&str]| {
@@ -756,7 +761,7 @@ fn write_desktop_entry(paths: &Paths, app: &str) -> std::io::Result<()> {
         let mime: String = schemes.iter().map(|s| format!("x-scheme-handler/{s};")).collect();
         fs::write(
             apps.join(&handler),
-            format!("[Desktop Entry]\nType=Application\nName={title} sign-in\nNoDisplay=true\nExec=\"{launcher}\" activate %u\nMimeType={mime}\n"),
+            format!("[Desktop Entry]\nType=Application\nName={title} sign-in\nNoDisplay=true\nExec={launcher} activate %u\nMimeType={mime}\n"),
         )?;
         for s in &schemes {
             host(&["xdg-mime", "default", &handler, &format!("x-scheme-handler/{s}")]);
