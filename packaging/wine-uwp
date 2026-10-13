@@ -3,6 +3,7 @@
 #
 #   wine-uwp                  the setup UI, which is also the launcher and updater once an app is installed (a
 #                             build with no setup UI runs the app)
+#   wine-uwp start            the app if one is installed, the setup otherwise (a menu entry's command)
 #   wine-uwp setup            the setup UI (when the build ships one)
 #   wine-uwp run [APP]        run an installed app (default: the first one installed)
 #   wine-uwp list             installed apps
@@ -35,7 +36,13 @@ cmd=${1:-}
 [ $# -gt 0 ] && shift
 # a desktop scheme handler passes the URI itself ("wine-uwp %u")
 case $cmd in *:*) set -- "$cmd"; cmd=activate ;; esac
-if [ -z "$cmd" ]; then
+if [ "$cmd" = start ]; then
+  # a menu entry that is also the scheme handler ("wine-uwp start %u") gets the URI here
+  case ${1:-} in *:*) cmd=activate ;; *) set -- ;; esac
+fi
+if [ "$cmd" = start ]; then
+  if [ -f "$data/prefix/.wine-uwp-ready" ] && [ -n "$(installed)" ]; then cmd=run; else cmd=setup; fi
+elif [ -z "$cmd" ]; then
   if [ -x "$bin/wine-uwp-installer" ] || ! [ -f "$data/prefix/.wine-uwp-ready" ] || [ -z "$(installed)" ]; then
     cmd=setup
   else
