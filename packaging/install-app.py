@@ -279,7 +279,9 @@ def main():
             raise SystemExit("these frameworks are not in the Windows files: " + ", ".join(missing))
 
         icon_member = pick_logo(pkg.namelist(), info["logo"])
-        dest = os.path.join(args.datadir, "stage", stage)
+        # built beside the installed copy and swapped in at the end, so a failed update leaves the old app working
+        final = os.path.join(args.datadir, "stage", stage)
+        dest = final + ".new"
         say(f"STAGE Unpacking {info['title'] or info['name']} {info['version']}")
         if os.path.exists(dest):
             shutil.rmtree(dest)
@@ -347,9 +349,31 @@ def main():
         f.write(f"export UWP_EXE='{info['exe']}'\n")
     with open(os.path.join(dest, ".wine-uwp-protocols"), "w") as f:
         f.writelines(p + "\n" for p in info["protocols"])
+    if os.path.exists(final):
+        os.rename(final, final + ".old")
+    os.rename(dest, final)
+    shutil.rmtree(final + ".old", ignore_errors=True)
     say(f"STAGE Installed {title} {info['version']}")
     say(f"INSTALLED {stage}")
 
 
+def cleanup_partial(datadir):
+    """A failed or cancelled install leaves no half-unpacked copy behind (the app is gigabytes)."""
+    stage = os.path.join(datadir, "stage")
+    for d in os.listdir(stage) if os.path.isdir(stage) else ():
+        if d.endswith((".new", ".old")):
+            shutil.rmtree(os.path.join(stage, d), ignore_errors=True)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    try:
+        rc = main()
+    except BaseException as e:
+        failed = not (isinstance(e, SystemExit) and e.code in (0, None))
+        a = [x for x in sys.argv[1:] if not x.startswith("-")]
+        if failed and "--info" not in sys.argv and len(a) >= 2:
+            cleanup_partial(a[1])
+        raise
+    sys.exit(rc)
