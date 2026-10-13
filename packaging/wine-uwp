@@ -7,6 +7,7 @@
 #   wine-uwp setup            the setup UI (when the build ships one)
 #   wine-uwp run [APP]        run an installed app (default: the first one installed)
 #   wine-uwp list             installed apps
+#   wine-uwp stop [APP]       close a running app (it gets a moment to exit, then Wine is ended)
 #   wine-uwp activate URI     hand a URI (a browser sign-in's callback) to the app that owns its scheme
 #   wine-uwp harvest ISO      extract the Windows files from an ISO     (command-line setup, step 1)
 #   wine-uwp new-prefix       build the Wine prefix from them            (step 2)
@@ -63,7 +64,21 @@ case $cmd in
     # one copy per data directory: the lock is held by run.sh and everything it starts (they inherit fd 9)
     exec 9> "$data/logs/.$app.running"
     flock -n 9 || { echo "$app is already running" >&2; exit 0; }
+    # "stop": the setup UI asks a running app to close (before an update) by creating logs/.APP.stop. A file, because
+    # the asker may be another Flatpak instance, which can neither see this one's processes nor reach its wineserver.
+    # The watcher closes fd 9, or it would keep the lock after the app is gone.
+    rm -f "$data/logs/.$app.stop"
+    ( exec 9>&-; while kill -0 $$ 2>/dev/null; do
+        if [ -e "$data/logs/.$app.stop" ]; then rm -f "$data/logs/.$app.stop"; "$bin/wineserver" -k; fi
+        sleep 1
+      done ) &
     UWP_STAGE=$app UWP_TIMEOUT=0 UWP_LOG="$data/logs/$app.log" exec "$root/run.sh" ;;
+  stop)
+    app=${1:-$(installed | head -1)}
+    running "$app" || exit 0
+    touch "$data/logs/.$app.stop"
+    for _ in $(seq 30); do running "$app" || exit 0; sleep 0.5; done
+    echo "$app did not close" >&2; exit 1 ;;
   harvest)    exec python3 "$root/packaging/harvest/harvest.py" "$1" "$data/windows" ;;
   new-prefix) "$root/packaging/new-prefix.sh" "$data/windows" "$data/prefix"; touch "$data/prefix/.wine-uwp-ready" ;;
   activate)
