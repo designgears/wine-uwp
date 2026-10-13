@@ -10631,3 +10631,26 @@ Two things turned out not to matter:
 Along the way, `gen-classes-reg.py` moved from `regipy` to `fasthive`: identical output, 0.15 s instead of 3
 minutes. The whole Wine tree builds again: `cpsf.c` fixed, a `wow64win` thunk added, stale `libc++`/`icu`
 objects cleared.
+
+## 2026-10-12: Shapr3D 26.180 crashed ~2 s after the dashboard - thread_local destructors never ran
+
+Seen as "opening a project crashed the app" on the user's 26.180 install; reproduced in a reflink copy of their data
+directory (4 of 4 runs, 2 s after the dashboard, while a project was downloading), never in a copy whose projects were
+all local. Both Sentry dumps: `Shapr.Native.dll+0x23188d0`, a read through garbage (`0x5`, `0x1212...`, a pointer's
+low half).
+
+- `WINE_UWP_BP=shapr.native.dll+2318880@rcx+0:10,...+23188d0@rax+0:8` showed a node `{fn, ctx, next, chain}`
+  whose `chain` pointed at memory holding the text `_ureserv`. The caller is a destructor walking 96-byte slots in
+  blocks of 32 with a block free-list at `+0xc30/+0xc38/+0xc40`: **moodycamel::ConcurrentQueue**, and the crashing
+  function is `ThreadExitNotifier::unsubscribe` (a global `std::mutex`, then an unlink from `listener->chain`).
+  `chain` is a `thread_local ThreadExitNotifier`; its destructor clears every listener's `chain` at thread exit.
+- That destructor never ran: `WINE_SKIP_NATIVE_THREAD_CALLS` (launch-defaults) skipped `MODULE_InitDLL` for
+  native modules on THREAD_DETACH, and Wine calls TLS callbacks from inside `MODULE_InitDLL`. So **no native DLL's
+  thread_local destructors (or attach-time TLS callbacks) ran at all**, and the exited thread's TLS block, freed
+  right after, was reused.
+- Fix (`dlls/ntdll/loader.c`): when skipping, still `call_tls_callbacks` for the module; only `DllMain` is
+  skipped. Control on the same build with the old loader: crash. Fixed: two fresh copies, no crash, the download
+  completes. Calculator AE 0, Media Player, `kb` unchanged.
+- Ruled out first, at some cost: the C++ runtime (it crashed with Wine's whole VC runtime set as builtins), and a race
+  (all nine unsubscribe calls on one UI thread). `warn+heap` saw nothing - this is a read of reused memory, not a write
+  after free.

@@ -1933,7 +1933,13 @@ static void thread_attach(void)
             continue;
         if ( mod->Flags & LDR_NO_DLL_CALLS )
             continue;
-        if (skip_native_thread_calls_enabled( mod )) continue;
+        if (skip_native_thread_calls_enabled( mod ))
+        {
+            /* skip only DllMain: the TLS callbacks are the module's thread_local constructors and
+             * destructors, and are what the deadlocking DllMains are not */
+            if (mod->TlsIndex == -1) call_tls_callbacks( mod->DllBase, DLL_THREAD_ATTACH );
+            continue;
+        }
 
         MODULE_InitDLL( CONTAINING_RECORD(mod, WINE_MODREF, ldr), DLL_THREAD_ATTACH, NULL );
     }
@@ -4093,7 +4099,14 @@ void WINAPI LdrShutdownThread(void)
                 continue;
             if ( mod->Flags & LDR_NO_DLL_CALLS )
                 continue;
-            if (skip_native_thread_calls_enabled( mod )) continue;
+            if (skip_native_thread_calls_enabled( mod ))
+            {
+                /* the thread_local destructors still have to run: an MSVC module registers per-thread
+                 * objects (moodycamel's ThreadExitNotifier in Shapr3D 26.180) that other threads keep
+                 * pointers to, and this thread's TLS blocks are freed just below */
+                if (mod->TlsIndex == -1) call_tls_callbacks( mod->DllBase, DLL_THREAD_DETACH );
+                continue;
+            }
 
             MODULE_InitDLL( CONTAINING_RECORD(mod, WINE_MODREF, ldr),
                             DLL_THREAD_DETACH, NULL );
