@@ -3,6 +3,11 @@
 
     install-app.py PACKAGE DATADIR --windows TREE [--stage NAME]
     install-app.py PACKAGE --info [--icon OUT.png] [--windows TREE]
+    install-app.py APPINSTALLER --latest
+
+PACKAGE may also be an .appinstaller file or URL (what a vendor's download page hands out): the bundle it names is
+read straight from the server with range requests, so nothing the size of the package is written to disk, and its
+URI is kept as DATADIR/stage/NAME/.wine-uwp-appinstaller for update checks.
 
 This is the registration step Windows' deployment service does, reduced to what wine-uwp needs:
 
@@ -35,6 +40,7 @@ import struct
 import sys
 import tempfile
 import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -67,11 +73,108 @@ def version_tuple(v):
     return tuple(int(x) for x in v.split("."))
 
 
+def is_url(p):
+    return str(p).startswith(("https://", "http://"))
+
+
+class HttpFile(io.RawIOBase):
+    """A file on a web server, read with range requests: a zip's directory and a few members cost a few requests,
+    and a sequential read of the whole thing streams it. Nothing is written to disk."""
+
+    BLOCK = 8 << 20
+
+    def __init__(self, url):
+        self.url, self.pos, self.cache = url, 0, (0, b"")
+        with self._open("HEAD") as r:
+            if r.headers.get("Accept-Ranges", "").lower() != "bytes":
+                raise SystemExit(f"{url}: the server does not support partial downloads")
+            self.size = int(r.headers["Content-Length"])
+
+    def _open(self, method="GET", rng=None):
+        req = urllib.request.Request(self.url, method=method, headers={"User-Agent": "wine-uwp"})
+        if rng:
+            req.add_header("Range", "bytes=%d-%d" % rng)
+        return urllib.request.urlopen(req, timeout=60)
+
+    def _fetch(self, start, end):
+        for attempt in range(5):
+            try:
+                with self._open(rng=(start, end - 1)) as r:
+                    data = r.read()
+                if len(data) == end - start:
+                    return data
+            except OSError as e:
+                if attempt == 4:
+                    raise SystemExit(f"download failed: {e}")
+        raise SystemExit("download failed: short reads from the server")
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.pos
+
+    def seek(self, off, whence=0):
+        self.pos = {0: off, 1: self.pos + off, 2: self.size + off}[whence]
+        return self.pos
+
+    def readinto(self, buf):
+        n = max(0, min(len(buf), self.size - self.pos))
+        if n == 0:
+            return 0
+        start, data = self.cache
+        if not (start <= self.pos and self.pos + n <= start + len(data)):
+            if n >= self.BLOCK:
+                buf[:n] = self._fetch(self.pos, self.pos + n)
+                self.pos += n
+                return n
+            start = self.pos
+            data = self._fetch(start, min(self.size, start + self.BLOCK))
+            self.cache = (start, data)
+        off = self.pos - start
+        buf[:n] = data[off:off + n]
+        self.pos += n
+        return n
+
+
+def open_raw(source):
+    """A seekable binary file for a local path or a URL."""
+    return io.BufferedReader(HttpFile(source), 1 << 16) if is_url(source) else open(source, "rb")
+
+
+def read_appinstaller(source):
+    """An .appinstaller file (local or a URL): its own update URI, the main bundle's URI and its version."""
+    if is_url(source):
+        with urllib.request.urlopen(urllib.request.Request(source, headers={"User-Agent": "wine-uwp"}), timeout=60) as r:
+            data = r.read()
+    else:
+        data = open(source, "rb").read()
+    root = ET.fromstring(data)
+    main = next(iter(children(root, "MainBundle") + children(root, "MainPackage")), None)
+    if main is None or not main.get("Uri"):
+        raise SystemExit(f"{source} names no package to download")
+    # only the main bundle is used: frameworks come from the Windows files, never from the vendor
+    return {"uri": root.get("Uri") or (source if is_url(source) else None),
+            "package": main.get("Uri"), "version": main.get("Version")}
+
+
+def resolve(source):
+    """What to read for a package argument: an .appinstaller (a file, as a vendor's download page hands out, or its
+    URL) is followed to the bundle it names. Returns (package path or URL, the parsed .appinstaller or None)."""
+    if str(source).lower().split("?")[0].endswith(".appinstaller"):
+        a = read_appinstaller(source)
+        return a["package"], a
+    return source, None
+
+
 class Slice(io.RawIOBase):
     """A read-only window onto part of a file: a package stored uncompressed inside a bundle, read in place."""
 
     def __init__(self, path, start, size):
-        self.f, self.start, self.size, self.pos = open(path, "rb"), start, size, 0
+        self.f, self.start, self.size, self.pos = open_raw(path), start, size, 0
 
     def readable(self):
         return True
@@ -116,7 +219,7 @@ def pick_from_bundle(path, bundle, tmp):
     inner = candidates[0]
     member = bundle.getinfo(next(n for n in names if urllib.parse.unquote(n) == inner or n == inner))
     if member.compress_type == zipfile.ZIP_STORED:
-        with open(path, "rb") as f:
+        with open_raw(path) as f:
             f.seek(member.header_offset)
             local = f.read(30)
             name_len, extra_len = struct.unpack_from("<HH", local, 26)
@@ -192,47 +295,57 @@ def extract(pkg, dest):
         say(f"PROGRESS {done * 100 // total} 100")
 
 
-def find_framework(apps_dir, name, min_version, publisher):
-    """The newest x64 framework package directory for name with version >= min_version, or None."""
+def find_framework(dirs, name, min_version, publisher, older=False):
+    """The newest x64 framework package for name with version >= min_version in any of dirs (the harvested
+    WindowsApps, and stage/frameworks): (directory name, the dir it is in), or None. With older, the newest of any
+    version: a package built against a newer framework than the Windows ISO has (VCLibs 14.0.33728 for Shapr3D
+    26.180, the ISO's is 14.0.30704) runs on the older one, since these keep their ABI within a major version."""
     pid = publisher_id(publisher) if publisher else None
     best = None
     pat = re.compile(re.escape(name) + r"_([0-9.]+)_" + ARCH + r"__([0-9a-z]{13})$", re.I)
-    for d in os.listdir(apps_dir) if os.path.isdir(apps_dir) else []:
-        m = pat.match(d)
-        if not m or (pid and m.group(2).lower() != pid):
-            continue
-        v = version_tuple(m.group(1))
-        if v >= version_tuple(min_version) and (best is None or v > best[0]):
-            best = (v, d)
-    return best[1] if best else None
+    for parent in dirs:
+        for d in os.listdir(parent) if parent and os.path.isdir(parent) else []:
+            m = pat.match(d)
+            if not m or (pid and m.group(2).lower() != pid):
+                continue
+            v = version_tuple(m.group(1))
+            if (older or v >= version_tuple(min_version)) and (best is None or v > best[0]):
+                best = (v, d, parent)
+    return best[1:] if best else None
 
 
 def open_package(path, tmp):
     try:
-        outer = zipfile.ZipFile(path)
+        outer = zipfile.ZipFile(open_raw(path))
     except (zipfile.BadZipFile, FileNotFoundError, IsADirectoryError):
         raise SystemExit(f"{path} is not an app package")
     with outer:
         inner = pick_from_bundle(path, outer, tmp)
-    return zipfile.ZipFile(inner or path)
+    return zipfile.ZipFile(inner or open_raw(path))
 
 
 def info_only(args):
+    package, ai = resolve(args.package)
     with tempfile.TemporaryDirectory(prefix="wine-uwp-info-") as tmp:
-        with open_package(args.package, tmp) as pkg:
+        with open_package(package, tmp) as pkg:
             info = read_manifest(pkg)
             member = pick_logo(pkg.namelist(), info["logo"])
             if args.icon and member:
                 with pkg.open(member) as src, open(args.icon, "wb") as dst:
                     shutil.copyfileobj(src, dst)
     apps_dir = os.path.join(args.windows, "Program Files", "WindowsApps") if args.windows else None
+    fw_dir = os.path.join(args.datadir, "stage", "frameworks") if args.datadir else None
     out = {
         "name": info["name"], "title": info["title"] or info["name"], "publisher": info["publisher_name"],
         "version": info["version"], "architecture": info["arch"],
         "icon": args.icon if args.icon and member else None,
         "protocols": info["protocols"],
+        "appinstaller": ai and ai["uri"],
+        "download": package if is_url(package) else None,
+        # available: in the Windows files; older: only an older version is, which is what gets used
         "frameworks": [{"name": n, "min_version": v,
-                        "available": bool(find_framework(apps_dir, n, v, p)) if apps_dir else None}
+                        "available": bool(find_framework([apps_dir, fw_dir], n, v, p)) if apps_dir else None,
+                        "older": bool(find_framework([apps_dir, fw_dir], n, v, p, older=True)) if apps_dir else None}
                        for n, v, p in info["deps"]],
     }
     print(json.dumps(out, indent=1))
@@ -246,8 +359,13 @@ def main():
     ap.add_argument("--windows", help="the harvested Windows tree (WIN11)")
     ap.add_argument("--info", action="store_true", help="describe the package as JSON, install nothing")
     ap.add_argument("--icon", help="with --info: write the app's logo here")
+    ap.add_argument("--latest", action="store_true",
+                    help="PACKAGE is an .appinstaller (file or URL): print the version it offers, install nothing")
     ap.add_argument("--stage", help="stage directory name (default: the package name's last part, lowercased)")
     args = ap.parse_args()
+    if args.latest:
+        print(read_appinstaller(args.package)["version"] or "")
+        return 0
     if args.info:
         return info_only(args)
     if not args.datadir or not args.windows:
@@ -257,7 +375,11 @@ def main():
     sys32 = os.path.join(args.windows, "Windows", "System32")
     with tempfile.TemporaryDirectory(prefix="wine-uwp-install-", dir=args.datadir) as tmp:
         say("STAGE Reading the package")
-        pkg = open_package(args.package, tmp)
+        package, ai = resolve(args.package)
+        appinstaller = ai and ai["uri"]
+        if is_url(package):
+            say(f"downloading {package}")
+        pkg = open_package(package, tmp)
         info = read_manifest(pkg)
         if info["arch"].lower() not in (ARCH, "neutral"):
             raise SystemExit(f"{info['name']} is built for {info['arch']}, not {ARCH}")
@@ -267,12 +389,18 @@ def main():
         stage = args.stage or info["name"].rsplit(".", 1)[-1].lower()
         say(f"package {full}")
 
+        # each framework from the Windows files; an older version than the package asks for if that is all there is
+        fw_root = os.path.join(args.datadir, "stage", "frameworks")
         missing = []
         frameworks = []
         for name, minv, publisher in info["deps"]:
-            d = find_framework(apps_dir, name, minv, publisher)
-            if d:
-                frameworks.append(d)
+            found = find_framework([apps_dir, fw_root], name, minv, publisher)
+            if not found:
+                found = find_framework([apps_dir, fw_root], name, minv, publisher, older=True)
+                if found:
+                    say(f"framework {name}: wants {minv}, using {found[0]}")
+            if found:
+                frameworks.append(found)
             else:
                 missing.append(f"{name} >= {minv}")
         if missing:
@@ -292,16 +420,16 @@ def main():
         pkg.close()
 
     say("STAGE Installing frameworks")
-    fw_root = os.path.join(args.datadir, "stage", "frameworks")
     os.makedirs(fw_root, exist_ok=True)
-    for d in frameworks:
+    for d, parent in frameworks:
         target = os.path.join(fw_root, d)
         if not os.path.isdir(target):
-            shutil.copytree(os.path.join(apps_dir, d), target)
+            shutil.copytree(os.path.join(parent, d), target)
         say(f"framework {d}")
+    frameworks = [d for d, _ in frameworks]
     # the DLLs an app loads by bare name, next to it (stage-app.sh does the same)
     for d in frameworks:
-        src = os.path.join(apps_dir, d)
+        src = os.path.join(fw_root, d)
         if d.startswith(("Microsoft.NET.Native.Runtime.", "Microsoft.VCLibs.140.00_")):
             for f in os.listdir(src):
                 if f.lower().endswith(".dll"):
@@ -349,6 +477,14 @@ def main():
         f.write(f"export UWP_EXE='{info['exe']}'\n")
     with open(os.path.join(dest, ".wine-uwp-protocols"), "w") as f:
         f.writelines(p + "\n" for p in info["protocols"])
+    # where updates come from: the vendor's .appinstaller URI, checked by the setup UI (--latest); an update from a
+    # plain package keeps the one the installed copy had
+    old_uri = os.path.join(final, ".wine-uwp-appinstaller")
+    if not appinstaller and os.path.exists(old_uri):
+        appinstaller = open(old_uri).read().strip()
+    if appinstaller:
+        with open(os.path.join(dest, ".wine-uwp-appinstaller"), "w") as f:
+            f.write(appinstaller + "\n")
     if os.path.exists(final):
         os.rename(final, final + ".old")
     os.rename(dest, final)
