@@ -11039,3 +11039,15 @@ looks the family up - its `DWriteFontCollection::LookupPhysicalFontFamily` sees 
 Sans Text, Segoe UI and Segoe UI Variable), the package SVG files (never opened), and server-driven icons (no such
 URL in a `trace+wininet` run). Useful breakpoints: `windows.ui.xaml.dll+5deac0@rdx+0:16` (family names looked up),
 `+2aaf00@r9+0:32` (`CreateFontCollectionFromUri`, the package font URI), `+2ab0ab` (its DirectWrite result).
+
+**The last three nav icons are never created, not mis-drawn** (same day, after the GetCreationFlags fix). `trace+dcomptree`
+at the My Library slot (18,189) shows only an empty 30x30 public visual (size/opacity/offset/clip set, no brush, no
+children); the Game Pass slot (18,133) has the same placeholder plus a scaled RNSVG subtree (scale 0.2 host ->
+30x30 child) that draws `GamePassInline4.svg`. So the app never instantiates an icon element for My Library, Cloud
+Gaming and Store - a decision in its JS (Hermes bytecode), not a Wine paint failure. `trace+tracelogging` has nothing
+about icons. Two side findings: the `mask brush ... is not a surface brush with a texture` / `facade ... not decoded yet`
+lines are the splash animation's `LoadedImageSurface` frames (`ms-appx:///Assets/SplashFG/images/img_N.png`,
+loaded by `XboxPcApp.exe+0x5ac4b0` via `LoadedImageSurface.StartLoadFromUri`); XAML maps and PNG-decodes them and
+raises LoadCompleted 19/19, yet `get_DecodedPhysicalSize` still reads 0x0 for our painter - which is why the splash
+and the sign-in gate show no Xbox logo. Breakpoints: `windows.ui.xaml.dll+35d850` (StartLoadFromUri),
+`+1348b0` (LoadCompleted raise).
