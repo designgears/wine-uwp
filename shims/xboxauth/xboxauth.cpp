@@ -743,17 +743,26 @@ static std::vector<std::string> signed_headers(const std::string &url, const std
 static void log_xbl_error(const char *what, DWORD status, const std::string &resp);
 
 /* XalAuthenticator::get_device_token: device.auth.xboxlive.com, AuthMethod ProofOfPossession */
+static std::string device_token_type; /* the DeviceType the cached token was issued for, "" = loaded from the store */
+
 static HRESULT xbl_device_token(std::string &token, bool force = false, Json *answer = nullptr)
 {
+    /* Android: SISU refuses this MSA client (xal-rs' APP_XBOX) with a Win32 device (401), and without SISU's title
+     * token peoplehub hands back an empty "people" for the signed-in user, which the Xbox app reads as "no
+     * profile" and drops back to its sign-in gate. xal-rs pairs this client with Android/iOS too. */
+    char want[32] = "Android";
+    GetEnvironmentVariableA("WINE_UWP_XBOX_DEVICE_TYPE", want, sizeof(want));
     if (!device_load()) return XA_E_XBL;
     EnterCriticalSection(&device.cs);
-    if (!force && !device.token.empty() && device.token_expires > now_s() + 3600)
+    /* a stored token's type is not recorded; a non-default type asked for in this process always gets a fresh one */
+    if (!force && !device.token.empty() && device.token_expires > now_s() + 3600 &&
+        (device_token_type.empty() ? !strcmp(want, "Android") : device_token_type == want))
     {
         token = device.token;
         LeaveCriticalSection(&device.cs);
         return S_OK;
     }
-    char type[32] = "Win32", version[64] = "10.0.26100";
+    char type[32] = "Android", version[64] = "13";
     GetEnvironmentVariableA("WINE_UWP_XBOX_DEVICE_TYPE", type, sizeof(type));
     GetEnvironmentVariableA("WINE_UWP_XBOX_DEVICE_VERSION", version, sizeof(version));
     /* xal-rs: Android and Nintendo want "{uuid}", iOS upper case, everything else plain */
@@ -775,6 +784,7 @@ static HRESULT xbl_device_token(std::string &token, bool force = false, Json *an
         return XA_E_XBL;
     }
     device.token = token = j["Token"].str();
+    device_token_type = type;
     device.token_expires = parse_iso(j["NotAfter"].str());
     if (!device.token_expires) device.token_expires = now_s() + 86400;
     char exp[24];
@@ -993,6 +1003,34 @@ static HRESULT xbl_sisu_authorize(const std::string &msa_token, std::string &use
     return S_OK;
 }
 
+/* title.auth.xboxlive.com/title/authenticate: the title token SISU would have returned, from the device token and
+ * the Microsoft account ticket. Some services (peoplehub's "people" for the signed-in user) answer an empty list to
+ * XSTS tokens that carry no title claims. Leaves account.title_token empty when the service refuses. */
+static HRESULT xbl_title_token(const std::string &msa_token)
+{
+    std::string device_token, resp, url = "https://title.auth.xboxlive.com/title/authenticate";
+    HRESULT hr;
+    if (FAILED(hr = xbl_device_token(device_token))) return hr;
+    std::string body = "{\"Properties\":{\"AuthMethod\":\"RPS\",\"DeviceToken\":\"" + json_escape(device_token) +
+        "\",\"RpsTicket\":\"t=" + json_escape(msa_token) + "\",\"SiteName\":\"user.auth.xboxlive.com\",\"ProofKey\":" +
+        proof_key_json() + "},\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\"}";
+    DWORD status = http_request(L"POST", url, signed_headers(url, body), body, resp);
+    if (!status) return XA_E_NETWORK;
+    Json j = parse_json(resp);
+    if (status != 200 || j["Token"].str().empty())
+    {
+        log_xbl_error("title/authenticate", status, resp);
+        return XA_E_XBL;
+    }
+    EnterCriticalSection(&account.cs);
+    account.title_token = j["Token"].str();
+    account.title_expires = parse_iso(j["NotAfter"].str());
+    if (!account.title_expires) account.title_expires = now_s() + 3600;
+    LeaveCriticalSection(&account.cs);
+    trace("Xbox Live title token received (%zu chars)", j["Token"].str().size());
+    return S_OK;
+}
+
 /* Microsoft account token in hand (account.msa_token): get the Xbox identity. Caller holds signin_cs.
  * SISU first; if it refuses, the plain user/authenticate + XSTS path (still device-bound, but no title). */
 static HRESULT xbl_sign_in(void)
@@ -1015,6 +1053,7 @@ static HRESULT xbl_sign_in(void)
         LeaveCriticalSection(&account.cs);
         trace("SISU refused; falling back to user/authenticate + XSTS");
         if (FAILED(hr = xbl_user_authenticate(msa, user_token, user_expires))) return hr;
+        if (xbl_title_token(msa) == XA_E_NETWORK) return XA_E_NETWORK;
         if (FAILED(hr = xbl_xsts(user_token, "http://xboxlive.com", x, &xui))) return hr;
     }
     if (xui["uhs"].str().empty() || xui["xid"].str().empty())
@@ -2390,6 +2429,27 @@ extern "C" __declspec(dllexport) int WINAPI XboxAuthSelfTest(const char *what, c
     {
         open_browser(arg ? arg : "https://www.microsoft.com/link");
         return 0;
+    }
+    /* get URL [contract]: an authenticated GET the way the app would send it (token from the title endpoints table,
+     * Signature when the URL has a policy); prints the status and the start of the body. Tokens are not printed. */
+    if (!strcmp(what, "get") && arg)
+    {
+        HRESULT hr = sign_in_silently();
+        if (FAILED(hr)) { printf("silent sign-in failed %#lx\n", (unsigned long)hr); return 1; }
+        std::string url = arg, header, resp;
+        if (FAILED(hr = get_token_for_url(url, false, header))) { printf("token failed %#lx\n", (unsigned long)hr); return 1; }
+        const char *contract = getenv("XBL_CONTRACT");
+        std::vector<std::string> h = { "Authorization: " + header, std::string("x-xbl-contract-version: ") + (contract ? contract : "3"),
+                                       "Accept: application/json", "Accept-Language: en-US" };
+        SigningPolicy policy;
+        if (find_policy(url, policy))
+        {
+            std::string sig = sign_request(policy.version, policy.max_body_bytes, "GET", split_url(url).path_and_query, header, "");
+            if (!sig.empty()) h.push_back("Signature: " + sig);
+        }
+        DWORD status = http_request(L"GET", url, h, "", resp);
+        printf("HTTP %lu, %zu bytes\n%.600s\n", (unsigned long)status, resp.size(), resp.c_str());
+        return status == 200 ? 0 : 1;
     }
     if (!strcmp(what, "silent"))
     {

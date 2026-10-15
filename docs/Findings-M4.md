@@ -11161,3 +11161,17 @@ step - SISU with a real token, title-bound XSTS, signed calls the app makes - st
 
 Regression (`prefix-test`): Calculator AE 0, Media Player 2250, `kb` 0/0/0.
 
+
+## 2026-10-15: Xbox app signed in - SISU needs an Android device token for this client
+
+The user completed the device-code sign-in on `:0` (gamertag DesignGears1342), and the app went back to its sign-in
+gate. The app's own log: `[UserSaga] handleSignInSucceeded` then `Failed to fetch Xbox Profile. Cannot read property
+'xuid' of undefined`. A new self-test mode, `probe-xboxauth.exe get <url>` (env `XBL_CONTRACT`), sends a GET the way the
+app would: `profile.xboxlive.com` answered fine, but `peoplehub .../people/xuids(<me>)/decoration/...` returned
+**200 with `"people":[]`** for every contract version. The cause was the token: SISU had answered 401 for our
+Win32 device token, so the fallback's XSTS carried no title claims, and `title.auth.xboxlive.com` refuses this client
+(403). **With an Android device token SISU authorizes** (user, title and XSTS in one call) and peoplehub returns the
+user. `shims/xboxauth` now defaults to DeviceType Android, version 13 (`WINE_UWP_XBOX_DEVICE_TYPE`/`_VERSION`
+override), and keys the cached device token by type. After a restart the app signs in silently and shows the
+signed-in home: DesignGears in the header, Play history, Friends (`docs/screenshots/xbox-signed-in.png`).
+`xbl_title_token` (title/authenticate) stays as a fallback attempt; it is 403 for this client.
