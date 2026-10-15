@@ -102,7 +102,7 @@ def kind_of(param):
 # same-shaped method of an unrelated class, and that truncated three of the four tables.
 vtable_addrs = sorted(a for a, n in syms if n.startswith("??_7"))
 
-def vtable_slots(rva, limit=96):
+def vtable_slots(rva, limit=160):
     o = r2o(rva)
     i = bisect.bisect_right(vtable_addrs, rva)
     end = vtable_addrs[i] if i < len(vtable_addrs) else rva + limit * 8

@@ -430,7 +430,7 @@ static const WCHAR *sr_collection_element(const WCHAR *cls, unsigned slot)
     return nullptr;
 }
 
-#define SR_GENERIC_SLOTS 64
+#define SR_GENERIC_SLOTS 160
 
 struct generic_object
 {
@@ -566,7 +566,7 @@ static HRESULT generic_slot_call(unsigned slot, void *iface, void *args[6])
                   SR_THUNK(p##4) SR_THUNK(p##5) SR_THUNK(p##6) SR_THUNK(p##7) \
                   SR_THUNK(p##8) SR_THUNK(p##9) SR_THUNK(p##a) SR_THUNK(p##b) \
                   SR_THUNK(p##c) SR_THUNK(p##d) SR_THUNK(p##e) SR_THUNK(p##f)
-SR_ROW(0) SR_ROW(1) SR_ROW(2) SR_ROW(3)
+SR_ROW(0) SR_ROW(1) SR_ROW(2) SR_ROW(3) SR_ROW(4) SR_ROW(5) SR_ROW(6) SR_ROW(7) SR_ROW(8) SR_ROW(9)
 #define SR_ROWP(p) (void *)generic_slot_##p##0, (void *)generic_slot_##p##1, (void *)generic_slot_##p##2, \
                    (void *)generic_slot_##p##3, (void *)generic_slot_##p##4, (void *)generic_slot_##p##5, \
                    (void *)generic_slot_##p##6, (void *)generic_slot_##p##7, (void *)generic_slot_##p##8, \
@@ -575,7 +575,7 @@ SR_ROW(0) SR_ROW(1) SR_ROW(2) SR_ROW(3)
                    (void *)generic_slot_##p##f
 static const void *generic_vtbl[SR_GENERIC_SLOTS] =
 {
-    SR_ROWP(0), SR_ROWP(1), SR_ROWP(2), SR_ROWP(3)
+    SR_ROWP(0), SR_ROWP(1), SR_ROWP(2), SR_ROWP(3), SR_ROWP(4), SR_ROWP(5), SR_ROWP(6), SR_ROWP(7), SR_ROWP(8), SR_ROWP(9)
 };
 
 static void generic_vtbl_init(void)

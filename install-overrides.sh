@@ -172,7 +172,7 @@ SR_SHIM=${SHIM_DIR}/wineuwp_staterepository.dll
 if [ -f "$SR_SHIM" ]; then
   SR_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_staterepository.dll
   if ! cmp -s "$SR_SHIM" "$SR_DST"; then cp -f --reflink=auto "$SR_SHIM" "$SR_DST"; fi
-  for cls in User Application MrtApplication Package PackageFamily MrtPackage PackageUser; do
+  for cls in User Application MrtApplication Package PackageFamily MrtPackage PackageUser TargetDeviceFamily; do
     K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Internal.StateRepository.$cls"
     "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_staterepository.dll' /f >/dev/null 2>&1
     "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
