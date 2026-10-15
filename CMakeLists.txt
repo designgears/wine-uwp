@@ -119,7 +119,7 @@ target_link_libraries(gameplatform PRIVATE runtimeobject.lib)
 # Microsoft.GamePlatform.Services.Identity: Xbox sign-in (MSA device code + Xbox Live tokens) for the Xbox app.
 add_library(xboxauth SHARED shims/xboxauth/xboxauth.cpp)
 set_target_properties(xboxauth PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_xboxauth")
-target_link_libraries(xboxauth PRIVATE runtimeobject.lib winhttp.lib crypt32.lib shell32.lib ole32.lib)
+target_link_libraries(xboxauth PRIVATE runtimeobject.lib winhttp.lib crypt32.lib bcrypt.lib shell32.lib ole32.lib)
 add_executable(probe-xboxauth probes/probe-xboxauth.cpp)
 set_target_properties(probe-xboxauth PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
 add_library(storecontext SHARED shims/storecontext/storecontext.cpp)

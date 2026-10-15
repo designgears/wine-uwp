@@ -11111,3 +11111,53 @@ default, the **dev prefix**, and ran `wineserver -k` there three times this sess
 The dev prefix therefore already has this shim and its registration.
 
 Regression: Calculator AE 0, Media Player 2250, `kb` 0/0/0 (in `prefix-test`).
+
+## 2026-10-15: Xbox request signing - proof key, device token and SISU (ported from xal-rs)
+
+The stand-in above answered `GetTokenAndSignatureAsync` with an empty `Signature`. It now has a device, ported from
+xal-rs (github.com/OpenXbox/xal-rs, fork xodus-gaming/xal-rs, MIT; credited in `shims/xboxauth/xboxauth.cpp`):
+
+- **Proof key**: an ECDSA P-256 key made once per prefix with CNG (`BCryptGenerateKeyPair` on the
+  `BCRYPT_ECDSA_P256_ALG_HANDLE` pseudo-handle, which Wine's bcrypt supports), kept as an `ECCPRIVATE_BLOB` in the
+  DPAPI-protected `xboxauth.bin` with a random device id. Sign-out now removes only the account keys; the key, device
+  id and device token stay (they are the machine's). The store is read-modify-written under a named mutex, because
+  the app and its FT server both write it.
+- **Signature** (`RequestSigner::prehash_message_data` / `sign_raw`): SHA-256 over `version(4 BE)\0 FILETIME(8 BE)\0
+  METHOD\0 path?query\0 authorization\0 body[:MaxBodyBytes]\0`, ECDSA r|s, header `base64(version|filetime|r|s)`.
+  The policy is xal-rs' `find_policy_for_url`: endpoints from the title table with a `SignaturePolicyIndex`, protocol
+  and host (fqdn exact, wildcard by suffix) and, if the endpoint has one, an *exactly equal* path; longest host wins.
+  The table has 3 policies now (sisu's `MaxBodyBytes` is 2147483647, the auth hosts' 8192).
+- **Device token**: `device.auth.xboxlive.com/device/authenticate`, `AuthMethod ProofOfPossession`, `DeviceType Win32`,
+  `Version 10.0.26100` (`WINE_UWP_XBOX_DEVICE_TYPE`/`_VERSION` override; xal-rs formats the id as `{uuid}` for
+  Android/Nintendo, upper case for iOS, plain otherwise). Valid 14 days, cached in the store.
+- **SISU**: after the device-code login, `sisu.xboxlive.com/authorize` (`AccessToken t=...`, `AppId 000000004C12AE6F`,
+  device token, `Sandbox RETAIL`, `SiteName user.auth.xboxlive.com`, `ProofKey`; no session id and no contract header,
+  as xal-rs' `xbox_live_sisu_authorization_flow` does) gives user, title and the `http://xboxlive.com` XSTS token in one
+  call. If SISU refuses, the old `user/authenticate` path runs (now signed). Every XSTS request carries `DeviceToken`, and
+  `TitleToken` when SISU gave one and the request does not set `IgnoreTitleIdentity`.
+- **GetTokenAndSignatureAsync** now reads `Method` (slot 6), `Body` (slot 12, `IBuffer` through `IBufferByteAccess`) and
+  `IgnoreTitleIdentity` (slot 16) from the app's `TokenRequest`, and signs with the token it returns as the
+  authorization whenever the URL has a policy.
+
+Client id: the device-code login stays on `000000004C12AE6F`, xal-rs' `APP_XBOX` (title 328178078, originally
+redirect `ms-xal-000000004c12ae6f://auth`), whose SISU use xal-rs documents. The real app's own MSA app is
+`000000004424DA1F` (title `0x29f95ee9`, from its `XboxAuthInitializationArgs`); login.live.com hands out device codes
+for it too, but whether SISU accepts it as `AppId` is untested. SISU's redirect flow (`sisu/authenticate` +
+`oauth20_authorize.srf` + a custom scheme) was not added: device code needs no callback, and the redirect would need
+an `ms-xal-...` scheme handler.
+
+**Measured, no account needed** (`probe-xboxauth`, in `prefix-test`):
+- `sigtest`: xal-rs' `prehashed_data` vector matches (`f7d61b6f...`), xal-rs' `verify_real_request` signature (a real
+  captured `device/authenticate`) verifies against its JWK through BCrypt, and our own key round-trips.
+- `devicetoken`: **`device/authenticate` answers 200 with a 1527-char token** (`xdi.did` present, 14 days). Controls on
+  the same request: **no `Signature` -> 400, one signature bit flipped -> 403**. So the signing is byte-correct.
+  Android works as well. Note XSTS with only a device token answers 200 even with a damaged signature: XSTS does not
+  check the signature there, so it cannot serve as a control.
+- `sisu` (invalid access token): 401, reported as 0x80047803.
+
+The app: gate -> Sign in -> `AddUserWithUiAsync` -> device code, URL to the launcher log, Xbox-logo waiting screen,
+as before (the device token is fetched only once a Microsoft account token exists). Everything after the browser
+step - SISU with a real token, title-bound XSTS, signed calls the app makes - still needs a real account.
+
+Regression (`prefix-test`): Calculator AE 0, Media Player 2250, `kb` 0/0/0.
+

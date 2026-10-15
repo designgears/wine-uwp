@@ -18,8 +18,11 @@
 //      XUID, gamertag, age group and privileges.
 //   3. User.GetTokenAndSignatureAsync picks the relying party for the URL from the title endpoints table
 //      (title.mgt.xboxlive.com/titles/default/endpoints?type=1, fetched once), and answers
-//      "XBL3.0 x=<uhs>;<xsts>". The Signature is empty: request signing needs a proof key bound to an Xbox device
-//      token, which this does not have (see Findings-M4).
+//      "XBL3.0 x=<uhs>;<xsts>", and a Signature whenever the endpoint has a signature policy.
+//   4. The device: an ECDSA P-256 proof key made once per prefix (kept in xboxauth.bin), a device token from
+//      device.auth.xboxlive.com (ProofOfPossession), SISU authorization (sisu.xboxlive.com/authorize) for user, title
+//      and XSTS tokens bound to that key, and the Xbox "Signature" header on every signed request. Ported from
+//      xal-rs (https://github.com/OpenXbox/xal-rs, MIT License, Copyright (c) 2023 Team OpenXbox); see "The device".
 //
 // Tokens are never written to the log: traces carry HTTP statuses, error codes and lengths only.
 //
@@ -36,6 +39,7 @@
 #include <winhttp.h>
 #include <shellapi.h>
 #include <wincrypt.h>
+#include <bcrypt.h>
 #include <roapi.h>
 #include <winstring.h>
 #include <activation.h>
@@ -456,6 +460,35 @@ static bool store_write(const std::map<std::string, std::string> &kv)
     return ok;
 }
 
+/* Read-modify-write of the store, under a prefix-wide mutex: the app and its FT server share the file, and
+ * each keeps only some of its keys in memory. An empty value removes the key. */
+static HANDLE store_mutex(void)
+{
+    static HANDLE m;
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, [](PINIT_ONCE, PVOID, PVOID *) -> BOOL {
+        m = CreateMutexW(nullptr, FALSE, L"Global\\wineuwp-xboxauth-store");
+        if (!m) m = CreateMutexW(nullptr, FALSE, L"Local\\wineuwp-xboxauth-store");
+        return TRUE;
+    }, nullptr, nullptr);
+    return m;
+}
+static void store_lock(void) { if (store_mutex()) WaitForSingleObject(store_mutex(), 10000); }
+static void store_unlock(void) { if (store_mutex()) ReleaseMutex(store_mutex()); }
+
+static bool store_update(const std::map<std::string, std::string> &changes)
+{
+    store_lock();
+    auto kv = store_read();
+    for (auto &e : changes)
+        if (e.second.empty()) kv.erase(e.first);
+        else kv[e.first] = e.second;
+    bool ok = store_write(kv);
+    for (auto &e : kv) SecureZeroMemory(&e.second[0], e.second.size());
+    store_unlock();
+    return ok;
+}
+
 /* ------------------------------------------------------------------------------------------- */
 /* The account: Microsoft account and Xbox Live tokens                                           */
 
@@ -465,6 +498,293 @@ static bool store_write(const std::map<std::string, std::string> &kv)
 #define XA_E_XBL            MAKE_HRESULT(1, FACILITY_ITF, 0x7803)  /* user.auth / xsts refused */
 #define XA_E_NETWORK        MAKE_HRESULT(1, FACILITY_ITF, 0x7804)
 #define XA_E_TIMEOUT        MAKE_HRESULT(1, FACILITY_ITF, 0x7805)  /* the device code expired */
+
+/* ------------------------------------------------------------------------------------------- */
+/* The device: proof key, request signing and the Xbox Live device token                        */
+/*                                                                                               */
+/* Ported from xal-rs (https://github.com/OpenXbox/xal-rs, fork xodus-gaming/xal-rs; MIT License, */
+/* Copyright (c) 2023 Team OpenXbox): src/request_signer.rs (RequestSigner::prehash_message_data,  */
+/* sign_raw, SignaturePolicyCache::find_policy_for_url), src/models.rs (ProofKey) and             */
+/* src/authenticator.rs (get_device_token, sisu_authorize, get_xsts_token).                       */
+/*                                                                                               */
+/* The proof key is an ECDSA P-256 key, made once per prefix and kept in the store; Xbox Live      */
+/* binds the device token (and every XSTS token made with it) to its public half, and services     */
+/* with a signature policy check each request's "Signature" header against it:                    */
+/*   base64( policy version (4 bytes BE) | FILETIME (8 bytes BE) | ECDSA r|s (64 bytes) )         */
+/* over SHA-256 of  version\0 filetime\0 METHOD\0 path?query\0 authorization\0 body[:max]\0.      */
+
+static std::string b64(const unsigned char *p, size_t n, bool url)
+{
+    static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string o;
+    for (size_t i = 0; i < n; i += 3)
+    {
+        unsigned v = p[i] << 16 | (i + 1 < n ? p[i + 1] << 8 : 0) | (i + 2 < n ? p[i + 2] : 0);
+        o += t[v >> 18 & 63];
+        o += t[v >> 12 & 63];
+        o += i + 1 < n ? t[v >> 6 & 63] : '=';
+        o += i + 2 < n ? t[v & 63] : '=';
+    }
+    if (url)
+    {
+        while (!o.empty() && o.back() == '=') o.pop_back();
+        for (auto &c : o) c = c == '+' ? '-' : c == '/' ? '_' : c;
+    }
+    return o;
+}
+
+static std::string unb64(const std::string &s)
+{
+    std::string o;
+    unsigned v = 0;
+    int bits = 0;
+    for (char c : s)
+    {
+        int d;
+        if (c >= 'A' && c <= 'Z') d = c - 'A';
+        else if (c >= 'a' && c <= 'z') d = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') d = c - '0' + 52;
+        else if (c == '+' || c == '-') d = 62;
+        else if (c == '/' || c == '_') d = 63;
+        else continue;
+        v = v << 6 | d;
+        bits += 6;
+        if (bits >= 8) { bits -= 8; o += (char)(v >> bits & 0xff); }
+    }
+    return o;
+}
+
+static bool sha256(const std::string &data, unsigned char out[32])
+{
+    return BCRYPT_SUCCESS(BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, (PUCHAR)data.data(), (ULONG)data.size(), out, 32));
+}
+
+/* RequestSigner::prehash_message_data */
+static std::string sign_prehash_input(const unsigned char version[4], const unsigned char filetime[8], const std::string &method,
+                                      const std::string &path_and_query, const std::string &authorization,
+                                      const std::string &body, ULONGLONG max_body_bytes)
+{
+    std::string m;
+    m.append((const char *)version, 4); m += '\0';
+    m.append((const char *)filetime, 8); m += '\0';
+    std::string up = method;
+    for (auto &c : up) c = (char)toupper((unsigned char)c);
+    m += up; m += '\0';
+    m += path_and_query; m += '\0';
+    m += authorization; m += '\0';
+    m.append(body, 0, (size_t)(body.size() < max_body_bytes ? body.size() : max_body_bytes)); m += '\0';
+    return m;
+}
+
+struct Device
+{
+    CRITICAL_SECTION cs;
+    BCRYPT_KEY_HANDLE key = nullptr;
+    std::string x, y;              /* public point, base64url */
+    std::string id;                /* device id, a GUID */
+    std::string token;             /* device token */
+    ULONGLONG token_expires = 0;
+};
+static Device device;
+
+static void device_init(void)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, [](PINIT_ONCE, PVOID, PVOID *) -> BOOL {
+        InitializeCriticalSection(&device.cs);
+        return TRUE;
+    }, nullptr, nullptr);
+}
+
+static bool device_take_key(BCRYPT_KEY_HANDLE key)
+{
+    unsigned char blob[sizeof(BCRYPT_ECCKEY_BLOB) + 64];
+    ULONG len = 0;
+    if (!BCRYPT_SUCCESS(BCryptExportKey(key, nullptr, BCRYPT_ECCPUBLIC_BLOB, blob, sizeof(blob), &len, 0)) ||
+        len != sizeof(blob)) return false;
+    device.key = key;
+    device.x = b64(blob + sizeof(BCRYPT_ECCKEY_BLOB), 32, true);
+    device.y = b64(blob + sizeof(BCRYPT_ECCKEY_BLOB) + 32, 32, true);
+    return true;
+}
+
+/* Loads the proof key, device id and device token from the store, or makes and stores a new key. */
+static bool device_load(void)
+{
+    device_init();
+    EnterCriticalSection(&device.cs);
+    if (device.key) { LeaveCriticalSection(&device.cs); return true; }
+    store_lock();
+    auto kv = store_read();
+    BCRYPT_KEY_HANDLE key = nullptr;
+    std::string priv = unb64(kv["proof_key"]);
+    if (priv.size() == sizeof(BCRYPT_ECCKEY_BLOB) + 96 &&
+        BCRYPT_SUCCESS(BCryptImportKeyPair(BCRYPT_ECDSA_P256_ALG_HANDLE, nullptr, BCRYPT_ECCPRIVATE_BLOB, &key,
+                                           (PUCHAR)priv.data(), (ULONG)priv.size(), 0)) &&
+        device_take_key(key))
+    {
+        device.id = kv["device_id"];
+        device.token = kv["device_token"];
+        device.token_expires = _strtoui64(kv["device_expires"].c_str(), nullptr, 10);
+        trace("proof key loaded");
+    }
+    else
+    {
+        if (key) BCryptDestroyKey(key);
+        key = nullptr;
+        unsigned char blob[sizeof(BCRYPT_ECCKEY_BLOB) + 96];
+        ULONG len = 0;
+        GUID g;
+        if (!BCRYPT_SUCCESS(BCryptGenerateKeyPair(BCRYPT_ECDSA_P256_ALG_HANDLE, &key, 256, 0)) ||
+            !BCRYPT_SUCCESS(BCryptFinalizeKeyPair(key, 0)) ||
+            !BCRYPT_SUCCESS(BCryptExportKey(key, nullptr, BCRYPT_ECCPRIVATE_BLOB, blob, sizeof(blob), &len, 0)) ||
+            len != sizeof(blob) || !device_take_key(key) || FAILED(CoCreateGuid(&g)))
+        {
+            trace("no proof key: ECDSA P-256 key generation failed");
+            if (key) BCryptDestroyKey(key);
+            store_unlock();
+            LeaveCriticalSection(&device.cs);
+            return false;
+        }
+        char id[40];
+        snprintf(id, sizeof(id), "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x", g.Data1, g.Data2, g.Data3,
+                 g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+        device.id = id;
+        device.token.clear();
+        device.token_expires = 0;
+        kv["proof_key"] = b64(blob, sizeof(blob), false);
+        kv["device_id"] = device.id;
+        kv.erase("device_token");
+        kv.erase("device_expires");
+        store_write(kv);
+        SecureZeroMemory(blob, sizeof(blob));
+        trace("proof key created");
+    }
+    for (auto &e : kv) SecureZeroMemory(&e.second[0], e.second.size());
+    SecureZeroMemory(&priv[0], priv.size());
+    store_unlock();
+    LeaveCriticalSection(&device.cs);
+    return true;
+}
+
+/* ProofKey, as JSON (xal-rs field order) */
+static std::string proof_key_json(void)
+{
+    return "{\"alg\":\"ES256\",\"crv\":\"P-256\",\"kty\":\"EC\",\"use\":\"sig\",\"x\":\"" + device.x + "\",\"y\":\"" + device.y + "\"}";
+}
+
+/* RequestSigner::sign_raw. filetime = 0: now. Returns the Signature header value, "" on failure. */
+static std::string sign_request(int policy_version, ULONGLONG max_body_bytes, const std::string &method,
+                                const std::string &path_and_query, const std::string &authorization,
+                                const std::string &body, ULONGLONG filetime = 0)
+{
+    if (!device_load()) return std::string();
+    if (!filetime)
+    {
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        filetime = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    }
+    unsigned char out[4 + 8 + 64], hash[32];
+    for (int i = 0; i < 4; i++) out[i] = (unsigned char)((unsigned)policy_version >> (24 - 8 * i));
+    for (int i = 0; i < 8; i++) out[4 + i] = (unsigned char)(filetime >> (56 - 8 * i));
+    std::string m = sign_prehash_input(out, out + 4, method, path_and_query, authorization, body, max_body_bytes);
+    ULONG len = 0;
+    if (!sha256(m, hash) ||
+        !BCRYPT_SUCCESS(BCryptSignHash(device.key, nullptr, hash, 32, out + 12, 64, &len, 0)) || len != 64)
+    {
+        trace("request signing failed");
+        return std::string();
+    }
+    return b64(out, sizeof(out), false);
+}
+
+/* scheme, host (lower case), path and path?query of a URL */
+struct UrlParts { std::string scheme, host, path, path_and_query; };
+static UrlParts split_url(const std::string &url)
+{
+    UrlParts u;
+    size_t p = url.find("://");
+    if (p == std::string::npos) return u;
+    u.scheme = url.substr(0, p);
+    size_t h = p + 3, slash = url.find_first_of("/?#", h);
+    u.host = url.substr(h, slash == std::string::npos ? std::string::npos : slash - h);
+    size_t at = u.host.rfind('@');
+    if (at != std::string::npos) u.host = u.host.substr(at + 1);
+    size_t colon = u.host.find(':');
+    if (colon != std::string::npos) u.host.resize(colon);
+    for (auto &c : u.host) c = (char)tolower((unsigned char)c);
+    for (auto &c : u.scheme) c = (char)tolower((unsigned char)c);
+    if (u.scheme == "wss") u.scheme = "https";
+    else if (u.scheme == "ws") u.scheme = "http";
+    std::string rest = slash == std::string::npos ? std::string() : url.substr(slash);
+    rest = rest.substr(0, rest.find('#'));
+    if (rest.empty() || rest[0] != '/') rest = "/" + rest;
+    u.path = rest.substr(0, rest.find('?'));
+    u.path_and_query = rest;
+    return u;
+}
+
+struct SigningPolicy { int version = 1; ULONGLONG max_body_bytes = 8192; bool es256 = true; };
+static bool find_policy(const std::string &url, struct SigningPolicy &out);
+
+/* signs one of our own requests to *.auth.xboxlive.com / sisu, with the endpoint's policy */
+static std::vector<std::string> signed_headers(const std::string &url, const std::string &body, bool contract = true)
+{
+    std::vector<std::string> h = { "Content-Type: application/json", "Accept: application/json" };
+    if (contract) h.push_back("x-xbl-contract-version: 1");
+    SigningPolicy policy; /* the table's; version 1 / 8192 bytes (xal-rs' default) without it */
+    if (!find_policy(url, policy)) policy = SigningPolicy();
+    std::string sig = sign_request(policy.version, policy.max_body_bytes, "POST", split_url(url).path_and_query, "", body);
+    if (!sig.empty()) h.push_back("Signature: " + sig);
+    return h;
+}
+
+static void log_xbl_error(const char *what, DWORD status, const std::string &resp);
+
+/* XalAuthenticator::get_device_token: device.auth.xboxlive.com, AuthMethod ProofOfPossession */
+static HRESULT xbl_device_token(std::string &token, bool force = false, Json *answer = nullptr)
+{
+    if (!device_load()) return XA_E_XBL;
+    EnterCriticalSection(&device.cs);
+    if (!force && !device.token.empty() && device.token_expires > now_s() + 3600)
+    {
+        token = device.token;
+        LeaveCriticalSection(&device.cs);
+        return S_OK;
+    }
+    char type[32] = "Win32", version[64] = "10.0.26100";
+    GetEnvironmentVariableA("WINE_UWP_XBOX_DEVICE_TYPE", type, sizeof(type));
+    GetEnvironmentVariableA("WINE_UWP_XBOX_DEVICE_VERSION", version, sizeof(version));
+    /* xal-rs: Android and Nintendo want "{uuid}", iOS upper case, everything else plain */
+    std::string id = device.id;
+    if (!strcmp(type, "Android") || !strcmp(type, "Nintendo")) id = "{" + id + "}";
+    else if (!strcmp(type, "iOS")) for (auto &c : id) c = (char)toupper((unsigned char)c);
+    std::string url = "https://device.auth.xboxlive.com/device/authenticate", resp, body =
+        "{\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\",\"Properties\":{\"AuthMethod\":"
+        "\"ProofOfPossession\",\"Id\":\"" + id + "\",\"DeviceType\":\"" + type + "\",\"Version\":\"" + version +
+        "\",\"ProofKey\":" + proof_key_json() + "}}";
+    DWORD status = http_request(L"POST", url, signed_headers(url, body), body, resp);
+    Json j = parse_json(resp);
+    if (answer) *answer = j;
+    if (!status) { LeaveCriticalSection(&device.cs); return XA_E_NETWORK; }
+    if (status != 200 || j["Token"].str().empty())
+    {
+        log_xbl_error("device/authenticate", status, resp);
+        LeaveCriticalSection(&device.cs);
+        return XA_E_XBL;
+    }
+    device.token = token = j["Token"].str();
+    device.token_expires = parse_iso(j["NotAfter"].str());
+    if (!device.token_expires) device.token_expires = now_s() + 86400;
+    char exp[24];
+    snprintf(exp, sizeof(exp), "%llu", device.token_expires);
+    LeaveCriticalSection(&device.cs);
+    store_update({ { "device_token", token }, { "device_expires", exp } });
+    trace("Xbox Live device token received (%s, %zu chars, valid %llu h)", type, token.size(),
+          (device.token_expires - now_s()) / 3600);
+    return S_OK;
+}
 
 struct Xsts { std::string token; ULONGLONG expires = 0; };
 
@@ -476,6 +796,8 @@ struct Account
     ULONGLONG msa_expires = 0;
     std::string user_token;
     ULONGLONG user_expires = 0;
+    std::string title_token;      /* from SISU; empty when it was refused (then XSTS carries no title claims) */
+    ULONGLONG title_expires = 0;
     std::map<std::string, Xsts> xsts;
     /* xui claims of the http://xboxlive.com XSTS token */
     std::string uhs, xid, gtg, agg, prv, mgt, mgs, umg;
@@ -505,7 +827,7 @@ static bool take_msa_tokens(const Json &j)
     if (!j["user_id"].str().empty()) account.msa_user_id = j["user_id"].str();
     std::map<std::string, std::string> kv = { { "refresh_token", account.refresh_token }, { "user_id", account.msa_user_id } };
     LeaveCriticalSection(&account.cs);
-    store_write(kv);
+    store_update(kv);
     trace("Microsoft account tokens received (access %zu chars, refresh %s, expires in %.0f s)", access.size(),
           refresh.empty() ? "unchanged" : "renewed", j["expires_in"].n);
     return true;
@@ -541,7 +863,7 @@ static HRESULT msa_refresh(const std::string &scope, std::string *token_out)
             EnterCriticalSection(&account.cs);
             account.refresh_token.clear();
             LeaveCriticalSection(&account.cs);
-            store_write({});
+            store_update({ { "refresh_token", "" }, { "user_id", "" } });
             return XA_E_NO_ACCOUNT;
         }
         return XA_E_MSA;
@@ -553,7 +875,7 @@ static HRESULT msa_refresh(const std::string &scope, std::string *token_out)
         account.refresh_token = j["refresh_token"].str();
         std::map<std::string, std::string> kv = { { "refresh_token", account.refresh_token }, { "user_id", account.msa_user_id } };
         LeaveCriticalSection(&account.cs);
-        store_write(kv);
+        store_update(kv);
     }
     if (token_out) *token_out = j["access_token"].str();
     return S_OK;
@@ -577,8 +899,7 @@ static HRESULT xbl_user_authenticate(const std::string &msa_token, std::string &
         "{\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\",\"Properties\":{\"AuthMethod\":\"RPS\","
         "\"SiteName\":\"user.auth.xboxlive.com\",\"RpsTicket\":\"t=" + json_escape(msa_token) + "\"}}";
     DWORD status = http_request(L"POST", "https://user.auth.xboxlive.com/user/authenticate",
-                                { "Content-Type: application/json", "Accept: application/json",
-                                  "x-xbl-contract-version: 1" }, body, resp);
+                                signed_headers("https://user.auth.xboxlive.com/user/authenticate", body), body, resp);
     if (!status) return XA_E_NETWORK;
     Json j = parse_json(resp);
     if (status != 200 || j["Token"].str().empty())
@@ -594,14 +915,26 @@ static HRESULT xbl_user_authenticate(const std::string &msa_token, std::string &
 }
 
 /* xsts.auth.xboxlive.com: user token -> XSTS token for one relying party */
-static HRESULT xbl_xsts(const std::string &user_token, const std::string &rp, Xsts &out, Json *claims)
+/* XalAuthenticator::get_xsts_token: the device token (and the title token, when SISU gave one) bind the XSTS
+ * token to our proof key, which is what makes signed requests acceptable. */
+static HRESULT xbl_xsts(const std::string &user_token, const std::string &rp, Xsts &out, Json *claims,
+                        bool with_title = true)
 {
+    std::string device_token, title_token;
+    if (FAILED(xbl_device_token(device_token))) device_token.clear();
+    if (with_title)
+    {
+        EnterCriticalSection(&account.cs);
+        if (account.title_expires > now_s() + 60) title_token = account.title_token;
+        LeaveCriticalSection(&account.cs);
+    }
     std::string resp, body =
-        "{\"RelyingParty\":\"" + json_escape(rp) + "\",\"TokenType\":\"JWT\",\"Properties\":{\"SandboxId\":\"RETAIL\","
-        "\"UserTokens\":[\"" + json_escape(user_token) + "\"]}}";
+        "{\"RelyingParty\":\"" + json_escape(rp) + "\",\"TokenType\":\"JWT\",\"Properties\":{\"SandboxId\":\"RETAIL\"";
+    if (!device_token.empty()) body += ",\"DeviceToken\":\"" + json_escape(device_token) + "\"";
+    if (!title_token.empty()) body += ",\"TitleToken\":\"" + json_escape(title_token) + "\"";
+    body += ",\"UserTokens\":[\"" + json_escape(user_token) + "\"]}}";
     DWORD status = http_request(L"POST", "https://xsts.auth.xboxlive.com/xsts/authorize",
-                                { "Content-Type: application/json", "Accept: application/json",
-                                  "x-xbl-contract-version: 1" }, body, resp);
+                                signed_headers("https://xsts.auth.xboxlive.com/xsts/authorize", body), body, resp);
     if (!status) return XA_E_NETWORK;
     Json j = parse_json(resp);
     if (status != 200 || j["Token"].str().empty())
@@ -615,11 +948,53 @@ static HRESULT xbl_xsts(const std::string &user_token, const std::string &rp, Xs
     if (!out.expires) out.expires = now_s() + 3600;
     out.expires = out.expires > 300 ? out.expires - 300 : 0;
     if (claims) *claims = j["DisplayClaims"]["xui"].at(0);
-    trace("XSTS token for %s received (%zu chars)", rp.c_str(), out.token.size());
+    trace("XSTS token for %s received (%zu chars; device %s, title %s)", rp.c_str(), out.token.size(),
+          device_token.empty() ? "no" : "yes", title_token.empty() ? "no" : "yes");
     return S_OK;
 }
 
-/* Microsoft account token in hand (account.msa_token): get the Xbox identity. Caller holds signin_cs. */
+/* XalAuthenticator::sisu_authorize, without a session id (xal-rs' xbox_live_sisu_authorization_flow after a
+ * device-code login): one signed call gives user, title and device-bound XSTS tokens. AppId is the MSA client
+ * the access token was issued to (xal-rs' APP_XBOX, 000000004c12ae6f, title 328178078). */
+static HRESULT xbl_sisu_authorize(const std::string &msa_token, std::string &user_token, ULONGLONG &user_expires,
+                                  Xsts &auth, Json &xui)
+{
+    std::string device_token;
+    HRESULT hr;
+    if (FAILED(hr = xbl_device_token(device_token))) return hr;
+    std::string url = "https://sisu.xboxlive.com/authorize", resp, body =
+        "{\"AccessToken\":\"t=" + json_escape(msa_token) + "\",\"AppId\":\"" + std::string(MSA_CLIENT_ID) +
+        "\",\"DeviceToken\":\"" + json_escape(device_token) + "\",\"Sandbox\":\"RETAIL\",\"SiteName\":"
+        "\"user.auth.xboxlive.com\",\"ProofKey\":" + proof_key_json() + "}";
+    /* xal-rs sends no contract version header here */
+    DWORD status = http_request(L"POST", url, signed_headers(url, body, false), body, resp);
+    if (!status) return XA_E_NETWORK;
+    Json j = parse_json(resp);
+    const Json &u = j["UserToken"], &t = j["TitleToken"], &a = j["AuthorizationToken"];
+    if (status != 200 || u["Token"].str().empty() || a["Token"].str().empty())
+    {
+        log_xbl_error("sisu/authorize", status, resp);
+        if (!a["XErr"].str().empty()) log_xbl_error("sisu/authorize (authorization)", status, "{\"XErr\":" + a["XErr"].str() + "}");
+        return XA_E_XBL;
+    }
+    user_token = u["Token"].str();
+    user_expires = parse_iso(u["NotAfter"].str());
+    if (!user_expires) user_expires = now_s() + 3600;
+    auth.token = a["Token"].str();
+    auth.expires = parse_iso(a["NotAfter"].str());
+    if (!auth.expires) auth.expires = now_s() + 3600;
+    auth.expires = auth.expires > 300 ? auth.expires - 300 : 0;
+    xui = a["DisplayClaims"]["xui"].at(0);
+    EnterCriticalSection(&account.cs);
+    account.title_token = t["Token"].str();
+    account.title_expires = parse_iso(t["NotAfter"].str());
+    LeaveCriticalSection(&account.cs);
+    trace("SISU authorization: user, title (%s) and XSTS tokens received", t["Token"].str().empty() ? "none" : "yes");
+    return S_OK;
+}
+
+/* Microsoft account token in hand (account.msa_token): get the Xbox identity. Caller holds signin_cs.
+ * SISU first; if it refuses, the plain user/authenticate + XSTS path (still device-bound, but no title). */
 static HRESULT xbl_sign_in(void)
 {
     std::string msa, user_token;
@@ -631,8 +1006,17 @@ static HRESULT xbl_sign_in(void)
     EnterCriticalSection(&account.cs);
     msa = account.msa_token;
     LeaveCriticalSection(&account.cs);
-    if (FAILED(hr = xbl_user_authenticate(msa, user_token, user_expires))) return hr;
-    if (FAILED(hr = xbl_xsts(user_token, "http://xboxlive.com", x, &xui))) return hr;
+    if (FAILED(hr = xbl_sisu_authorize(msa, user_token, user_expires, x, xui)))
+    {
+        if (hr == XA_E_NETWORK) return hr;
+        EnterCriticalSection(&account.cs);
+        account.title_token.clear();
+        account.title_expires = 0;
+        LeaveCriticalSection(&account.cs);
+        trace("SISU refused; falling back to user/authenticate + XSTS");
+        if (FAILED(hr = xbl_user_authenticate(msa, user_token, user_expires))) return hr;
+        if (FAILED(hr = xbl_xsts(user_token, "http://xboxlive.com", x, &xui))) return hr;
+    }
     if (xui["uhs"].str().empty() || xui["xid"].str().empty())
     {
         trace("XSTS answer carries no xid/uhs claims");
@@ -665,7 +1049,9 @@ static HRESULT sign_in_silently(void)
     bool done = account.signed_in;
     if (account.refresh_token.empty())
     {
+        store_lock();
         auto kv = store_read();
+        store_unlock();
         account.refresh_token = kv["refresh_token"];
         account.msa_user_id = kv["user_id"];
     }
@@ -760,7 +1146,8 @@ static void sign_out(void)
     account.user_token.clear();
     account.xsts.clear();
     LeaveCriticalSection(&account.cs);
-    store_write({});
+    /* the device's proof key and device token stay: they belong to the machine, not the user */
+    store_update({ { "refresh_token", "" }, { "user_id", "" } });
     LeaveCriticalSection(&account.signin_cs);
     trace("signed out; the stored sign-in is deleted");
 }
@@ -768,8 +1155,9 @@ static void sign_out(void)
 /* ------------------------------------------------------------------------------------------- */
 /* Relying parties: the title endpoints table                                                    */
 
-struct Endpoint { std::string protocol, host, path, rp; bool wildcard; };
+struct Endpoint { std::string protocol, host, path, rp; bool wildcard; int policy = -1; };
 static std::vector<Endpoint> endpoints;
+static std::vector<SigningPolicy> policies;
 static bool endpoints_loaded;
 
 static void load_endpoints(void)
@@ -792,15 +1180,27 @@ static void load_endpoints(void)
         ep.path = e["Path"].str();
         ep.rp = e["RelyingParty"].str();
         ep.wildcard = e["HostType"].str() == "wildcard";
+        if (e["SignaturePolicyIndex"].type == Json::NUM) ep.policy = (int)e["SignaturePolicyIndex"].n;
         for (auto &c : ep.host) c = (char)tolower((unsigned char)c);
         for (auto &c : ep.protocol) c = (char)tolower((unsigned char)c);
         list.push_back(ep);
     }
-    trace("title endpoints: HTTP %lu, %zu entries", status, list.size());
+    std::vector<SigningPolicy> pols;
+    for (auto &p : j["SignaturePolicies"].a)
+    {
+        SigningPolicy sp;
+        sp.version = (int)p["Version"].n;
+        sp.max_body_bytes = (ULONGLONG)p["MaxBodyBytes"].n;
+        sp.es256 = false;
+        for (auto &alg : p["SupportedAlgorithms"].a) if (alg.str() == "ES256") sp.es256 = true;
+        pols.push_back(sp);
+    }
+    trace("title endpoints: HTTP %lu, %zu entries, %zu signature policies", status, list.size(), pols.size());
     EnterCriticalSection(&account.cs);
     if (!endpoints_loaded && (status == 200 || !status))
     {
         endpoints = list;
+        policies = pols;
         /* a failed fetch leaves the table empty and the fallback below in force; retry next time */
         endpoints_loaded = !list.empty();
     }
@@ -855,7 +1255,37 @@ static std::string relying_party(const std::string &url)
     return rp;
 }
 
-static HRESULT get_token_for_url(const std::string &url, bool force, std::string &header)
+/* SignaturePolicyCache::find_policy_for_url: among endpoints with a signature policy, the one whose protocol and
+ * host match (fqdn exactly, wildcard by suffix) and whose path, if it has one, equals the URL's; the longest
+ * host wins. false: the request is not signed. */
+static bool find_policy(const std::string &url, SigningPolicy &out)
+{
+    UrlParts u = split_url(url);
+    if (u.scheme != "http" && u.scheme != "https") return false;
+    load_endpoints();
+    EnterCriticalSection(&account.cs);
+    const Endpoint *best = nullptr;
+    for (auto &e : endpoints)
+    {
+        if (e.policy < 0 || e.protocol != u.scheme) continue;
+        bool match;
+        if (e.wildcard)
+        {
+            std::string suffix = e.host;
+            while (!suffix.empty() && suffix[0] == '*') suffix.erase(0, 1);
+            match = u.host.size() >= suffix.size() && !u.host.compare(u.host.size() - suffix.size(), suffix.size(), suffix);
+        }
+        else match = u.host == e.host;
+        if (!match || (!e.path.empty() && u.path != e.path)) continue;
+        if (!best || e.host.size() > best->host.size()) best = &e;
+    }
+    bool found = best && (size_t)best->policy < policies.size();
+    if (found) out = policies[best->policy];
+    LeaveCriticalSection(&account.cs);
+    return found && out.es256;
+}
+
+static HRESULT get_token_for_url(const std::string &url, bool force, std::string &header, bool with_title = true)
 {
     header.clear();
     std::string rp = relying_party(url);
@@ -869,7 +1299,8 @@ static HRESULT get_token_for_url(const std::string &url, bool force, std::string
     bool signed_in = account.signed_in;
     std::string uhs = account.uhs, user_token = account.user_token;
     ULONGLONG user_expires = account.user_expires;
-    auto it = account.xsts.find(rp);
+    std::string key = with_title ? rp : rp + " (no title)";
+    auto it = account.xsts.find(key);
     bool cached = !force && it != account.xsts.end() && it->second.expires > now_s();
     std::string xsts = cached ? it->second.token : std::string();
     LeaveCriticalSection(&account.cs);
@@ -890,7 +1321,16 @@ static HRESULT get_token_for_url(const std::string &url, bool force, std::string
                 EnterCriticalSection(&account.cs);
                 msa = account.msa_token;
                 LeaveCriticalSection(&account.cs);
-                hr = xbl_user_authenticate(msa, user_token, user_expires);
+                Xsts ax;
+                Json axui;
+                hr = xbl_sisu_authorize(msa, user_token, user_expires, ax, axui);
+                if (FAILED(hr) && hr != XA_E_NETWORK) hr = xbl_user_authenticate(msa, user_token, user_expires);
+                else if (SUCCEEDED(hr))
+                {
+                    EnterCriticalSection(&account.cs);
+                    account.xsts["http://xboxlive.com"] = ax;
+                    LeaveCriticalSection(&account.cs);
+                }
                 if (SUCCEEDED(hr))
                 {
                     EnterCriticalSection(&account.cs);
@@ -902,9 +1342,9 @@ static HRESULT get_token_for_url(const std::string &url, bool force, std::string
             LeaveCriticalSection(&account.signin_cs);
             if (FAILED(hr)) return hr;
         }
-        if (FAILED(hr = xbl_xsts(user_token, rp, x, nullptr))) return hr;
+        if (FAILED(hr = xbl_xsts(user_token, rp, x, nullptr, with_title))) return hr;
         EnterCriticalSection(&account.cs);
-        account.xsts[rp] = x;
+        account.xsts[key] = x;
         LeaveCriticalSection(&account.cs);
         xsts = x.token;
     }
@@ -1354,18 +1794,52 @@ struct User : IUserAbi, IClosable_
         boolean force = FALSE;
         IInspectable *tr = nullptr;
         if (!request || FAILED(request->QueryInterface(IID_ITokenRequest, (void **)&tr))) return E_INVALIDARG;
+        /* ITokenRequest: 6 get_Method 8 get_Url 10 get_Headers 12 get_Body 14 get_ForceRefresh 16 get_IgnoreTitleIdentity */
         typedef HRESULT (STDMETHODCALLTYPE *get_str)(IInspectable *, HSTRING *);
         typedef HRESULT (STDMETHODCALLTYPE *get_bool)(IInspectable *, boolean *);
+        typedef HRESULT (STDMETHODCALLTYPE *get_obj)(IInspectable *, IInspectable **);
+        std::string method = "GET", body;
+        boolean ignore_title = FALSE;
         HSTRING h = nullptr;
+        if (SUCCEEDED(((get_str)(*(void ***)tr)[6])(tr, &h))) { if (h) method = from_hstr(h); WindowsDeleteString(h); h = nullptr; }
         if (SUCCEEDED(((get_str)(*(void ***)tr)[8])(tr, &h))) { url = from_hstr(h); WindowsDeleteString(h); }
         ((get_bool)(*(void ***)tr)[14])(tr, &force);
+        ((get_bool)(*(void ***)tr)[16])(tr, &ignore_title);
+        IInspectable *buf = nullptr;
+        if (SUCCEEDED(((get_obj)(*(void ***)tr)[12])(tr, &buf)) && buf)
+        {
+            /* IBuffer: 7 get_Length; IBufferByteAccess {905a0fef-bc53-11df-8c49-001e4fc686da}: 3 Buffer */
+            static const GUID IID_IBufferByteAccess_ = {0x905a0fef,0xbc53,0x11df,{0x8c,0x49,0x00,0x1e,0x4f,0xc6,0x86,0xda}};
+            typedef HRESULT (STDMETHODCALLTYPE *get_u32)(IInspectable *, UINT32 *);
+            typedef HRESULT (STDMETHODCALLTYPE *get_bytes)(IUnknown *, BYTE **);
+            UINT32 len = 0;
+            IUnknown *access = nullptr;
+            BYTE *bytes = nullptr;
+            if (SUCCEEDED(((get_u32)(*(void ***)buf)[7])(buf, &len)) && len &&
+                SUCCEEDED(buf->QueryInterface(IID_IBufferByteAccess_, (void **)&access)))
+            {
+                if (SUCCEEDED(((get_bytes)(*(void ***)access)[3])(access, &bytes)) && bytes) body.assign((char *)bytes, len);
+                access->Release();
+            }
+            buf->Release();
+        }
         tr->Release();
         *out = start_async(IID_AsyncOp_TokenRequestResult, R_STRINGS2, "GetTokenAndSignatureAsync",
-            [url, force](AsyncOp *op) -> HRESULT {
+            [url, method, body, force, ignore_title](AsyncOp *op) -> HRESULT {
                 std::string header;
-                HRESULT hr = get_token_for_url(url, force != FALSE, header);
-                if (SUCCEEDED(hr)) { op->s1 = header; op->s2.clear(); }
-                return hr;
+                HRESULT hr = get_token_for_url(url, force != FALSE, header, !ignore_title);
+                if (FAILED(hr)) return hr;
+                op->s1 = header;
+                op->s2.clear();
+                SigningPolicy policy;
+                if (find_policy(url, policy))
+                {
+                    op->s2 = sign_request(policy.version, policy.max_body_bytes, method, split_url(url).path_and_query,
+                                          header, body);
+                    trace("signed %s %s (policy %d, body %zu bytes)", method.c_str(), url.substr(0, url.find('?')).c_str(),
+                          policy.version, body.size());
+                }
+                return S_OK;
             });
         return S_OK;
     }
@@ -1766,6 +2240,123 @@ extern "C" __declspec(dllexport) HRESULT WINAPI DllCanUnloadNow(void) { return S
 extern "C" __declspec(dllexport) int WINAPI XboxAuthSelfTest(const char *what, const char *arg)
 {
     account_init();
+    if (!strcmp(what, "sigtest"))
+    {
+        /* xal-rs src/request_signer.rs tests: prehashed_data and verify_real_request */
+        int fails = 0;
+        unsigned char ver[4] = { 0, 0, 0, 1 }, ft[8], hash[32];
+        ULONGLONG t = (1586999965ULL + 11644473600ULL) * 10000000ULL;
+        for (int i = 0; i < 8; i++) ft[i] = (unsigned char)(t >> (56 - 8 * i));
+        sha256(sign_prehash_input(ver, ft, "POST", "/path?query=1", "XBL3.0 x=userid;jsonwebtoken", "thebodygoeshere", 8192), hash);
+        static const unsigned char want[32] = { 0xf7,0xd6,0x1b,0x6f,0x8d,0x4d,0xcd,0x86,0xda,0x1a,0xa8,0x55,0x3f,0x0e,0xe7,0xc1,
+                                                0x54,0x50,0x81,0x1e,0x7c,0xd2,0x75,0x93,0x64,0xe2,0x2f,0x67,0xd8,0x53,0xff,0x50 };
+        bool ok = !memcmp(hash, want, 32);
+        fails += !ok;
+        trace("sigtest prehash vector: %s", ok ? "match" : "MISMATCH");
+
+        std::string body = "{\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\",\"Properties\":{\"AuthMethod\":\"ProofOfPossession\",\"Id\":\"{e51d4344-196a-4550-9e27-f6c5006a9949}\",\"DeviceType\":\"Android\",\"Version\":\"8.0.0\",\"ProofKey\":{\"kty\":\"EC\",\"alg\":\"ES256\",\"crv\":\"P-256\",\"x\":\"GJS1AAhiPYw0ZSQJDCF8kcZkKAc2tRWXAN6Yw-o_hMQ\",\"y\":\"UAQJHUc_yVIhUQgIvoED3kt0JDz_G8jgXys_XR2s-Xc\",\"use\":\"sig\"}}}";
+        std::string sig = unb64("AAAAAQHY4xgs5DyIujFG5E5MZ4D1xjd9Up+H4AKLoyBHd95MAUZcabUN//Y/gijed4vvKtlfp4Cd4dJzVhpK0m+sYZcYRqQjBEKAZw==");
+        std::string x = unb64("GJS1AAhiPYw0ZSQJDCF8kcZkKAc2tRWXAN6Yw-o_hMQ"), y = unb64("UAQJHUc_yVIhUQgIvoED3kt0JDz_G8jgXys_XR2s-Xc");
+        std::vector<unsigned char> pub(sizeof(BCRYPT_ECCKEY_BLOB) + 64);
+        BCRYPT_ECCKEY_BLOB *hdr = (BCRYPT_ECCKEY_BLOB *)pub.data();
+        hdr->dwMagic = BCRYPT_ECDSA_PUBLIC_P256_MAGIC;
+        hdr->cbKey = 32;
+        memcpy(&pub[sizeof(*hdr)], x.data(), 32);
+        memcpy(&pub[sizeof(*hdr) + 32], y.data(), 32);
+        BCRYPT_KEY_HANDLE k = nullptr;
+        ok = sig.size() == 76 && x.size() == 32 && y.size() == 32 &&
+             BCRYPT_SUCCESS(BCryptImportKeyPair(BCRYPT_ECDSA_P256_ALG_HANDLE, nullptr, BCRYPT_ECCPUBLIC_BLOB, &k, pub.data(), (ULONG)pub.size(), 0));
+        if (ok)
+        {
+            sha256(sign_prehash_input((const unsigned char *)sig.data(), (const unsigned char *)sig.data() + 4, "POST",
+                                      "/device/authenticate", "", body, 8192), hash);
+            ok = BCRYPT_SUCCESS(BCryptVerifySignature(k, nullptr, hash, 32, (PUCHAR)sig.data() + 12, 64, 0));
+            BCryptDestroyKey(k);
+        }
+        fails += !ok;
+        trace("sigtest real device/authenticate signature from xal-rs: %s", ok ? "verifies" : "DOES NOT VERIFY");
+
+        /* our own key: sign, then verify through the exported public key */
+        std::string mine = unb64(sign_request(1, 8192, "POST", "/path?query=1", "XBL3.0 x=userid;jsonwebtoken", "thebodygoeshere"));
+        ok = mine.size() == 76 && !memcmp(mine.data(), ver, 4);
+        if (ok)
+        {
+            sha256(sign_prehash_input((const unsigned char *)mine.data(), (const unsigned char *)mine.data() + 4, "POST",
+                                      "/path?query=1", "XBL3.0 x=userid;jsonwebtoken", "thebodygoeshere", 8192), hash);
+            ok = BCRYPT_SUCCESS(BCryptVerifySignature(device.key, nullptr, hash, 32, (PUCHAR)mine.data() + 12, 64, 0));
+        }
+        fails += !ok;
+        trace("sigtest own proof key round trip: %s", ok ? "verifies" : "FAILS");
+        return fails;
+    }
+    if (!strcmp(what, "devicetoken"))
+    {
+        if (arg && *arg) SetEnvironmentVariableA("WINE_UWP_XBOX_DEVICE_TYPE", arg);
+        std::string token;
+        Json j;
+        HRESULT hr = xbl_device_token(token, true, &j);
+        const Json &xdi = j["DisplayClaims"]["xdi"];
+        trace("device token -> %#lx: %zu chars, NotAfter %s, claims did %s dcs %s", (unsigned long)hr, token.size(),
+              j["NotAfter"].str().c_str(), xdi["did"].str().empty() ? "absent" : "present", xdi["dcs"].str().c_str());
+        if (SUCCEEDED(hr))
+        {
+            /* an XSTS request with the device token only: proves the token and the signature are accepted together */
+            Xsts x;
+            std::string resp, url = "https://xsts.auth.xboxlive.com/xsts/authorize", body =
+                "{\"RelyingParty\":\"http://xboxlive.com\",\"TokenType\":\"JWT\",\"Properties\":{\"SandboxId\":\"RETAIL\","
+                "\"DeviceToken\":\"" + token + "\"}}";
+            DWORD status = http_request(L"POST", url, signed_headers(url, body), body, resp);
+            Json r = parse_json(resp);
+            trace("xsts with the device token alone: HTTP %lu, token %zu chars, XErr %s", status, r["Token"].str().size(),
+                  r["XErr"].str().c_str());
+            /* and the same with a corrupted signature, as a control: it must be refused */
+            auto hdrs = signed_headers(url, body);
+            for (auto &hh : hdrs) if (!hh.compare(0, 11, "Signature: ")) hh[hh.size() - 5] = hh[hh.size() - 5] == 'A' ? 'B' : 'A';
+            status = http_request(L"POST", url, hdrs, body, resp);
+            trace("control, same request with a damaged signature: HTTP %lu", status);
+
+            /* controls on device/authenticate itself: unsigned, and with one signature byte changed */
+            std::string durl = "https://device.auth.xboxlive.com/device/authenticate", dbody =
+                "{\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\",\"Properties\":{\"AuthMethod\":"
+                "\"ProofOfPossession\",\"Id\":\"" + device.id + "\",\"DeviceType\":\"Win32\",\"Version\":\"10.0.26100\","
+                "\"ProofKey\":" + proof_key_json() + "}}";
+            auto dh = signed_headers(durl, dbody);
+            status = http_request(L"POST", durl, dh, dbody, resp);
+            trace("device/authenticate, signed: HTTP %lu", status);
+            std::vector<std::string> unsigned_h;
+            for (auto &hh : dh) if (hh.compare(0, 11, "Signature: ")) unsigned_h.push_back(hh);
+            status = http_request(L"POST", durl, unsigned_h, dbody, resp);
+            trace("device/authenticate, no Signature: HTTP %lu, XErr %s", status, parse_json(resp)["XErr"].str().c_str());
+            for (auto &hh : dh)
+                if (!hh.compare(0, 11, "Signature: "))
+                {
+                    std::string raw = unb64(hh.substr(11));
+                    raw[40] ^= 1;
+                    hh = "Signature: " + b64((const unsigned char *)raw.data(), raw.size(), false);
+                }
+            status = http_request(L"POST", durl, dh, dbody, resp);
+            trace("device/authenticate, one signature bit flipped: HTTP %lu, XErr %s", status, parse_json(resp)["XErr"].str().c_str());
+        }
+        return SUCCEEDED(hr) ? 0 : 1;
+    }
+    if (!strcmp(what, "sisu"))
+    {
+        /* sisu/authorize with an invalid access token: the shape of the answer, no account needed */
+        std::string u;
+        ULONGLONG e;
+        Xsts x;
+        Json xui;
+        HRESULT hr = xbl_sisu_authorize("invalid", u, e, x, xui);
+        trace("sisu/authorize with an invalid ticket -> %#lx", (unsigned long)hr);
+        return 0;
+    }
+    if (!strcmp(what, "policy"))
+    {
+        SigningPolicy sp;
+        bool f = find_policy(arg ? arg : "", sp);
+        trace("signature policy for %s: %s version %d max body %llu", arg ? arg : "", f ? "yes" : "none", sp.version, sp.max_body_bytes);
+        return 0;
+    }
     if (!strcmp(what, "endpoints"))
     {
         std::string rp = relying_party(arg ? arg : "");
