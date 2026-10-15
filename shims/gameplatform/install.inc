@@ -469,7 +469,7 @@ static void report(Install *in, bool added_or_removed = false, bool removed = fa
 
 /* ---- the Store's delivery service (FE3) ---- */
 
-static std::string http_post_soap(const wchar_t *path, const std::string &body, DWORD *status_out)
+static std::string http_post_soap_once(const wchar_t *path, const std::string &body, DWORD *status_out)
 {
     std::string out;
     DWORD status = 0, size = sizeof(status);
@@ -480,7 +480,7 @@ static std::string http_post_soap(const wchar_t *path, const std::string &body, 
     if (s && (c = WinHttpConnect(s, L"fe3.delivery.mp.microsoft.com", INTERNET_DEFAULT_HTTPS_PORT, 0)) &&
         (r = WinHttpOpenRequest(c, L"POST", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)))
     {
-        WinHttpSetTimeouts(r, 20000, 20000, 60000, 60000);
+        WinHttpSetTimeouts(r, 10000, 10000, 60000, 60000);
         if (WinHttpSendRequest(r, L"Content-Type: application/soap+xml; charset=utf-8\r\n", (DWORD)-1, (void *)body.data(),
                                (DWORD)body.size(), (DWORD)body.size(), 0) && WinHttpReceiveResponse(r, nullptr))
         {
@@ -501,6 +501,20 @@ static std::string http_post_soap(const wchar_t *path, const std::string &body, 
     if (c) WinHttpCloseHandle(c);
     if (s) WinHttpCloseHandle(s);
     if (status_out) *status_out = status;
+    return out;
+}
+
+/* a connection to the delivery service sometimes times out (10060) where the next one goes through */
+static std::string http_post_soap(const wchar_t *path, const std::string &body, DWORD *status_out)
+{
+    std::string out;
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
+        *status_out = 0;
+        out = http_post_soap_once(path, body, status_out);
+        if (*status_out) break;
+        tracef("FE3 POST %ls: retrying", path);
+    }
     return out;
 }
 
