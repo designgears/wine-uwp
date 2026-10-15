@@ -10990,3 +10990,52 @@ the image decode, which logs no error.
   not evidence.
 
 Tasks 1 (banners), 3 and 4 are not done.
+
+### Xbox nav icons (My Library, Cloud Gaming, Store): where they are not coming from (2026-10-14, not solved)
+
+Measured on `:93` with the reflink test prefix; Home and Game Pass draw, the other three do not
+(`/tmp/x2.png`, zoomed `/tmp/navzoom.png`). Ruled out, each by a trace of the app's own requests:
+
+- **Not an SVG file.** `Store.svg`, `Home.svg`, `Cloud.svg` and `GamePass.svg` are never opened. RNSVG opens
+  only `GamePassInline4.svg` (heavily), `TagSolid`, `BundleSolid`, `ChevronRight`, `Play`, `Search`.
+- **Not in the JS bundle as path data.** `index.bundle` is Hermes bytecode; the first `d=` of each nav SVG
+  (`M6,30.9986966 ...`, `M9.875,32 ...`, `M17.0213257,...`) is not in it.
+- **Not an icon font glyph reaching dwrite.** No `CreateTextFormat`, `FindFamilyName` or `HasCharacter` ever
+  receives a private-use code point. `SegoeIcons.ttf` is loaded into the system collection
+  (`AddFontFile`) but nothing asks it for a glyph. `XboxFluent2.ttf` and `SegoeXboxMDL2Assets.ttf` are never
+  opened. `dwritefactory2_CreateGlyphRunAnalysis` runs 16 times in the whole run.
+- **Not an image file.** No PNG, JPG or PRI-named icon is opened for these entries (the `Store.png` names in
+  `resources.pri` are jump-list icons).
+- **No HTTP request** carries an icon URL (`+wininet` not traced; the `+file` and `+dwrite` runs show no
+  network icon path).
+- The nav labels are in `resources.pri` (`Most Recent`, `My Library`, `Install queue`), not in the bundle, so
+  the nav is probably native XAML. `LottieReactNative.dll` and `Microsoft.UI.Xaml.Controls.AnimatedVisualPlayer`
+  are both loaded, which makes a Lottie or composition-drawn icon the next candidate. `semi-stub` on
+  `RoGetActivationFactory` is only the normal DLL-factory path (`roapi.c:460`), not a failure.
+- Fail-fasts in the run are not the icon: 261 ignored `E_INVALIDARG` fail-fasts (`XamlFailFast`) appeared in one
+  run and none in later ones, so their timing does not line up with the nav.
+
+Not tried: a Lottie or composition trace (`+dcomptree` at the nav), and `WINE_UWP_BP` on XAML's element
+creation for the nav item. The next measurement is which visual or element the Store row creates, and whether it
+is ever given a size.
+
+## 2026-10-15: most of the Xbox app's missing icons were d3d11's GetCreationFlags stub
+
+The home screen logged **1219 stowed `E_INVALIDARG`** while it drew (`dump_stowed_exception`; a run with
+`fixme+all,err+all` after "Browse app"). Mapping the frames through `/proc/<pid>/maps` and
+`windows.ui.xaml.pdb.syms`: `DirectUI::SurfaceImageSource::SetDeviceWithD2D` ->
+`CSurfaceImageSource::ObtainSurfaceFactory` -> `DCompSurfaceFactory::Create`. That function takes the D3D11
+device behind the D2D device, calls slot 38 (`ID3D11Device::GetCreationFlags`) and fails with E_INVALIDARG unless
+bit 0x20 (`D3D11_CREATE_DEVICE_BGRA_SUPPORT`) is set. Wine's `GetCreationFlags` was a stub returning 0, so every
+Win2D / RNSVG `SurfaceImageSource` failed and drew nothing. Fixed in `dlls/d3d11` (the flags from
+`D3D11CoreCreateDevice` are kept on the device). After it: 0 stowed exceptions, and the Sign in person, search
+magnifier, chevrons, Most Recent play icon, Install queue arrow and every tile's Game Pass / Bundle badges draw.
+Calculator AE 0, Media Player 2242, `kb` 0/0/0, Shapr3D's home screen AE 0 against
+`docs/screenshots/shapr3d-home-after-xbox-changes.png`.
+
+Still blank: the My Library, Cloud Gaming and Store nav icons. Ruled out for those: the app's bundled icon font
+(`SegXbox2.ttf`, family "Segoe Xbox MDL2 Assets"; installing it as a system font changes nothing, and XAML never
+looks the family up - its `DWriteFontCollection::LookupPhysicalFontFamily` sees only Segoe Fluent Icons, Segoe
+Sans Text, Segoe UI and Segoe UI Variable), the package SVG files (never opened), and server-driven icons (no such
+URL in a `trace+wininet` run). Useful breakpoints: `windows.ui.xaml.dll+5deac0@rdx+0:16` (family names looked up),
+`+2aaf00@r9+0:32` (`CreateFontCollectionFromUri`, the package font URI), `+2ab0ab` (its DirectWrite result).

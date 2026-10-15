@@ -584,6 +584,7 @@ struct d3d_device
     LONG refcount;
 
     BOOL d3d11_only;
+    UINT create_flags; /* as passed to D3D11CreateDevice, for GetCreationFlags */
 
     struct d3d_device_context_state *state;
     struct d3d11_device_context immediate_context;
