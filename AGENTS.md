@@ -68,6 +68,8 @@ that were ours; the Calculator tree is no longer involved.
   instant, signed in like the original) and `export WINEPREFIX=$PWD/uwp-bin/prefix-test` for every test command - a
   different prefix gets its own wineserver, so `wineserver -k` there leaves the user's app alone.
 - **A wrapper that sets `WINEPREFIX` on its `wineserver -k` only runs `run.sh` on the dev prefix**, because `env.sh` defaults it: `/tmp/xbox-test.sh` did that on 10-15 and killed the dev prefix's wineserver three times. Export it for the whole script, and check `/proc/$(pgrep -x wineserver)/environ` when in doubt.
+- **A separate prefix does not isolate you from the user's app: the Wine build tree is shared.** Every prefix loads its builtins from `~/src/wine-build`, so an experimental `make dlls/ntdll/all` there goes straight into the user's next launch. On 10-15 an agent's heap instrumentation made the user's Xbox app abort in ReactNative. Build experiments in a reflinked copy (`cp -a --reflink=auto ~/src/wine-build uwp-bin/wine-build-<name>`, then point `WINE_BUILD` and `PATH` at it), and rebuild the shared tree only with a finished, regression-tested change.
+- **`run.sh` stops the app after `UWP_TIMEOUT` seconds (60 by default).** Launching an app for the user to use needs `UWP_TIMEOUT=86400`, or it vanishes after a minute.
 - **Run on Xvfb `:98`, never the user's `:0`.** `DISPLAY=:98 ./run.sh`. **Check that `:98` is yours before
   trusting a capture**: another program took it over on 09-24 with a full-screen window, and every
   Shapr3D capture came back black (1 colour) while the app was fine. `xdotool search --onlyvisible
