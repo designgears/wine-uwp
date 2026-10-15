@@ -28,6 +28,7 @@ struct json_array
     IJsonValue IJsonValue_iface;
     IVector_IJsonValue IVector_IJsonValue_iface;
     IIterable_IJsonValue IIterable_IJsonValue_iface;
+    IStringable IStringable_iface;
     LONG ref;
     IJsonValue **elements;
     ULONG capacity;
@@ -89,6 +90,12 @@ static HRESULT WINAPI json_array_QueryInterface( IJsonArray *iface, REFIID iid, 
     if (IsEqualGUID( iid, &IID_IIterable_IJsonValue ))
     {
         *out = &impl->IIterable_IJsonValue_iface;
+        IInspectable_AddRef( *out );
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IStringable ))
+    {
+        *out = &impl->IStringable_iface;
         IInspectable_AddRef( *out );
         return S_OK;
     }
@@ -222,6 +229,20 @@ static const struct IJsonArrayVtbl json_array_vtbl =
 /* IJsonValue: a JsonArray is also its own JSON value */
 DEFINE_IINSPECTABLE( json_array_value, IJsonValue, struct json_array, IJsonArray_iface )
 
+DEFINE_IINSPECTABLE_( json_array_stringable, IStringable, struct json_array, impl_from_json_array_stringable,
+                      IStringable_iface, &impl->IJsonArray_iface )
+static HRESULT WINAPI json_array_stringable_ToString( IStringable *iface, HSTRING *value );
+static const struct IStringableVtbl json_array_stringable_vtbl =
+{
+    json_array_stringable_QueryInterface,
+    json_array_stringable_AddRef,
+    json_array_stringable_Release,
+    json_array_stringable_GetIids,
+    json_array_stringable_GetRuntimeClassName,
+    json_array_stringable_GetTrustLevel,
+    json_array_stringable_ToString,
+};
+
 static HRESULT WINAPI json_array_value_get_ValueType( IJsonValue *iface, JsonValueType *value )
 {
     if (!value) return E_POINTER;
@@ -230,8 +251,14 @@ static HRESULT WINAPI json_array_value_get_ValueType( IJsonValue *iface, JsonVal
 }
 static HRESULT WINAPI json_array_value_Stringify( IJsonValue *iface, HSTRING *value )
 {
-    FIXME( "iface %p, value %p stub!\n", iface, value );
-    return E_NOTIMPL;
+    struct json_buf buf = {0};
+    HRESULT hr;
+
+    TRACE( "iface %p, value %p.\n", iface, value );
+
+    if (!value) return E_POINTER;
+    if (FAILED(hr = json_write_value( iface, &buf ))) { json_buf_free( &buf ); return hr; }
+    return json_buf_to_hstring( &buf, value );
 }
 static HRESULT WINAPI json_array_value_GetString( IJsonValue *iface, HSTRING *value ) { return E_ILLEGAL_METHOD_CALL; }
 static HRESULT WINAPI json_array_value_GetNumber( IJsonValue *iface, DOUBLE *value ) { return E_ILLEGAL_METHOD_CALL; }
@@ -530,6 +557,19 @@ struct json_array_statics
     LONG ref;
 };
 
+static HRESULT WINAPI json_array_stringable_ToString( IStringable *iface, HSTRING *value )
+{
+    struct json_array *impl = impl_from_json_array_stringable( iface );
+    struct json_buf buf = {0};
+    HRESULT hr;
+
+    TRACE( "iface %p, value %p.\n", iface, value );
+
+    if (!value) return E_POINTER;
+    if (FAILED(hr = json_write_array( &impl->IJsonArray_iface, &buf ))) { json_buf_free( &buf ); return hr; }
+    return json_buf_to_hstring( &buf, value );
+}
+
 static inline struct json_array_statics *impl_from_IActivationFactory( IActivationFactory *iface )
 {
     return CONTAINING_RECORD( iface, struct json_array_statics, IActivationFactory_iface );
@@ -607,6 +647,7 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
 
     impl->IJsonArray_iface.lpVtbl = &json_array_vtbl;
     json_array_init_views( impl );
+    impl->IStringable_iface.lpVtbl = &json_array_stringable_vtbl;
     impl->ref = 1;
 
     *instance = (IInspectable *)&impl->IJsonArray_iface;

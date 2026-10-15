@@ -44,6 +44,21 @@ extern IActivationFactory *json_value_factory;
 HRESULT json_array_push( IJsonArray *iface, IJsonValue *value );
 HRESULT json_parse( HSTRING input, IJsonValue **value );
 
+/* JSON text output: IJsonValue/IJsonObject/IJsonArray.Stringify and IStringable.ToString */
+struct json_buf
+{
+    WCHAR *str;
+    SIZE_T len, cap;
+};
+HRESULT json_write_value( IJsonValue *value, struct json_buf *buf );
+HRESULT json_write_object( IJsonObject *object, struct json_buf *buf );
+HRESULT json_write_array( IJsonArray *array, struct json_buf *buf );
+HRESULT json_buf_to_hstring( struct json_buf *buf, HSTRING *value );
+void json_buf_free( struct json_buf *buf );
+/* calls back once per member, with the key (borrowed) and the value (a reference the callback must not keep) */
+HRESULT json_object_for_each( IJsonObject *object, HRESULT (*callback)( HSTRING key, IJsonValue *value, void *context ),
+                              void *context );
+
 #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
     static inline impl_type *impl_from( iface_type *iface )                                        \
     {                                                                                              \

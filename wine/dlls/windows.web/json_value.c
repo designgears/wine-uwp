@@ -18,6 +18,10 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "private.h"
 #include "wine/debug.h"
 
@@ -119,6 +123,7 @@ static const struct IActivationFactoryVtbl factory_vtbl =
 struct json_value
 {
     IJsonValue IJsonValue_iface;
+    IStringable IStringable_iface;
     LONG ref;
 
     JsonValueType json_value_type;
@@ -137,6 +142,20 @@ static inline struct json_value *impl_from_IJsonValue( IJsonValue *iface )
     return CONTAINING_RECORD( iface, struct json_value, IJsonValue_iface );
 }
 
+DEFINE_IINSPECTABLE_( json_value_stringable, IStringable, struct json_value, impl_from_json_value_stringable,
+                      IStringable_iface, &impl->IJsonValue_iface )
+static HRESULT WINAPI json_value_stringable_ToString( IStringable *iface, HSTRING *value );
+static const struct IStringableVtbl json_value_stringable_vtbl =
+{
+    json_value_stringable_QueryInterface,
+    json_value_stringable_AddRef,
+    json_value_stringable_Release,
+    json_value_stringable_GetIids,
+    json_value_stringable_GetRuntimeClassName,
+    json_value_stringable_GetTrustLevel,
+    json_value_stringable_ToString,
+};
+
 static HRESULT WINAPI json_value_QueryInterface( IJsonValue *iface, REFIID iid, void **out )
 {
     struct json_value *impl = impl_from_IJsonValue( iface );
@@ -149,6 +168,12 @@ static HRESULT WINAPI json_value_QueryInterface( IJsonValue *iface, REFIID iid, 
         IsEqualGUID( iid, &IID_IJsonValue ))
     {
         *out = &impl->IJsonValue_iface;
+        IInspectable_AddRef( *out );
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IStringable ))
+    {
+        *out = &impl->IStringable_iface;
         IInspectable_AddRef( *out );
         return S_OK;
     }
@@ -219,8 +244,14 @@ static HRESULT WINAPI json_value_get_ValueType( IJsonValue *iface, JsonValueType
 
 static HRESULT WINAPI json_value_Stringify( IJsonValue *iface, HSTRING *value )
 {
-    FIXME( "iface %p, value %p stub!\n", iface, value );
-    return E_NOTIMPL;
+    struct json_buf buf = {0};
+    HRESULT hr;
+
+    TRACE( "iface %p, value %p.\n", iface, value );
+
+    if (!value) return E_POINTER;
+    if (FAILED(hr = json_write_value( iface, &buf ))) { json_buf_free( &buf ); return hr; }
+    return json_buf_to_hstring( &buf, value );
 }
 
 static HRESULT WINAPI json_value_GetString( IJsonValue *iface, HSTRING *value )
@@ -477,6 +508,7 @@ static HRESULT parse_json_value( struct json_buffer *json, IJsonValue **value )
 
     if (!(impl = calloc( 1, sizeof( *impl ) ))) return E_OUTOFMEMORY;
     impl->IJsonValue_iface.lpVtbl = &json_value_vtbl;
+    impl->IStringable_iface.lpVtbl = &json_value_stringable_vtbl;
     impl->ref = 1;
 
     if (json_buffer_take( json, L"null", TRUE ))
@@ -591,6 +623,7 @@ static HRESULT WINAPI json_value_statics_CreateBooleanValue( IJsonValueStatics *
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
 
     impl->IJsonValue_iface.lpVtbl = &json_value_vtbl;
+    impl->IStringable_iface.lpVtbl = &json_value_stringable_vtbl;
     impl->ref = 1;
     impl->json_value_type = JsonValueType_Boolean;
     impl->boolean_value = input != FALSE;
@@ -610,6 +643,7 @@ static HRESULT WINAPI json_value_statics_CreateNumberValue( IJsonValueStatics *i
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
 
     impl->IJsonValue_iface.lpVtbl = &json_value_vtbl;
+    impl->IStringable_iface.lpVtbl = &json_value_stringable_vtbl;
     impl->ref = 1;
     impl->json_value_type = JsonValueType_Number;
     impl->number_value = input;
@@ -630,6 +664,7 @@ static HRESULT WINAPI json_value_statics_CreateStringValue( IJsonValueStatics *i
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
 
     impl->IJsonValue_iface.lpVtbl = &json_value_vtbl;
+    impl->IStringable_iface.lpVtbl = &json_value_stringable_vtbl;
     impl->ref = 1;
     impl->json_value_type = JsonValueType_String;
     if (FAILED(hr = WindowsDuplicateString( input, &impl->string_value )))
@@ -668,3 +703,214 @@ static struct json_value_statics json_value_statics =
 };
 
 IActivationFactory *json_value_factory = &json_value_statics.IActivationFactory_iface;
+
+static HRESULT WINAPI json_value_stringable_ToString( IStringable *iface, HSTRING *value )
+{
+    struct json_value *impl = impl_from_json_value_stringable( iface );
+    struct json_buf buf = {0};
+    HRESULT hr;
+
+    TRACE( "iface %p, value %p.\n", iface, value );
+
+    if (!value) return E_POINTER;
+    if (FAILED(hr = json_write_value( &impl->IJsonValue_iface, &buf ))) { json_buf_free( &buf ); return hr; }
+    return json_buf_to_hstring( &buf, value );
+}
+
+void json_buf_free( struct json_buf *buf )
+{
+    free( buf->str );
+    buf->str = NULL;
+    buf->len = buf->cap = 0;
+}
+
+static HRESULT json_buf_append( struct json_buf *buf, const WCHAR *str, SIZE_T len )
+{
+    if (buf->len + len + 1 > buf->cap)
+    {
+        SIZE_T cap = max( buf->cap * 2, buf->len + len + 64 );
+        WCHAR *ptr = realloc( buf->str, cap * sizeof(WCHAR) );
+
+        if (!ptr) return E_OUTOFMEMORY;
+        buf->str = ptr;
+        buf->cap = cap;
+    }
+    memcpy( buf->str + buf->len, str, len * sizeof(WCHAR) );
+    buf->len += len;
+    buf->str[buf->len] = 0;
+    return S_OK;
+}
+
+static HRESULT json_buf_char( struct json_buf *buf, WCHAR c )
+{
+    return json_buf_append( buf, &c, 1 );
+}
+
+static HRESULT json_buf_ascii( struct json_buf *buf, const char *str )
+{
+    HRESULT hr = S_OK;
+
+    while (SUCCEEDED(hr) && *str) hr = json_buf_char( buf, (unsigned char)*str++ );
+    return hr;
+}
+
+HRESULT json_buf_to_hstring( struct json_buf *buf, HSTRING *value )
+{
+    HRESULT hr = WindowsCreateString( buf->str ? buf->str : L"", (UINT32)buf->len, value );
+
+    json_buf_free( buf );
+    return hr;
+}
+
+/* RFC 8259 escapes; everything else is written as is, as Windows does */
+static HRESULT json_write_string( struct json_buf *buf, const WCHAR *str, SIZE_T len )
+{
+    static const WCHAR hex[] = L"0123456789abcdef";
+    HRESULT hr = json_buf_char( buf, '"' );
+    SIZE_T i;
+
+    for (i = 0; SUCCEEDED(hr) && i < len; i++)
+    {
+        WCHAR c = str[i];
+        switch (c)
+        {
+        case '"': hr = json_buf_ascii( buf, "\\\"" ); break;
+        case '\\': hr = json_buf_ascii( buf, "\\\\" ); break;
+        case '\b': hr = json_buf_ascii( buf, "\\b" ); break;
+        case '\f': hr = json_buf_ascii( buf, "\\f" ); break;
+        case '\n': hr = json_buf_ascii( buf, "\\n" ); break;
+        case '\r': hr = json_buf_ascii( buf, "\\r" ); break;
+        case '\t': hr = json_buf_ascii( buf, "\\t" ); break;
+        default:
+            if (c < 0x20)
+            {
+                WCHAR esc[6] = { '\\', 'u', hex[c >> 12], hex[(c >> 8) & 15], hex[(c >> 4) & 15], hex[c & 15] };
+                hr = json_buf_append( buf, esc, 6 );
+            }
+            else hr = json_buf_char( buf, c );
+        }
+    }
+    if (SUCCEEDED(hr)) hr = json_buf_char( buf, '"' );
+    return hr;
+}
+
+static HRESULT json_write_number( struct json_buf *buf, double number )
+{
+    char text[64];
+
+    if (!isfinite( number )) return json_buf_ascii( buf, "null" );
+    /* shortest form that reads back to the same double, as the JSON writer does */
+    sprintf( text, "%.15g", number );
+    if (strtod( text, NULL ) != number) sprintf( text, "%.17g", number );
+    return json_buf_ascii( buf, text );
+}
+
+HRESULT json_write_array( IJsonArray *array, struct json_buf *buf )
+{
+    IVector_IJsonValue *vector;
+    IJsonValue *item;
+    UINT32 size, i;
+    HRESULT hr;
+
+    if (FAILED(hr = IJsonArray_QueryInterface( array, &IID_IVector_IJsonValue, (void **)&vector ))) return hr;
+    if (SUCCEEDED(hr = IVector_IJsonValue_get_Size( vector, &size )))
+    {
+        hr = json_buf_char( buf, '[' );
+        for (i = 0; SUCCEEDED(hr) && i < size; i++)
+        {
+            if (i) hr = json_buf_char( buf, ',' );
+            if (SUCCEEDED(hr) && SUCCEEDED(hr = IVector_IJsonValue_GetAt( vector, i, &item )))
+            {
+                hr = json_write_value( item, buf );
+                IJsonValue_Release( item );
+            }
+        }
+        if (SUCCEEDED(hr)) hr = json_buf_char( buf, ']' );
+    }
+    IVector_IJsonValue_Release( vector );
+    return hr;
+}
+
+struct member_writer
+{
+    struct json_buf *buf;
+    BOOL first;
+};
+
+static HRESULT write_member( HSTRING key, IJsonValue *value, void *context )
+{
+    struct member_writer *writer = context;
+    UINT32 len;
+    const WCHAR *str = WindowsGetStringRawBuffer( key, &len );
+    HRESULT hr;
+
+    if (!writer->first && FAILED(hr = json_buf_char( writer->buf, ',' ))) return hr;
+    writer->first = FALSE;
+    if (FAILED(hr = json_write_string( writer->buf, str, len ))) return hr;
+    if (FAILED(hr = json_buf_char( writer->buf, ':' ))) return hr;
+    return json_write_value( value, writer->buf );
+}
+
+HRESULT json_write_object( IJsonObject *object, struct json_buf *buf )
+{
+    struct member_writer writer = { buf, TRUE };
+    HRESULT hr;
+
+    if (FAILED(hr = json_buf_char( buf, '{' ))) return hr;
+    if (FAILED(hr = json_object_for_each( object, write_member, &writer ))) return hr;
+    return json_buf_char( buf, '}' );
+}
+
+HRESULT json_write_value( IJsonValue *value, struct json_buf *buf )
+{
+    JsonValueType type;
+    HRESULT hr;
+
+    if (FAILED(hr = IJsonValue_get_ValueType( value, &type ))) return hr;
+    switch (type)
+    {
+    case JsonValueType_Null:
+        return json_buf_ascii( buf, "null" );
+    case JsonValueType_Boolean:
+    {
+        boolean b;
+        if (FAILED(hr = IJsonValue_GetBoolean( value, &b ))) return hr;
+        return json_buf_ascii( buf, b ? "true" : "false" );
+    }
+    case JsonValueType_Number:
+    {
+        DOUBLE number;
+        if (FAILED(hr = IJsonValue_GetNumber( value, &number ))) return hr;
+        return json_write_number( buf, number );
+    }
+    case JsonValueType_String:
+    {
+        HSTRING str;
+        UINT32 len;
+        const WCHAR *raw;
+        if (FAILED(hr = IJsonValue_GetString( value, &str ))) return hr;
+        raw = WindowsGetStringRawBuffer( str, &len );
+        hr = json_write_string( buf, raw, len );
+        WindowsDeleteString( str );
+        return hr;
+    }
+    case JsonValueType_Array:
+    {
+        IJsonArray *array;
+        if (FAILED(hr = IJsonValue_GetArray( value, &array ))) return hr;
+        hr = json_write_array( array, buf );
+        IJsonArray_Release( array );
+        return hr;
+    }
+    case JsonValueType_Object:
+    {
+        IJsonObject *object;
+        if (FAILED(hr = IJsonValue_GetObject( value, &object ))) return hr;
+        hr = json_write_object( object, buf );
+        IJsonObject_Release( object );
+        return hr;
+    }
+    default:
+        return E_UNEXPECTED;
+    }
+}

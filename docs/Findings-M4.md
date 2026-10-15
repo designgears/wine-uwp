@@ -10892,3 +10892,31 @@ Shapr3D in a reflink copy of the dev prefix, after all of this: home screen iden
 Not done: sign-in itself (Xbox identity via `Microsoft.GamePlatform.Services.Identity.XboxAuthManager`, still unanswered),
 game install and launch (that is the real Gaming Services), BackgroundTaskRegistration (endpoints not registered),
 BadgeUpdateManager (0x803E0105), ExtendedExecutionForegroundSession.
+
+### Xbox app: Windows.Data.Json on the builtin (2026-10-14, evening)
+
+Task 2 of the Xbox follow-up: run without the native `Windows.Web.dll`. Wine's `windows.web` now has the JSON
+text output that was stubbed: `JsonValue.Stringify`, `JsonArray`'s `IJsonValue` face, and `IStringable.ToString`
+on `JsonValue`, `JsonObject` and `JsonArray` (`dlls/windows.web/json_*.c`, commit cf49c6e3 in ~/src/wine,
+vendored by `sync-wine.sh`). The writer goes through each object's public interfaces (IVector for arrays,
+`json_object_for_each` over the members' key-value iterable), escapes per RFC 8259, and is compact.
+
+Test: `/tmp/xbox-test.sh` (the `/tmp/xbox.sh` launcher with `windows.web=b`, on a fresh reflink copy
+`uwp-bin/prefix-test`, `TESTDISPLAY` :93). The app still faults, now on the builtin. It is not ToString:
+
+- `JsonObject.QueryInterface({c9d9a725-786b-5113-b4b7-9b61764c220b})` answers E_NOINTERFACE. That IID is
+  `IMap<HSTRING, IJsonValue*>` (windows.data.json.h line 2487; `piid.py` does not reproduce it, so trust the
+  header). `XboxPcApp.exe` +0x9cd8d and +0x21209 are both `consume_Windows_Foundation_Collections_IMap<JsonObject,
+  hstring, IJsonValue>` methods, and the caller reads through NULL after the failed QI.
+- So the next step is a typed `IMap<HSTRING, IJsonValue>` view on `JsonObject` (Lookup, Size, HasKey, GetView,
+  Insert, Remove, Clear, First). It forwards to the members map, which holds IJsonValue objects as IInspectable.
+  That needs `IMapView<HSTRING,IJsonValue>` (`{...}` from windows.data.json.h), `IIterable<IKeyValuePair<...>>`
+  (`{dfabb6e1-...}`) and `IKeyValuePair<HSTRING,IJsonValue>` (`{4deecc89-...}`), all of which are in the header.
+  Not started; the IStringable and writer work stands on its own.
+
+Regression after the JSON change: `TESTDISPLAY=:97 ./regress.sh calc mp` (Calculator AE 0, Media Player 2250),
+`./regress.sh kb` (Enter/Backspace/Escape 0/0/0). No screenshot of the Xbox window: the run ends in the page fault
+above, so there is no new picture to show.
+
+Not started in this round: task 1 (nav icons and washed banners), task 3 (sign-in identity classes), task 4 (Store
+hero video). Task 4 is the same blocker family as the hero video: media playback is needed for it.
