@@ -4,6 +4,7 @@
   winmd.py FILE.winmd --guid 845bf0b4-d8de-462f-8753-c80d43c6ff5a
   winmd.py FILE.winmd --type Windows.UI.Composition.ICompositionAnimation2
   winmd.py FILE.winmd --grep Animation
+  winmd.py FILE.winmd --sig Namespace.Type     (method signatures, struct fields, enum values)
 
 Private interfaces are not in the public metadata; everything else is, and knowing the method order
 is what turns a dcomp slot number into a method name. Minimal ECMA-335 reader: no dependencies.
@@ -216,6 +217,75 @@ class WinMD:
             out[str(uuid.UUID(bytes_le=v[2:18]))] = r["Parent"] >> bits
         return out
 
+    ELT = {1: "void", 2: "bool", 3: "char16", 4: "i1", 5: "u1", 6: "i2", 7: "u2", 8: "i4", 9: "u4", 0xa: "i8",
+           0xb: "u8", 0xc: "f4", 0xd: "f8", 0xe: "string", 0x1c: "object", 0x18: "isize", 0x19: "usize"}
+
+    def tdr_name(self, coded):
+        bits, tabs = CODED["TypeDefOrRef"]
+        t, i = tabs[coded & 3], coded >> bits
+        if t == 2: return self.type_name(i)
+        if t == 1:
+            r = self.row(1, i); ns, nm = self.string(r["Namespace"]), self.string(r["Name"])
+            return f"{ns}.{nm}" if ns else nm
+        return "typespec#%d" % i
+
+    def _cu(self, b, p):
+        n = b[p]
+        if n & 0x80 == 0: return n, p + 1
+        if n & 0xc0 == 0x80: return ((n & 0x3f) << 8) | b[p + 1], p + 2
+        return ((n & 0x1f) << 24) | (b[p + 1] << 16) | (b[p + 2] << 8) | b[p + 3], p + 4
+
+    def _type(self, b, p):
+        e = b[p]; p += 1
+        if e in self.ELT: return self.ELT[e], p
+        if e in (0x11, 0x12):
+            c, p = self._cu(b, p); return self.tdr_name(c), p
+        if e == 0x1d:
+            t, p = self._type(b, p); return t + "[]", p
+        if e == 0x10:
+            t, p = self._type(b, p); return t + "&", p
+        if e == 0x0f:
+            t, p = self._type(b, p); return t + "*", p
+        if e == 0x13:
+            n, p = self._cu(b, p); return "!%d" % n, p
+        if e == 0x15:
+            g, p = self._type(b, p); n, p = self._cu(b, p); args = []
+            for _ in range(n):
+                a, p = self._type(b, p); args.append(a)
+            return "%s<%s>" % (g, ", ".join(args)), p
+        if e == 0x1f or e == 0x20:
+            c, p = self._cu(b, p); t, p = self._type(b, p); return t, p
+        return "?%x" % e, p
+
+    def method_sig(self, m):
+        r = self.row(6, m); b = self.blob(r["Signature"]); p = 1
+        n, p = self._cu(b, p); ret, p = self._type(b, p); ps = []
+        for _ in range(n):
+            t, p = self._type(b, p); ps.append(t)
+        last = self.row(6, m + 1)["ParamList"] if m < self.rows[6] else self.rows[8] + 1
+        names = {}
+        for q in range(r["ParamList"], last):
+            pr = self.row(8, q); names[pr["Sequence"]] = (self.string(pr["Name"]), pr["Flags"])
+        out = []
+        for k, t in enumerate(ps):
+            nm, fl = names.get(k + 1, ("", 0))
+            out.append(("out " if fl & 2 else "") + t + " " + nm)
+        return "%s %s(%s)" % (ret, self.string(r["Name"]), ", ".join(out))
+
+    def fields(self, i):
+        first = self.row(2, i)["FieldList"]
+        last = self.row(2, i + 1)["FieldList"] if i < self.rows[2] else self.rows[4] + 1
+        consts = {}
+        bits, tabs = CODED["HasConstant"]
+        for c in range(1, self.rows.get(0x0b, 0) + 1):
+            cr = self.row(0x0b, c)
+            if tabs[cr["Parent"] & 3] == 4: consts[cr["Parent"] >> bits] = int.from_bytes(self.blob(cr["Value"]), "little", signed=True)
+        out = []
+        for f in range(first, last):
+            r = self.row(4, f); b = self.blob(r["Signature"]); t, _ = self._type(b, 1)
+            out.append("%s %s%s" % (t, self.string(r["Name"]), (" = %d" % consts[f]) if f in consts else ""))
+        return out
+
 def main():
     md = WinMD(sys.argv[1])
     a = sys.argv[2:]
@@ -235,6 +305,16 @@ def main():
                 print(md.type_name(i), rg.get(i, ""))
                 for n, name in enumerate(md.methods(i)):
                     print("  slot %2d  %s" % (n + 6, name))
+    elif "--sig" in a:
+        want = a[a.index("--sig") + 1].lower()
+        for i in range(1, md.rows[2] + 1):
+            if md.type_name(i).lower() == want:
+                print(md.type_name(i))
+                for f in md.fields(i): print("  field", f)
+                first = md.row(2, i)["MethodList"]
+                last = md.row(2, i + 1)["MethodList"] if i < md.rows[2] else md.rows[6] + 1
+                for n, m in enumerate(range(first, last)):
+                    print("  slot %2d  %s" % (n + 6, md.method_sig(m)))
     elif "--grep" in a:
         pat = a[a.index("--grep") + 1].lower()
         rg = {v: k for k, v in md.guids().items()}

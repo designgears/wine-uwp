@@ -11051,3 +11051,63 @@ loaded by `XboxPcApp.exe+0x5ac4b0` via `LoadedImageSurface.StartLoadFromUri`); X
 raises LoadCompleted 19/19, yet `get_DecodedPhysicalSize` still reads 0x0 for our painter - which is why the splash
 and the sign-in gate show no Xbox logo. Breakpoints: `windows.ui.xaml.dll+35d850` (StartLoadFromUri),
 `+1348b0` (LoadCompleted raise).
+
+## 2026-10-15: Xbox sign-in through an XboxAuthManager stand-in (device code, Xbox Live tokens)
+
+Clicking "Sign in" on the gate did nothing: `Microsoft.GamePlatform.Services.Identity.XboxAuthManager` comes from the
+package's own `Microsoft.GamePlatform.Services.dll`, which asks Gaming Services' token broker and fails every call with
+0x87E00196 (`Identity.h (350)`), so `GrtsAuthProvider` "skips sign in due to missing auth manager".
+
+`shims/xboxauth` (`wineuwp_xboxauth.dll`) now answers `XboxAuthManager` and `XboxAuthInitializationArgs`
+(`OverridesPackage=1`, registered by `install-overrides.sh`). It signs in for real, without an embedded browser:
+
+- **Microsoft account by device code.** `login.live.com/oauth20_connect.srf` (client `000000004C12AE6F`, scope
+  `service::user.auth.xboxlive.com::MBI_SSL`) gives a user code; the user's browser is opened at
+  `https://www.microsoft.com/link?otc=<code>` (ShellExecute -> winebrowser -> xdg-open; `WINE_UWP_LAUNCHER=log` only
+  logs it and writes `C:\users\Public\wineuwp-launched.uri`, like `shims/launcher`); `oauth20_token.srf` is polled at
+  the server's interval (`authorization_pending`, `slow_down`, expiry after 900 s, `Cancel` honoured). The refresh
+  token is kept DPAPI-protected in `%LOCALAPPDATA%\wineuwp\xboxauth.bin`, prefix-wide, so the app and its FT server
+  (each makes its own manager) both sign in silently from it, and on the next start.
+- **Xbox Live.** `user.auth.xboxlive.com/user/authenticate` (`RpsTicket` `t=<token>`, contract 1), then XSTS for
+  `http://xboxlive.com`, whose `xui` claims give uhs, xid, gtg, agg and `prv` (privileges). `User.CheckPrivilege`
+  answers from `prv`.
+- **Tokens for requests.** `User.GetTokenAndSignatureAsync` reads the URL (and ForceRefresh) from the app's own
+  `TokenRequest` (the package's class is fine for that) and picks the relying party from the title endpoints table
+  (`title.mgt.xboxlive.com/titles/default/endpoints?type=1`, 88 entries, fetched once): `profile.xboxlive.com` ->
+  `http://xboxlive.com`, `emerald.xboxservices.com` and `purchase.mp.microsoft.com` -> `http://mp.microsoft.com/`,
+  `collections.mp.microsoft.com` -> `http://licensing.xboxlive.com`, a non-Xbox host -> no token (empty, S_OK).
+  XSTS tokens are cached per relying party until five minutes before `NotAfter`. The answer is
+  `XBL3.0 x=<uhs>;<xsts>`. **The `Signature` is empty**: signing needs a proof key bound to an Xbox *device* token,
+  which this does not obtain; endpoints with a signature policy may refuse. `GetDeviceUserAsync` is E_NOTIMPL.
+- Others: `GetMsaTicketAsync(scope)` is a refresh-token grant for that scope; `CheckConsent`/`ManageConsentWithUi`
+  say NotApplicable; `IsStoreUser` false; `SignOutAsync` raises `UserStateChanged` (SigningOut, SignedOut) and deletes
+  the stored sign-in; `AddUserWithTransferTokenAsync` completes with NotSupported; `GetGamerPictureAsync` is E_NOTIMPL
+  (traced; not called so far). Asyncs run on their own thread and complete from it; `put_Completed` after completion
+  invokes at once.
+- Nothing logs a token: traces carry HTTP status, `error`/`XErr` codes and lengths. XErr 2148916233 (no Xbox profile),
+  ...235, ...236/237 and ...238 (child account) are named in the log.
+
+What the app does with it (`trace+tracelogging`, `[xboxauth]` lines): it creates the args (MSA app
+`000000004424DA1F`, title `0x29f95ee9`) and a manager in both processes, calls `TryAddDefaultUserSilentlyAsync` many
+times (null user while nothing is stored; `UserSaga` then logs "Cannot read property 'xuid' of null" and shows the
+gate, which is the signed-out path), and on **Sign in** calls `AddUserWithUiAsync`. The device code is issued, the
+sign-in page URL goes to the launcher, and the app shows its Xbox-logo "signing in" screen while polling continues
+(`docs/screenshots/xbox-signin-gate.png`, `xbox-signin-waiting.png`). Finishing needs the user's Microsoft account in a
+real browser, so everything after the token poll (Xbox Live exchange in the app, the signed-in home screen) is not
+verified yet. `probes/probe-xboxauth.cpp` checks the HTTP side without the app: `devicecode` (HTTP 200, a code),
+`endpoints <url>` (relying parties above), `xbl invalid` (user/authenticate 401, XSTS 400, both reported as
+0x80047803), `silent [url]` (stored sign-in -> token, for after a real sign-in).
+
+Also seen, not followed: the FT server's `XblAuthManagerHelper` gets REGDB_E_CLASSNOTREG (`XblAuthManagerHelper.cpp
+(29)`) when "Checking for XBL Auth Manager availability" (Windows' Xbox Live Auth Manager service); sign-in goes on
+without it. `StoreAccountManager`'s `GetMsaProviderAsync` fails E_NOINTERFACE (`GetAuthTokenDetailsError` 50031), a
+separate Store account path.
+
+Tooling: `winmd.py --sig <Type>` prints method signatures with parameter names and directions, struct fields and enum
+values, which the slot list alone did not give (struct returns, `out` parameters, the `TokenRequestResult` layout).
+
+Trap: `/tmp/xbox-test.sh` set `WINEPREFIX=prefix-test` only on its `wineserver -k`; `run.sh` then took `env.sh`'s
+default, the **dev prefix**, and ran `wineserver -k` there three times this session. It exports it for `run.sh` now.
+The dev prefix therefore already has this shim and its registration.
+
+Regression: Calculator AE 0, Media Player 2250, `kb` 0/0/0 (in `prefix-test`).

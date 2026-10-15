@@ -456,6 +456,24 @@ if [ -f "$GP_SHIM" ]; then
   echo "installed: GamePlatform (Gaming Services client) stand-in"
 fi
 
+# Microsoft.GamePlatform.Services.Identity: Xbox sign-in (see shims/xboxauth). On Windows it is Gaming Services'
+# token broker; this one signs in with a Microsoft account device code in the user's browser and talks to Xbox
+# Live itself. The sign-in is kept, DPAPI-protected, in %LOCALAPPDATA%\wineuwp\xboxauth.bin.
+XA_SHIM=${SHIM_DIR}/wineuwp_xboxauth.dll
+if [ -f "$XA_SHIM" ]; then
+  XA_DST=$SYS32/wineuwp_xboxauth.dll
+  if ! cmp -s "$XA_SHIM" "$XA_DST"; then cp -f --reflink=auto "$XA_SHIM" "$XA_DST"; fi
+  for cls in XboxAuthManager XboxAuthInitializationArgs; do
+    K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Microsoft.GamePlatform.Services.Identity.$cls"
+    "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_xboxauth.dll' /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 0 /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v OverridesPackage /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  done
+  echo "installed: Xbox sign-in (XboxAuthManager) stand-in"
+fi
+
 # api-ms-win-appmodel-advertisingid-l1-1-0.dll. No registry entry: this is a plain DLL resolved by
 # name at load time, so it only has to exist in system32 for twinapi.appcore's imports to bind to
 # it instead of Wine's raising stub.
