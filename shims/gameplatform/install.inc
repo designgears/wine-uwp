@@ -623,6 +623,39 @@ static HRESULT fe3_packages(const std::string &category, std::vector<Fe3Update> 
     return out.empty() ? HRESULT_FROM_WIN32(ERROR_NOT_FOUND) : S_OK;
 }
 
+/* the file name the delivery server gives a download (Content-Disposition), from a HEAD request */
+static std::wstring http_head_filename(const std::string &url)
+{
+    std::wstring w(url.begin(), url.end()), host(256, 0), path(4096, 0), out;
+    URL_COMPONENTS uc = {sizeof(uc)};
+    uc.lpszHostName = &host[0]; uc.dwHostNameLength = (DWORD)host.size();
+    uc.lpszUrlPath = &path[0]; uc.dwUrlPathLength = (DWORD)path.size();
+    if (!WinHttpCrackUrl(w.c_str(), 0, 0, &uc)) return out;
+    host.resize(uc.dwHostNameLength);
+    path.resize(uc.dwUrlPathLength);
+    HINTERNET s = WinHttpOpen(L"Microsoft-Delivery-Optimization/10.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+                              WINHTTP_NO_PROXY_BYPASS, 0), c = nullptr, r = nullptr;
+    if (s && (c = WinHttpConnect(s, host.c_str(), uc.nPort, 0)) &&
+        (r = WinHttpOpenRequest(c, L"HEAD", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0)))
+    {
+        WinHttpSetTimeouts(r, 20000, 20000, 20000, 20000);
+        wchar_t buf[1024];
+        DWORD size = sizeof(buf);
+        if (WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr) &&
+            WinHttpQueryHeaders(r, WINHTTP_QUERY_CONTENT_DISPOSITION, nullptr, buf, &size, nullptr))
+        {
+            out = buf;
+            size_t f = out.find(L"filename=");
+            if (f != std::wstring::npos) out = out.substr(f + 9);
+        }
+    }
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    if (s) WinHttpCloseHandle(s);
+    return out;
+}
+
 static std::string fe3_file_url(const Fe3Update &u)
 {
     static const char TO[] = "https://fe3.delivery.mp.microsoft.com/ClientWebService/client.asmx/secured";
@@ -636,7 +669,13 @@ static std::string fe3_file_url(const Fe3Update &u)
     for (size_t p = 0; (p = r.find("<Url>", p)) != std::string::npos; p += 5)
     {
         std::string url = r.substr(p + 5, r.find("</Url>", p) - p - 5);
-        if (url.find("filestreamingservice") != std::string::npos) return url;
+        if (url.find("filestreamingservice") == std::string::npos) continue;
+        /* both URLs look alike; only the server's file name tells the block map (a cabinet) from the package */
+        std::wstring name = http_head_filename(url);
+        size_t dot = name.rfind(L'.');
+        if (dot != std::wstring::npos && !_wcsicmp(name.c_str() + dot, L".BlockMap")) continue;
+        tracef("FE3 file %ls", name.c_str());
+        return url;
     }
     tracef("FE3 GetExtendedUpdateInfo2: HTTP %lu, no file URL", status);
     return "";
@@ -747,7 +786,8 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
     if (!installed)
     {
         /* the installer's own last line says why */
-        size_t e = seen.find_last_not_of("\r\n", seen.rfind("EXIT"));
+        size_t x = seen.rfind("EXIT");
+        size_t e = x == std::string::npos || !x ? std::string::npos : seen.find_last_not_of("\r\n", x - 1);
         size_t b = seen.rfind('\n', e == std::string::npos ? 0 : e);
         tracef("install: %s", seen.substr(b == std::string::npos ? 0 : b + 1, e == std::string::npos ? 0 : e - b).c_str());
     }
