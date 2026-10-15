@@ -439,6 +439,21 @@ if [ -f "$GP_SHIM" ]; then
   "${WINE_BIN}wine" reg add "$K" /v Version /d 37.114.26001.0 /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v Architecture /t REG_DWORD /d 9 /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v FullName /d Microsoft.GamingServices_37.114.26001.0_x64__8wekyb3d8bbwe /f >/dev/null 2>&1
+  # The packages the Xbox app lists under Settings > App > Dependencies, registered as installed with the identities
+  # of a Windows 11 install's copies (2026-10). Identity only: none of them is staged, so anything the app launches
+  # in them (the Store, Purchase App, Game Bar) does not open.
+  for dep in Microsoft.DesktopAppInstaller:1.29.379.0 Microsoft.WindowsFeedbackHub:1.2401.20253.0 \
+             Microsoft.XboxGamingOverlay:7.326.8061.0 Microsoft.XboxIdentityProvider:12.130.16001.0 \
+             Microsoft.Xbox.TCUI:1.24.10001.0 Microsoft.WindowsStore:22608.1401.3.0 Microsoft.StorePurchaseApp:22607.1401.4.0; do
+    dn=${dep%%:*}; dv=${dep#*:}
+    K="HKLM\\Software\\Wine\\WineUWP\\StandInPackages\\${dn}_8wekyb3d8bbwe"
+    "${WINE_BIN}wine" reg add "$K" /v Name /d "$dn" /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v Publisher /d 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US' /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v PublisherId /d 8wekyb3d8bbwe /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v Version /d "$dv" /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v Architecture /t REG_DWORD /d 9 /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v FullName /d "${dn}_${dv}_x64__8wekyb3d8bbwe" /f >/dev/null 2>&1
+  done
   # ...and its two NT services, as stand-ins that start, report RUNNING and stop (shims/gamingservice)
   GS_SVC=${SHIM_DIR}/wineuwp_gamingservice.exe
   if [ -f "$GS_SVC" ]; then
