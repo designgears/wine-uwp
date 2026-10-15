@@ -211,8 +211,22 @@ static HRESULT d3d11_create_device(IDXGIAdapter *adapter, D3D_DRIVER_TYPE driver
             }
 
             case D3D_DRIVER_TYPE_NULL:
-                FIXME("NULL device not implemented, falling back to refrast.\n");
-                /* fall through, for now */
+            {
+                /* A null device renders nothing and is meant for code that only wants the API (feature
+                 * queries, resource creation). The hardware adapter does all of that, so use it rather than
+                 * refrast: refrast is not shipped, and an app that retries the failed create in a loop
+                 * (Candy Crush Saga did ~590 times a minute on its loading screen) never gets its device. */
+                FIXME("NULL device not implemented, falling back to hardware.\n");
+                hr = IDXGIFactory_EnumAdapters(factory, 0, &adapter);
+                if (FAILED(hr))
+                {
+                    WARN("No adapters found, returning %#lx.\n", hr);
+                    IDXGIFactory_Release(factory);
+                    return hr;
+                }
+                break;
+            }
+
             case D3D_DRIVER_TYPE_REFERENCE:
             {
                 HMODULE refrast = LoadLibraryA("d3d11ref.dll");
