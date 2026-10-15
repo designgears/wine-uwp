@@ -10832,3 +10832,63 @@ server's `Launcher.QueryUriSupportAsync` (E_NOTIMPL).
 Regression after this round: Calculator AE 0, Media Player 2250, `kb` 0/0/0. The kernelbase change (no
 version lie for packaged apps) and the real DeviceFamilyVersion apply to every packaged app; Shapr3D was not
 re-tested against them.
+
+### Xbox app: Gaming Services as a stand-in, and the home screen (2026-10-14, later)
+
+The app decides whether Gaming Services is usable from four facts. Its own log (`trace+tracelogging`) names each
+step: VerifyPackage, VerifyMinVersionRequirements, EnsureServiceInReadyState, GetUsageType. Gaming Services itself is
+NT services plus kernel drivers and cannot run here. Each fact now has an honestly shaped answer, all registered
+by `install-overrides.sh` and none of them a byte patch:
+
+1. **The package.** `PackageManager.FindPackagesByUserSecurityIdPackageFamilyName("", "Microsoft.GamingServices_8wekyb3d8bbwe")`
+   only ever found the running package. `appxdeploymentclient/standin.c` answers registered *stand-in packages*
+   (`HKLM\Software\Wine\WineUWP\StandInPackages\<family>`: Name, Publisher, PublisherId, Version, Architecture,
+   FullName). The package is an IPackage with IPackageId, IPackage3 (Status, InstalledDate) and an all-clear
+   PackageStatus. The Gaming Services identity registered is the one its bundled appxbundle carries, 37.114.26001.0.
+2. **The client API.** `shims/gameplatform` answers `Microsoft.GamePlatform.Services.PlatformStatus` (`ApiStatus` =
+   Ready, event registrations accepted) and `PackageQueue` (event registrations accepted). Every other slot is
+   traced and returns E_NOTIMPL, so the app shows what it needs next. Package classes resolve from the manifest
+   *before* the registry, so combase now gives a registry entry with `OverridesPackage=1` precedence. That opt-in is
+   used for these two classes only.
+3. **The services.** The FT server's `ServiceMonitor::StartAsync` opens the `GamingServices` NT service, and
+   failed with ERROR_SERVICE_DOES_NOT_EXIST. `shims/gamingservice` is a service executable that starts, reports
+   RUNNING and stops. It is registered as `GamingServices` and `GamingServicesNet`, demand-start. Trap:
+   `services.exe` reads its database when it starts, and `install-overrides.sh`'s own `wine reg add` starts it.
+   So a service added in the same run is unknown until the next start of Wine.
+4. Result: "Service state: [Ready]", "State: Installed", "Blocking work is complete", and the splash is dismissed.
+
+Then:
+
+5. **`Windows.System.User`** (served by the UserManager service on Windows) is `shims/user`: the one local user,
+   LocallyAuthenticated, `NonRoamableId` = the account SID string. `FindAllAsync`/`GetDefault`/`GetFromId` return it,
+   and `GetPropertyAsync`/`GetPropertiesAsync` answer from the account name. The asyncs are born completed. PIIDs
+   come from `piid.py --signature` (control: IVector<String> = 98b9acc1). The app's config loads, and sign-in stays
+   signed out.
+6. **React Native aborted right after the splash.** The abort was C++/WinRT's inlined HSTRING release
+   (`lock xadd` at `+0x18`, abort when negative) on a pointer that was *our dcomp ExpressionAnimation*:
+   - `CompositionAnimation.Target` (ICompositionAnimation2 slot 7) on an expression animation reached the generic
+     recording handler, which writes a recording object into any out-parameter, here an HSTRING.
+   - Fixed with an ICompositionAnimation2 view for expression animations. Target is kept in a side table keyed by
+     owner, because the struct prefix is shared.
+   - A second layer: the typed ExpressionAnimation answers XAML's private IIDs with a *recording clone*, and XAML
+     read Target from the clone. `UIElement.StartAnimation` then returned E_INVALIDARG, found with the AGENTS.md
+     `throw_hresult` branch trick (`ReactNative+0xc6d8` is the `0x80070057` arm). Clones now get their origin's
+     Target.
+   - Found by a `WINE_UWP_BP` dump at `ReactNative+0x163126`, whose "string" began with a vtable in dcomp.dll.
+7. **"Looks like you're offline":** `ConnectionProfile.GetSignalBars` was E_NOTIMPL, so the app's network check
+   threw. A wired connection has no bars; it answers NULL now.
+
+**Result: the home screen** (`docs/screenshots/xbox-home.png`): signed out, with a navigation pane (Home, Game Pass,
+My Library, Cloud Gaming, Store, Install queue), a search box, hero tiles and "Top paid games" with live store
+content and box art. Game Pass (`xbox-game-pass.png`) and Store (`xbox-store.png`) navigate. The Store's hero is an
+empty dark panel, probably a video.
+
+Also seen: arming `WINE_UWP_BP` breakpoints on module loads once deadlocked the loader (`blocked by ... in DllMain of
+ReactNativeGameStreaming.dll`). Without breakpoints it does not happen.
+
+Shapr3D in a reflink copy of the dev prefix, after all of this: home screen identical (`magick compare` AE 0;
+`docs/screenshots/shapr3d-home-after-xbox-changes.png`). Regression: Calculator AE 0, Media Player 2250, `kb` 0/0/0.
+
+Not done: sign-in itself (Xbox identity via `Microsoft.GamePlatform.Services.Identity.XboxAuthManager`, still unanswered),
+game install and launch (that is the real Gaming Services), BackgroundTaskRegistration (endpoints not registered),
+BadgeUpdateManager (0x803E0105), ExtendedExecutionForegroundSession.

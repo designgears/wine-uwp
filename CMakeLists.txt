@@ -106,6 +106,16 @@ target_link_libraries(webauthcore PRIVATE runtimeobject.lib)
 
 # Windows.Services.Store.StoreContext - a traced stand-in used to find out which Store methods
 # the app actually calls, before implementing any of them.
+add_executable(gamingservice shims/gamingservice/gamingservice.cpp)
+set_target_properties(gamingservice PROPERTIES OUTPUT_NAME "wineuwp_gamingservice")
+target_link_options(gamingservice PRIVATE -municode)
+target_link_libraries(gamingservice PRIVATE advapi32)
+add_library(user SHARED shims/user/user.cpp)
+set_target_properties(user PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_user")
+target_link_libraries(user PRIVATE runtimeobject.lib advapi32)
+add_library(gameplatform SHARED shims/gameplatform/gameplatform.cpp)
+set_target_properties(gameplatform PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_gameplatform")
+target_link_libraries(gameplatform PRIVATE runtimeobject.lib)
 add_library(storecontext SHARED shims/storecontext/storecontext.cpp)
 set_target_properties(storecontext PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_storecontext")
 target_link_libraries(storecontext PRIVATE runtimeobject.lib)

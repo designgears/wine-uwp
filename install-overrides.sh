@@ -402,6 +402,60 @@ if [ -f "$SC_SHIM" ]; then
   echo "installed: StoreContext traced stand-in"
 fi
 
+# Windows.System.User: the local user (see shims/user). Windows serves it from the UserManager service.
+US_SHIM=${SHIM_DIR}/wineuwp_user.dll
+if [ -f "$US_SHIM" ]; then
+  US_DST=$SYS32/wineuwp_user.dll
+  if ! cmp -s "$US_SHIM" "$US_DST"; then cp -f --reflink=auto "$US_SHIM" "$US_DST"; fi
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.System.User"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_user.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: Windows.System.User stand-in"
+fi
+
+# Microsoft.GamePlatform.Services.*: the Gaming Services client classes (see shims/gameplatform). They
+# replace the package's own Microsoft.GamePlatform.Services.dll (OverridesPackage=1, read by combase),
+# whose NT services cannot run under Wine.
+GP_SHIM=${SHIM_DIR}/wineuwp_gameplatform.dll
+if [ -f "$GP_SHIM" ]; then
+  GP_DST=$SYS32/wineuwp_gameplatform.dll
+  if ! cmp -s "$GP_SHIM" "$GP_DST"; then cp -f --reflink=auto "$GP_SHIM" "$GP_DST"; fi
+  for cls in PlatformStatus PackageQueue; do
+    K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Microsoft.GamePlatform.Services.$cls"
+    "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_gameplatform.dll' /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 0 /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v OverridesPackage /t REG_DWORD /d 1 /f >/dev/null 2>&1
+  done
+  # ...and its package identity, so PackageManager reports Gaming Services as installed (appxdeploymentclient
+  # standin.c). The identity is the one gamingservices-signed.appxbundle carries (Xbox app 2608.1001.17.0).
+  K="HKLM\\Software\\Wine\\WineUWP\\StandInPackages\\Microsoft.GamingServices_8wekyb3d8bbwe"
+  "${WINE_BIN}wine" reg add "$K" /v Name /d Microsoft.GamingServices /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Publisher /d 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v PublisherId /d 8wekyb3d8bbwe /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Version /d 37.114.26001.0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Architecture /t REG_DWORD /d 9 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v FullName /d Microsoft.GamingServices_37.114.26001.0_x64__8wekyb3d8bbwe /f >/dev/null 2>&1
+  # ...and its two NT services, as stand-ins that start, report RUNNING and stop (shims/gamingservice)
+  GS_SVC=${SHIM_DIR}/wineuwp_gamingservice.exe
+  if [ -f "$GS_SVC" ]; then
+    if ! cmp -s "$GS_SVC" "$SYS32/wineuwp_gamingservice.exe"; then cp -f --reflink=auto "$GS_SVC" "$SYS32/wineuwp_gamingservice.exe"; fi
+    for svc in GamingServices GamingServicesNet; do
+      K="HKLM\\System\\CurrentControlSet\\Services\\$svc"
+      "${WINE_BIN}wine" reg add "$K" /v ImagePath /d 'C:\windows\system32\wineuwp_gamingservice.exe' /f >/dev/null 2>&1
+      "${WINE_BIN}wine" reg add "$K" /v Type /t REG_DWORD /d 16 /f >/dev/null 2>&1
+      "${WINE_BIN}wine" reg add "$K" /v Start /t REG_DWORD /d 3 /f >/dev/null 2>&1
+      "${WINE_BIN}wine" reg add "$K" /v ErrorControl /t REG_DWORD /d 1 /f >/dev/null 2>&1
+      "${WINE_BIN}wine" reg add "$K" /v ObjectName /d LocalSystem /f >/dev/null 2>&1
+      "${WINE_BIN}wine" reg add "$K" /v DisplayName /d "$svc" /f >/dev/null 2>&1
+    done
+  fi
+  echo "installed: GamePlatform (Gaming Services client) stand-in"
+fi
+
 # api-ms-win-appmodel-advertisingid-l1-1-0.dll. No registry entry: this is a plain DLL resolved by
 # name at load time, so it only has to exist in system32 for twinapi.appcore's imports to bind to
 # it instead of Wine's raising stub.

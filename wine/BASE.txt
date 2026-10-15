@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     0b191e60ca299d30ab1557d6df820c1864537e2b
-                 wine-uwp: Xbox app dependency checks
+  wine HEAD:     4a9adc69d1c08a51fb472fa1e2ef90e62ff5fd0a
+                 wine-uwp: Xbox app to its home screen
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-15T03:04:07Z
+  captured:      2026-10-15T03:40:39Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

@@ -269,6 +269,18 @@ static HRESULT get_library_for_classid(const WCHAR *classid, WCHAR **out)
         return S_OK;
     }
 
+    /* a stand-in that explicitly replaces a package's own class (wine-uwp): the registry entry carries
+     * OverridesPackage=1. Used for the Gaming Services client classes, whose service cannot run here. */
+    {
+        DWORD override = 0, len = sizeof(override);
+        WCHAR key[512];
+
+        swprintf( key, ARRAY_SIZE(key), L"Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\%s", classid );
+        if (!RegGetValueW( HKEY_LOCAL_MACHINE, key, L"OverridesPackage", RRF_RT_REG_DWORD, NULL, &override, &len ) &&
+            override)
+            goto registry;
+    }
+
     /* package graph manifests (wine-uwp) */
     {
         const WCHAR *dll = uwp_find_class( classid );
@@ -280,6 +292,7 @@ static HRESULT get_library_for_classid(const WCHAR *classid, WCHAR **out)
         }
     }
 
+registry:
     /* load class registry key */
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\WindowsRuntime\\ActivatableClassId",
                       0, KEY_READ, &hkey_root))

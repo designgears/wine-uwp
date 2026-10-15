@@ -2388,6 +2388,128 @@ static HRESULT WINAPI comp_object_GetRuntimeClassName( void *iface, HSTRING *nam
 static const GUID IID_IDCompositionSurfaceCopy_local =
     { 0x43390de3, 0xac87, 0x4fc4, { 0xa8, 0xee, 0xbe, 0x3a, 0x1f, 0x43, 0xeb, 0xdd } };
 static HRESULT surface_copy_query( void *iface, void *caller, void **out );
+static const GUID IID_ICompositionAnimation2_early =
+    {0x369b603e,0xa80f,0x4948,{0x93,0xe3,0xed,0x23,0xfb,0x38,0xc6,0xcb}};
+
+/* ExpressionAnimation.Target, in a side table: the struct prefix is shared and must not grow */
+struct expr_anim_target { void *owner; WCHAR target[64]; };
+static struct expr_anim_target *expr_targets;
+static unsigned int expr_target_count, expr_target_capacity;
+static CRITICAL_SECTION expr_targets_cs = { NULL, -1, 0, 0, 0, 0 };
+
+static struct expr_anim_target *expr_target_find( void *owner, BOOL create )
+{
+    unsigned int i;
+    for (i = 0; i < expr_target_count; i++) if (expr_targets[i].owner == owner) return &expr_targets[i];
+    if (!create) return NULL;
+    if (expr_target_count == expr_target_capacity)
+    {
+        unsigned int cap = expr_target_capacity ? expr_target_capacity * 2 : 64;
+        struct expr_anim_target *t = (realloc)( expr_targets, cap * sizeof(*t) );
+        if (!t) return NULL;
+        expr_targets = t;
+        expr_target_capacity = cap;
+    }
+    expr_targets[expr_target_count].owner = owner;
+    expr_targets[expr_target_count].target[0] = 0;
+    return &expr_targets[expr_target_count++];
+}
+
+static void expr_anim_target_gone( void *owner )
+{
+    struct expr_anim_target *t;
+    if (!expr_target_count) return;
+    EnterCriticalSection( &expr_targets_cs );
+    if ((t = expr_target_find( owner, FALSE ))) *t = expr_targets[--expr_target_count];
+    LeaveCriticalSection( &expr_targets_cs );
+}
+
+static void expr_anim_target_copy( void *from, void *to )
+{
+    struct expr_anim_target *src, *dst;
+    WCHAR target[64];
+
+    EnterCriticalSection( &expr_targets_cs );
+    if ((src = expr_target_find( from, FALSE )))
+    {
+        lstrcpynW( target, src->target, ARRAY_SIZE(target) );
+        if ((dst = expr_target_find( to, TRUE ))) lstrcpynW( dst->target, target, ARRAY_SIZE(dst->target) );
+    }
+    LeaveCriticalSection( &expr_targets_cs );
+}
+
+struct expr_anim2 { const void **vtbl; LONG ref; IUnknown *owner; };
+
+static HRESULT WINAPI expr_anim2_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct expr_anim2 *impl = iface;
+    return IUnknown_QueryInterface( impl->owner, iid, out );
+}
+static ULONG WINAPI expr_anim2_AddRef( void *iface ) { return InterlockedIncrement( &((struct expr_anim2 *)iface)->ref ); }
+static ULONG WINAPI expr_anim2_Release( void *iface )
+{
+    struct expr_anim2 *impl = iface;
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref)
+    {
+        IUnknown_Release( impl->owner );
+        (free)( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI expr_anim2_GetIids( void *iface, ULONG *count, IID **iids ) { *count = 0; *iids = NULL; return S_OK; }
+static HRESULT WINAPI expr_anim2_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( L"Windows.UI.Composition.ExpressionAnimation", 42, name );
+}
+static HRESULT WINAPI expr_anim2_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
+static HRESULT WINAPI expr_anim2_SetBooleanParameter( void *iface, HSTRING key, boolean value ) { return S_OK; }
+static HRESULT WINAPI expr_anim2_get_Target( void *iface, HSTRING *value )
+{
+    struct expr_anim2 *impl = iface;
+    struct expr_anim_target *t;
+    HRESULT hr = S_OK;
+
+    if (!value) return E_POINTER;
+    *value = NULL;  /* a NULL HSTRING is the empty string */
+    EnterCriticalSection( &expr_targets_cs );
+    if ((t = expr_target_find( impl->owner, FALSE )) && t->target[0])
+        hr = WindowsCreateString( t->target, wcslen( t->target ), value );
+    LeaveCriticalSection( &expr_targets_cs );
+    TRACE_(dcompanim)( "expression %p: Target read -> %s, from %p\n", impl->owner, debugstr_hstring( *value ),
+                       __builtin_return_address( 0 ) );
+    return hr;
+}
+static HRESULT WINAPI expr_anim2_put_Target( void *iface, HSTRING value )
+{
+    struct expr_anim2 *impl = iface;
+    const WCHAR *str = value ? WindowsGetStringRawBuffer( value, NULL ) : L"";
+    struct expr_anim_target *t;
+
+    EnterCriticalSection( &expr_targets_cs );
+    if ((t = expr_target_find( impl->owner, TRUE ))) lstrcpynW( t->target, str, ARRAY_SIZE(t->target) );
+    LeaveCriticalSection( &expr_targets_cs );
+    TRACE_(dcompanim)( "expression %p: Target %s\n", impl->owner, debugstr_w( str ) );
+    return t ? S_OK : E_OUTOFMEMORY;
+}
+static const void *expr_anim2_vtbl[] =
+{
+    expr_anim2_QueryInterface, expr_anim2_AddRef, expr_anim2_Release,
+    expr_anim2_GetIids, expr_anim2_GetRuntimeClassName, expr_anim2_GetTrustLevel,
+    expr_anim2_SetBooleanParameter, expr_anim2_get_Target, expr_anim2_put_Target,
+};
+
+static HRESULT expr_anim2_create( IUnknown *owner, void **out )
+{
+    struct expr_anim2 *impl;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->vtbl = expr_anim2_vtbl;
+    impl->ref = 1;
+    IUnknown_AddRef( (impl->owner = owner) );
+    *out = impl;
+    return S_OK;
+}
+
 static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void **out )
 {
     struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
@@ -2408,6 +2530,11 @@ static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void 
         return create_composition_object_view( (IUnknown *)&object->vtbl, out );
     if (IsEqualGUID( iid, &IID_IMap_animations_local ))
         return comp_map_for_owner( (IUnknown *)&object->vtbl, out );
+    /* An ExpressionAnimation's Target: the catch-all answered ICompositionAnimation2 with this table, whose slot 7
+     * then wrote a recording object into get_Target's HSTRING; React Native's animation driver released it as a
+     * string and aborted (Xbox app, right after its splash) */
+    if (IsEqualGUID( iid, &IID_ICompositionAnimation2_early ) && object->vtbl == (const void **)expression_animation_vtbl)
+        return expr_anim2_create( (IUnknown *)&object->vtbl, out );
     /* dcomp's surface-copy interface has a contract (CopySurface must return a surface): surfaces answer it, anything
      * else must refuse rather than hand XAML a vtable whose slot 3 returns nothing */
     if (IsEqualGUID( iid, &IID_IDCompositionSurfaceCopy_local ))
@@ -2432,6 +2559,7 @@ static ULONG WINAPI comp_object_Release( void *iface )
     if (!ref)
     {
         comp_map_owner_gone( &object->vtbl );
+        expr_anim_target_gone( &object->vtbl );
         free( object );
     }
     return ref;
@@ -14157,6 +14285,10 @@ static HRESULT WINAPI expr_animation_QueryInterface( void *iface, REFIID iid, vo
     /* ICompositionObject stays the generic table, as for every recording object: XAML's expression
      * conversion walks Properties and private partner interfaces from there, which only the
      * recording table survives. */
+    /* CompositionAnimation.Target (ICompositionAnimation2): the fallback below hands out a recording object, whose
+     * slot 7 then wrote an object into get_Target's HSTRING (React Native's animation driver aborted on it) */
+    if (IsEqualGUID( iid, &IID_ICompositionAnimation2_early ))
+        return expr_anim2_create( (IUnknown *)&impl->vtbl, out );
     if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
         return create_object4_view( (IUnknown *)&impl->vtbl, out );
     /* A real ICompositionObject view: WinUI calls get_Compositor on it, which on this table would be
@@ -14180,7 +14312,12 @@ static HRESULT WINAPI expr_animation_QueryInterface( void *iface, REFIID iid, vo
     }
     /* Anything else (XAML asks for several private animation interfaces) gets the recording table
      * with the animator-partner slot, not this table whose slots 6/7 are get/put_Expression. */
-    return create_comp_object_vtbl( "ExpressionAnimation", expression_animation_vtbl, out );
+    {
+        /* XAML reaches the animation through such a clone (its private IIDs) and reads Target from that */
+        HRESULT hr = create_comp_object_vtbl( "ExpressionAnimation", expression_animation_vtbl, out );
+        if (SUCCEEDED(hr)) expr_anim_target_copy( &impl->vtbl, *out );
+        return hr;
+    }
 }
 static HRESULT WINAPI expr_view_QueryInterface( void *iface, REFIID iid, void **out )
 {

@@ -309,3 +309,4 @@ dlls/rpcrt4/ndr_winmd.c
 include/rpcasync.h
 include/windows.management.deployment.idl
 include/windows.networking.connectivity.idl
+dlls/appxdeploymentclient/standin.c

@@ -445,14 +445,14 @@ static HRESULT WINAPI connection_profile2_GetTrustLevel( IConnectionProfile2 *if
 
 HRESULT WINAPI connection_profile2_get_IsWwanConnectionProfile( IConnectionProfile2 *iface, boolean *value )
 {
-    FIXME( "iface %p, value %p stub!\n", iface, value );
+    TRACE( "iface %p, value %p: wired.\n", iface, value );
     *value = 0;
     return S_OK;
 }
 
 HRESULT WINAPI connection_profile2_get_IsWlanConnectionProfile( IConnectionProfile2 *iface, boolean *value )
 {
-    FIXME( "iface %p, value %p stub!\n", iface, value );
+    TRACE( "iface %p, value %p: wired.\n", iface, value );
     *value = 0;
     return S_OK;
 }
@@ -475,10 +475,13 @@ HRESULT WINAPI connection_profile2_get_ServiceProviderGuid( IConnectionProfile2 
     return E_NOTIMPL;
 }
 
+/* a wired connection has no signal bars: Windows answers NULL. E_NOTIMPL made the Xbox app's network
+ * check throw and show its offline page. */
 HRESULT WINAPI connection_profile2_GetSignalBars( IConnectionProfile2 *iface, IReference_BYTE **value )
 {
-    FIXME( "iface %p, value %p stub!\n", iface, value );
-    return E_NOTIMPL;
+    TRACE( "iface %p, value %p.\n", iface, value );
+    *value = NULL;
+    return S_OK;
 }
 
 HRESULT WINAPI connection_profile2_GetDomainConnectivityLevel( IConnectionProfile2 *iface, DomainConnectivityLevel *value )

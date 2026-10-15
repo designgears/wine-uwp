@@ -51,6 +51,7 @@ extern HRESULT async_operation_inspectable_create( const GUID *iid, IUnknown *in
 
 extern IActivationFactory *package_manager_factory;
 HRESULT package_volume_create( IPackageVolume **out );
+HRESULT standin_package_create( const WCHAR *family, IPackage **out );
 HRESULT package_list_create( IPackage *package, IIterable_Package **out );
 
 #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \

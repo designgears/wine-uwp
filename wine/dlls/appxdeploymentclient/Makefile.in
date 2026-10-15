@@ -8,5 +8,6 @@ SOURCES = \
 	main.c \
 	package.c \
 	packagelist.c \
+	standin.c \
 	vector.c \
 	volume.c

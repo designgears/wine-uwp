@@ -211,6 +211,19 @@ static HRESULT find_packages( const struct package_filter *filter, IIterable_Pac
     WindowsDeleteString( publisher );
     WindowsDeleteString( family );
 
+    if (!match && filter->family_name)
+    {
+        /* a registered stand-in for a platform package (standin.c) */
+        IPackage *standin;
+        if (standin_package_create( WindowsGetStringRawBuffer( filter->family_name, NULL ), &standin ) == S_OK)
+        {
+            IPackage_Release( package );
+            hr = package_list_create( standin, packages );
+            IPackage_Release( standin );
+            return hr;
+        }
+    }
+
     hr = package_list_create( match ? package : NULL, packages );
     IPackage_Release( package );
     return hr;
