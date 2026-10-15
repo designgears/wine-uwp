@@ -276,3 +276,5 @@ HRESULT ipid_get_dispatch_params(const IPID *ipid, struct apartment **stub_apt,
 HRESULT ipid_get_dest_context(const IPID *ipid, MSHCTX *dest_context, void **dest_context_data);
 HRESULT start_apartment_remote_unknown(struct apartment *apt);
 void get_process_secret(GUID *process_secret);
+BOOL uwp_find_exe_server( REFCLSID clsid, WCHAR *exe, DWORD size );
+

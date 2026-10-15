@@ -1213,7 +1213,7 @@ static size_t emit_pointer(struct gen *g, BYTE kind, BYTE flags, size_t target)
 }
 
 /* one ABI parameter of a method */
-struct param { USHORT flags; BYTE fc; size_t type; BYTE fpu; };
+struct param { USHORT flags; BYTE fc; size_t type; BYTE fpu; UINT32 srv_size; };
 
 #define P_MustSize 0x01
 #define P_MustFree 0x02
@@ -1253,6 +1253,7 @@ static BOOL add_in(struct gen *g, struct wtype *t, struct param *p)
 static BOOL add_out(struct gen *g, struct wtype *t, struct param *p)
 {
     BYTE fc;
+    p->srv_size = t->kind == K_ARRAY ? sizeof(void *) : t->size;
     if (type_fc(t, &fc))
     {
         p->flags = P_Out | P_Basetype | P_SimpleRef;
@@ -1318,6 +1319,8 @@ static BOOL write_method(struct gen *g, struct winmd *md, UINT32 method, struct 
             {
                 params[np].flags = P_Out | P_Basetype | P_SimpleRef;
                 params[np].fc = FC_ULONG;
+                params[np].srv_size = sizeof(UINT32);
+                params[np + 1].srv_size = sizeof(void *);
                 params[np + 1].flags = P_MustSize | P_MustFree | P_Out;
                 params[np + 1].type = emit_pointer(g, FC_RP, FC_ALLOCED_ON_STACK | FC_POINTER_DEREF,
                         emit_pointer(g, FC_OP, 0, emit_array(g, t->elem, off, TRUE)));
@@ -1347,6 +1350,8 @@ static BOOL write_method(struct gen *g, struct winmd *md, UINT32 method, struct 
         {
             params[np].flags = P_Out | P_Basetype | P_SimpleRef;
             params[np].fc = FC_ULONG;
+            params[np].srv_size = sizeof(UINT32);
+            params[np + 1].srv_size = sizeof(void *);
             params[np + 1].flags = P_MustSize | P_MustFree | P_Out;
             params[np + 1].type = emit_pointer(g, FC_RP, FC_ALLOCED_ON_STACK | FC_POINTER_DEREF,
                     emit_pointer(g, FC_OP, 0, emit_array(g, ret->elem, off, TRUE)));
@@ -1389,6 +1394,11 @@ static BOOL write_method(struct gen *g, struct winmd *md, UINT32 method, struct 
 #endif
     for (i = 0; i < np; i++)
     {
+        /* the stub allocates an out parameter's memory itself: say how much, as widl and MIDL do
+         * (bits 13-15, in 8-byte units). Without it a [out] boolean reached the server as NULL. */
+        if ((params[i].flags & P_Out) && !(params[i].flags & P_In) && params[i].srv_size &&
+            params[i].srv_size <= 7 * 8)
+            params[i].flags |= ((params[i].srv_size + 7) / 8) << 13;
         put2(&g->proc, params[i].flags);
         put2(&g->proc, (i + 1) * sizeof(void *));
         if (params[i].flags & P_Basetype) { put1(&g->proc, params[i].fc); put1(&g->proc, 0); }

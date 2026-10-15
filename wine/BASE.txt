@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     accb726aa3a25da22e602b75dd8056f41ca4ac26
-                 wine-uwp: PackageVolume (the system volume); TraceLogging events under trace+tracelogging
+  wine HEAD:     0b191e60ca299d30ab1557d6df820c1864537e2b
+                 wine-uwp: Xbox app dependency checks
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-15T02:35:05Z
+  captured:      2026-10-15T03:04:07Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

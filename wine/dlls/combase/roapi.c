@@ -160,6 +160,41 @@ static void uwp_scan_manifest( const WCHAR *package_dir )
         *end = '<';
         end += 18;
     }
+    /* <com:ExeServer Executable="x.exe" ...> <com:Class Id="GUID" .../> ... </com:ExeServer>: packaged
+     * out-of-process COM servers (the Xbox app's XboxPcAppFT.exe and XboxPcAppAdminServer.exe). They
+     * go in the same table as "{GUID}" -> exe, for create_server(). */
+    for (p = wcsstr( text, L"ExeServer " ); p; p = wcsstr( end, L"ExeServer " ))
+    {
+        WCHAR exe[MAX_PATH], *e;
+
+        if (!(end = wcsstr( p, L"ExeServer>" ))) break;   /* the closing tag, whatever its prefix */
+        *end = 0;
+        exe[0] = 0;
+        if ((q = wcsstr( p, L"Executable=\"" )) && (e = wcschr( q += 12, '"' )) && e > q)
+        {
+            unsigned int i, n = e - q;
+            swprintf( exe, ARRAY_SIZE(exe), L"%s\\", package_dir );
+            i = lstrlenW( exe );
+            if (i + n < ARRAY_SIZE(exe))
+            {
+                memcpy( exe + i, q, n * sizeof(WCHAR) );
+                exe[i + n] = 0;
+                for (; exe[i]; i++) if (exe[i] == '/') exe[i] = '\\';
+            }
+            else exe[0] = 0;
+        }
+        for (q = p; exe[0] && (q = wcsstr( q, L"Class Id=\"" )); q = e)
+        {
+            WCHAR guid[40];
+            q += 10;
+            if (!(e = wcschr( q, '"' ))) break;
+            if (e - q != 36) continue;
+            swprintf( guid, ARRAY_SIZE(guid), L"{%.36s}", q );
+            uwp_add_class( guid, lstrlenW( guid ), exe );
+        }
+        *end = 'E';
+        end += 10;
+    }
     TRACE( "%s: %u classes\n", debugstr_w(package_dir), uwp_classes_count - before );
     free( text );
 }
@@ -193,6 +228,24 @@ static const WCHAR *uwp_find_class( const WCHAR *classid )
     for (i = 0; i < uwp_classes_count; i++)
         if (!wcscmp( uwp_classes[i].classid, classid )) return uwp_classes[i].dll;
     return NULL;
+}
+
+/* the executable of a packaged COM server (<com:ExeServer>) serving clsid, if any */
+BOOL uwp_find_exe_server( REFCLSID clsid, WCHAR *exe, DWORD size )
+{
+    WCHAR guid[40];
+    unsigned int i;
+
+    InitOnceExecuteOnce( &uwp_classes_once, uwp_classes_init, NULL, NULL );
+    StringFromGUID2( clsid, guid, ARRAY_SIZE(guid) );
+    for (i = 0; i < uwp_classes_count; i++)
+    {
+        if (wcsicmp( uwp_classes[i].classid, guid )) continue;
+        if (lstrlenW( uwp_classes[i].dll ) >= size) return FALSE;
+        lstrcpyW( exe, uwp_classes[i].dll );
+        return TRUE;
+    }
+    return FALSE;
 }
 
 static HRESULT get_library_for_classid(const WCHAR *classid, WCHAR **out)

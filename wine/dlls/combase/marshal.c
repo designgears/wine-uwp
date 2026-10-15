@@ -30,6 +30,9 @@
 #include "wine/debug.h"
 #include "wine/exception.h"
 
+extern BOOL CDECL __wine_metadata_ps_lookup(const GUID *iid);
+extern HRESULT CDECL __wine_metadata_ps_factory(REFIID riid, void **out);
+
 WINE_DEFAULT_DEBUG_CHANNEL(ole);
 
 HRESULT WINAPI RPC_CreateClientChannel(const OXID *oxid, const IPID *ipid,
@@ -1103,6 +1106,17 @@ HRESULT WINAPI CoUnmarshalInterface(IStream *stream, REFIID riid, void **ppv)
  * IPIDs identify an interface stub and are apartment scoped
  */
 
+/* The prefix registry names Windows' proxy/stub DLL for many Windows Runtime interfaces, and Wine's
+ * builtin of that name may not have the interface (IUriRuntimeClass -> ieproxy.dll, IPackageVolume
+ * -> appxdeploymentclient.dll). Windows' own DLL always does; here the metadata-based marshaler
+ * stands in when the registered factory refuses. */
+static HRESULT metadata_facbuf_for_iid(REFIID riid, IPSFactoryBuffer **facbuf)
+{
+    if (!__wine_metadata_ps_lookup(riid)) return E_NOINTERFACE;
+    TRACE("registered factory refused %s, using metadata\n", debugstr_guid(riid));
+    return __wine_metadata_ps_factory(&IID_IPSFactoryBuffer, (void **)facbuf);
+}
+
 static inline HRESULT get_facbuf_for_iid(REFIID riid, IPSFactoryBuffer **facbuf)
 {
     HRESULT       hr;
@@ -1111,7 +1125,9 @@ static inline HRESULT get_facbuf_for_iid(REFIID riid, IPSFactoryBuffer **facbuf)
     hr = CoGetPSClsid(riid, &clsid);
     if (hr != S_OK)
         return hr;
-    return CoGetClassObject(&clsid, CLSCTX_INPROC_SERVER | CLSCTX_PS_DLL, NULL, &IID_IPSFactoryBuffer, (void **)facbuf);
+    hr = CoGetClassObject(&clsid, CLSCTX_INPROC_SERVER | CLSCTX_PS_DLL, NULL, &IID_IPSFactoryBuffer, (void **)facbuf);
+    if (FAILED(hr) && metadata_facbuf_for_iid(riid, facbuf) == S_OK) hr = S_OK;
+    return hr;
 }
 
 /* marshals an object into a STDOBJREF structure */
@@ -1156,6 +1172,11 @@ HRESULT marshal_object(struct apartment *apt, STDOBJREF *stdobjref, REFIID riid,
             if (hr == S_OK) {
                 hr = IPSFactoryBuffer_CreateStub(psfb, riid, manager->object, &stub);
                 IPSFactoryBuffer_Release(psfb);
+                if (FAILED(hr) && metadata_facbuf_for_iid(riid, &psfb) == S_OK)
+                {
+                    hr = IPSFactoryBuffer_CreateStub(psfb, riid, manager->object, &stub);
+                    IPSFactoryBuffer_Release(psfb);
+                }
                 if (hr != S_OK)
                     ERR("Failed to create an IRpcStubBuffer from IPSFactory for %s with error %#lx\n",
                         debugstr_guid(riid), hr);
@@ -2001,6 +2022,12 @@ static HRESULT proxy_manager_create_ifproxy(
             hr = IPSFactoryBuffer_CreateProxy(psfb, (IUnknown*)&This->IMultiQI_iface, riid,
                                               &ifproxy->proxy, &ifproxy->iface);
             IPSFactoryBuffer_Release(psfb);
+            if (FAILED(hr) && metadata_facbuf_for_iid(riid, &psfb) == S_OK)
+            {
+                hr = IPSFactoryBuffer_CreateProxy(psfb, (IUnknown*)&This->IMultiQI_iface, riid,
+                                                  &ifproxy->proxy, &ifproxy->iface);
+                IPSFactoryBuffer_Release(psfb);
+            }
             if (hr != S_OK)
                 ERR("Could not create proxy for interface %s, error %#lx\n", debugstr_guid(riid), hr);
         }

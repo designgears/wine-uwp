@@ -10785,3 +10785,50 @@ package ships inside the app as `gamingservices-signed.appxbundle`), `Windows.Sy
 (sign-in: `GetShellUserAsync`), `IXpaftFactory.ProcessHandle` -> ERROR_NOACCESS across processes,
 `BackgroundTaskRegistration` (endpoints not registered), `BadgeUpdateManager` (0x803E0105), and the FT
 server's `Launcher.QueryUriSupportAsync` (E_NOTIMPL).
+
+### Xbox app: the dependency checks, and where it stops (Gaming Services)
+
+10. **`RtlGetDeviceFamilyInfoEnum` reported version 0.** On Windows its `uapInfo` is the packed OS version
+    (`major<<48 | minor<<32 | build<<16 | UBR`), which native twinapi.appcore returns as
+    `AnalyticsInfo.VersionInfo.DeviceFamilyVersion`. It is computed from `RtlGetVersion` and `UBR` now.
+11. **`VerifyVersionInfoW(10.0.19042)` returned FALSE (ERROR_OLD_WIN_VERSION): kernelbase's manifest
+    compatibility lie** (Windows 8 for an exe with no `supportedOS` and an old PE subsystem version). Windows
+    does not lie to a packaged app, which states its OS range in `TargetDeviceFamily`. The app logged
+    "Deployment requirement: StoreInstall, reason OsVersionTooOld"; the check is `IsWindowsVersionOrGreater`
+    at `XboxPcApp.exe+0x6ddb24` (0x4a62 = 19042). Setting the prefix to win11 changed nothing, which is
+    what pointed away from the version table and at the shim.
+12. **Out parameters of metadata-built proxies had no `ServerAllocSize`.** Wine's stub then passed NULL for
+    an `[out] boolean`, and the FT server's `UserUtilities::IsInAdministratorsGroup` wrote through it
+    (ERROR_NOACCESS at the client). widl and MIDL always set bits 13-15 for simple-ref and pointer outs, and
+    `ndr_winmd.c` does now.
+13. **Packaged COM exe servers are found from the AppxManifest** (`<com:ExeServer Executable=...>`
+    `<com:Class Id=...>`, in combase's manifest scan, used by `create_server` when the registry has no
+    `LocalServer32`). The hand-made `LocalServer32` keys for XboxPcAppFT's two CLSIDs are deleted from the dev
+    prefix, and the FT server still starts. `XboxPcAppAdminServer.exe` (`{1B222FE2}`) is reached the same way.
+14. **A registered proxy/stub factory that does not have the interface now falls back to the metadata
+    factory.** The prefix registry names Windows' PS DLL for many WinRT interfaces, and Wine's builtin of the
+    same name may lack it: `IUriRuntimeClass` -> ieproxy.dll (CreateStub E_NOINTERFACE), `IPackageVolume` ->
+    appxdeploymentclient.dll (no class object at all). Both now marshal.
+
+**Where it stops.** The app then installs Gaming Services itself.
+- The admin server calls `PackageManager`'s `IPackageManager3.AddPackageAsync(uri, deps, options, volume)` on
+  the bundled `gamingservices-signed.appxbundle`. Our PackageManager lacks `IPackageManager3`, and C++/WinRT
+  dereferences the failed QI (`XboxPcAppAdminServer.exe+0x17b3`). Its `AddPackageAsync` and 18 other
+  methods are stubs too.
+- The UI shows "Try the update again - 0x800703e6" over "Installing update.. 0%"
+  (`docs/screenshots/xbox-gaming-services-install-failed.png`). When the admin server is not reachable it
+  shows "Gaming Services required" instead (`docs/screenshots/xbox-gaming-services-required.png`).
+- No dialog can be skipped: Escape does nothing, and the only button installs.
+- Getting past it means a real AppX deployment, *and* then running Gaming Services. That is
+  `Microsoft.GamingServices` 37.114.26001.0: two auto-start NT services (`GamingServices`, LocalSystem;
+  `GamingServicesNet`, LocalService) whose package carries the kernel drivers `drivers\xvdd.sys`
+  (virtual disks) and `drivers\gameflt.sys` (filesystem filter).
+- The app waits for `GrtsStatusMonitor` to report the GamePlatform API Ready;
+  `Microsoft.GamePlatform.Services.PackageQueue` returns 0x87E00196 meanwhile.
+- After that, from the app's own log: `Windows.System.User` is not registered (sign-in), `BackgroundTaskRegistration`
+  (endpoints not registered), `BadgeUpdateManager`, `Launcher.QueryUriSupportAsync` (FT server), and XAML
+  asks for the unregistered context switcher `{00000352}` and fail-fasts E_INVALIDARG (ignored here).
+
+Regression after this round: Calculator AE 0, Media Player 2250, `kb` 0/0/0. The kernelbase change (no
+version lie for packaged apps) and the real DeviceFamilyVersion apply to every packaged app; Shapr3D was not
+re-tested against them.

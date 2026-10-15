@@ -497,6 +497,13 @@ static HRESULT create_server(REFCLSID rclsid, HANDLE *process)
     }
     if (FAILED(hr))
     {
+        /* a COM server declared in the package manifest, which Windows registers with the package */
+        if (uwp_find_exe_server(rclsid, command, MAX_PATH))
+        {
+            is_opposite = FALSE;
+            TRACE("packaged server %s for %s\n", debugstr_w(command), debugstr_guid(rclsid));
+            goto have_command;
+        }
         ERR("class %s not registered\n", debugstr_guid(rclsid));
         return hr;
     }
@@ -508,6 +515,8 @@ static HRESULT create_server(REFCLSID rclsid, HANDLE *process)
         WARN("No default value for LocalServer32 key\n");
         return REGDB_E_CLASSNOTREG; /* FIXME: check retval */
     }
+
+have_command:
 
     memset(&sinfo, 0, sizeof(sinfo));
     sinfo.cb = sizeof(sinfo);

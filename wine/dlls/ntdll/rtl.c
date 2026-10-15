@@ -2075,11 +2075,39 @@ static void arm_uwp_breaks( void );
 
 void WINAPI RtlGetDeviceFamilyInfoEnum(ULONGLONG *version, DWORD *family, DWORD *form)
 {
-    FIXME("%p %p %p: stub\n", version, family, form);
+    TRACE("%p %p %p\n", version, family, form);
 
     arm_uwp_breaks();   /* debugging aid: reaches threads that never call RtlIsMultiSessionSku */
 
-    if (version) *version = 0;
+    /* the packed OS version, as AnalyticsInfo.VersionInfo.DeviceFamilyVersion reports it. It was 0,
+     * and the Xbox app then judged the OS too old to install Gaming Services. */
+    if (version)
+    {
+        RTL_OSVERSIONINFOEXW info = { sizeof(info) };
+        ULONGLONG revision = 0;
+
+        RtlGetVersion( &info );
+        {
+            UNICODE_STRING name;
+            OBJECT_ATTRIBUTES attr;
+            HANDLE key;
+            char buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(DWORD)];
+            DWORD len;
+
+            RtlInitUnicodeString( &name, L"\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion" );
+            InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, 0, NULL );
+            if (!NtOpenKey( &key, KEY_QUERY_VALUE, &attr ))
+            {
+                RtlInitUnicodeString( &name, L"UBR" );
+                if (!NtQueryValueKey( key, &name, KeyValuePartialInformation, buf, sizeof(buf), &len ) &&
+                    ((KEY_VALUE_PARTIAL_INFORMATION *)buf)->Type == REG_DWORD)
+                    revision = *(DWORD *)((KEY_VALUE_PARTIAL_INFORMATION *)buf)->Data;
+                NtClose( key );
+            }
+        }
+        *version = ((ULONGLONG)info.dwMajorVersion << 48) | ((ULONGLONG)info.dwMinorVersion << 32) |
+                   ((ULONGLONG)(info.dwBuildNumber & 0xffff) << 16) | (revision & 0xffff);
+    }
     if (family)
     {
         WCHAR buffer[16];

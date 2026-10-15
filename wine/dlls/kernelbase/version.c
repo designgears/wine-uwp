@@ -172,6 +172,8 @@ static const struct
  */
 static RTL_OSVERSIONINFOEXW current_version;
 
+static BOOL is_packaged_process(void);
+
 static BOOL CALLBACK init_current_version(PINIT_ONCE init_once, PVOID parameter, PVOID *context)
 {
     struct acci
@@ -195,6 +197,10 @@ static BOOL CALLBACK init_current_version(PINIT_ONCE init_once, PVOID parameter,
             break;
 
     if (idx < 0) return TRUE;
+    /* No version lie for a packaged app: it states the OS versions it supports in its package
+     * manifest (TargetDeviceFamily) and gets the true version. The Xbox app checks for
+     * 10.0.19042 through VerifyVersionInfo and has no compatibility manifest. */
+    if (is_packaged_process()) return TRUE;
     ver = &windows8_version_info;
 
     if (RtlQueryInformationActivationContext(0, NtCurrentTeb()->Peb->ActivationContextData, NULL,
