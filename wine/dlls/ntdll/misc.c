@@ -23,12 +23,14 @@
 
 #include "ntstatus.h"
 #include "wine/debug.h"
+#include "wine/exception.h"
 #include "ntdll_misc.h"
 #include "wmistr.h"
 #include "evntrace.h"
 #include "evntprov.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(ntdll);
+WINE_DECLARE_DEBUG_CHANNEL(tracelogging);
 
 LPCSTR debugstr_us( const UNICODE_STRING *us )
 {
@@ -311,7 +313,92 @@ ULONG WINAPI EtwEventRegister( LPCGUID provider, PENABLECALLBACK callback, PVOID
     if (!handle) return ERROR_INVALID_PARAMETER;
 
     *handle = 0xdeadbeef;
+    /* With trace+tracelogging, enable every provider at verbose level so TraceLogging (and wil)
+     * events are written, and print them below: it is the app's own log. */
+    if (TRACE_ON(tracelogging) && callback)
+        callback( provider, 1 /* EVENT_CONTROL_CODE_ENABLE_PROVIDER */, 5, ~(ULONGLONG)0, 0, NULL, context );
     return ERROR_SUCCESS;
+}
+
+/* decode a TraceLogging event (self-describing: the event and field names travel with the data) */
+static void dump_tracelogging( ULONG count, const EVENT_DATA_DESCRIPTOR *data )
+{
+    const char *provider = "?", *meta = NULL, *end = NULL, *p;
+    char line[900];
+    size_t len = 0;
+    ULONG i, next = 0;
+
+#define TLG_OUT(...) do { if (len < sizeof(line) - 1) len += snprintf( line + len, sizeof(line) - len, __VA_ARGS__ ); \
+                      if (len > sizeof(line) - 1) len = sizeof(line) - 1; } while (0)
+    __TRY
+    {
+        for (i = 0; i < count; i++)
+        {
+            BYTE type = data[i].Reserved & 0xff;
+            if (type == 2) provider = (const char *)(ULONG_PTR)data[i].Ptr + 2;
+            else if (type == 1) { meta = (const char *)(ULONG_PTR)data[i].Ptr; end = meta + data[i].Size; }
+            else if (type == 0 && !next) next = i;
+        }
+        p = meta ? meta + 2 : end;
+        while (p < end && (*p++ & 0x80)) ;   /* event tags */
+        if (p < end)
+        {
+            TLG_OUT( "%s %s:", provider, p );
+            p += strlen( p ) + 1;
+        }
+        while (p < end && next < count)
+        {
+            const char *name = p;
+            BYTE in, out = 0;
+            const BYTE *v;
+            ULONG size;
+
+            p += strlen( p ) + 1;
+            in = *p++;
+            if (in & 0x80) { out = *p++; while (out & 0x80 && p < end) out = *p++; }
+            if ((in & 0x60) == 0x20) p += 2;   /* constant count */
+            if ((in & 0x1f) == 24) { TLG_OUT( " %s{", name ); continue; }   /* struct: members follow */
+            if (in & 0x40)                      /* variable-count array: count, then data */
+            {
+                TLG_OUT( " %s=[%u]", name, *(const USHORT *)(ULONG_PTR)data[next].Ptr );
+                next += 2;
+                continue;
+            }
+            v = (const BYTE *)(ULONG_PTR)data[next].Ptr;
+            size = data[next].Size;
+            next++;
+            switch (in & 0x1f)
+            {
+            case 1: TLG_OUT( " %s=%s", name, debugstr_wn( (const WCHAR *)v, size / 2 ) ); break;
+            case 2: TLG_OUT( " %s=%s", name, debugstr_an( (const char *)v, size ) ); break;
+            case 3: case 4: TLG_OUT( " %s=%u", name, v[0] ); break;
+            case 5: case 6: TLG_OUT( " %s=%u", name, *(const USHORT *)v ); break;
+            case 7: TLG_OUT( " %s=%d", name, *(const int *)v ); break;
+            case 8: case 13: case 20: TLG_OUT( " %s=%#x", name, *(const UINT *)v ); break;
+            case 9: case 10: case 21: case 16: TLG_OUT( " %s=%#I64x", name, *(const ULONGLONG *)v ); break;
+            case 11: TLG_OUT( " %s=%f", name, *(const float *)v ); break;
+            case 12: TLG_OUT( " %s=%f", name, *(const double *)v ); break;
+            case 15: TLG_OUT( " %s=%s", name, debugstr_guid( (const GUID *)v ) ); break;
+            case 22: case 23: case 14: case 25:  /* counted: a UINT16 size descriptor, then the data */
+                if (next >= count) break;
+                v = (const BYTE *)(ULONG_PTR)data[next].Ptr;
+                size = data[next].Size;
+                next++;
+                if ((in & 0x1f) == 22) TLG_OUT( " %s=%s", name, debugstr_wn( (const WCHAR *)v, size / 2 ) );
+                else if ((in & 0x1f) == 23) TLG_OUT( " %s=%s", name, debugstr_an( (const char *)v, size ) );
+                else TLG_OUT( " %s=<%lu bytes>", name, size );
+                break;
+            default: TLG_OUT( " %s=<type %u>", name, in & 0x1f ); break;
+            }
+        }
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        TLG_OUT( " <fault>" );
+    }
+    __ENDTRY
+#undef TLG_OUT
+    if (len) TRACE_(tracelogging)( "%s\n", line );
 }
 
 /******************************************************************************
@@ -375,8 +462,9 @@ ULONG WINAPI EtwEventWriteString( REGHANDLE handle, UCHAR level, ULONGLONG keywo
 ULONG WINAPI EtwEventWriteTransfer( REGHANDLE handle, PCEVENT_DESCRIPTOR descriptor, LPCGUID activity,
                                     LPCGUID related, ULONG count, PEVENT_DATA_DESCRIPTOR data )
 {
-    FIXME("%s, %p, %s, %s, %lu, %p: stub\n", wine_dbgstr_longlong(handle), descriptor,
-          debugstr_guid(activity), debugstr_guid(related), count, data);
+    if (TRACE_ON(tracelogging)) dump_tracelogging( count, data );
+    else FIXME("%s, %p, %s, %s, %lu, %p: stub\n", wine_dbgstr_longlong(handle), descriptor,
+               debugstr_guid(activity), debugstr_guid(related), count, data);
     return ERROR_SUCCESS;
 }
 
@@ -463,7 +551,8 @@ BOOLEAN WINAPI EtwEventEnabled( REGHANDLE handle, const EVENT_DESCRIPTOR *descri
 ULONG WINAPI EtwEventWrite( REGHANDLE handle, const EVENT_DESCRIPTOR *descriptor, ULONG count,
     EVENT_DATA_DESCRIPTOR *data )
 {
-    FIXME("(%s, %p, %lu, %p): stub\n", wine_dbgstr_longlong(handle), descriptor, count, data);
+    if (TRACE_ON(tracelogging)) dump_tracelogging( count, data );
+    else FIXME("(%s, %p, %lu, %p): stub\n", wine_dbgstr_longlong(handle), descriptor, count, data);
     return ERROR_SUCCESS;
 }
 
@@ -474,8 +563,9 @@ ULONG WINAPI EtwEventWriteEx( REGHANDLE handle, const EVENT_DESCRIPTOR *descript
                             ULONG flags, const GUID *activity_id, const GUID *related_activity_id,
                             ULONG data_count, EVENT_DATA_DESCRIPTOR *data )
 {
-    FIXME( "(%s, %p, %#I64x, %lu, %p, %p, %lu, %p): stub\n", wine_dbgstr_longlong(handle), descriptor, filter,
-           flags, activity_id, related_activity_id, data_count, data );
+    if (TRACE_ON(tracelogging)) dump_tracelogging( data_count, data );
+    else FIXME( "(%s, %p, %#I64x, %lu, %p, %p, %lu, %p): stub\n", wine_dbgstr_longlong(handle), descriptor, filter,
+                flags, activity_id, related_activity_id, data_count, data );
     return ERROR_SUCCESS;
 }
 

@@ -24,6 +24,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(iertutil);
 struct uri
 {
     IUriRuntimeClass IUriRuntimeClass_iface;
+    IStringable IStringable_iface;
     IUri *uri;
     LONG ref;
 };
@@ -43,6 +44,13 @@ static HRESULT STDMETHODCALLTYPE uri_QueryInterface(IUriRuntimeClass *iface, REF
     {
         IUnknown_AddRef(iface);
         *out = iface;
+        return S_OK;
+    }
+
+    if (IsEqualGUID(iid, &IID_IStringable))
+    {
+        IUnknown_AddRef(iface);
+        *out = &impl_from_IUriRuntimeClass(iface)->IStringable_iface;
         return S_OK;
     }
 
@@ -228,6 +236,60 @@ static HRESULT STDMETHODCALLTYPE uri_RawUri(IUriRuntimeClass *iface, HSTRING *va
     return uri_prop_to_hstring(impl->uri, Uri_PROPERTY_RAW_URI, value);
 }
 
+/* IStringable: Uri.ToString() is the URI in its canonical absolute form */
+static inline struct uri *impl_from_IStringable(IStringable *iface)
+{
+    return CONTAINING_RECORD(iface, struct uri, IStringable_iface);
+}
+
+static HRESULT STDMETHODCALLTYPE uri_stringable_QueryInterface(IStringable *iface, REFIID iid, void **out)
+{
+    return IUriRuntimeClass_QueryInterface(&impl_from_IStringable(iface)->IUriRuntimeClass_iface, iid, out);
+}
+
+static ULONG STDMETHODCALLTYPE uri_stringable_AddRef(IStringable *iface)
+{
+    return IUriRuntimeClass_AddRef(&impl_from_IStringable(iface)->IUriRuntimeClass_iface);
+}
+
+static ULONG STDMETHODCALLTYPE uri_stringable_Release(IStringable *iface)
+{
+    return IUriRuntimeClass_Release(&impl_from_IStringable(iface)->IUriRuntimeClass_iface);
+}
+
+static HRESULT STDMETHODCALLTYPE uri_stringable_GetIids(IStringable *iface, ULONG *count, IID **iids)
+{
+    return IUriRuntimeClass_GetIids(&impl_from_IStringable(iface)->IUriRuntimeClass_iface, count, iids);
+}
+
+static HRESULT STDMETHODCALLTYPE uri_stringable_GetRuntimeClassName(IStringable *iface, HSTRING *name)
+{
+    return IUriRuntimeClass_GetRuntimeClassName(&impl_from_IStringable(iface)->IUriRuntimeClass_iface, name);
+}
+
+static HRESULT STDMETHODCALLTYPE uri_stringable_GetTrustLevel(IStringable *iface, TrustLevel *level)
+{
+    return IUriRuntimeClass_GetTrustLevel(&impl_from_IStringable(iface)->IUriRuntimeClass_iface, level);
+}
+
+static HRESULT STDMETHODCALLTYPE uri_stringable_ToString(IStringable *iface, HSTRING *value)
+{
+    struct uri *impl = impl_from_IStringable(iface);
+    TRACE("iface %p, value %p.\n", iface, value);
+    return uri_prop_to_hstring(impl->uri, Uri_PROPERTY_ABSOLUTE_URI, value);
+}
+
+static const struct IStringableVtbl uri_stringable_vtbl =
+{
+    uri_stringable_QueryInterface,
+    uri_stringable_AddRef,
+    uri_stringable_Release,
+    uri_stringable_GetIids,
+    uri_stringable_GetRuntimeClassName,
+    uri_stringable_GetTrustLevel,
+    uri_stringable_ToString,
+};
+
 static HRESULT STDMETHODCALLTYPE uri_SchemeName(IUriRuntimeClass *iface, HSTRING *value)
 {
     struct uri *impl = impl_from_IUriRuntimeClass(iface);
@@ -285,6 +347,7 @@ static HRESULT uri_object_create(IUri *uri, IUriRuntimeClass **instance)
         return E_OUTOFMEMORY;
     }
     uri_impl->IUriRuntimeClass_iface.lpVtbl = &uri_vtbl;
+    uri_impl->IStringable_iface.lpVtbl = &uri_stringable_vtbl;
     uri_impl->uri = uri;
     uri_impl->ref = 1;
     *instance = &uri_impl->IUriRuntimeClass_iface;
@@ -504,6 +567,7 @@ static HRESULT STDMETHODCALLTYPE uri_factory_CreateUri(IUriRuntimeClassFactory *
     }
 
     uri_impl->IUriRuntimeClass_iface.lpVtbl = &uri_vtbl;
+    uri_impl->IStringable_iface.lpVtbl = &uri_stringable_vtbl;
     uri_impl->uri = uri;
     uri_impl->ref = 1;
 

@@ -39,6 +39,7 @@ SOURCES = \
 	ole32_objidl.idl \
 	ole32_oleidl.idl \
 	ole32_unknwn.idl \
+	ole32_weakreference.idl \
 	ole32res.rc \
 	oleobj.c \
 	oleproxy.c \

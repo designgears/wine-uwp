@@ -269,13 +269,33 @@ HRESULT package_list_create( IPackage *package, IIterable_Package **out )
     return S_OK;
 }
 
-/* Package change notifications (ordinals 39 and 40). Windows.ApplicationModel registers with three
- * strings and a flags word and only records that it is registered; nothing installs or removes
- * packages behind an app's back here, so there is never a notification to deliver. */
-HRESULT WINAPI RegisterNotificationForUser( const void *id, const WCHAR *a, const WCHAR *b, const WCHAR *c,
-                                            DWORD flags )
+/* Package change notifications (ordinals 39 and 40). Windows.ApplicationModel registers with the
+ * user's SID, an event GUID and a package family (or "*"), then opens and watches
+ * HKLM\...\AppModel\Deployment\Package\<family>\<SID>\<GUID>, which the AppX service creates as a
+ * volatile key on registration and writes to when a package changes. Nothing installs or removes
+ * packages behind an app's back here, so the key only has to exist: without it PackageCatalog's
+ * event registrations failed with ERROR_FILE_NOT_FOUND (the Xbox app's dependency monitor). */
+HRESULT WINAPI RegisterNotificationForUser( const void *id, const WCHAR *sid, const WCHAR *event,
+                                            const WCHAR *family, DWORD flags )
 {
-    FIXME( "(%p, %s, %s, %s, %#lx) stub\n", id, debugstr_w(a), debugstr_w(b), debugstr_w(c), flags );
+    WCHAR path[512];
+    HKEY key;
+    LONG ret;
+
+    TRACE( "(%p, %s, %s, %s, %#lx)\n", id, debugstr_w(sid), debugstr_w(event), debugstr_w(family), flags );
+
+    if (!sid || !event || !family) return E_INVALIDARG;
+    swprintf( path, ARRAY_SIZE(path), L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\"
+              L"CurrentVersion\\AppModel\\Deployment\\Package\\%s\\%s\\%s", family, sid, event );
+    ret = RegCreateKeyExW( HKEY_LOCAL_MACHINE, path, 0, NULL, REG_OPTION_VOLATILE, KEY_ALL_ACCESS, NULL, &key, NULL );
+    if (ret) return HRESULT_FROM_WIN32( ret );
+    /* the change counter the watcher reads first, bumped by the service on every change */
+    if (RegQueryValueExW( key, L"Version", NULL, NULL, NULL, NULL ))
+    {
+        UINT64 version = 0;
+        RegSetValueExW( key, L"Version", 0, REG_QWORD, (BYTE *)&version, sizeof(version) );
+    }
+    RegCloseKey( key );
     return S_OK;
 }
 

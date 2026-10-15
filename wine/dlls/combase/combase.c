@@ -33,6 +33,10 @@
 #include "wine/debug.h"
 #include "wine/exception.h"
 
+static const CLSID CLSID_MetadataPSFactory = {0x00000355, 0x0000, 0x0000, {0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x46}};
+extern BOOL CDECL __wine_metadata_ps_lookup(const GUID *iid);
+extern HRESULT CDECL __wine_metadata_ps_factory(REFIID riid, void **out);
+
 WINE_DEFAULT_DEBUG_CHANNEL(ole);
 
 HINSTANCE hProxyDll;
@@ -1752,6 +1756,12 @@ static HRESULT com_get_class_object(REFCLSID rclsid, DWORD clscontext,
         clscontext |= CLSCTX_INPROC_SERVER;
     }
 
+    if ((clscontext & CLSCTX_INPROC_SERVER) && IsEqualCLSID(rclsid, &CLSID_MetadataPSFactory))
+    {
+        apartment_release(apt);
+        return __wine_metadata_ps_factory(riid, obj);
+    }
+
     if (clscontext & CLSCTX_INPROC_SERVER)
     {
         if (IsEqualCLSID(rclsid, &CLSID_InProcFreeMarshaler) ||
@@ -2394,6 +2404,14 @@ HRESULT WINAPI CoGetPSClsid(REFIID riid, CLSID *pclsid)
     hr = get_ps_clsid_from_registry(path, KEY_READ, pclsid);
     if (FAILED(hr) && (opposite == KEY_WOW64_32KEY || (IsWow64Process(GetCurrentProcess(), &is_wow64) && is_wow64)))
         hr = get_ps_clsid_from_registry(path, opposite | KEY_READ, pclsid);
+
+    /* A Windows Runtime interface with no registered proxy/stub is marshaled from its metadata,
+     * by the MetadataPSFactory (rpcrt4's ndr_winmd.c), as on Windows. */
+    if (hr != S_OK && __wine_metadata_ps_lookup(riid))
+    {
+        *pclsid = CLSID_MetadataPSFactory;
+        hr = S_OK;
+    }
 
     if (hr == S_OK)
         TRACE("() Returning CLSID %s\n", debugstr_guid(pclsid));

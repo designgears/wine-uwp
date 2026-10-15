@@ -10716,3 +10716,72 @@ is the closest model. Further known gaps after it: Gaming Services (`Microsoft.G
 `XboxPcAppFT.RequestFetchIfNeededResult` activatable class.
 
 Regression after the six fixes: Calculator AE 0, Media Player 2250 colours, `kb` enter/bs/esc 0/0/0.
+
+## 2026-10-14 (continued): metadata-based marshaling, and the Xbox app to its own UI
+
+**The MetadataPSFactory exists now** (`dlls/rpcrt4/ndr_winmd.c`, ~1300 lines). CLSID `{00000355}`, as on Windows.
+- **Lookup.** `CoGetPSClsid` falls back to it for an IID with no registered proxy that metadata knows, and
+  `CoGetClassObject` serves the CLSID. On first use it maps the package's `.winmd` files
+  (`WINE_UWP_PACKAGE_PATH`) and `system32\WinMetadata`, indexes every TypeDef by name and every interface and
+  delegate by `GuidAttribute`, and finds the generic instances named in the package's own signatures and
+  TypeSpecs. Their PIIDs are SHA-1 over the WinRT signature (`pinterface(...)`, `rc(...)`, `struct(...)`,
+  `enum(...)`, `delegate(...)`, `string`, `g16`...). A generic instance is expanded through its definition's
+  methods and required interfaces (`IVector<T>` -> `IIterable<T>` -> `IIterator<T>`, `IAsyncOperation<T>`
+  -> its handler). 61 files, 18,716 types and 11,624 interfaces index at start-up.
+- **Format strings.** They follow what widl emits for the same IDL: HSTRING through combase's
+  `HSTRING_User*` (`FC_USER_MARSHAL`), interfaces as `FC_IP` with a constant IID, structs as
+  `FC_BOGUS_STRUCT`, `GUID` as `FC_STRUCT`. Pass, fill and receive arrays become conformant arrays correlated
+  to their UINT32 count parameter. On x64, structs other than 1/2/4/8 bytes are passed by simple reference.
+- **Proxies and stubs.** They are `ndr_typelib.c`'s objects, factored into `ndr_create_generated_proxy/stub`.
+  Interfaces delegate to IInspectable's proxy; delegates derive from IUnknown with `Invoke` at slot 3.
+- **Not yet supported:** interface pointers inside structs (`gamestreaming_sdk.AudioConfigurationOptions`
+  logs a FIXME).
+- `IXpaftFactory`, its 45 component interfaces, `TypedEventHandler`/`EventHandler`/`IAsyncOperation`
+  instances and their completion handlers all cross to `XboxPcAppFT.exe`.
+
+Each further blocker, in order:
+1. **ntdll ran a threadpool object's `FinalizationCallback` after every callback** (upstream Wine). Windows
+   runs it once, when the object is released and its last callback has finished. Native threadpoolwinrt
+   releases a `ThreadPoolTimer`'s handler there, so the FT server crashed on the timer's next tick (NULL at
+   `threadpoolwinrt!CThreadPoolTimer::TimerCallback+0x6d`). It now runs once, after the last callback of a
+   released object, or is posted to the pool by `TpRelease*` when nothing is in flight.
+2. **`FileIO.ReadBufferAsync`** was E_NOTIMPL, which held the "Launching XBOX" splash. Implemented with a sized
+   `Windows.Storage.Streams.Buffer` (`buffer_create`, the stream-copy buffer generalised).
+3. **`IConnectionCost2`** (`BackgroundDataUsageRestricted` = FALSE): C++/WinRT dereferenced the failed QI.
+4. **Proxies for `IWeakReference` / `IWeakReferenceSource`** in ole32, for C++/WinRT `weak_ref` on a proxy.
+5. **`RpcServerInqCallAttributesW/A`** (protocol, locality, client PID, auth level), plus the
+   `RPC_CALL_ATTRIBUTES_V1..V3` types in `rpcasync.h`. It was a `@ stub`, and the FT server died with
+   EXCEPTION_WINE_STUB inside a call.
+6. **`Uri` had no `IStringable`.**
+7. **`PackageCatalog` events: `RegisterNotificationForUser` now creates the volatile
+   `...\AppModel\Deployment\Package\<family>\<SID>\<event GUID>` key with a `Version` QWORD.** Native
+   Windows.ApplicationModel opens and watches that key, which the AppX service creates. Without it
+   `EventListenerAdded` failed with ERROR_FILE_NOT_FOUND, and the app's `DependencyMonitor` never existed.
+   Found with `WINE_UWP_BP` on wil's `Return_Hr` (`edx` = source line, `r9` = HRESULT), then the line's
+   branch.
+8. **`IPackageManager4.GetPackageVolumesAsync`**, and then a real **`PackageVolume`** (the system volume).
+   The first version returned an empty list, and the app said "Failed to find the system volume for install"
+   (E_UNEXPECTED, the "Try the update again" dialog). It was the empty-collection trap from AGENTS.md again.
+9. **`DisableThreadLibraryCalls` failed for a module with a TLS directory**, as upstream Wine and old Windows
+   documentation have it. `Windows.ApplicationModel.LockScreen.dll`'s DllMain *returns* that result, so the
+   DLL could not load (ERROR_DLL_INIT_FAILED for `UserProfilePersonalizationSettings`, then a noexcept
+   abort). It now succeeds, and the TLS callbacks of such modules keep running on thread attach and detach.
+   Found by loading the DLL alone in `probe-load.exe` under `+relay`.
+
+**The tool that made the second half fast: `trace+tracelogging`.** With the channel on, ntdll's
+`EtwEventRegister` enables every provider at verbose level, and `EtwEventWrite*` decode each TraceLogging
+event from its self-describing metadata. The Xbox app's own `LogMsgError` lines name every failure with
+source file, line and HRESULT ("GetSystemPackageVolumeAsync - Failed to find the system volume for install").
+
+Also fixed: `sync-wine.sh --check` reported random files as "unlisted". `printf | grep -q` under
+`pipefail`: grep's early exit SIGPIPEs printf.
+
+**State:** both processes stay up. React Native renders the app's own **"Gaming Services required"** dialog
+over the splash (`docs/screenshots/xbox-gaming-services-required.png`). Regression after each step:
+Calculator AE 0, Media Player 2250, `kb` 0/0/0.
+
+Next, from the app's log: Gaming Services (`Microsoft.GamePlatform.Services.PackageQueue` -> 0x87E00196; the
+package ships inside the app as `gamingservices-signed.appxbundle`), `Windows.System.User` not registered
+(sign-in: `GetShellUserAsync`), `IXpaftFactory.ProcessHandle` -> ERROR_NOACCESS across processes,
+`BackgroundTaskRegistration` (endpoints not registered), `BadgeUpdateManager` (0x803E0105), and the FT
+server's `Launcher.QueryUriSupportAsync` (E_NOTIMPL).

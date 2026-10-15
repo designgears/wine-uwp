@@ -31,7 +31,7 @@ struct copy_buffer
     IBufferByteAccess IBufferByteAccess_iface;
     LONG ref;
     UINT32 capacity, length;
-    BYTE data[COPY_CHUNK];
+    BYTE data[];
 };
 
 static inline struct copy_buffer *impl_from_IBuffer( IBuffer *iface )
@@ -298,6 +298,20 @@ static ULONG WINAPI copy_params_Release( IUnknown *iface )
 
 static const IUnknownVtbl copy_params_vtbl = { copy_params_QueryInterface, copy_params_AddRef, copy_params_Release };
 
+/* A Windows.Storage.Streams.Buffer of the given capacity, empty. */
+HRESULT buffer_create( UINT32 capacity, IBuffer **out )
+{
+    struct copy_buffer *buffer;
+
+    if (!(buffer = calloc( 1, offsetof( struct copy_buffer, data[capacity] ) ))) return E_OUTOFMEMORY;
+    buffer->IBuffer_iface.lpVtbl = &copy_buffer_vtbl;
+    buffer->IBufferByteAccess_iface.lpVtbl = &copy_buffer_access_vtbl;
+    buffer->ref = 1;
+    buffer->capacity = capacity;
+    *out = &buffer->IBuffer_iface;
+    return S_OK;
+}
+
 static HRESULT stream_copy_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
 {
     struct copy_params *params = impl_from_copy_IUnknown( param );
@@ -308,7 +322,7 @@ static HRESULT stream_copy_async( IUnknown *invoker, IUnknown *param, PROPVARIAN
     /* the copy blocks on the streams; do it on the thread pool, not the caller's thread */
     if (!called_async) return STATUS_PENDING;
 
-    if (!(buffer = calloc( 1, sizeof(*buffer) ))) return E_OUTOFMEMORY;
+    if (!(buffer = calloc( 1, offsetof( struct copy_buffer, data[COPY_CHUNK] ) ))) return E_OUTOFMEMORY;
     buffer->IBuffer_iface.lpVtbl = &copy_buffer_vtbl;
     buffer->IBufferByteAccess_iface.lpVtbl = &copy_buffer_access_vtbl;
     buffer->ref = 1;

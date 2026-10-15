@@ -2249,6 +2249,8 @@ HRESULT async_operation_##name##_create( IUnknown *invoker, IUnknown *param,    
     return S_OK;                                                                                           \
 }
 
+DEFINE_IASYNCOPERATION_IFACE( ibuffer, IBuffer,
+        L"Windows.Foundation.IAsyncOperation`1<Windows.Storage.Streams.IBuffer>" )
 DEFINE_IASYNCOPERATION_IFACE( input_stream, IInputStream,
         L"Windows.Foundation.IAsyncOperation`1<Windows.Storage.Streams.IInputStream>" )
 DEFINE_IASYNCOPERATION_IFACE( random_access_stream, IRandomAccessStream,

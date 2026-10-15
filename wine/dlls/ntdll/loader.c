@@ -1932,7 +1932,11 @@ static void thread_attach(void)
         if ( !(mod->Flags & LDR_PROCESS_ATTACHED) )
             continue;
         if ( mod->Flags & LDR_NO_DLL_CALLS )
+        {
+            /* DisableThreadLibraryCalls stops DllMain, not the TLS callbacks */
+            if (mod->TlsIndex == -1) call_tls_callbacks( mod->DllBase, DLL_THREAD_ATTACH );
             continue;
+        }
         if (skip_native_thread_calls_enabled( mod ))
         {
             /* skip only DllMain: the TLS callbacks are the module's thread_local constructors and
@@ -1956,8 +1960,11 @@ NTSTATUS WINAPI LdrDisableThreadCalloutsForDll(HMODULE hModule)
 
     RtlEnterCriticalSection( &loader_section );
 
+    /* Old Windows refused modules with static TLS, because their TLS callbacks went with DllMain.
+     * Current Windows succeeds, and its own DLLs depend on it: Windows.ApplicationModel.LockScreen's
+     * DllMain returns this call's result and has a TLS directory. The TLS callbacks keep running. */
     wm = get_modref( hModule );
-    if (!wm || wm->ldr.TlsIndex == -1)
+    if (!wm)
         ret = STATUS_DLL_NOT_FOUND;
     else
         wm->ldr.Flags |= LDR_NO_DLL_CALLS;
@@ -4098,7 +4105,10 @@ void WINAPI LdrShutdownThread(void)
             if ( !(mod->Flags & LDR_PROCESS_ATTACHED) )
                 continue;
             if ( mod->Flags & LDR_NO_DLL_CALLS )
+            {
+                if (mod->TlsIndex == -1) call_tls_callbacks( mod->DllBase, DLL_THREAD_DETACH );
                 continue;
+            }
             if (skip_native_thread_calls_enabled( mod ))
             {
                 /* the thread_local destructors still have to run: an MSVC module registers per-thread

@@ -78,7 +78,7 @@ if [ "$MODE" = --check ]; then
   base=$(git -C "$WINE_SRC" rev-list --max-parents=0 HEAD | head -1)
   while read -r f; do
     case $f in configure|autom4te.cache/*|*~|*.orig|*.rej) continue ;; esac
-    printf '%s\n' "${FILES[@]}" | grep -qxF "$f" && continue
+    printf '%s\n' "${FILES[@]}" | grep -xF "$f" >/dev/null && continue   # not -q: an early exit SIGPIPEs printf, and pipefail then made random files "unlisted"
     echo "  unlisted: $f"; unlisted=$((unlisted+1))
   done < <( { git -C "$WINE_SRC" diff --name-only "$base"; \
               git -C "$WINE_SRC" ls-files --others --exclude-standard; } | sort -u )

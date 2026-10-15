@@ -239,6 +239,8 @@ static HRESULT WINAPI connection_profile_GetNetworkNames( IConnectionProfile *if
 
 /* Wine has no metering information: report an unrestricted, unmetered connection. Calculator's currency
  * converter asks for the cost before loading rates and treated the failure as no connection. */
+static IConnectionCost2 connection_cost2;
+
 static HRESULT WINAPI connection_cost_QueryInterface( IConnectionCost *iface, REFIID iid, void **out )
 {
     TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
@@ -247,6 +249,11 @@ static HRESULT WINAPI connection_cost_QueryInterface( IConnectionCost *iface, RE
         IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IConnectionCost ))
     {
         *out = iface;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IConnectionCost2 ))
+    {
+        *out = &connection_cost2;
         return S_OK;
     }
     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
@@ -303,6 +310,38 @@ static const struct IConnectionCostVtbl connection_cost_vtbl =
     connection_cost_get_ApproachingDataLimit,
 };
 static IConnectionCost connection_cost = { &connection_cost_vtbl };
+
+static HRESULT WINAPI connection_cost2_QueryInterface( IConnectionCost2 *iface, REFIID iid, void **out )
+{
+    return connection_cost_QueryInterface( &connection_cost, iid, out );
+}
+static ULONG WINAPI connection_cost2_AddRef( IConnectionCost2 *iface ) { return 2; }
+static ULONG WINAPI connection_cost2_Release( IConnectionCost2 *iface ) { return 1; }
+static HRESULT WINAPI connection_cost2_GetIids( IConnectionCost2 *iface, ULONG *iid_count, IID **iids )
+{
+    return connection_cost_GetIids( &connection_cost, iid_count, iids );
+}
+static HRESULT WINAPI connection_cost2_GetRuntimeClassName( IConnectionCost2 *iface, HSTRING *class_name )
+{
+    return connection_cost_GetRuntimeClassName( &connection_cost, class_name );
+}
+static HRESULT WINAPI connection_cost2_GetTrustLevel( IConnectionCost2 *iface, TrustLevel *trust_level )
+{
+    return connection_cost_GetTrustLevel( &connection_cost, trust_level );
+}
+/* no Data Saver here: background data is never restricted */
+static HRESULT WINAPI connection_cost2_get_BackgroundDataUsageRestricted( IConnectionCost2 *iface, boolean *value )
+{
+    *value = FALSE;
+    return S_OK;
+}
+static const struct IConnectionCost2Vtbl connection_cost2_vtbl =
+{
+    connection_cost2_QueryInterface, connection_cost2_AddRef, connection_cost2_Release,
+    connection_cost2_GetIids, connection_cost2_GetRuntimeClassName, connection_cost2_GetTrustLevel,
+    connection_cost2_get_BackgroundDataUsageRestricted,
+};
+static IConnectionCost2 connection_cost2 = { &connection_cost2_vtbl };
 
 static HRESULT WINAPI connection_profile_GetConnectionCost( IConnectionProfile *iface, IConnectionCost **value )
 {

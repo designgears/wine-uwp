@@ -30,6 +30,7 @@ struct package_manager
 {
     IPackageManager IPackageManager_iface;
     IPackageManager2 IPackageManager2_iface;
+    IPackageManager4 IPackageManager4_iface;
     LONG ref;
 };
 
@@ -57,6 +58,13 @@ static HRESULT WINAPI package_manager_QueryInterface( IPackageManager *iface, RE
     if (IsEqualGUID( iid, &IID_IPackageManager2 ))
     {
         *out = &impl->IPackageManager2_iface;
+        IInspectable_AddRef( *out );
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_IPackageManager4 ))
+    {
+        *out = &impl->IPackageManager4_iface;
         IInspectable_AddRef( *out );
         return S_OK;
     }
@@ -443,6 +451,59 @@ static inline struct package_manager_statics *impl_from_IActivationFactory( IAct
     return CONTAINING_RECORD( iface, struct package_manager_statics, IActivationFactory_iface );
 }
 
+DEFINE_IINSPECTABLE( package_manager4, IPackageManager4, struct package_manager, IPackageManager_iface );
+
+/* The volumes: the system volume alone (volume.c). The Xbox app asks for them when it looks for
+ * where to install a dependency or a game, and an empty list made that fail. */
+static HRESULT get_package_volumes( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+{
+    static const struct vector_iids iids =
+    {
+        .vector = &IID_IVector_PackageVolume,
+        .view = &IID_IVectorView_PackageVolume,
+        .iterable = &IID_IIterable_PackageVolume,
+        .iterator = &IID_IIterator_PackageVolume,
+    };
+    IVector_PackageVolume *vector;
+    IVectorView_PackageVolume *view;
+    IPackageVolume *volume;
+    HRESULT hr;
+
+    if (FAILED(hr = vector_create( &iids, (void **)&vector ))) return hr;
+    if (SUCCEEDED(hr = package_volume_create( &volume )))
+    {
+        hr = IVector_PackageVolume_Append( vector, volume );
+        IPackageVolume_Release( volume );
+    }
+    if (SUCCEEDED(hr)) hr = IVector_PackageVolume_GetView( vector, &view );
+    IVector_PackageVolume_Release( vector );
+    if (FAILED(hr)) return hr;
+    result->vt = VT_UNKNOWN;
+    result->punkVal = (IUnknown *)view;
+    return S_OK;
+}
+
+static HRESULT WINAPI package_manager4_GetPackageVolumesAsync( IPackageManager4 *iface,
+        IAsyncOperation_IVectorView_PackageVolume **operation )
+{
+    TRACE( "iface %p, operation %p.\n", iface, operation );
+    return async_operation_inspectable_create( &IID_IAsyncOperation_IVectorView_PackageVolume, (IUnknown *)iface,
+                                               NULL, get_package_volumes, (IAsyncOperation_IInspectable **)operation );
+}
+
+static const struct IPackageManager4Vtbl package_manager4_vtbl =
+{
+    package_manager4_QueryInterface,
+    package_manager4_AddRef,
+    package_manager4_Release,
+    /* IInspectable methods */
+    package_manager4_GetIids,
+    package_manager4_GetRuntimeClassName,
+    package_manager4_GetTrustLevel,
+    /* IPackageManager4 methods */
+    package_manager4_GetPackageVolumesAsync,
+};
+
 static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
 {
     struct package_manager_statics *impl = impl_from_IActivationFactory( iface );
@@ -511,6 +572,7 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
 
     impl->IPackageManager_iface.lpVtbl = &package_manager_vtbl;
     impl->IPackageManager2_iface.lpVtbl = &package_manager2_vtbl;
+    impl->IPackageManager4_iface.lpVtbl = &package_manager4_vtbl;
     impl->ref = 1;
 
     *instance = (IInspectable *)&impl->IPackageManager_iface;

@@ -1550,11 +1550,61 @@ static HRESULT typelib_proxy_init(struct typelib_proxy *proxy, IUnknown *outer,
     return S_OK;
 }
 
+/* Build a proxy from finished format strings, which it takes ownership of. Shared with the
+ * metadata-based marshaler (ndr_winmd.c). */
+HRESULT ndr_create_generated_proxy(REFIID iid, const GUID *parentiid, WORD funcs, WORD parentfuncs,
+        const unsigned char *type, const unsigned char *proc, unsigned short *offset,
+        const USER_MARSHAL_ROUTINE_QUADRUPLE *user_marshal, IUnknown *outer,
+        IRpcProxyBuffer **proxy_buffer, void **out)
+{
+    struct typelib_proxy *proxy;
+    HRESULT hr;
+    WORD i;
+
+    if (!(proxy = calloc(1, sizeof(*proxy))) ||
+        !(proxy->proxy_vtbl = calloc(1, sizeof(proxy->proxy_vtbl->header) + (funcs + parentfuncs) * sizeof(void *))))
+    {
+        ERR("Failed to allocate proxy object.\n");
+        free(proxy);
+        free((void *)type);
+        free((void *)proc);
+        free(offset);
+        return E_OUTOFMEMORY;
+    }
+
+    init_stub_desc(&proxy->stub_desc);
+    if (user_marshal) proxy->stub_desc.aUserMarshalQuadruple = user_marshal;
+    proxy->proxy_info.pStubDesc = &proxy->stub_desc;
+    proxy->proxy_vtbl->header.pStublessProxyInfo = &proxy->proxy_info;
+    proxy->iid = *iid;
+    proxy->proxy_vtbl->header.piid = &proxy->iid;
+    fill_delegated_proxy_table((IUnknownVtbl *)proxy->proxy_vtbl->Vtbl, parentfuncs, NULL);
+    for (i = 0; i < funcs; i++)
+        proxy->proxy_vtbl->Vtbl[parentfuncs + i] = (void *)-1;
+
+    proxy->stub_desc.pFormatTypes = type;
+    proxy->proxy_info.ProcFormatString = proc;
+    proxy->offset_table = offset;
+    proxy->proxy_info.FormatStringOffset = &proxy->offset_table[-3];
+
+    hr = typelib_proxy_init(proxy, outer, funcs + parentfuncs, parentiid, proxy_buffer, out);
+    if (FAILED(hr))
+    {
+        free((void *)proxy->stub_desc.pFormatTypes);
+        free((void *)proxy->proxy_info.ProcFormatString);
+        free((void *)proxy->offset_table);
+        free(proxy->proxy_vtbl);
+        free(proxy);
+    }
+    return hr;
+}
+
 HRESULT WINAPI CreateProxyFromTypeInfo(ITypeInfo *typeinfo, IUnknown *outer,
         REFIID iid, IRpcProxyBuffer **proxy_buffer, void **out)
 {
-    struct typelib_proxy *proxy;
-    WORD funcs, parentfuncs, i;
+    const unsigned char *type, *proc;
+    unsigned short *offset;
+    WORD funcs, parentfuncs;
     ITypeInfo *real_typeinfo;
     GUID parentiid;
     HRESULT hr;
@@ -1566,53 +1616,13 @@ HRESULT WINAPI CreateProxyFromTypeInfo(ITypeInfo *typeinfo, IUnknown *outer,
     if (FAILED(hr))
         return hr;
 
-    if (!(proxy = calloc(1, sizeof(*proxy))))
-    {
-        ERR("Failed to allocate proxy object.\n");
-        ITypeInfo_Release(real_typeinfo);
-        return E_OUTOFMEMORY;
-    }
-
-    init_stub_desc(&proxy->stub_desc);
-    proxy->proxy_info.pStubDesc = &proxy->stub_desc;
-
-    proxy->proxy_vtbl = calloc(1, sizeof(proxy->proxy_vtbl->header) + (funcs + parentfuncs) * sizeof(void *));
-    if (!proxy->proxy_vtbl)
-    {
-        ERR("Failed to allocate proxy vtbl.\n");
-        free(proxy);
-        ITypeInfo_Release(real_typeinfo);
-        return E_OUTOFMEMORY;
-    }
-    proxy->proxy_vtbl->header.pStublessProxyInfo = &proxy->proxy_info;
-    proxy->iid = *iid;
-    proxy->proxy_vtbl->header.piid = &proxy->iid;
-    fill_delegated_proxy_table((IUnknownVtbl *)proxy->proxy_vtbl->Vtbl, parentfuncs, NULL);
-    for (i = 0; i < funcs; i++)
-        proxy->proxy_vtbl->Vtbl[parentfuncs + i] = (void *)-1;
-
-    hr = build_format_strings(real_typeinfo, funcs, parentfuncs, &proxy->stub_desc.pFormatTypes,
-            &proxy->proxy_info.ProcFormatString, &proxy->offset_table);
+    hr = build_format_strings(real_typeinfo, funcs, parentfuncs, &type, &proc, &offset);
     ITypeInfo_Release(real_typeinfo);
     if (FAILED(hr))
-    {
-        free(proxy->proxy_vtbl);
-        free(proxy);
         return hr;
-    }
-    proxy->proxy_info.FormatStringOffset = &proxy->offset_table[-3];
 
-    hr = typelib_proxy_init(proxy, outer, funcs + parentfuncs, &parentiid, proxy_buffer, out);
-    if (FAILED(hr))
-    {
-        free((void *)proxy->stub_desc.pFormatTypes);
-        free((void *)proxy->proxy_info.ProcFormatString);
-        free((void *)proxy->offset_table);
-        free(proxy->proxy_vtbl);
-        free(proxy);
-    }
-
-    return hr;
+    return ndr_create_generated_proxy(iid, &parentiid, funcs, parentfuncs, type, proc, offset,
+            NULL, outer, proxy_buffer, out);
 }
 
 struct typelib_stub
@@ -1687,40 +1697,29 @@ static HRESULT typelib_stub_init(struct typelib_stub *stub, IUnknown *server,
     return S_OK;
 }
 
-HRESULT WINAPI CreateStubFromTypeInfo(ITypeInfo *typeinfo, REFIID iid,
-        IUnknown *server, IRpcStubBuffer **stub_buffer)
+HRESULT ndr_create_generated_stub(REFIID iid, const GUID *parentiid, WORD funcs, WORD parentfuncs,
+        const unsigned char *type, const unsigned char *proc, unsigned short *offset,
+        const USER_MARSHAL_ROUTINE_QUADRUPLE *user_marshal, IUnknown *server, IRpcStubBuffer **stub_buffer)
 {
-    WORD funcs, parentfuncs, i;
     struct typelib_stub *stub;
-    ITypeInfo *real_typeinfo;
-    GUID parentiid;
     HRESULT hr;
-
-    TRACE("typeinfo %p, iid %s, server %p, stub_buffer %p.\n",
-            typeinfo, debugstr_guid(iid), server, stub_buffer);
-
-    hr = get_iface_info(typeinfo, &funcs, &parentfuncs, &parentiid, &real_typeinfo);
-    if (FAILED(hr))
-        return hr;
+    WORD i;
 
     if (!(stub = calloc(1, sizeof(*stub))))
     {
         ERR("Failed to allocate stub object.\n");
-        ITypeInfo_Release(real_typeinfo);
+        free((void *)type);
+        free((void *)proc);
+        free(offset);
         return E_OUTOFMEMORY;
     }
 
     init_stub_desc(&stub->stub_desc);
+    if (user_marshal) stub->stub_desc.aUserMarshalQuadruple = user_marshal;
     stub->server_info.pStubDesc = &stub->stub_desc;
-
-    hr = build_format_strings(real_typeinfo, funcs, parentfuncs, &stub->stub_desc.pFormatTypes,
-            &stub->server_info.ProcString, &stub->offset_table);
-    ITypeInfo_Release(real_typeinfo);
-    if (FAILED(hr))
-    {
-        free(stub);
-        return hr;
-    }
+    stub->stub_desc.pFormatTypes = type;
+    stub->server_info.ProcString = proc;
+    stub->offset_table = offset;
     stub->server_info.FmtStringOffset = &stub->offset_table[-3];
 
     stub->iid = *iid;
@@ -1728,7 +1727,7 @@ HRESULT WINAPI CreateStubFromTypeInfo(ITypeInfo *typeinfo, REFIID iid,
     stub->stub_vtbl.header.pServerInfo = &stub->server_info;
     stub->stub_vtbl.header.DispatchTableCount = funcs + parentfuncs;
 
-    if (!IsEqualGUID(&parentiid, &IID_IUnknown))
+    if (!IsEqualGUID(parentiid, &IID_IUnknown))
     {
         stub->dispatch_table = malloc((funcs + parentfuncs) * sizeof(void *));
         for (i = 3; i < parentfuncs; i++)
@@ -1742,9 +1741,10 @@ HRESULT WINAPI CreateStubFromTypeInfo(ITypeInfo *typeinfo, REFIID iid,
         stub->stub_vtbl.Vtbl = CStdStubBuffer_Vtbl;
     stub->stub_vtbl.Vtbl.Release = typelib_stub_Release;
 
-    hr = typelib_stub_init(stub, server, &parentiid, stub_buffer);
+    hr = typelib_stub_init(stub, server, parentiid, stub_buffer);
     if (FAILED(hr))
     {
+        free(stub->dispatch_table);
         free((void *)stub->stub_desc.pFormatTypes);
         free((void *)stub->server_info.ProcString);
         free(stub->offset_table);
@@ -1752,4 +1752,30 @@ HRESULT WINAPI CreateStubFromTypeInfo(ITypeInfo *typeinfo, REFIID iid,
     }
 
     return hr;
+}
+
+HRESULT WINAPI CreateStubFromTypeInfo(ITypeInfo *typeinfo, REFIID iid,
+        IUnknown *server, IRpcStubBuffer **stub_buffer)
+{
+    const unsigned char *type, *proc;
+    unsigned short *offset;
+    WORD funcs, parentfuncs;
+    ITypeInfo *real_typeinfo;
+    GUID parentiid;
+    HRESULT hr;
+
+    TRACE("typeinfo %p, iid %s, server %p, stub_buffer %p.\n",
+            typeinfo, debugstr_guid(iid), server, stub_buffer);
+
+    hr = get_iface_info(typeinfo, &funcs, &parentfuncs, &parentiid, &real_typeinfo);
+    if (FAILED(hr))
+        return hr;
+
+    hr = build_format_strings(real_typeinfo, funcs, parentfuncs, &type, &proc, &offset);
+    ITypeInfo_Release(real_typeinfo);
+    if (FAILED(hr))
+        return hr;
+
+    return ndr_create_generated_stub(iid, &parentiid, funcs, parentfuncs, type, proc, offset,
+            NULL, server, stub_buffer);
 }

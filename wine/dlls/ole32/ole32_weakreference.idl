@@ -1,0 +1,18 @@
+/*
+ * Proxies/stubs for IWeakReference and IWeakReferenceSource. Windows registers them under the
+ * standard PSFactoryBuffer CLSID; C++/WinRT takes a weak_ref to objects that live in another
+ * process (the Xbox app does to its full-trust server's interop objects).
+ *
+ * Copyright 2026 wine-uwp contributors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ */
+
+#pragma makedep ident
+#pragma makedep proxy
+#pragma makedep register
+
+#include "weakreference.idl"

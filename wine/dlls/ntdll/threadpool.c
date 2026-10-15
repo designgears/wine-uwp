@@ -145,6 +145,7 @@ struct threadpool_object
     PVOID                   userdata;
     PTP_CLEANUP_GROUP_CANCEL_CALLBACK group_cancel_callback;
     PTP_SIMPLE_CALLBACK     finalization_callback;
+    BOOL                    finalized;
     BOOL                    may_run_long;
     HMODULE                 race_dll;
     TP_CALLBACK_PRIORITY    priority;
@@ -2232,6 +2233,43 @@ static void tp_wait_close_duped_handle( struct threadpool_object *wait )
     }
 }
 
+
+struct finalization_post
+{
+    PTP_SIMPLE_CALLBACK callback;
+    void *userdata;
+};
+
+static void CALLBACK finalization_post_proc( TP_CALLBACK_INSTANCE *instance, void *userdata )
+{
+    struct finalization_post *post = userdata;
+    post->callback( instance, post->userdata );
+    RtlFreeHeap( GetProcessHeap(), 0, post );
+}
+
+/* A released object with nothing left to run gets its finalization callback now, on the pool. */
+static void tp_object_finalize_on_release( struct threadpool_object *object )
+{
+    struct finalization_post *post;
+    TP_CALLBACK_ENVIRON environment;
+    BOOL run;
+
+    RtlEnterCriticalSection( &object->pool->cs );
+    run = object->finalization_callback && !object->finalized &&
+          !object->num_pending_callbacks && !object->num_running_callbacks;
+    if (run) object->finalized = TRUE;
+    RtlLeaveCriticalSection( &object->pool->cs );
+    if (!run || !(post = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*post) ))) return;
+
+    post->callback = object->finalization_callback;
+    post->userdata = object->userdata;
+    memset( &environment, 0, sizeof(environment) );
+    environment.Version = 1;
+    environment.Pool = (TP_POOL *)object->pool;
+    if (TpSimpleTryPost( finalization_post_proc, post, &environment ))
+        RtlFreeHeap( GetProcessHeap(), 0, post );
+}
+
 /***********************************************************************
  *           tp_object_release    (internal)
  *
@@ -2307,6 +2345,7 @@ static void tp_object_execute( struct threadpool_object *object, BOOL wait_threa
     struct io_completion completion;
     struct threadpool *pool = object->pool;
     TP_WAIT_RESULT wait_result = 0;
+    BOOL run_finalization;
     NTSTATUS status;
 
     object->num_pending_callbacks--;
@@ -2405,8 +2444,17 @@ static void tp_object_execute( struct threadpool_object *object, BOOL wait_threa
             break;
     }
 
-    /* Execute finalization callback. */
-    if (object->finalization_callback)
+    /* Execute the finalization callback once, after the object's last callback: a simple callback
+     * is done after one, anything else once it has been released and nothing is left to run. Native
+     * threadpoolwinrt frees a ThreadPoolTimer's handler in it, so finalizing after every tick
+     * crashed the next one (the Xbox app's full-trust server). */
+    RtlEnterCriticalSection( &pool->cs );
+    run_finalization = object->finalization_callback && !object->finalized &&
+        (object->type == TP_OBJECT_TYPE_SIMPLE ||
+         (object->shutdown && !object->num_pending_callbacks && object->num_running_callbacks == 1));
+    if (run_finalization) object->finalized = TRUE;
+    RtlLeaveCriticalSection( &pool->cs );
+    if (run_finalization)
     {
         TRACE( "executing finalization callback %p(%p, %p)\n",
                object->finalization_callback, callback_instance, object->userdata );
@@ -3025,6 +3073,7 @@ VOID WINAPI TpReleaseTimer( TP_TIMER *timer )
 
     tp_object_prepare_shutdown( this );
     this->shutdown = TRUE;
+    tp_object_finalize_on_release( this );
     tp_object_release( this );
 }
 
@@ -3039,6 +3088,7 @@ VOID WINAPI TpReleaseWait( TP_WAIT *wait )
 
     tp_object_prepare_shutdown( this );
     this->shutdown = TRUE;
+    tp_object_finalize_on_release( this );
     tp_object_release( this );
 }
 
@@ -3053,6 +3103,7 @@ VOID WINAPI TpReleaseWork( TP_WORK *work )
 
     tp_object_prepare_shutdown( this );
     this->shutdown = TRUE;
+    tp_object_finalize_on_release( this );
     tp_object_release( this );
 }
 

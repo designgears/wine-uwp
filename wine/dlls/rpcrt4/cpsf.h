@@ -65,6 +65,13 @@ const MIDL_SERVER_INFO *CStdStubBuffer_GetServerInfo(IRpcStubBuffer *iface);
 extern const IRpcStubBufferVtbl CStdStubBuffer_Vtbl;
 extern const IRpcStubBufferVtbl CStdStubBuffer_Delegating_Vtbl;
 
+HRESULT ndr_create_generated_proxy(REFIID iid, const GUID *parentiid, WORD funcs, WORD parentfuncs,
+        const unsigned char *type, const unsigned char *proc, unsigned short *offset,
+        const USER_MARSHAL_ROUTINE_QUADRUPLE *user_marshal, IUnknown *outer,
+        IRpcProxyBuffer **proxy_buffer, void **out);
+HRESULT ndr_create_generated_stub(REFIID iid, const GUID *parentiid, WORD funcs, WORD parentfuncs,
+        const unsigned char *type, const unsigned char *proc, unsigned short *offset,
+        const USER_MARSHAL_ROUTINE_QUADRUPLE *user_marshal, IUnknown *server, IRpcStubBuffer **stub_buffer);
 BOOL fill_delegated_proxy_table(IUnknownVtbl *vtbl, DWORD num, const unsigned short *offsets);
 void *get_delegating_vtbl_method(DWORD index);
 BOOL proxy_info_is_stubless(const ProxyFileInfo *info);

@@ -34,6 +34,7 @@
 #include "winternl.h"
 
 #include "rpc.h"
+#include "rpcasync.h"
 #include "rpcndr.h"
 
 #include "wine/debug.h"
@@ -1956,6 +1957,79 @@ RPC_STATUS WINAPI RpcBindingSetOption(RPC_BINDING_HANDLE BindingHandle, ULONG Op
         break;
     }
     return RPC_S_OK;
+}
+
+/* RpcServerInqCallAttributes{A,W}: the A and W structures differ only in their string types,
+ * and no principal names are known here, so one implementation serves both. */
+static RPC_STATUS inq_call_attributes(RPC_BINDING_HANDLE handle, RPC_CALL_ATTRIBUTES_V3_W *attr, unsigned int char_size)
+{
+    RpcBinding *binding = handle ? handle : RPCRT4_GetThreadCurrentCallHandle();
+    ULONG authn_level = RPC_C_AUTHN_LEVEL_NONE, authn_svc = RPC_C_AUTHN_NONE, pid = 0;
+    RPC_STATUS status = RPC_S_OK;
+
+    if (!binding) return RPC_S_NO_CALL_ACTIVE;
+    if (!attr || attr->Version < 1 || attr->Version > 3) return RPC_S_INVALID_ARG;
+
+    if (binding->FromConn && binding->FromConn->AuthInfo)
+    {
+        authn_level = binding->FromConn->AuthInfo->AuthnLevel;
+        authn_svc = binding->FromConn->AuthInfo->AuthnSvc;
+    }
+
+    if (attr->Flags & RPC_QUERY_SERVER_PRINCIPAL_NAME)
+    {
+        if (attr->ServerPrincipalNameBufferLength < char_size) status = ERROR_MORE_DATA;
+        else if (attr->ServerPrincipalName) memset(attr->ServerPrincipalName, 0, char_size);
+        attr->ServerPrincipalNameBufferLength = char_size;
+    }
+    if (attr->Flags & RPC_QUERY_CLIENT_PRINCIPAL_NAME)
+    {
+        if (attr->ClientPrincipalNameBufferLength < char_size) status = ERROR_MORE_DATA;
+        else if (attr->ClientPrincipalName) memset(attr->ClientPrincipalName, 0, char_size);
+        attr->ClientPrincipalNameBufferLength = char_size;
+    }
+    attr->AuthenticationLevel = authn_level;
+    attr->AuthenticationService = authn_svc;
+    attr->NullSession = FALSE;
+
+    if (attr->Version >= 2)
+    {
+        const char *protseq = binding->Protseq ? binding->Protseq : "";
+
+        attr->KernelModeCaller = FALSE;
+        if (!strcmp(protseq, "ncalrpc")) attr->ProtocolSequence = RPC_PROTSEQ_LRPC;
+        else if (!strcmp(protseq, "ncacn_np")) attr->ProtocolSequence = RPC_PROTSEQ_NMP;
+        else attr->ProtocolSequence = RPC_PROTSEQ_TCP;
+        attr->IsClientLocal = attr->ProtocolSequence == RPC_PROTSEQ_TCP ? rcclClientUnknownLocality : rcclLocal;
+        if (binding->FromConn && binding->FromConn->ops->inquire_client_pid)
+            binding->FromConn->ops->inquire_client_pid(binding->FromConn, &pid);
+        attr->ClientPID = ULongToHandle(pid);
+        attr->CallStatus = 0;
+        attr->CallType = rctNormal;
+        attr->OpNum = 0;
+        memset(&attr->InterfaceUuid, 0, sizeof(attr->InterfaceUuid));
+    }
+    if (attr->Version >= 3 && (attr->Flags & RPC_QUERY_CLIENT_ID))
+        attr->ClientIdentifierBufferLength = 0;
+
+    TRACE("version %u, flags %#lx: level %lu, pid %lu -> %ld\n", attr->Version, attr->Flags, authn_level, pid, status);
+    return status;
+}
+
+/***********************************************************************
+ *             RpcServerInqCallAttributesW (RPCRT4.@)
+ */
+RPC_STATUS WINAPI RpcServerInqCallAttributesW(RPC_BINDING_HANDLE handle, void *attr)
+{
+    return inq_call_attributes(handle, attr, sizeof(WCHAR));
+}
+
+/***********************************************************************
+ *             RpcServerInqCallAttributesA (RPCRT4.@)
+ */
+RPC_STATUS WINAPI RpcServerInqCallAttributesA(RPC_BINDING_HANDLE handle, void *attr)
+{
+    return inq_call_attributes(handle, attr, sizeof(char));
 }
 
 /***********************************************************************

@@ -432,8 +432,8 @@
 @ stdcall RpcRevertToSelf()
 @ stdcall RpcRevertToSelfEx(ptr)
 @ stdcall RpcServerInqBindings(ptr)
-@ stub RpcServerInqCallAttributesA
-@ stub RpcServerInqCallAttributesW
+@ stdcall RpcServerInqCallAttributesA(ptr ptr)
+@ stdcall RpcServerInqCallAttributesW(ptr ptr)
 @ stdcall RpcServerInqDefaultPrincNameA(long ptr)
 @ stdcall RpcServerInqDefaultPrincNameW(long ptr)
 @ stub RpcServerInqIf
@@ -564,3 +564,7 @@
 @ stdcall -norelay ObjectStublessClient30()
 @ stdcall -norelay ObjectStublessClient31()
 @ stdcall -norelay ObjectStublessClient32()
+
+# wine-uwp: the metadata-based marshaler (MetadataPSFactory)
+@ cdecl __wine_metadata_ps_lookup(ptr)
+@ cdecl __wine_metadata_ps_factory(ptr ptr)

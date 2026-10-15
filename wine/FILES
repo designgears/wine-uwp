@@ -299,3 +299,13 @@ dlls/msvcp140_app/msvcp140_app.spec
 dlls/appxdeploymentclient/appxdeploymentclient.spec
 dlls/ole32/ole32_activation.idl
 dlls/rpcrt4/ndr_typelib.c
+dlls/appxdeploymentclient/async.c
+dlls/appxdeploymentclient/async_private.idl
+dlls/appxdeploymentclient/vector.c
+dlls/appxdeploymentclient/volume.c
+dlls/ole32/ole32_weakreference.idl
+dlls/rpcrt4/Makefile.in
+dlls/rpcrt4/ndr_winmd.c
+include/rpcasync.h
+include/windows.management.deployment.idl
+include/windows.networking.connectivity.idl

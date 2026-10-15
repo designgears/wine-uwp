@@ -408,10 +408,62 @@ static HRESULT WINAPI file_io_statics_AppendLinesWithEncodingAsync( IFileIOStati
     return E_NOTIMPL;
 }
 
+/* the whole file as a Buffer */
+static HRESULT read_buffer( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+{
+    struct write_param *impl = write_param_from_IUnknown( param );
+    IBufferByteAccess *access;
+    LARGE_INTEGER size;
+    IBuffer *buffer;
+    DWORD read_size;
+    HANDLE file;
+    HRESULT hr;
+    BYTE *data;
+
+    if (!called_async) return STATUS_PENDING;
+
+    file = CreateFileW( impl->path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                        OPEN_EXISTING, 0, NULL );
+    if (file == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32( GetLastError() );
+    if (!GetFileSizeEx( file, &size ) || size.QuadPart > 0x7fffffff)
+    {
+        CloseHandle( file );
+        return E_FAIL;
+    }
+    if (FAILED(hr = buffer_create( size.LowPart, &buffer )))
+    {
+        CloseHandle( file );
+        return hr;
+    }
+    IBuffer_QueryInterface( buffer, &IID_IBufferByteAccess, (void **)&access );
+    IBufferByteAccess_Buffer( access, &data );
+    IBufferByteAccess_Release( access );
+    if (!ReadFile( file, data, size.LowPart, &read_size, NULL )) hr = HRESULT_FROM_WIN32( GetLastError() );
+    CloseHandle( file );
+    if (FAILED(hr))
+    {
+        IBuffer_Release( buffer );
+        return hr;
+    }
+    IBuffer_put_Length( buffer, read_size );
+    result->vt = VT_UNKNOWN;
+    result->punkVal = (IUnknown *)buffer;
+    return S_OK;
+}
+
 static HRESULT WINAPI file_io_statics_ReadBufferAsync( IFileIOStatics *iface, IStorageFile *file, IInspectable **operation )
 {
-    FIXME( "iface %p, file %p, operation %p stub!\n", iface, file, operation );
-    return E_NOTIMPL;
+    IUnknown *param;
+    HRESULT hr;
+
+    TRACE( "iface %p, file %p, operation %p.\n", iface, file, operation );
+
+    if (!operation) return E_POINTER;
+    if (FAILED(hr = write_param_create( file, NULL, FALSE, &param ))) return hr;
+    hr = async_operation_ibuffer_create( (IUnknown *)iface, param, read_buffer,
+                                         (IAsyncOperation_IBuffer **)operation );
+    IUnknown_Release( param );
+    return hr;
 }
 
 static HRESULT WINAPI file_io_statics_WriteBufferAsync( IFileIOStatics *iface, IStorageFile *file, IBuffer *buffer,

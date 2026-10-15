@@ -52,6 +52,9 @@ HRESULT async_operation_uint32_uint32_create( IUnknown *invoker, IUnknown *param
 HRESULT async_operation_uint64_uint64_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
         IAsyncOperationWithProgress_UINT64_UINT64 **out );
 HRESULT storage_file_create( const WCHAR *path, IStorageFile **out );
+HRESULT buffer_create( UINT32 capacity, IBuffer **out );
+HRESULT async_operation_ibuffer_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+                                        IAsyncOperation_IBuffer **out );
 HRESULT async_operation_input_stream_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
         IAsyncOperation_IInputStream **out );
 HRESULT async_operation_random_access_stream_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
