@@ -165,149 +165,7 @@ static ULONGLONG parse_iso(const std::string &s)
     return t / 10000000ULL - 11644473600ULL;
 }
 
-/* ------------------------------------------------------------------------------------------- */
-/* A small JSON reader                                                                           */
-
-struct Json
-{
-    enum Type { NUL, BOOL, NUM, STR, ARR, OBJ } type = NUL;
-    bool b = false;
-    double n = 0;
-    std::string s;
-    std::vector<Json> a;
-    std::vector<std::pair<std::string, Json>> o;
-
-    const Json &operator[](const char *key) const
-    {
-        static const Json none;
-        if (type == OBJ) for (auto &kv : o) if (kv.first == key) return kv.second;
-        return none;
-    }
-    const Json &at(size_t i) const
-    {
-        static const Json none;
-        return type == ARR && i < a.size() ? a[i] : none;
-    }
-    std::string str() const
-    {
-        if (type == STR) return s;
-        if (type == NUM) { char b2[64]; snprintf(b2, sizeof(b2), "%.0f", n); return b2; }
-        return std::string();
-    }
-};
-
-struct JsonParser
-{
-    const char *p, *end;
-    void ws() { while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++; }
-    static void put_utf8(std::string &o, unsigned cp)
-    {
-        if (cp < 0x80) o += (char)cp;
-        else if (cp < 0x800) { o += (char)(0xc0 | cp >> 6); o += (char)(0x80 | (cp & 0x3f)); }
-        else if (cp < 0x10000) { o += (char)(0xe0 | cp >> 12); o += (char)(0x80 | (cp >> 6 & 0x3f)); o += (char)(0x80 | (cp & 0x3f)); }
-        else { o += (char)(0xf0 | cp >> 18); o += (char)(0x80 | (cp >> 12 & 0x3f)); o += (char)(0x80 | (cp >> 6 & 0x3f)); o += (char)(0x80 | (cp & 0x3f)); }
-    }
-    bool string(std::string &out)
-    {
-        if (p >= end || *p != '"') return false;
-        p++;
-        while (p < end && *p != '"')
-        {
-            if (*p == '\\' && p + 1 < end)
-            {
-                p++;
-                switch (*p)
-                {
-                case 'n': out += '\n'; break;
-                case 't': out += '\t'; break;
-                case 'r': out += '\r'; break;
-                case 'b': out += '\b'; break;
-                case 'f': out += '\f'; break;
-                case 'u':
-                {
-                    if (end - p < 5) return false;
-                    unsigned cp = (unsigned)strtoul(std::string(p + 1, 4).c_str(), nullptr, 16);
-                    p += 4;
-                    if (cp >= 0xd800 && cp < 0xdc00 && end - p > 6 && p[1] == '\\' && p[2] == 'u')
-                    {
-                        unsigned lo = (unsigned)strtoul(std::string(p + 3, 4).c_str(), nullptr, 16);
-                        cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
-                        p += 6;
-                    }
-                    put_utf8(out, cp);
-                    break;
-                }
-                default: out += *p; break;
-                }
-                p++;
-            }
-            else out += *p++;
-        }
-        if (p >= end) return false;
-        p++;
-        return true;
-    }
-    bool value(Json &v, int depth)
-    {
-        if (depth > 64) return false;
-        ws();
-        if (p >= end) return false;
-        if (*p == '{')
-        {
-            v.type = Json::OBJ;
-            p++; ws();
-            if (p < end && *p == '}') { p++; return true; }
-            for (;;)
-            {
-                std::string key;
-                ws();
-                if (!string(key)) return false;
-                ws();
-                if (p >= end || *p != ':') return false;
-                p++;
-                v.o.emplace_back(key, Json());
-                if (!value(v.o.back().second, depth + 1)) return false;
-                ws();
-                if (p < end && *p == ',') { p++; continue; }
-                if (p < end && *p == '}') { p++; return true; }
-                return false;
-            }
-        }
-        if (*p == '[')
-        {
-            v.type = Json::ARR;
-            p++; ws();
-            if (p < end && *p == ']') { p++; return true; }
-            for (;;)
-            {
-                v.a.emplace_back();
-                if (!value(v.a.back(), depth + 1)) return false;
-                ws();
-                if (p < end && *p == ',') { p++; continue; }
-                if (p < end && *p == ']') { p++; return true; }
-                return false;
-            }
-        }
-        if (*p == '"') { v.type = Json::STR; return string(v.s); }
-        if (!strncmp(p, "true", 4)) { v.type = Json::BOOL; v.b = true; p += 4; return true; }
-        if (!strncmp(p, "false", 5)) { v.type = Json::BOOL; p += 5; return true; }
-        if (!strncmp(p, "null", 4)) { p += 4; return true; }
-        char *e;
-        v.n = strtod(p, &e);
-        if (e == p) return false;
-        v.type = Json::NUM;
-        p = e;
-        return true;
-    }
-};
-
-static Json parse_json(const std::string &text)
-{
-    Json v;
-    JsonParser jp{ text.data(), text.data() + text.size() };
-    if (!jp.value(v, 0)) return Json();
-    return v;
-}
+#include "../common/json.h"
 
 /* ------------------------------------------------------------------------------------------- */
 /* HTTP, with WinHTTP                                                                            */
@@ -803,6 +661,7 @@ struct Account
     CRITICAL_SECTION cs;          /* guards everything below */
     CRITICAL_SECTION signin_cs;   /* one sign-in (refresh or device code) at a time */
     std::string refresh_token, msa_token, msa_user_id;
+    std::string puid;             /* the account's PUID, 16 hex digits: what a Microsoft account WebAccount.Id is */
     ULONGLONG msa_expires = 0;
     std::string user_token;
     ULONGLONG user_expires = 0;
@@ -834,8 +693,10 @@ static bool take_msa_tokens(const Json &j)
     account.msa_token = access;
     account.msa_expires = now_s() + (ULONGLONG)(j["expires_in"].n > 60 ? j["expires_in"].n - 60 : 0);
     if (!refresh.empty()) account.refresh_token = refresh;
+    bool other = !j["user_id"].str().empty() && j["user_id"].str() != account.msa_user_id && !account.msa_user_id.empty();
     if (!j["user_id"].str().empty()) account.msa_user_id = j["user_id"].str();
     std::map<std::string, std::string> kv = { { "refresh_token", account.refresh_token }, { "user_id", account.msa_user_id } };
+    if (other) { kv["email"] = ""; kv["store_account_id"] = ""; kv["puid"] = ""; account.puid.clear(); } /* another account: forget the last one's */
     LeaveCriticalSection(&account.cs);
     store_update(kv);
     trace("Microsoft account tokens received (access %zu chars, refresh %s, expires in %.0f s)", access.size(),
@@ -867,8 +728,9 @@ static HRESULT msa_refresh(const std::string &scope, std::string *token_out)
     if (status != 200 || j["access_token"].str().empty())
     {
         log_oauth_error("refresh", status, resp);
-        if (j["error"].str() == "invalid_grant")
+        if (j["error"].str() == "invalid_grant" && scope == MSA_SCOPE)
         {
+            /* (only for the sign-in scope: another scope's invalid_grant means that scope is not granted) */
             /* the stored sign-in is gone for good (password change, revoked): forget it */
             EnterCriticalSection(&account.cs);
             account.refresh_token.clear();
@@ -1033,6 +895,10 @@ static HRESULT xbl_title_token(const std::string &msa_token)
 
 /* Microsoft account token in hand (account.msa_token): get the Xbox identity. Caller holds signin_cs.
  * SISU first; if it refuses, the plain user/authenticate + XSTS path (still device-bound, but no title). */
+static void fetch_account_email(void);
+static void fetch_account_puid(void);
+static std::string stored_msa_account(void);
+
 static HRESULT xbl_sign_in(void)
 {
     std::string msa, user_token;
@@ -1077,6 +943,9 @@ static HRESULT xbl_sign_in(void)
     account.signed_in = true;
     LeaveCriticalSection(&account.cs);
     trace("signed in to Xbox Live as \"%s\" (age group %s)", xui["gtg"].str().c_str(), xui["agg"].str().c_str());
+    store_update({ { "gamertag", xui["gtg"].str() } }); /* the WebAccount's user name, before this process signs in */
+    fetch_account_email();
+    fetch_account_puid();
     return S_OK;
 }
 
@@ -1181,12 +1050,13 @@ static void sign_out(void)
     EnterCriticalSection(&account.cs);
     account.signed_in = false;
     account.refresh_token.clear();
+    account.puid.clear();
     account.msa_token.clear();
     account.user_token.clear();
     account.xsts.clear();
     LeaveCriticalSection(&account.cs);
     /* the device's proof key and device token stay: they belong to the machine, not the user */
-    store_update({ { "refresh_token", "" }, { "user_id", "" } });
+    store_update({ { "refresh_token", "" }, { "user_id", "" }, { "gamertag", "" }, { "email", "" }, { "store_account_id", "" }, { "puid", "" } });
     LeaveCriticalSection(&account.signin_cs);
     trace("signed out; the stored sign-in is deleted");
 }
@@ -1803,16 +1673,16 @@ struct User : IUserAbi, IClosable_
     HRESULT STDMETHODCALLTYPE get_State(INT32 *v) override { if (!v) return E_POINTER; *v = state; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_IsStoreUser(boolean *v) override
     {
-        /* there is no Microsoft Store account on this machine to be the same as */
+        /* the Store account is the Microsoft account WebAccount below, which is this user's own account */
         if (!v) return E_POINTER;
-        *v = FALSE;
-        trace("User.IsStoreUser -> false");
+        *v = TRUE;
+        trace("User.IsStoreUser -> true");
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_WebAccountId(HSTRING *v) override
     {
         trace("User.WebAccountId");
-        return to_hstr(field(&Account::msa_user_id), v);
+        return to_hstr(stored_msa_account(), v);
     }
     HRESULT STDMETHODCALLTYPE CheckPrivilege(INT32 privilege, PrivilegeResult *v) override
     {
@@ -2250,6 +2120,1266 @@ struct ManagerFactory : IXboxAuthManagerFactoryAbi, IXboxAuthManagerStaticsAbi, 
 static ManagerFactory manager_factory;
 
 /* ------------------------------------------------------------------------------------------- */
+/* Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager: the Microsoft account  */
+/*                                                                                              */
+/* On Windows the Store's account is the Microsoft account WebAccount that the Web Account       */
+/* Manager (the token broker, out of process) holds for provider https://login.microsoft.com,     */
+/* authority "consumers". The Xbox app's StoreAccountManager asks for that provider with          */
+/* FindAccountProviderAsync(id, authority, user) (Statics2), finds the account by its id and asks  */
+/* GetTokenSilentlyAsync for tokens. There is no broker here, so the manager answers from the same */
+/* Microsoft account the Xbox sign-in above holds: WebAccount.Id is the account's user id, which   */
+/* is also what User.WebAccountId reports, and tokens are refresh-token grants for the request's  */
+/* scope. Other providers are not found (null), as before (shims/webauthcore, now retired).       */
+/*                                                                                              */
+/* Slots (Windows.Security.winmd, ./winmd.py --sig):                                             */
+/*   Statics {6aca7c92}: 6/7 GetTokenSilentlyAsync(request[, account]) 8/9 RequestTokenAsync      */
+/*                       10 FindAccountAsync(provider, id) 11/12 FindAccountProviderAsync(id[, auth]) */
+/*   Statics2 {f584184a}: 6 FindAccountProviderAsync(id, authority, user)                          */
+/*   Statics4 {54e633fe}: 6/7 FindAllAccountsAsync(provider[, clientId]) 8-10 FindSystemAccountProviderAsync */
+
+static const GUID IID_IWACMStatics = {0x6aca7c92,0xa581,0x4479,{0x9c,0x10,0x75,0x2e,0xff,0x44,0xfd,0x34}};
+static const GUID IID_IWACMStatics2 = {0xf584184a,0x8b57,0x4820,{0xb6,0xa4,0x70,0xa5,0xb6,0xfc,0xf4,0x4a}};
+static const GUID IID_IWACMStatics4 = {0x54e633fe,0x96e0,0x41e8,{0x98,0x32,0x12,0x98,0x89,0x7c,0x2a,0xaf}};
+static const GUID IID_IWebAccountProvider = {0x29dcc8c3,0x7ab9,0x4a7c,{0xa3,0x36,0xb9,0x42,0xf9,0xdb,0xf7,0xc7}};
+static const GUID IID_IWebAccountProvider2 = {0x4a01eb05,0x4e42,0x41d4,{0xb5,0x18,0xe0,0x08,0xa5,0x16,0x36,0x14}};
+static const GUID IID_IWebAccountProvider3 = {0xda1c518b,0x970d,0x4d49,{0x82,0x5c,0xf2,0x70,0x6f,0x8c,0xa7,0xfe}};
+static const GUID IID_IWebAccountProvider4 = {0x718fd8db,0xe796,0x4210,{0xb7,0x4e,0x84,0xd2,0x98,0x94,0xb0,0x80}};
+static const GUID IID_IWebAccount = {0x69473eb2,0x8031,0x49be,{0x80,0xbb,0x96,0xcb,0x46,0xd9,0x9a,0xba}};
+static const GUID IID_IWebAccount2 = {0x7b56d6f8,0x990b,0x4eb5,{0x94,0xa7,0x56,0x21,0xf3,0xa8,0xb8,0x24}};
+static const GUID IID_IWebTokenRequest = {0xb77b4d68,0xadcb,0x4673,{0xb3,0x64,0x0c,0xf7,0xb3,0x5c,0xaf,0x97}};
+static const GUID IID_IWebTokenRequestResult = {0xc12a8305,0xd1f8,0x4483,{0x8d,0x54,0x38,0xfe,0x29,0x27,0x84,0xff}};
+static const GUID IID_IWebTokenResponse = {0x67a7c5ca,0x83f6,0x44c6,{0xa3,0xb1,0x0e,0xb6,0x9e,0x41,0xfa,0x8a}};
+static const GUID IID_IWebProviderError = {0xdb191bb1,0x50c5,0x4809,{0x8d,0xca,0x09,0xc9,0x94,0x10,0x24,0x5c}};
+static const GUID IID_IFindAllAccountsResult = {0xa5812b5d,0xb72e,0x420c,{0x86,0xab,0xaa,0xc0,0xd7,0xb7,0x26,0x1f}};
+static const GUID IID_AsyncOp_WebAccountProvider = {0x88c66009,0x12f7,0x58e2,{0x8d,0xbe,0x6e,0xfc,0x62,0x0c,0x85,0xba}};
+static const GUID IID_AsyncOp_WebAccount = {0xacd76b54,0x297f,0x5a18,{0x91,0x43,0x20,0xa3,0x09,0xe2,0xdf,0xd3}};
+static const GUID IID_AsyncOp_WebTokenRequestResult = {0x0a815852,0x7c44,0x5674,{0xb3,0xd2,0xfa,0x2e,0x4c,0x1e,0x46,0xc9}};
+static const GUID IID_AsyncOp_FindAllAccountsResult = {0x9affb572,0x58c3,0x5c6c,{0x93,0x97,0x2b,0x77,0x04,0xaa,0x35,0xc3}};
+static const GUID IID_IVectorView_WebTokenResponse = {0x199e065c,0x8195,0x55da,{0x9c,0x10,0x8a,0xea,0xf9,0xac,0x10,0x62}};
+static const GUID IID_IVectorView_WebAccount = {0xe0798d3d,0x2b4a,0x589a,{0xab,0x12,0x02,0xdc,0xcc,0x15,0x8a,0xfc}};
+static const GUID IID_IMap_String_String = {0xf6d1f700,0x49c2,0x52ae,{0x81,0x54,0x82,0x6f,0x99,0x08,0x77,0x3c}};
+static const GUID IID_IIterable_KVP_String_String = {0xe9bdaaf0,0xcbf6,0x5c72,{0xbe,0x90,0x29,0xcb,0xf3,0xa1,0x31,0x9b}};
+
+static const char MSA_PROVIDER_ID[] = "https://login.microsoft.com";
+
+/* IMap<String,String>, IMapView<String,String> and their iterator, by slot */
+struct IMapSSAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE Lookup(HSTRING, HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Size(UINT32 *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE HasKey(HSTRING, boolean *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetView(IInspectable **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE Insert(HSTRING, HSTRING, boolean *) = 0;
+};
+struct IIterableAbi : IInspectable { virtual HRESULT STDMETHODCALLTYPE First(IInspectable **) = 0; };
+struct IIteratorAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_Current(IInspectable **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_HasCurrent(boolean *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE MoveNext(boolean *) = 0;
+};
+struct IKeyValuePairSSAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_Key(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Value(HSTRING *) = 0;
+};
+
+/* A Windows.Foundation.Collections.StringMap (Windows' own, from wintypes) holding kv. */
+static IMapSSAbi *make_string_map(const std::vector<std::pair<std::string, std::string>> &kv)
+{
+    HSTRING cls = nullptr;
+    IInspectable *obj = nullptr;
+    IMapSSAbi *map = nullptr;
+    to_hstr(L"Windows.Foundation.Collections.StringMap", &cls);
+    HRESULT hr = RoActivateInstance(cls, &obj);
+    WindowsDeleteString(cls);
+    if (FAILED(hr)) { trace("StringMap: activation failed, hr %#lx", (unsigned long)hr); return nullptr; }
+    hr = obj->QueryInterface(IID_IMap_String_String, (void **)&map);
+    obj->Release();
+    if (FAILED(hr)) return nullptr;
+    for (auto &p : kv)
+    {
+        HSTRING k = nullptr, v = nullptr;
+        boolean replaced;
+        to_hstr(p.first, &k);
+        to_hstr(p.second, &v);
+        map->Insert(k, v, &replaced);
+        WindowsDeleteString(k);
+        WindowsDeleteString(v);
+    }
+    return map;
+}
+
+/* key=value of an app's IMap<String,String>, values cut short: they are request options, but be safe */
+static std::string describe_map(IInspectable *map)
+{
+    std::string out;
+    IIterableAbi *it = nullptr;
+    IInspectable *first = nullptr;
+    if (!map || FAILED(map->QueryInterface(IID_IIterable_KVP_String_String, (void **)&it))) return "?";
+    if (SUCCEEDED(it->First(&first)) && first)
+    {
+        IIteratorAbi *iter = (IIteratorAbi *)first;
+        boolean has = FALSE;
+        iter->get_HasCurrent(&has);
+        while (has)
+        {
+            IInspectable *cur = nullptr;
+            if (SUCCEEDED(iter->get_Current(&cur)) && cur)
+            {
+                HSTRING k = nullptr, v = nullptr;
+                ((IKeyValuePairSSAbi *)cur)->get_Key(&k);
+                ((IKeyValuePairSSAbi *)cur)->get_Value(&v);
+                std::string val = from_hstr(v);
+                if (val.size() > 48) val = val.substr(0, 48) + "...";
+                out += (out.empty() ? "" : ", ") + from_hstr(k) + "=" + val;
+                WindowsDeleteString(k);
+                WindowsDeleteString(v);
+                cur->Release();
+            }
+            if (FAILED(iter->MoveNext(&has))) break;
+        }
+        first->Release();
+    }
+    it->Release();
+    return out;
+}
+
+/* The stored Microsoft account, loaded if this process has not signed in yet. Returns its user id. */
+/* The id of the Microsoft account's WebAccount, or "" when nobody is signed in. */
+static std::string stored_msa_account(void)
+{
+    EnterCriticalSection(&account.cs);
+    if (account.refresh_token.empty())
+    {
+        store_lock();
+        auto kv = store_read();
+        store_unlock();
+        account.refresh_token = kv["refresh_token"];
+        if (account.msa_user_id.empty()) account.msa_user_id = kv["user_id"];
+    }
+    if (account.puid.empty() && !account.refresh_token.empty())
+    {
+        store_lock();
+        auto kv = store_read();
+        store_unlock();
+        account.puid = kv["puid"];
+    }
+    /* the PUID once it is known (fetch_account_puid); until then the account's user id */
+    std::string id = account.refresh_token.empty() ? std::string() : !account.puid.empty() ? account.puid : account.msa_user_id;
+    LeaveCriticalSection(&account.cs);
+    return id;
+}
+
+/* A refresh-token grant for any scope, cached until a minute before it expires. */
+struct ScopedToken { std::string token, form; ULONGLONG expires = 0; };
+static std::map<std::string, ScopedToken> scoped_tokens; /* guarded by account.signin_cs */
+
+/* With oauth2_response=1 among a request's properties, WAM answers the whole OAuth response as form data (the
+ * Xbox app's age verification reads an id_token out of it: "Invalid token form data" otherwise). form_out gets the
+ * string and number fields of the token endpoint's JSON answer, url-encoded. */
+static std::string json_to_form(const Json &j)
+{
+    std::string out;
+    for (auto &kv : j.o)
+        if (kv.second.type == Json::STR || kv.second.type == Json::NUM)
+            out += (out.empty() ? "" : "&") + urlencode(kv.first) + "=" + urlencode(kv.second.str());
+    return out;
+}
+
+static HRESULT msa_token_for_scope(const std::string &scope, bool force, std::string &token, std::string &error,
+                                   std::string *form_out = nullptr, const std::string &extra = std::string())
+{
+    HRESULT hr = S_OK;
+    EnterCriticalSection(&account.signin_cs);
+    auto it = scoped_tokens.find(scope + extra);
+    if (!force && it != scoped_tokens.end() && it->second.expires > now_s())
+    {
+        token = it->second.token;
+        if (form_out) *form_out = it->second.form;
+        LeaveCriticalSection(&account.signin_cs);
+        return S_OK;
+    }
+    std::string refresh;
+    EnterCriticalSection(&account.cs);
+    refresh = account.refresh_token;
+    LeaveCriticalSection(&account.cs);
+    if (refresh.empty()) { LeaveCriticalSection(&account.signin_cs); return XA_E_NO_ACCOUNT; }
+
+    std::string resp;
+    DWORD status = http_form("https://login.live.com/oauth20_token.srf",
+                             "grant_type=refresh_token&client_id=" + std::string(MSA_CLIENT_ID) + "&scope=" +
+                             urlencode(scope) + "&refresh_token=" + urlencode(refresh) + extra, resp);
+    Json j = parse_json(resp);
+    if (!status) hr = XA_E_NETWORK;
+    else if (status != 200 || j["access_token"].str().empty())
+    {
+        error = j["error"].str();
+        trace("WebAuthenticationCoreManager: scope \"%s\": HTTP %lu, error \"%s\"", scope.c_str(), status, error.c_str());
+        hr = XA_E_MSA;
+    }
+    else
+    {
+        token = j["access_token"].str();
+        ScopedToken &t = scoped_tokens[scope + extra];
+        t.token = token;
+        t.form = json_to_form(j);
+        if (form_out) *form_out = t.form;
+        t.expires = now_s() + (ULONGLONG)(j["expires_in"].n > 120 ? j["expires_in"].n - 60 : 60);
+        if (!j["refresh_token"].str().empty())
+        {
+            EnterCriticalSection(&account.cs);
+            account.refresh_token = j["refresh_token"].str();
+            std::map<std::string, std::string> kv = { { "refresh_token", account.refresh_token }, { "user_id", account.msa_user_id } };
+            LeaveCriticalSection(&account.cs);
+            store_update(kv);
+        }
+        std::string fields;
+        for (auto &kv : j.o) fields += (fields.empty() ? "" : " ") + kv.first;
+        trace("WebAuthenticationCoreManager: scope \"%s\": token (%zu chars, expires in %.0f s; answer fields: %s)", scope.c_str(),
+              token.size(), j["expires_in"].n, fields.c_str());
+    }
+    LeaveCriticalSection(&account.signin_cs);
+    return hr;
+}
+
+/* The Microsoft account's e-mail address, for WebAccount.UserName (what Windows shows for a Microsoft account): the
+ * preferred_username claim of an "openid profile" id_token, fetched once and kept in xboxauth.bin. */
+static void fetch_account_email(void)
+{
+    store_lock();
+    auto kv = store_read();
+    store_unlock();
+    if (!kv["email"].empty()) return;
+    std::string token, error, form;
+    HRESULT hr = msa_token_for_scope("openid profile", false, token, error, &form);
+    size_t at = form.find("id_token=");
+    if (FAILED(hr) || at == std::string::npos) { trace("Microsoft account e-mail address: none (hr %#lx)", (unsigned long)hr); return; }
+    std::string jwt = form.substr(at + 9);
+    jwt = jwt.substr(0, jwt.find('&'));
+    size_t d1 = jwt.find('.'), d2 = jwt.find('.', d1 + 1);
+    if (d1 == std::string::npos || d2 == std::string::npos) return;
+    Json claims = parse_json(unb64(jwt.substr(d1 + 1, d2 - d1 - 1)));
+    std::string email = claims["preferred_username"].str();
+    if (email.empty()) email = claims["email"].str();
+    if (email.empty()) return;
+    store_update({ { "email", email } });
+    trace("Microsoft account e-mail address stored (%zu chars)", email.size());
+}
+
+/* The account's PUID. A Microsoft account WebAccount's Id is the PUID in hex, and the Xbox app checks the Store
+ * account against the account its content access answer is for ("ContentAccessWrongPuid"). No Microsoft account
+ * token carries it (the id_token's oid is the CID, like user_id), but the content access answer does: protobuf
+ * field 3 (the user), its field 1, in decimal. Fetched once, with the user's Xbox Live token, and kept. */
+static bool pb_varint(const unsigned char *&p, const unsigned char *end, ULONGLONG &v)
+{
+    v = 0;
+    for (int shift = 0; p < end && shift < 64; shift += 7)
+    {
+        unsigned char c = *p++;
+        v |= (ULONGLONG)(c & 0x7f) << shift;
+        if (!(c & 0x80)) return true;
+    }
+    return false;
+}
+/* the first length-delimited field `field` of a message */
+static bool pb_field(const unsigned char *p, const unsigned char *end, unsigned field, const unsigned char *&out, size_t &len)
+{
+    while (p < end)
+    {
+        ULONGLONG key, v;
+        if (!pb_varint(p, end, key)) return false;
+        switch (key & 7)
+        {
+        case 0: if (!pb_varint(p, end, v)) return false; break;
+        case 1: p += 8; break;
+        case 5: p += 4; break;
+        case 2:
+            if (!pb_varint(p, end, v) || v > (ULONGLONG)(end - p)) return false;
+            if ((key >> 3) == field) { out = p; len = (size_t)v; return true; }
+            p += v;
+            break;
+        default: return false;
+        }
+    }
+    return false;
+}
+extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthHttpGet(const char *, const char *, const char *, unsigned char **, UINT32 *, DWORD *);
+static void fetch_account_puid(void)
+{
+    EnterCriticalSection(&account.cs);
+    bool have = !account.puid.empty();
+    LeaveCriticalSection(&account.cs);
+    if (have) return;
+    store_lock();
+    auto kv = store_read();
+    store_unlock();
+    if (!kv["puid"].empty()) { EnterCriticalSection(&account.cs); account.puid = kv["puid"]; LeaveCriticalSection(&account.cs); return; }
+    unsigned char *body = nullptr;
+    UINT32 len = 0;
+    DWORD status = 0;
+    if (FAILED(XboxAuthHttpGet("https://contentaccess.exp.xboxservices.com/all/v1?market=US&offering=XGPUPCAPP",
+                               "MS-CV: wineuwpPuidFetch.0", "1", &body, &len, &status)) || status != 200)
+    {
+        trace("account PUID: content access HTTP %lu", status);
+        if (body) CoTaskMemFree(body);
+        return;
+    }
+    const unsigned char *user, *id;
+    size_t ulen, idlen;
+    std::string dec;
+    if (pb_field(body, body + len, 3, user, ulen) && pb_field(user, user + ulen, 1, id, idlen)) dec.assign((const char *)id, idlen);
+    CoTaskMemFree(body);
+    ULONGLONG puid = _strtoui64(dec.c_str(), nullptr, 10);
+    if (!puid) { trace("account PUID: not in the content access answer"); return; }
+    char hex[17];
+    snprintf(hex, sizeof(hex), "%016llX", puid);
+    EnterCriticalSection(&account.cs);
+    account.puid = hex;
+    LeaveCriticalSection(&account.cs);
+    store_update({ { "puid", hex } });
+    trace("account PUID stored");
+}
+
+struct IWebAccountProviderAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_Id(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_DisplayName(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_IconUri(IInspectable **) = 0;
+};
+struct IWebAccountProvider2Abi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_DisplayPurpose(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Authority(HSTRING *) = 0;
+};
+struct IWebAccountProvider3Abi : IInspectable { virtual HRESULT STDMETHODCALLTYPE get_User(IInspectable **) = 0; };
+struct IWebAccountProvider4Abi : IInspectable { virtual HRESULT STDMETHODCALLTYPE get_IsSystemProvider(boolean *) = 0; };
+
+struct WebAccountProvider : IWebAccountProviderAbi, IWebAccountProvider2Abi, IWebAccountProvider3Abi, IWebAccountProvider4Abi
+{
+    LONG ref = 1;
+    std::string authority;
+    IInspectable *user = nullptr;
+    WebAccountProvider(const std::string &a, IInspectable *u) : authority(a), user(u) { if (user) user->AddRef(); }
+    ~WebAccountProvider() { if (user) user->Release(); }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (!out) return E_POINTER;
+        if (is_base_iid(iid) || IsEqualGUID(iid, IID_IWebAccountProvider)) *out = static_cast<IWebAccountProviderAbi *>(this);
+        else if (IsEqualGUID(iid, IID_IWebAccountProvider2)) *out = static_cast<IWebAccountProvider2Abi *>(this);
+        else if (IsEqualGUID(iid, IID_IWebAccountProvider3)) *out = static_cast<IWebAccountProvider3Abi *>(this);
+        else if (IsEqualGUID(iid, IID_IWebAccountProvider4)) *out = static_cast<IWebAccountProvider4Abi *>(this);
+        else { trace_refused("WebAccountProvider", iid); *out = nullptr; return E_NOINTERFACE; }
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    HRESULT STDMETHODCALLTYPE GetIids(ULONG *c, IID **ids) override { if (c) *c = 0; if (ids) *ids = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING *n) override { return to_hstr(L"Windows.Security.Credentials.WebAccountProvider", n); }
+    HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel *l) override { if (!l) return E_POINTER; *l = BaseTrust; return S_OK; }
+
+    HRESULT STDMETHODCALLTYPE get_Id(HSTRING *v) override { return to_hstr(MSA_PROVIDER_ID, v); }
+    HRESULT STDMETHODCALLTYPE get_DisplayName(HSTRING *v) override { return to_hstr(L"Microsoft account", v); }
+    HRESULT STDMETHODCALLTYPE get_IconUri(IInspectable **v) override
+    {
+        if (!v) return E_POINTER;
+        *v = nullptr;
+        trace("WebAccountProvider.IconUri -> null");
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_DisplayPurpose(HSTRING *v) override { if (!v) return E_POINTER; *v = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_Authority(HSTRING *v) override { return to_hstr(authority, v); }
+    HRESULT STDMETHODCALLTYPE get_User(IInspectable **v) override
+    {
+        if (!v) return E_POINTER;
+        if ((*v = user)) user->AddRef();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_IsSystemProvider(boolean *v) override { if (!v) return E_POINTER; *v = FALSE; return S_OK; }
+};
+
+struct IWebAccountAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_WebAccountProvider(IWebAccountProviderAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_UserName(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_State(INT32 *) = 0;
+};
+struct IWebAccount2Abi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_Id(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Properties(IInspectable **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetPictureAsync(INT32, IAsyncOpAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SignOutAsync(IAsyncOpAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SignOutAsync2(HSTRING, IAsyncOpAbi **) = 0;
+};
+
+struct WebAccount : IWebAccountAbi, IWebAccount2Abi
+{
+    LONG ref = 1;
+    WebAccountProvider *provider;
+    std::string id, user_name;
+    WebAccount(WebAccountProvider *p, const std::string &i, const std::string &n) : provider(p), id(i), user_name(n) { provider->AddRef(); }
+    ~WebAccount() { provider->Release(); }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (!out) return E_POINTER;
+        if (is_base_iid(iid) || IsEqualGUID(iid, IID_IWebAccount)) *out = static_cast<IWebAccountAbi *>(this);
+        else if (IsEqualGUID(iid, IID_IWebAccount2)) *out = static_cast<IWebAccount2Abi *>(this);
+        else { trace_refused("WebAccount", iid); *out = nullptr; return E_NOINTERFACE; }
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    HRESULT STDMETHODCALLTYPE GetIids(ULONG *c, IID **ids) override { if (c) *c = 0; if (ids) *ids = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING *n) override { return to_hstr(L"Windows.Security.Credentials.WebAccount", n); }
+    HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel *l) override { if (!l) return E_POINTER; *l = BaseTrust; return S_OK; }
+
+    HRESULT STDMETHODCALLTYPE get_WebAccountProvider(IWebAccountProviderAbi **v) override
+    {
+        if (!v) return E_POINTER;
+        provider->AddRef();
+        *v = provider;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_UserName(HSTRING *v) override { trace("WebAccount.UserName"); return to_hstr(user_name, v); }
+    HRESULT STDMETHODCALLTYPE get_State(INT32 *v) override { if (!v) return E_POINTER; *v = 1; /* Connected */ return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_Id(HSTRING *v) override { return to_hstr(id, v); }
+    HRESULT STDMETHODCALLTYPE get_Properties(IInspectable **v) override
+    {
+        if (!v) return E_POINTER;
+        *v = nullptr;
+        trace("WebAccount.Properties");
+        IMapSSAbi *map = make_string_map({ { "Authority", provider->authority }, { "UserName", user_name }, { "CID", id } });
+        if (!map) return E_OUTOFMEMORY;
+        HRESULT hr = map->GetView(v);
+        map->Release();
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE GetPictureAsync(INT32 size, IAsyncOpAbi **v) override;
+    HRESULT STDMETHODCALLTYPE SignOutAsync(IAsyncOpAbi **v) override
+    {
+        /* signing the Store out would sign Xbox out too: it is one account here. Accept and keep it. */
+        trace("WebAccount.SignOutAsync -> kept");
+        if (!v) return E_POINTER;
+        AsyncOp *op = new AsyncOp(IID_IAsyncAction_, R_ACTION, "WebAccount.SignOutAsync");
+        op->finish(S_OK);
+        *v = op;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SignOutAsync2(HSTRING, IAsyncOpAbi **v) override { return SignOutAsync(v); }
+};
+
+/* The account picture: the Xbox gamer picture of the same account (profile setting GameDisplayPicRaw), as an
+ * IRandomAccessStream over the downloaded PNG. The app's StoreAccountModule.GetProfile reads it, and without it
+ * reports no Store account at all. If the picture cannot be fetched, a 1x1 transparent PNG stands in. */
+static const GUID IID_AsyncOp_RandomAccessStream = {0x430ecece,0x1418,0x5d19,{0x81,0xb2,0x5d,0xdb,0x38,0x16,0x03,0xcc}};
+static const GUID IID_IRandomAccessStream_ = {0x905a0fe1,0xbc53,0x11df,{0x8c,0x49,0x00,0x1e,0x4f,0xc6,0x86,0xda}};
+
+static std::string gamer_picture(int size)
+{
+    std::string url = "https://profile.xboxlive.com/users/me/profile/settings?settings=GameDisplayPicRaw", header, resp;
+    if (FAILED(sign_in_silently()) || FAILED(get_token_for_url(url, false, header))) return std::string();
+    std::vector<std::string> h = { "Authorization: " + header, "x-xbl-contract-version: 2", "Accept: application/json" };
+    SigningPolicy policy;
+    if (find_policy(url, policy))
+    {
+        std::string sig = sign_request(policy.version, policy.max_body_bytes, "GET", split_url(url).path_and_query, header, "");
+        if (!sig.empty()) h.push_back("Signature: " + sig);
+    }
+    DWORD status = http_request(L"GET", url, h, "", resp);
+    std::string pic = parse_json(resp)["profileUsers"].at(0)["settings"].at(0)["value"].str();
+    if (status != 200 || pic.empty()) { trace("gamer picture: profile HTTP %lu, no picture", status); return std::string(); }
+    char dims[64];
+    snprintf(dims, sizeof(dims), "%sw=%d&h=%d", pic.find('?') == std::string::npos ? "?" : "&", size, size);
+    status = http_request(L"GET", pic + dims, { "Accept: image/png" }, "", resp);
+    trace("gamer picture: HTTP %lu, %zu bytes", status, resp.size());
+    return status == 200 ? resp : std::string();
+}
+
+/* A Windows.Storage.Streams.InMemoryRandomAccessStream holding bytes, positioned at 0. Wine's completes WriteAsync inline. */
+static const GUID IID_IBuffer_ = {0x905a0fe0,0xbc53,0x11df,{0x8c,0x49,0x00,0x1e,0x4f,0xc6,0x86,0xda}};
+static const GUID IID_IBufferByteAccess_ = {0x905a0fef,0xbc53,0x11df,{0x8c,0x49,0x00,0x1e,0x4f,0xc6,0x86,0xda}};
+static const GUID IID_IOutputStream_ = {0x905a0fe6,0xbc53,0x11df,{0x8c,0x49,0x00,0x1e,0x4f,0xc6,0x86,0xda}};
+struct IBufferAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_Capacity(UINT32 *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Length(UINT32 *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_Length(UINT32) = 0;
+};
+struct IBufferByteAccessAbi : IUnknown { virtual HRESULT STDMETHODCALLTYPE Buffer(BYTE **) = 0; };
+struct ByteBuffer : IBufferAbi, IBufferByteAccessAbi
+{
+    LONG ref = 1;
+    std::string bytes;
+    UINT32 length;
+    ByteBuffer(const std::string &b) : bytes(b), length((UINT32)b.size()) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (!out) return E_POINTER;
+        if (is_base_iid(iid) || IsEqualGUID(iid, IID_IBuffer_)) *out = static_cast<IBufferAbi *>(this);
+        else if (IsEqualGUID(iid, IID_IBufferByteAccess_)) *out = static_cast<IBufferByteAccessAbi *>(this);
+        else { *out = nullptr; return E_NOINTERFACE; }
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    HRESULT STDMETHODCALLTYPE GetIids(ULONG *c, IID **ids) override { if (c) *c = 0; if (ids) *ids = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING *n) override { return to_hstr(L"Windows.Storage.Streams.Buffer", n); }
+    HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel *l) override { if (!l) return E_POINTER; *l = BaseTrust; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_Capacity(UINT32 *v) override { if (!v) return E_POINTER; *v = (UINT32)bytes.size(); return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_Length(UINT32 *v) override { if (!v) return E_POINTER; *v = length; return S_OK; }
+    HRESULT STDMETHODCALLTYPE put_Length(UINT32 v) override { if (v > bytes.size()) return E_INVALIDARG; length = v; return S_OK; }
+    HRESULT STDMETHODCALLTYPE Buffer(BYTE **v) override { if (!v) return E_POINTER; *v = (BYTE *)&bytes[0]; return S_OK; }
+};
+struct IRandomAccessStreamSeekAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_Size(UINT64 *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_Size(UINT64) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetInputStreamAt(UINT64, IInspectable **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetOutputStreamAt(UINT64, IInspectable **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Position(UINT64 *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE Seek(UINT64) = 0;
+};
+struct IOutputStreamAbi : IInspectable { virtual HRESULT STDMETHODCALLTYPE WriteAsync(IBufferAbi *, IAsyncInfoAbi **) = 0; };
+
+static HRESULT make_memory_stream(const std::string &bytes, IInspectable **out)
+{
+    HSTRING cls = nullptr;
+    IInspectable *obj = nullptr;
+    IOutputStreamAbi *output = nullptr;
+    IRandomAccessStreamSeekAbi *ras = nullptr;
+    *out = nullptr;
+    to_hstr(L"Windows.Storage.Streams.InMemoryRandomAccessStream", &cls);
+    HRESULT hr = RoActivateInstance(cls, &obj);
+    WindowsDeleteString(cls);
+    if (FAILED(hr)) return hr;
+    if (SUCCEEDED(hr = obj->QueryInterface(IID_IOutputStream_, (void **)&output)))
+    {
+        ByteBuffer *buf = new ByteBuffer(bytes);
+        IAsyncInfoAbi *write = nullptr;
+        if (SUCCEEDED(hr = output->WriteAsync(buf, &write)))
+        {
+            IAsyncInfoAbi *info = nullptr;
+            INT32 st = 0;
+            if (SUCCEEDED(write->QueryInterface(IID_IAsyncInfo_, (void **)&info)))
+            {
+                for (int i = 0; i < 500 && SUCCEEDED(info->get_Status(&st)) && !st; i++) Sleep(10);
+                info->Release();
+            }
+            write->Release();
+            if (st != 1) hr = E_FAIL;
+        }
+        buf->Release();
+        output->Release();
+    }
+    if (SUCCEEDED(hr) && SUCCEEDED(hr = obj->QueryInterface(IID_IRandomAccessStream_, (void **)&ras)))
+    {
+        ras->Seek(0);
+        *out = ras;
+    }
+    obj->Release();
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE WebAccount::GetPictureAsync(INT32 size, IAsyncOpAbi **v)
+{
+    if (!v) return E_POINTER;
+    trace("WebAccount.GetPictureAsync(%d)", size);
+    *v = start_async(IID_AsyncOp_RandomAccessStream, R_IFACE, "WebAccount.GetPictureAsync", [size](AsyncOp *op) -> HRESULT {
+        static const unsigned char blank_png[] = {
+            0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0x00,0x00,0x00,0x0d,0x49,0x48,0x44,0x52,0x00,0x00,0x00,0x01,
+            0x00,0x00,0x00,0x01,0x08,0x06,0x00,0x00,0x00,0x1f,0x15,0xc4,0x89,0x00,0x00,0x00,0x0d,0x49,0x44,0x41,
+            0x54,0x78,0x9c,0x63,0x00,0x01,0x00,0x00,0x05,0x00,0x01,0x0d,0x0a,0x2d,0xb4,0x00,0x00,0x00,0x00,0x49,
+            0x45,0x4e,0x44,0xae,0x42,0x60,0x82 };
+        std::string bytes = gamer_picture(size > 0 ? size : 208);
+        if (bytes.empty()) bytes.assign((const char *)blank_png, sizeof(blank_png));
+        return make_memory_stream(bytes, (IInspectable **)&op->iface);
+    });
+    return S_OK;
+}
+
+/* The user name a Microsoft account WebAccount shows: the account's e-mail address (fetch_account_email), or until
+ * that is known the Xbox gamertag of the same account. */
+static std::string web_account_user_name(void)
+{
+    store_lock();
+    auto kv = store_read();
+    store_unlock();
+    if (!kv["email"].empty()) return kv["email"];
+    EnterCriticalSection(&account.cs);
+    std::string n = account.gtg;
+    LeaveCriticalSection(&account.cs);
+    if (n.empty()) n = kv["gamertag"];
+    return n.empty() ? std::string("Microsoft account") : n;
+}
+
+static WebAccount *make_web_account(WebAccountProvider *provider)
+{
+    std::string id = stored_msa_account();
+    if (id.empty()) return nullptr;
+    return new WebAccount(provider, id, web_account_user_name());
+}
+
+struct IWebProviderErrorAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_ErrorCode(UINT32 *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_ErrorMessage(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Properties(IInspectable **) = 0;
+};
+struct WebProviderError : IWebProviderErrorAbi
+{
+    LONG ref = 1;
+    UINT32 code;
+    std::string message;
+    WebProviderError(UINT32 c, const std::string &m) : code(c), message(m) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (!out) return E_POINTER;
+        if (is_base_iid(iid) || IsEqualGUID(iid, IID_IWebProviderError)) *out = static_cast<IWebProviderErrorAbi *>(this);
+        else { trace_refused("WebProviderError", iid); *out = nullptr; return E_NOINTERFACE; }
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    HRESULT STDMETHODCALLTYPE GetIids(ULONG *c, IID **ids) override { if (c) *c = 0; if (ids) *ids = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING *n) override { return to_hstr(L"Windows.Security.Authentication.Web.Core.WebProviderError", n); }
+    HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel *l) override { if (!l) return E_POINTER; *l = BaseTrust; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_ErrorCode(UINT32 *v) override { if (!v) return E_POINTER; *v = code; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_ErrorMessage(HSTRING *v) override { return to_hstr(message, v); }
+    HRESULT STDMETHODCALLTYPE get_Properties(IInspectable **v) override
+    {
+        if (!v) return E_POINTER;
+        *v = (IInspectable *)make_string_map({});
+        return *v ? S_OK : E_OUTOFMEMORY;
+    }
+};
+
+struct IWebTokenResponseAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_Token(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_ProviderError(IWebProviderErrorAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_WebAccount(IWebAccountAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Properties(IInspectable **) = 0;
+};
+struct WebTokenResponse : IWebTokenResponseAbi
+{
+    LONG ref = 1;
+    std::string token;
+    WebAccount *web_account;
+    IMapSSAbi *properties;
+    WebTokenResponse(const std::string &t, WebAccount *a) : token(t), web_account(a)
+    {
+        if (a) a->AddRef();
+        properties = make_string_map({ { "Authority", a ? a->provider->authority : "consumers" } });
+    }
+    ~WebTokenResponse()
+    {
+        if (web_account) web_account->Release();
+        if (properties) properties->Release();
+        SecureZeroMemory(&token[0], token.size());
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (!out) return E_POINTER;
+        if (is_base_iid(iid) || IsEqualGUID(iid, IID_IWebTokenResponse)) *out = static_cast<IWebTokenResponseAbi *>(this);
+        else { trace_refused("WebTokenResponse", iid); *out = nullptr; return E_NOINTERFACE; }
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    HRESULT STDMETHODCALLTYPE GetIids(ULONG *c, IID **ids) override { if (c) *c = 0; if (ids) *ids = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING *n) override { return to_hstr(L"Windows.Security.Authentication.Web.Core.WebTokenResponse", n); }
+    HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel *l) override { if (!l) return E_POINTER; *l = BaseTrust; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_Token(HSTRING *v) override { return to_hstr(token, v); }
+    HRESULT STDMETHODCALLTYPE get_ProviderError(IWebProviderErrorAbi **v) override { if (!v) return E_POINTER; *v = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_WebAccount(IWebAccountAbi **v) override
+    {
+        if (!v) return E_POINTER;
+        if ((*v = web_account)) web_account->AddRef();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_Properties(IInspectable **v) override
+    {
+        if (!v) return E_POINTER;
+        if ((*v = properties)) properties->AddRef();
+        return properties ? S_OK : E_OUTOFMEMORY;
+    }
+};
+
+/* IVectorView<T> of interfaces, with IIterable<T> (both by slot; the iterator is IIterator<T>) */
+struct IVectorViewAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE GetAt(UINT32, IInspectable **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Size(UINT32 *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE IndexOf(IInspectable *, UINT32 *, boolean *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetMany(UINT32, UINT32, IInspectable **, UINT32 *) = 0;
+};
+struct VectorView : IVectorViewAbi, IIterableAbi
+{
+    LONG ref = 1;
+    GUID view_iid, iterable_iid, iterator_iid;
+    const wchar_t *class_name;
+    std::vector<IInspectable *> items;
+    VectorView(REFIID v, REFIID it, REFIID itr, const wchar_t *n) : view_iid(v), iterable_iid(it), iterator_iid(itr), class_name(n) {}
+    ~VectorView() { for (auto i : items) i->Release(); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (!out) return E_POINTER;
+        if (is_base_iid(iid) || IsEqualGUID(iid, view_iid)) *out = static_cast<IVectorViewAbi *>(this);
+        else if (IsEqualGUID(iid, iterable_iid)) *out = static_cast<IIterableAbi *>(this);
+        else { trace_refused("VectorView", iid); *out = nullptr; return E_NOINTERFACE; }
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    HRESULT STDMETHODCALLTYPE GetIids(ULONG *c, IID **ids) override { if (c) *c = 0; if (ids) *ids = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING *n) override { return to_hstr(class_name, n); }
+    HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel *l) override { if (!l) return E_POINTER; *l = BaseTrust; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetAt(UINT32 i, IInspectable **v) override
+    {
+        if (!v) return E_POINTER;
+        if (i >= items.size()) { *v = nullptr; return E_BOUNDS; }
+        (*v = items[i])->AddRef();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_Size(UINT32 *v) override { if (!v) return E_POINTER; *v = (UINT32)items.size(); return S_OK; }
+    HRESULT STDMETHODCALLTYPE IndexOf(IInspectable *x, UINT32 *idx, boolean *found) override
+    {
+        if (!idx || !found) return E_POINTER;
+        *found = FALSE; *idx = 0;
+        for (UINT32 i = 0; i < items.size(); i++) if (items[i] == x) { *found = TRUE; *idx = i; break; }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetMany(UINT32 start, UINT32 n, IInspectable **out, UINT32 *got) override
+    {
+        if (!got || (n && !out)) return E_POINTER;
+        *got = 0;
+        for (UINT32 i = start; i < items.size() && *got < n; i++) { (out[*got] = items[i])->AddRef(); (*got)++; }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE First(IInspectable **v) override;
+};
+struct VectorIterator : IIteratorAbi
+{
+    LONG ref = 1;
+    VectorView *view;
+    UINT32 pos = 0;
+    VectorIterator(VectorView *v) : view(v) { view->AddRef(); }
+    ~VectorIterator() { view->Release(); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (!out) return E_POINTER;
+        if (is_base_iid(iid) || IsEqualGUID(iid, view->iterator_iid)) *out = static_cast<IIteratorAbi *>(this);
+        else { *out = nullptr; return E_NOINTERFACE; }
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    HRESULT STDMETHODCALLTYPE GetIids(ULONG *c, IID **ids) override { if (c) *c = 0; if (ids) *ids = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING *n) override { return to_hstr(L"Windows.Foundation.Collections.IIterator`1", n); }
+    HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel *l) override { if (!l) return E_POINTER; *l = BaseTrust; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_Current(IInspectable **v) override { return view->GetAt(pos, v); }
+    HRESULT STDMETHODCALLTYPE get_HasCurrent(boolean *v) override { if (!v) return E_POINTER; *v = pos < view->items.size(); return S_OK; }
+    HRESULT STDMETHODCALLTYPE MoveNext(boolean *v) override
+    {
+        if (pos < view->items.size()) pos++;
+        return get_HasCurrent(v);
+    }
+};
+HRESULT STDMETHODCALLTYPE VectorView::First(IInspectable **v)
+{
+    if (!v) return E_POINTER;
+    *v = static_cast<IIteratorAbi *>(new VectorIterator(this));
+    return S_OK;
+}
+static const GUID IID_IIterable_WebTokenResponse = {0x7e5bb7ec,0xbbd7,0x5575,{0x9a,0x61,0xf5,0x81,0x5f,0xa2,0x2a,0x0e}};
+static const GUID IID_IIterator_WebTokenResponse = {0xf080b0c9,0xa095,0x5b3a,{0xa1,0xdc,0xd1,0x7e,0x7d,0x29,0x82,0xc7}};
+static const GUID IID_IIterable_WebAccount = {0xcb15d439,0xa910,0x542a,{0x89,0xed,0x7c,0xfe,0x67,0x84,0x8a,0x83}};
+static const GUID IID_IIterator_WebAccount = {0xbfb82cca,0xaebc,0x567c,{0x95,0xd9,0xeb,0xa2,0x5c,0x36,0x5f,0xaa}};
+
+struct IWebTokenRequestResultAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_ResponseData(IVectorViewAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_ResponseStatus(INT32 *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_ResponseError(IWebProviderErrorAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE InvalidateCacheAsync(IAsyncOpAbi **) = 0;
+};
+struct WebTokenRequestResult : IWebTokenRequestResultAbi
+{
+    LONG ref = 1;
+    INT32 status;            /* WebTokenRequestStatus */
+    VectorView *data;
+    WebProviderError *error = nullptr;
+    std::string scope;
+    WebTokenRequestResult(INT32 s, const std::string &sc) : status(s), scope(sc)
+    {
+        data = new VectorView(IID_IVectorView_WebTokenResponse, IID_IIterable_WebTokenResponse, IID_IIterator_WebTokenResponse,
+                              L"Windows.Foundation.Collections.IVectorView`1<Windows.Security.Authentication.Web.Core.WebTokenResponse>");
+    }
+    ~WebTokenRequestResult() { data->Release(); if (error) error->Release(); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (!out) return E_POINTER;
+        if (is_base_iid(iid) || IsEqualGUID(iid, IID_IWebTokenRequestResult)) *out = static_cast<IWebTokenRequestResultAbi *>(this);
+        else { trace_refused("WebTokenRequestResult", iid); *out = nullptr; return E_NOINTERFACE; }
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    HRESULT STDMETHODCALLTYPE GetIids(ULONG *c, IID **ids) override { if (c) *c = 0; if (ids) *ids = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING *n) override { return to_hstr(L"Windows.Security.Authentication.Web.Core.WebTokenRequestResult", n); }
+    HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel *l) override { if (!l) return E_POINTER; *l = BaseTrust; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_ResponseData(IVectorViewAbi **v) override
+    {
+        if (!v) return E_POINTER;
+        data->AddRef();
+        *v = data;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_ResponseStatus(INT32 *v) override { if (!v) return E_POINTER; *v = status; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_ResponseError(IWebProviderErrorAbi **v) override
+    {
+        if (!v) return E_POINTER;
+        if ((*v = error)) error->AddRef();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE InvalidateCacheAsync(IAsyncOpAbi **v) override
+    {
+        if (!v) return E_POINTER;
+        EnterCriticalSection(&account.signin_cs);
+        scoped_tokens.erase(scope);
+        LeaveCriticalSection(&account.signin_cs);
+        trace("WebTokenRequestResult.InvalidateCacheAsync(\"%s\")", scope.c_str());
+        AsyncOp *op = new AsyncOp(IID_IAsyncAction_, R_ACTION, "InvalidateCacheAsync");
+        op->finish(S_OK);
+        *v = op;
+        return S_OK;
+    }
+};
+
+struct IWebTokenRequestAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_WebAccountProvider(IInspectable **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Scope(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_ClientId(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_PromptType(INT32 *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Properties(IInspectable **) = 0;
+};
+
+/* WebTokenRequestStatus */
+enum { WTRS_SUCCESS = 0, WTRS_USER_CANCEL = 1, WTRS_USER_INTERACTION_REQUIRED = 3, WTRS_PROVIDER_NOT_AVAILABLE = 4,
+       WTRS_PROVIDER_ERROR = 5 };
+
+/* GetTokenSilentlyAsync / RequestTokenAsync: a token for the request's scope from the stored Microsoft account. */
+static HRESULT get_web_token(IInspectable *request, IInspectable *account_in, bool ui, IAsyncOpAbi **out)
+{
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    IWebTokenRequestAbi *req = nullptr;
+    if (!request || FAILED(request->QueryInterface(IID_IWebTokenRequest, (void **)&req))) return E_INVALIDARG;
+    std::string scope, client, provider_id, props;
+    HSTRING h = nullptr;
+    INT32 prompt = 0;
+    if (SUCCEEDED(req->get_Scope(&h))) { scope = from_hstr(h); WindowsDeleteString(h); h = nullptr; }
+    if (SUCCEEDED(req->get_ClientId(&h))) { client = from_hstr(h); WindowsDeleteString(h); h = nullptr; }
+    req->get_PromptType(&prompt);
+    IInspectable *pv = nullptr;
+    if (SUCCEEDED(req->get_WebAccountProvider(&pv)) && pv)
+    {
+        IWebAccountProviderAbi *p = nullptr;
+        if (SUCCEEDED(pv->QueryInterface(IID_IWebAccountProvider, (void **)&p)))
+        {
+            if (SUCCEEDED(p->get_Id(&h))) { provider_id = from_hstr(h); WindowsDeleteString(h); h = nullptr; }
+            p->Release();
+        }
+        pv->Release();
+    }
+    IInspectable *map = nullptr;
+    std::string extra;
+    if (SUCCEEDED(req->get_Properties(&map)) && map)
+    {
+        props = describe_map(map);
+        /* "claims" (an id_token claims request, e.g. the age verification's xms_agvs) goes to the token endpoint too */
+        IMapSSAbi *m = nullptr;
+        if (SUCCEEDED(map->QueryInterface(IID_IMap_String_String, (void **)&m)))
+        {
+            HSTRING key = nullptr, value = nullptr;
+            boolean has = FALSE;
+            to_hstr(L"claims", &key);
+            if (SUCCEEDED(m->HasKey(key, &has)) && has && SUCCEEDED(m->Lookup(key, &value)))
+            {
+                extra = "&claims=" + urlencode(from_hstr(value));
+                WindowsDeleteString(value);
+            }
+            WindowsDeleteString(key);
+            m->Release();
+        }
+        map->Release();
+    }
+    req->Release();
+    trace("WebAuthenticationCoreManager.%s(provider \"%s\", scope \"%s\", client \"%s\", prompt %d, account %s, properties {%s})",
+          ui ? "RequestTokenAsync" : "GetTokenSilentlyAsync", provider_id.c_str(), scope.c_str(), client.c_str(), prompt,
+          account_in ? "given" : "none", props.c_str());
+
+    if (account_in) account_in->AddRef();
+    bool msa = !_stricmp(provider_id.c_str(), MSA_PROVIDER_ID);
+    bool oauth2_response = (", " + props + ",").find(", oauth2_response=1,") != std::string::npos;
+    AsyncOp *op = start_async(IID_AsyncOp_WebTokenRequestResult, R_IFACE, ui ? "RequestTokenAsync" : "GetTokenSilentlyAsync",
+                              [scope, msa, account_in, ui, oauth2_response, extra](AsyncOp *op) -> HRESULT {
+        WebTokenRequestResult *result;
+        std::string id = stored_msa_account();
+        if (!msa) result = new WebTokenRequestResult(WTRS_PROVIDER_NOT_AVAILABLE, scope);
+        else if (id.empty()) result = new WebTokenRequestResult(ui ? WTRS_USER_CANCEL : WTRS_USER_INTERACTION_REQUIRED, scope);
+        else
+        {
+            std::string token, error, form;
+            HRESULT hr = msa_token_for_scope(scope, false, token, error, &form, extra);
+            if (SUCCEEDED(hr) && oauth2_response) token.swap(form);
+            SecureZeroMemory(&form[0], form.size());
+            if (SUCCEEDED(hr))
+            {
+                WebAccountProvider *provider = new WebAccountProvider("consumers", nullptr);
+                WebAccount *wa = new WebAccount(provider, id, web_account_user_name());
+                provider->Release();
+                result = new WebTokenRequestResult(WTRS_SUCCESS, scope);
+                result->data->items.push_back(static_cast<IWebTokenResponseAbi *>(new WebTokenResponse(token, wa)));
+                wa->Release();
+                SecureZeroMemory(&token[0], token.size());
+            }
+            else if (error == "invalid_grant" || error == "interaction_required")
+                result = new WebTokenRequestResult(WTRS_USER_INTERACTION_REQUIRED, scope);
+            else
+            {
+                result = new WebTokenRequestResult(WTRS_PROVIDER_ERROR, scope);
+                result->error = new WebProviderError((UINT32)hr, error.empty() ? "the Microsoft account service refused" : error);
+            }
+        }
+        trace("  -> status %d", result->status);
+        op->iface = static_cast<IWebTokenRequestResultAbi *>(result);
+        if (account_in) account_in->Release();
+        return S_OK;
+    });
+    *out = op;
+    return S_OK;
+}
+
+static HRESULT completed_iface(REFIID iid, const char *name, IUnknown *result, IAsyncOpAbi **out)
+{
+    if (!out) { if (result) result->Release(); return E_POINTER; }
+    AsyncOp *op = new AsyncOp(iid, R_IFACE, name);
+    op->iface = result; /* takes the reference */
+    op->finish(S_OK);
+    *out = op;
+    return S_OK;
+}
+
+static HRESULT find_provider(HSTRING id, HSTRING authority, IInspectable *user, IAsyncOpAbi **out)
+{
+    std::string pid = from_hstr(id), auth = authority ? from_hstr(authority) : std::string("consumers");
+    bool msa = !_stricmp(pid.c_str(), MSA_PROVIDER_ID) && (auth.empty() || !_stricmp(auth.c_str(), "consumers"));
+    trace("WebAuthenticationCoreManager.FindAccountProviderAsync(\"%s\", \"%s\", user %s) -> %s", pid.c_str(), auth.c_str(),
+          user ? "given" : "none", msa ? "Microsoft account" : "none");
+    IUnknown *p = msa ? static_cast<IWebAccountProviderAbi *>(new WebAccountProvider(auth.empty() ? "consumers" : auth, user)) : nullptr;
+    return completed_iface(IID_AsyncOp_WebAccountProvider, "FindAccountProviderAsync", p, out);
+}
+
+static WebAccountProvider *our_provider(IInspectable *provider)
+{
+    IWebAccountProviderAbi *p = nullptr;
+    if (!provider || FAILED(provider->QueryInterface(IID_IWebAccountProvider, (void **)&p))) return nullptr;
+    HSTRING h = nullptr;
+    std::string id;
+    if (SUCCEEDED(p->get_Id(&h))) { id = from_hstr(h); WindowsDeleteString(h); }
+    p->Release();
+    if (_stricmp(id.c_str(), MSA_PROVIDER_ID)) return nullptr;
+    /* a provider object of the app's making (WebAccountProvider's own constructor) is answered as ours */
+    return new WebAccountProvider("consumers", nullptr);
+}
+
+struct IFindAllAccountsResultAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_Accounts(IVectorViewAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Status(INT32 *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_ProviderError(IWebProviderErrorAbi **) = 0;
+};
+struct FindAllAccountsResult : IFindAllAccountsResultAbi
+{
+    LONG ref = 1;
+    VectorView *accounts;
+    FindAllAccountsResult()
+    {
+        accounts = new VectorView(IID_IVectorView_WebAccount, IID_IIterable_WebAccount, IID_IIterator_WebAccount,
+                                  L"Windows.Foundation.Collections.IVectorView`1<Windows.Security.Credentials.WebAccount>");
+    }
+    ~FindAllAccountsResult() { accounts->Release(); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (!out) return E_POINTER;
+        if (is_base_iid(iid) || IsEqualGUID(iid, IID_IFindAllAccountsResult)) *out = static_cast<IFindAllAccountsResultAbi *>(this);
+        else { trace_refused("FindAllAccountsResult", iid); *out = nullptr; return E_NOINTERFACE; }
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    HRESULT STDMETHODCALLTYPE GetIids(ULONG *c, IID **ids) override { if (c) *c = 0; if (ids) *ids = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING *n) override { return to_hstr(L"Windows.Security.Authentication.Web.Core.FindAllAccountsResult", n); }
+    HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel *l) override { if (!l) return E_POINTER; *l = BaseTrust; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_Accounts(IVectorViewAbi **v) override { if (!v) return E_POINTER; accounts->AddRef(); *v = accounts; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_Status(INT32 *v) override { if (!v) return E_POINTER; *v = 0; /* Success */ return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_ProviderError(IWebProviderErrorAbi **v) override { if (!v) return E_POINTER; *v = nullptr; return S_OK; }
+};
+
+struct IWACMStaticsAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE GetTokenSilentlyAsync(IInspectable *, IAsyncOpAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetTokenSilentlyWithAccountAsync(IInspectable *, IInspectable *, IAsyncOpAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE RequestTokenAsync(IInspectable *, IAsyncOpAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE RequestTokenWithAccountAsync(IInspectable *, IInspectable *, IAsyncOpAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindAccountAsync(IInspectable *, HSTRING, IAsyncOpAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindAccountProviderAsync(HSTRING, IAsyncOpAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindAccountProviderWithAuthorityAsync(HSTRING, HSTRING, IAsyncOpAbi **) = 0;
+};
+struct IWACMStatics2Abi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE FindAccountProviderWithAuthorityForUserAsync(HSTRING, HSTRING, IInspectable *, IAsyncOpAbi **) = 0;
+};
+struct IWACMStatics4Abi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE FindAllAccountsAsync(IInspectable *, IAsyncOpAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindAllAccountsWithClientIdAsync(IInspectable *, HSTRING, IAsyncOpAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindSystemAccountProviderAsync(HSTRING, IAsyncOpAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindSystemAccountProviderWithAuthorityAsync(HSTRING, HSTRING, IAsyncOpAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindSystemAccountProviderWithAuthorityForUserAsync(HSTRING, HSTRING, IInspectable *, IAsyncOpAbi **) = 0;
+};
+
+struct WebAuthManagerFactory : IWACMStaticsAbi, IWACMStatics2Abi, IWACMStatics4Abi, IActivationFactoryAbi
+{
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (!out) return E_POINTER;
+        if (is_base_iid(iid) || IsEqualGUID(iid, IID_IActivationFactory)) *out = static_cast<IActivationFactoryAbi *>(this);
+        else if (IsEqualGUID(iid, IID_IWACMStatics)) *out = static_cast<IWACMStaticsAbi *>(this);
+        else if (IsEqualGUID(iid, IID_IWACMStatics2)) *out = static_cast<IWACMStatics2Abi *>(this);
+        else if (IsEqualGUID(iid, IID_IWACMStatics4)) *out = static_cast<IWACMStatics4Abi *>(this);
+        else { trace_refused("WebAuthenticationCoreManager", iid); *out = nullptr; return E_NOINTERFACE; }
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE GetIids(ULONG *c, IID **ids) override { if (c) *c = 0; if (ids) *ids = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING *n) override
+    { return to_hstr(L"Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager", n); }
+    HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel *l) override { if (!l) return E_POINTER; *l = BaseTrust; return S_OK; }
+    HRESULT STDMETHODCALLTYPE ActivateInstance(IInspectable **out) override { if (out) *out = nullptr; return E_NOTIMPL; }
+
+    HRESULT STDMETHODCALLTYPE GetTokenSilentlyAsync(IInspectable *r, IAsyncOpAbi **o) override { return get_web_token(r, nullptr, false, o); }
+    HRESULT STDMETHODCALLTYPE GetTokenSilentlyWithAccountAsync(IInspectable *r, IInspectable *a, IAsyncOpAbi **o) override { return get_web_token(r, a, false, o); }
+    HRESULT STDMETHODCALLTYPE RequestTokenAsync(IInspectable *r, IAsyncOpAbi **o) override { return get_web_token(r, nullptr, true, o); }
+    HRESULT STDMETHODCALLTYPE RequestTokenWithAccountAsync(IInspectable *r, IInspectable *a, IAsyncOpAbi **o) override { return get_web_token(r, a, true, o); }
+    HRESULT STDMETHODCALLTYPE FindAccountAsync(IInspectable *provider, HSTRING id, IAsyncOpAbi **out) override
+    {
+        std::string want = from_hstr(id), have = stored_msa_account();
+        WebAccountProvider *p = our_provider(provider);
+        WebAccount *wa = nullptr;
+        std::string cid;
+        EnterCriticalSection(&account.cs);
+        cid = account.msa_user_id;
+        LeaveCriticalSection(&account.cs);
+        if (p && !have.empty() && (!_stricmp(want.c_str(), have.c_str()) || !_stricmp(want.c_str(), cid.c_str())))
+            wa = make_web_account(p);
+        trace("WebAuthenticationCoreManager.FindAccountAsync(%s) -> %s", want.empty() ? "\"\"" : "an id",
+              wa ? "the Microsoft account" : have.empty() ? "none (not signed in)" : p ? "none (another account)" : "none (provider)");
+        if (p) p->Release();
+        return completed_iface(IID_AsyncOp_WebAccount, "FindAccountAsync", wa ? static_cast<IWebAccountAbi *>(wa) : nullptr, out);
+    }
+    HRESULT STDMETHODCALLTYPE FindAccountProviderAsync(HSTRING id, IAsyncOpAbi **out) override { return find_provider(id, nullptr, nullptr, out); }
+    HRESULT STDMETHODCALLTYPE FindAccountProviderWithAuthorityAsync(HSTRING id, HSTRING a, IAsyncOpAbi **out) override { return find_provider(id, a, nullptr, out); }
+    HRESULT STDMETHODCALLTYPE FindAccountProviderWithAuthorityForUserAsync(HSTRING id, HSTRING a, IInspectable *u, IAsyncOpAbi **out) override
+    { return find_provider(id, a, u, out); }
+    HRESULT STDMETHODCALLTYPE FindAllAccountsAsync(IInspectable *provider, IAsyncOpAbi **out) override
+    {
+        FindAllAccountsResult *r = new FindAllAccountsResult();
+        WebAccountProvider *p = our_provider(provider);
+        WebAccount *wa = p ? make_web_account(p) : nullptr;
+        if (wa) r->accounts->items.push_back(static_cast<IWebAccountAbi *>(wa));
+        if (p) p->Release();
+        trace("WebAuthenticationCoreManager.FindAllAccountsAsync -> %zu", r->accounts->items.size());
+        return completed_iface(IID_AsyncOp_FindAllAccountsResult, "FindAllAccountsAsync", static_cast<IFindAllAccountsResultAbi *>(r), out);
+    }
+    HRESULT STDMETHODCALLTYPE FindAllAccountsWithClientIdAsync(IInspectable *provider, HSTRING, IAsyncOpAbi **out) override
+    { return FindAllAccountsAsync(provider, out); }
+    HRESULT STDMETHODCALLTYPE FindSystemAccountProviderAsync(HSTRING id, IAsyncOpAbi **out) override { return find_provider(id, nullptr, nullptr, out); }
+    HRESULT STDMETHODCALLTYPE FindSystemAccountProviderWithAuthorityAsync(HSTRING id, HSTRING a, IAsyncOpAbi **out) override { return find_provider(id, a, nullptr, out); }
+    HRESULT STDMETHODCALLTYPE FindSystemAccountProviderWithAuthorityForUserAsync(HSTRING id, HSTRING a, IInspectable *u, IAsyncOpAbi **out) override
+    { return find_provider(id, a, u, out); }
+};
+static WebAuthManagerFactory web_auth_manager_factory;
+
+/* ------------------------------------------------------------------------------------------- */
+/* Windows.ApplicationModel.Store.Preview.StoreConfiguration: which WebAccount is the Store's     */
+/*                                                                                              */
+/* Windows' own (Windows.ApplicationModel.Store.dll) asks an out-of-process StoreConfigurationServer, */
+/* which is not registered here (REGDB_E_CLASSNOTREG at IStoreConfigurationStatics4). The Xbox app   */
+/* reads the Store's web account id with GetStoreWebAccountId[ForUser], finds it with                */
+/* WebAuthenticationCoreManager.FindAccountAsync and compares it with the Xbox user's WebAccountId     */
+/* ("Account mismatch"), and sets it with SetStoreWebAccountId[ForUser] ("trySetAccount"). The only    */
+/* account here is the Microsoft account of the Xbox sign-in, so that is the Store's account unless    */
+/* the app sets another id, which is kept in xboxauth.bin ("store_account_id").                       */
+/*                                                                                              */
+/* Slots (Windows.ApplicationModel.winmd): Statics {728f7fc0} 6 SetSystemConfiguration                */
+/*   7 SetMobileOperatorConfiguration 8 SetStoreWebAccountId 9 IsStoreWebAccountId                    */
+/*   10 get_HardwareManufacturerInfo 11 FilterUnsupportedSystemFeaturesAsync; Statics2 {657c4595}      */
+/*   6/7 PurchasePromptingPolicy; Statics3 {6d45f57c} 6 HasStoreWebAccount 7 ..ForUser 8 GetStoreLogDataAsync */
+/*   9 SetStoreWebAccountIdForUser 10 IsStoreWebAccountIdForUser 11/12 ..PurchasePromptingPolicyForUser; */
+/*   Statics4 {20ff56d2} 6 GetStoreWebAccountId 7 ..ForUser 8-11 enterprise ids 12/13 ShouldRestrictToEnterpriseStoreOnly */
+
+static const GUID IID_IStoreConfigurationStatics = {0x728f7fc0,0x8628,0x42ec,{0x84,0xa2,0x07,0x78,0x0e,0xb4,0x4d,0x8b}};
+static const GUID IID_IStoreConfigurationStatics2 = {0x657c4595,0xc8b7,0x4fe9,{0x9f,0x4c,0x4d,0x71,0x02,0x7d,0x34,0x7e}};
+static const GUID IID_IStoreConfigurationStatics3 = {0x6d45f57c,0xf144,0x4cb5,{0x9d,0x3f,0x4e,0xb0,0x5e,0x30,0xb6,0xd3}};
+static const GUID IID_IStoreConfigurationStatics4 = {0x20ff56d2,0x4ee3,0x4cf0,{0x9b,0x12,0x55,0x2c,0x03,0x31,0x0f,0x75}};
+
+static std::string store_web_account_id(void)
+{
+    std::string id = stored_msa_account();
+    if (id.empty()) return id;
+    store_lock();
+    auto kv = store_read();
+    store_unlock();
+    return kv["store_account_id"].empty() ? id : kv["store_account_id"];
+}
+static HRESULT set_store_web_account_id(HSTRING h)
+{
+    std::string id = from_hstr(h), msa = stored_msa_account();
+    trace("StoreConfiguration.SetStoreWebAccountId(%s)", id.empty() ? "\"\"" : !_stricmp(id.c_str(), msa.c_str()) ?
+          "the Microsoft account" : "another id");
+    store_update({ { "store_account_id", _stricmp(id.c_str(), msa.c_str()) ? id : std::string() } });
+    return S_OK;
+}
+static HRESULT is_store_web_account_id(HSTRING h, boolean *v)
+{
+    if (!v) return E_POINTER;
+    std::string id = from_hstr(h), have = store_web_account_id();
+    *v = !have.empty() && !_stricmp(id.c_str(), have.c_str());
+    trace("StoreConfiguration.IsStoreWebAccountId -> %d", *v);
+    return S_OK;
+}
+
+struct IStoreConfigurationStaticsAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE SetSystemConfiguration(HSTRING, HSTRING, INT64, HSTRING) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetMobileOperatorConfiguration(HSTRING, UINT32, UINT32) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetStoreWebAccountId(HSTRING) = 0;
+    virtual HRESULT STDMETHODCALLTYPE IsStoreWebAccountId(HSTRING, boolean *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_HardwareManufacturerInfo(IInspectable **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FilterUnsupportedSystemFeaturesAsync(IInspectable *, IAsyncOpAbi **) = 0;
+};
+struct IStoreConfigurationStatics2Abi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_PurchasePromptingPolicy(IInspectable **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_PurchasePromptingPolicy(IInspectable *) = 0;
+};
+struct IStoreConfigurationStatics3Abi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE HasStoreWebAccount(boolean *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE HasStoreWebAccountForUser(IInspectable *, boolean *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetStoreLogDataAsync(UINT32, IAsyncOpAbi **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetStoreWebAccountIdForUser(IInspectable *, HSTRING) = 0;
+    virtual HRESULT STDMETHODCALLTYPE IsStoreWebAccountIdForUser(IInspectable *, HSTRING, boolean *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetPurchasePromptingPolicyForUser(IInspectable *, IInspectable **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetPurchasePromptingPolicyForUser(IInspectable *, IInspectable *) = 0;
+};
+struct IStoreConfigurationStatics4Abi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE GetStoreWebAccountId(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetStoreWebAccountIdForUser(IInspectable *, HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetEnterpriseStoreWebAccountId(HSTRING) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetEnterpriseStoreWebAccountIdForUser(IInspectable *, HSTRING) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetEnterpriseStoreWebAccountId(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetEnterpriseStoreWebAccountIdForUser(IInspectable *, HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ShouldRestrictToEnterpriseStoreOnly(boolean *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ShouldRestrictToEnterpriseStoreOnlyForUser(IInspectable *, boolean *) = 0;
+};
+
+struct StoreConfigurationFactory : IStoreConfigurationStaticsAbi, IStoreConfigurationStatics2Abi, IStoreConfigurationStatics3Abi,
+                                   IStoreConfigurationStatics4Abi, IActivationFactoryAbi
+{
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (!out) return E_POINTER;
+        if (is_base_iid(iid) || IsEqualGUID(iid, IID_IActivationFactory)) *out = static_cast<IActivationFactoryAbi *>(this);
+        else if (IsEqualGUID(iid, IID_IStoreConfigurationStatics)) *out = static_cast<IStoreConfigurationStaticsAbi *>(this);
+        else if (IsEqualGUID(iid, IID_IStoreConfigurationStatics2)) *out = static_cast<IStoreConfigurationStatics2Abi *>(this);
+        else if (IsEqualGUID(iid, IID_IStoreConfigurationStatics3)) *out = static_cast<IStoreConfigurationStatics3Abi *>(this);
+        else if (IsEqualGUID(iid, IID_IStoreConfigurationStatics4)) *out = static_cast<IStoreConfigurationStatics4Abi *>(this);
+        else { trace_refused("StoreConfiguration", iid); *out = nullptr; return E_NOINTERFACE; }
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE GetIids(ULONG *c, IID **ids) override { if (c) *c = 0; if (ids) *ids = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING *n) override
+    { return to_hstr(L"Windows.ApplicationModel.Store.Preview.StoreConfiguration", n); }
+    HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel *l) override { if (!l) return E_POINTER; *l = BaseTrust; return S_OK; }
+    HRESULT STDMETHODCALLTYPE ActivateInstance(IInspectable **out) override { if (out) *out = nullptr; return E_NOTIMPL; }
+
+    HRESULT STDMETHODCALLTYPE SetSystemConfiguration(HSTRING, HSTRING, INT64, HSTRING) override
+    { trace("StoreConfiguration.SetSystemConfiguration: ignored"); return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetMobileOperatorConfiguration(HSTRING, UINT32, UINT32) override
+    { trace("StoreConfiguration.SetMobileOperatorConfiguration: ignored"); return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetStoreWebAccountId(HSTRING id) override { return set_store_web_account_id(id); }
+    HRESULT STDMETHODCALLTYPE IsStoreWebAccountId(HSTRING id, boolean *v) override { return is_store_web_account_id(id, v); }
+    HRESULT STDMETHODCALLTYPE get_HardwareManufacturerInfo(IInspectable **v) override
+    { trace("StoreConfiguration.HardwareManufacturerInfo -> E_NOTIMPL"); if (v) *v = nullptr; return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE FilterUnsupportedSystemFeaturesAsync(IInspectable *, IAsyncOpAbi **v) override
+    { trace("StoreConfiguration.FilterUnsupportedSystemFeaturesAsync -> E_NOTIMPL"); if (v) *v = nullptr; return E_NOTIMPL; }
+
+    /* null is the documented "no policy set" */
+    HRESULT STDMETHODCALLTYPE get_PurchasePromptingPolicy(IInspectable **v) override { if (!v) return E_POINTER; *v = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE put_PurchasePromptingPolicy(IInspectable *) override { trace("StoreConfiguration.PurchasePromptingPolicy: ignored"); return S_OK; }
+
+    HRESULT STDMETHODCALLTYPE HasStoreWebAccount(boolean *v) override
+    {
+        if (!v) return E_POINTER;
+        *v = !store_web_account_id().empty();
+        trace("StoreConfiguration.HasStoreWebAccount -> %d", *v);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE HasStoreWebAccountForUser(IInspectable *, boolean *v) override { return HasStoreWebAccount(v); }
+    HRESULT STDMETHODCALLTYPE GetStoreLogDataAsync(UINT32, IAsyncOpAbi **v) override
+    { trace("StoreConfiguration.GetStoreLogDataAsync -> E_NOTIMPL"); if (v) *v = nullptr; return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetStoreWebAccountIdForUser(IInspectable *, HSTRING id) override { return set_store_web_account_id(id); }
+    HRESULT STDMETHODCALLTYPE IsStoreWebAccountIdForUser(IInspectable *, HSTRING id, boolean *v) override { return is_store_web_account_id(id, v); }
+    HRESULT STDMETHODCALLTYPE GetPurchasePromptingPolicyForUser(IInspectable *, IInspectable **v) override { return get_PurchasePromptingPolicy(v); }
+    HRESULT STDMETHODCALLTYPE SetPurchasePromptingPolicyForUser(IInspectable *, IInspectable *p) override { return put_PurchasePromptingPolicy(p); }
+
+    HRESULT STDMETHODCALLTYPE GetStoreWebAccountId(HSTRING *v) override
+    {
+        std::string id = store_web_account_id();
+        trace("StoreConfiguration.GetStoreWebAccountId -> %s", id.empty() ? "none" : "the Microsoft account");
+        return to_hstr(id, v);
+    }
+    HRESULT STDMETHODCALLTYPE GetStoreWebAccountIdForUser(IInspectable *, HSTRING *v) override { return GetStoreWebAccountId(v); }
+    HRESULT STDMETHODCALLTYPE SetEnterpriseStoreWebAccountId(HSTRING) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetEnterpriseStoreWebAccountIdForUser(IInspectable *, HSTRING) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetEnterpriseStoreWebAccountId(HSTRING *v) override { if (!v) return E_POINTER; *v = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetEnterpriseStoreWebAccountIdForUser(IInspectable *, HSTRING *v) override { return GetEnterpriseStoreWebAccountId(v); }
+    HRESULT STDMETHODCALLTYPE ShouldRestrictToEnterpriseStoreOnly(boolean *v) override { if (!v) return E_POINTER; *v = FALSE; return S_OK; }
+    HRESULT STDMETHODCALLTYPE ShouldRestrictToEnterpriseStoreOnlyForUser(IInspectable *, boolean *v) override { return ShouldRestrictToEnterpriseStoreOnly(v); }
+};
+static StoreConfigurationFactory store_configuration_factory;
+
+/* ------------------------------------------------------------------------------------------- */
 
 extern "C" __declspec(dllexport) HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **factory)
 {
@@ -2259,6 +3389,10 @@ extern "C" __declspec(dllexport) HRESULT WINAPI DllGetActivationFactory(HSTRING 
         *factory = (IActivationFactory *)static_cast<IActivationFactoryAbi *>(&manager_factory);
     else if (!wcscmp(name, L"Microsoft.GamePlatform.Services.Identity.XboxAuthInitializationArgs"))
         *factory = (IActivationFactory *)static_cast<IActivationFactoryAbi *>(&init_args_factory);
+    else if (!wcscmp(name, L"Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager"))
+        *factory = (IActivationFactory *)static_cast<IActivationFactoryAbi *>(&web_auth_manager_factory);
+    else if (!wcscmp(name, L"Windows.ApplicationModel.Store.Preview.StoreConfiguration"))
+        *factory = (IActivationFactory *)static_cast<IActivationFactoryAbi *>(&store_configuration_factory);
     else
     {
         trace("%ls: no stand-in", name);
@@ -2271,11 +3405,48 @@ extern "C" __declspec(dllexport) HRESULT WINAPI DllGetActivationFactory(HSTRING 
 
 extern "C" __declspec(dllexport) HRESULT WINAPI DllCanUnloadNow(void) { return S_FALSE; }
 
+/* An authenticated GET for the other stand-ins (shims/gameplatform answers Gaming Services' content access with it):
+ * the Xbox Live token for the URL's relying party, its Signature when the endpoint has a policy, and extra headers
+ * ('|'-separated). *body is CoTaskMemAlloc'ed. Returns S_OK when a response arrived, whatever its status. */
+extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthHttpGet(const char *url, const char *extra, const char *contract,
+                                                                unsigned char **body, UINT32 *len, DWORD *status)
+{
+    std::string header, resp;
+    HRESULT hr;
+    account_init();
+    *body = nullptr; *len = 0; *status = 0;
+    if (FAILED(hr = sign_in_silently())) return hr;
+    if (FAILED(hr = get_token_for_url(url, false, header))) return hr;
+    std::vector<std::string> h = { "Authorization: " + header, std::string("x-xbl-contract-version: ") + (contract ? contract : "1"),
+                                   "Accept-Language: en-US" };
+    std::string e = extra ? extra : "";
+    for (size_t a = 0, b; a < e.size(); a = b + 1)
+    {
+        b = e.find('|', a);
+        if (b == std::string::npos) b = e.size();
+        if (b > a) h.push_back(e.substr(a, b - a));
+    }
+    SigningPolicy policy;
+    if (find_policy(url, policy))
+    {
+        std::string sig = sign_request(policy.version, policy.max_body_bytes, "GET", split_url(url).path_and_query, header, "");
+        if (!sig.empty()) h.push_back("Signature: " + sig);
+    }
+    *status = http_request(L"GET", url, h, "", resp);
+    if (!*status) return XA_E_NETWORK;
+    if (!(*body = (unsigned char *)CoTaskMemAlloc(resp.size() ? resp.size() : 1))) return E_OUTOFMEMORY;
+    memcpy(*body, resp.data(), resp.size());
+    *len = (UINT32)resp.size();
+    trace("GET %s: HTTP %lu, %zu bytes", url, *status, resp.size());
+    return S_OK;
+}
+
 /* For probes/probe-xboxauth.cpp: exercises the HTTP paths without an app.
  *   "endpoints <url>"   relying party lookup for a URL
  *   "xbl <rps>"         user/authenticate with a deliberately invalid ticket (request shape, error path)
  *   "devicecode"        obtains a device code and stops (no browser, no polling)
- *   "silent"            silent sign-in from the stored refresh token, then the profile claims */
+ *   "silent"            silent sign-in from the stored refresh token, then the profile claims
+ *   "msascope <scope>"  a Microsoft account token for a scope (WebAuthenticationCoreManager's path) */
 extern "C" __declspec(dllexport) int WINAPI XboxAuthSelfTest(const char *what, const char *arg)
 {
     account_init();
@@ -2441,6 +3612,16 @@ extern "C" __declspec(dllexport) int WINAPI XboxAuthSelfTest(const char *what, c
         const char *contract = getenv("XBL_CONTRACT");
         std::vector<std::string> h = { "Authorization: " + header, std::string("x-xbl-contract-version: ") + (contract ? contract : "3"),
                                        "Accept: application/json", "Accept-Language: en-US" };
+        if (const char *extra = getenv("XBL_EXTRA")) /* more headers, '|'-separated */
+        {
+            std::string e = extra;
+            for (size_t a = 0, b; a < e.size(); a = b + 1)
+            {
+                b = e.find('|', a);
+                if (b == std::string::npos) b = e.size();
+                h.push_back(e.substr(a, b - a));
+            }
+        }
         SigningPolicy policy;
         if (find_policy(url, policy))
         {
@@ -2449,6 +3630,8 @@ extern "C" __declspec(dllexport) int WINAPI XboxAuthSelfTest(const char *what, c
         }
         DWORD status = http_request(L"GET", url, h, "", resp);
         printf("HTTP %lu, %zu bytes\n%.600s\n", (unsigned long)status, resp.size(), resp.c_str());
+        if (const char *out = getenv("XBL_OUT"))  /* the whole body, for binary answers */
+            if (FILE *f = fopen(out, "wb")) { fwrite(resp.data(), 1, resp.size(), f); fclose(f); }
         return status == 200 ? 0 : 1;
     }
     if (!strcmp(what, "silent"))
@@ -2460,6 +3643,40 @@ extern "C" __declspec(dllexport) int WINAPI XboxAuthSelfTest(const char *what, c
             std::string h;
             hr = get_token_for_url(arg && *arg ? arg : "https://profile.xboxlive.com/users/me/profile/settings", false, h);
             trace("token -> %#lx, header %zu chars", (unsigned long)hr, h.size());
+        }
+        return SUCCEEDED(hr) ? 0 : 1;
+    }
+    if (!strcmp(what, "msascope") && arg)
+    {
+        /* a refresh-token grant for a scope, as WebAuthenticationCoreManager.GetTokenSilentlyAsync makes it */
+        std::string token, error, scope = arg, extra;
+        if (scope.find('|') != std::string::npos) { extra = "&" + scope.substr(scope.find('|') + 1); scope.resize(scope.find('|')); }
+        if (stored_msa_account().empty()) { trace("msascope: no stored sign-in"); return 1; }
+        HRESULT hr = msa_token_for_scope(scope, true, token, error, nullptr, extra);
+        trace("msascope \"%s\" -> %#lx%s%s, token %zu chars", arg, (unsigned long)hr, error.empty() ? "" : ", error ",
+              error.c_str(), token.size());
+        EnterCriticalSection(&account.signin_cs);
+        std::string form = scoped_tokens[scope + extra].form;
+        LeaveCriticalSection(&account.signin_cs);
+        size_t at = form.find("id_token=");
+        if (at != std::string::npos)
+        {
+            /* the claim names of the id_token (never the values) */
+            std::string jwt = form.substr(at + 9);
+            jwt = jwt.substr(0, jwt.find('&'));
+            size_t d1 = jwt.find('.'), d2 = jwt.find('.', d1 + 1);
+            Json claims = parse_json(unb64(jwt.substr(d1 + 1, d2 - d1 - 1)));
+            std::string names;
+            for (auto &kv : claims.o) names += " " + kv.first;
+            trace("  id_token claims:%s", names.c_str());
+            if (const char *want = getenv("XBA_COMPARE_OID_TAIL"))
+            {
+                std::string oid = claims["oid"].str(), tail;
+                for (char ch : oid) if (ch != '-') tail += (char)toupper((unsigned char)ch);
+                if (tail.size() > 16) tail = tail.substr(tail.size() - 16);
+                trace("  oid tail %s the given value (oid starts %.19s); it %s the user_id", _stricmp(tail.c_str(), want) ? "differs from" : "equals",
+                      oid.c_str(), _stricmp(tail.c_str(), account.msa_user_id.c_str()) ? "differs from" : "equals");
+            }
         }
         return SUCCEEDED(hr) ? 0 : 1;
     }

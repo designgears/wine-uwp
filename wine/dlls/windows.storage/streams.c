@@ -336,13 +336,45 @@ static HRESULT WINAPI memory_stream_random_access_put_Size( IRandomAccessStream 
     return S_OK;
 }
 
+static HRESULT memory_stream_create( IRandomAccessStream **out );
+
+/* A new stream holding a copy of the data, at position. Windows' clones share the data; a copy differs only when
+ * one of them is written to afterwards, which the readers seen (GetInputStreamAt for a DataReader, CloneStream
+ * for a decoder) do not do. */
+static HRESULT memory_stream_clone( struct memory_stream *impl, UINT64 position, struct memory_stream **out )
+{
+    IRandomAccessStream *stream;
+    struct memory_stream *copy;
+    HRESULT hr;
+
+    *out = NULL;
+    if (impl->closed) return RO_E_CLOSED;
+    if (FAILED(hr = memory_stream_create( &stream ))) return hr;
+    copy = impl_from_IRandomAccessStream( stream );
+    if (impl->size && FAILED(hr = memory_stream_require_capacity( copy, impl->size )))
+    {
+        IRandomAccessStream_Release( stream );
+        return hr;
+    }
+    if (impl->size) memcpy( copy->buffer, impl->buffer, impl->size );
+    copy->size = impl->size;
+    copy->pos = position;
+    *out = copy;
+    return S_OK;
+}
+
 static HRESULT WINAPI memory_stream_random_access_GetInputStreamAt( IRandomAccessStream *iface, UINT64 position,
         IInputStream **stream )
 {
-    FIXME( "iface %p, position %I64u, stream %p stub!\n", iface, position, stream );
+    struct memory_stream *impl = impl_from_IRandomAccessStream( iface ), *copy;
+    HRESULT hr;
+
+    TRACE( "iface %p, position %I64u, stream %p.\n", iface, position, stream );
 
     *stream = NULL;
-    return E_NOTIMPL;
+    if (FAILED(hr = memory_stream_clone( impl, position, &copy ))) return hr;
+    *stream = &copy->IInputStream_iface;
+    return S_OK;
 }
 
 static HRESULT WINAPI memory_stream_random_access_GetOutputStreamAt( IRandomAccessStream *iface, UINT64 position,
@@ -379,10 +411,15 @@ static HRESULT WINAPI memory_stream_random_access_Seek( IRandomAccessStream *ifa
 
 static HRESULT WINAPI memory_stream_random_access_CloneStream( IRandomAccessStream *iface, IRandomAccessStream **stream )
 {
-    FIXME( "iface %p, stream %p stub!\n", iface, stream );
+    struct memory_stream *impl = impl_from_IRandomAccessStream( iface ), *copy;
+    HRESULT hr;
+
+    TRACE( "iface %p, stream %p.\n", iface, stream );
 
     *stream = NULL;
-    return E_NOTIMPL;
+    if (FAILED(hr = memory_stream_clone( impl, 0, &copy ))) return hr;
+    *stream = &copy->IRandomAccessStream_iface;
+    return S_OK;
 }
 
 static HRESULT WINAPI memory_stream_random_access_get_CanRead( IRandomAccessStream *iface, BOOLEAN *value )

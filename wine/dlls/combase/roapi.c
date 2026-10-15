@@ -432,6 +432,51 @@ static void factory_cache_add( const WCHAR *classid, IActivationFactory *factory
     LeaveCriticalSection( &factory_cache_cs );
 }
 
+/* The DllGetActivationFactory of every library that served a class, kept with a module reference for good (Windows
+ * keeps activated WinRT servers loaded too). Activating another class of an already loaded library then needs no
+ * LoadLibrary, and so no loader lock. That matters: the Xbox app's UI thread activates a Microsoft.UI.Xaml class
+ * while XAML holds its g_csStatic, and a pool thread running a DLL's DllMain (holding the loader lock) wants
+ * g_csStatic - one start in three hung there. Windows' loader does not take the loader lock for a module that is
+ * already loaded and initialised either. */
+struct library_cache_entry
+{
+    struct list entry;
+    PFNGETACTIVATIONFACTORY get_factory;
+    WCHAR library[1];
+};
+static struct list library_cache = LIST_INIT( library_cache );
+
+static PFNGETACTIVATIONFACTORY library_cache_get( const WCHAR *library )
+{
+    struct library_cache_entry *entry;
+    PFNGETACTIVATIONFACTORY fn = NULL;
+
+    EnterCriticalSection( &factory_cache_cs );
+    LIST_FOR_EACH_ENTRY( entry, &library_cache, struct library_cache_entry, entry )
+    {
+        if (wcsicmp( entry->library, library )) continue;
+        fn = entry->get_factory;
+        break;
+    }
+    LeaveCriticalSection( &factory_cache_cs );
+    return fn;
+}
+
+static BOOL library_cache_add( const WCHAR *library, PFNGETACTIVATIONFACTORY fn )
+{
+    struct library_cache_entry *entry;
+    SIZE_T len = wcslen( library );
+
+    if (library_cache_get( library )) return FALSE;
+    if (!(entry = malloc( offsetof( struct library_cache_entry, library[len + 1] ) ))) return FALSE;
+    memcpy( entry->library, library, (len + 1) * sizeof(WCHAR) );
+    entry->get_factory = fn;
+    EnterCriticalSection( &factory_cache_cs );
+    list_add_tail( &library_cache, &entry->entry );
+    LeaveCriticalSection( &factory_cache_cs );
+    return TRUE;
+}
+
 /***********************************************************************
  *      RoGetActivationFactory (combase.@)
  */
@@ -466,18 +511,22 @@ HRESULT WINAPI DECLSPEC_HOTPATCH RoGetActivationFactory(HSTRING classid, REFIID 
         return hr;
     }
 
-    if (!(module = LoadLibraryW(library)))
+    module = NULL;
+    if (!(pDllGetActivationFactory = library_cache_get(library)))
     {
-        ERR("Failed to load module %s\n", debugstr_w(library));
-        hr = HRESULT_FROM_WIN32(GetLastError());
-        goto done;
-    }
+        if (!(module = LoadLibraryW(library)))
+        {
+            ERR("Failed to load module %s\n", debugstr_w(library));
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            goto done;
+        }
 
-    if (!(pDllGetActivationFactory = (void *)GetProcAddress(module, "DllGetActivationFactory")))
-    {
-        ERR("Module %s does not implement DllGetActivationFactory\n", debugstr_w(library));
-        hr = E_FAIL;
-        goto done;
+        if (!(pDllGetActivationFactory = (void *)GetProcAddress(module, "DllGetActivationFactory")))
+        {
+            ERR("Module %s does not implement DllGetActivationFactory\n", debugstr_w(library));
+            hr = E_FAIL;
+            goto done;
+        }
     }
 
     TRACE("Found library %s for class %s\n", debugstr_w(library), debugstr_hstring(classid));
@@ -490,6 +539,8 @@ HRESULT WINAPI DECLSPEC_HOTPATCH RoGetActivationFactory(HSTRING classid, REFIID 
         {
             TRACE("Created interface %p\n", *class_factory);
             if (name) factory_cache_add(name, factory);
+            /* the module stays loaded, as before: the cached factory lives in it */
+            if (module) library_cache_add(library, pDllGetActivationFactory);
             module = NULL;
         }
         IActivationFactory_Release(factory);

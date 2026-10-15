@@ -349,18 +349,6 @@ if [ -f "$SA" ]; then
   echo "installed: SpatialAudioDeviceConfiguration + FormatSubtype stand-ins"
 fi
 
-# WebAuthenticationCoreManager stand-in (see shims/webauthcore).
-WAC=${SHIM_DIR}/wineuwp_webauthcore.dll
-if [ -f "$WAC" ]; then
-  if ! cmp -s "$WAC" "$SYS32/wineuwp_webauthcore.dll"; then cp -f --reflink=auto "$WAC" "$SYS32/wineuwp_webauthcore.dll"; fi
-  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_webauthcore.dll' /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: WebAuthenticationCoreManager stand-in"
-fi
-
 # UserActivityChannel.GetDefault needs cdp.dll in the native implementation. Its failure
 # unwinds out of Solitaire's startup subscriber and terminates the engine thread.
 UA_SHIM=${SHIM_DIR}/wineuwp_useractivitychannel.dll
@@ -422,7 +410,10 @@ GP_SHIM=${SHIM_DIR}/wineuwp_gameplatform.dll
 if [ -f "$GP_SHIM" ]; then
   GP_DST=$SYS32/wineuwp_gameplatform.dll
   if ! cmp -s "$GP_SHIM" "$GP_DST"; then cp -f --reflink=auto "$GP_SHIM" "$GP_DST"; fi
-  for cls in PlatformStatus PackageQueue; do
+  # every class of the client that has statics (gen-gameplatform.py lists them in shims/gameplatform/slots.h)
+  for cls in PackageRequest Package PackagePreview PackageQueue PackageUpdate UploadQueue Storage GameFolder \
+              GameProfile GameSave GameStreaming GameMetrics Licensing SupportedFeatures PlatformStatus \
+              ProcessMonitor Store Customization ContentAccess BackgroundConsent; do
     K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Microsoft.GamePlatform.Services.$cls"
     "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_gameplatform.dll' /f >/dev/null 2>&1
     "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -486,7 +477,21 @@ if [ -f "$XA_SHIM" ]; then
     "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
     "${WINE_BIN}wine" reg add "$K" /v OverridesPackage /t REG_DWORD /d 1 /f >/dev/null 2>&1
   done
-  echo "installed: Xbox sign-in (XboxAuthManager) stand-in"
+  # WebAuthenticationCoreManager from the same DLL: the Microsoft account provider (https://login.microsoft.com,
+  # "consumers") and its WebAccount are the account the Xbox sign-in holds, which is what the Store account is on
+  # Windows. Other providers are not found. (It replaced shims/webauthcore, which found no provider at all.)
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_xboxauth.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  # StoreConfiguration likewise: which WebAccount is the Store's. Windows' own needs StoreConfigurationServer.
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.ApplicationModel.Store.Preview.StoreConfiguration"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_xboxauth.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  echo "installed: Xbox sign-in (XboxAuthManager, WebAuthenticationCoreManager, StoreConfiguration) stand-in"
 fi
 
 # api-ms-win-appmodel-advertisingid-l1-1-0.dll. No registry entry: this is a plain DLL resolved by
@@ -596,7 +601,8 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_deviceinformation.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Devices.Enumeration.DeviceInformation:wineuwp_deviceinformation.dll"
 [ -f "$SYS32/wineuwp_taskbarmanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Shell.TaskbarManager:wineuwp_taskbarmanager.dll"
 [ -f "$SYS32/wineuwp_storecontext.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Services.Store.StoreContext:wineuwp_storecontext.dll"
-[ -f "$SYS32/wineuwp_webauthcore.dll" ]       && SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager:wineuwp_webauthcore.dll"
+[ -f "$SYS32/wineuwp_xboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager:wineuwp_xboxauth.dll"
+[ -f "$SYS32/wineuwp_xboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.StoreConfiguration:wineuwp_xboxauth.dll"
 [ -f "$SYS32/wineuwp_spatialaudio.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioDeviceConfiguration:wineuwp_spatialaudio.dll"
 [ -f "$SYS32/wineuwp_spatialaudio.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioFormatSubtype:wineuwp_spatialaudio.dll"
 [ -f "$SYS32/wineuwp_networkstatus.dll" ]     && SHIM_CLASSES="$SHIM_CLASSES Windows.Networking.Connectivity.NetworkInformation:wineuwp_networkstatus.dll"

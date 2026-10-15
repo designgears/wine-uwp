@@ -327,6 +327,8 @@ static void dump_tracelogging( ULONG count, const EVENT_DATA_DESCRIPTOR *data )
     char line[900];
     size_t len = 0;
     ULONG i, next = 0;
+    const WCHAR *long_str = NULL;   /* the first string too long for one line, continued below it */
+    ULONG long_len = 0;
 
 #define TLG_OUT(...) do { if (len < sizeof(line) - 1) len += snprintf( line + len, sizeof(line) - len, __VA_ARGS__ ); \
                       if (len > sizeof(line) - 1) len = sizeof(line) - 1; } while (0)
@@ -369,7 +371,10 @@ static void dump_tracelogging( ULONG count, const EVENT_DATA_DESCRIPTOR *data )
             next++;
             switch (in & 0x1f)
             {
-            case 1: TLG_OUT( " %s=%s", name, debugstr_wn( (const WCHAR *)v, size / 2 ) ); break;
+            case 1:
+                TLG_OUT( " %s=%s", name, debugstr_wn( (const WCHAR *)v, size / 2 ) );
+                if (size / 2 > 200 && !long_str) { long_str = (const WCHAR *)v; long_len = size / 2; }
+                break;
             case 2: TLG_OUT( " %s=%s", name, debugstr_an( (const char *)v, size ) ); break;
             case 3: case 4: TLG_OUT( " %s=%u", name, v[0] ); break;
             case 5: case 6: TLG_OUT( " %s=%u", name, *(const USHORT *)v ); break;
@@ -384,7 +389,11 @@ static void dump_tracelogging( ULONG count, const EVENT_DATA_DESCRIPTOR *data )
                 v = (const BYTE *)(ULONG_PTR)data[next].Ptr;
                 size = data[next].Size;
                 next++;
-                if ((in & 0x1f) == 22) TLG_OUT( " %s=%s", name, debugstr_wn( (const WCHAR *)v, size / 2 ) );
+                if ((in & 0x1f) == 22)
+                {
+                    TLG_OUT( " %s=%s", name, debugstr_wn( (const WCHAR *)v, size / 2 ) );
+                    if (size / 2 > 200 && !long_str) { long_str = (const WCHAR *)v; long_len = size / 2; }
+                }
                 else if ((in & 0x1f) == 23) TLG_OUT( " %s=%s", name, debugstr_an( (const char *)v, size ) );
                 else TLG_OUT( " %s=<%lu bytes>", name, size );
                 break;
@@ -399,6 +408,21 @@ static void dump_tracelogging( ULONG count, const EVENT_DATA_DESCRIPTOR *data )
     __ENDTRY
 #undef TLG_OUT
     if (len) TRACE_(tracelogging)( "%s\n", line );
+    /* A long string (an app's own log message with a JSON payload) is cut short in that line; the rest follows in
+     * pieces of 160 characters, up to 8 KiB, each line short enough for one debug line. */
+    if (long_str && TRACE_ON(tracelogging))
+    {
+        __TRY
+        {
+            ULONG pos;
+            for (pos = 160; pos < long_len && pos < 8192; pos += 160)
+                TRACE_(tracelogging)( "  +%lu %s\n", pos, debugstr_wn( long_str + pos, min( 160, long_len - pos ) ) );
+        }
+        __EXCEPT_PAGE_FAULT
+        {
+        }
+        __ENDTRY
+    }
 }
 
 /******************************************************************************

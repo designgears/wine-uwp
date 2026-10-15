@@ -310,3 +310,4 @@ include/rpcasync.h
 include/windows.management.deployment.idl
 include/windows.networking.connectivity.idl
 dlls/appxdeploymentclient/standin.c
+dlls/kernelbase/registry.c

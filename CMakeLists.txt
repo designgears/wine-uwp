@@ -100,9 +100,6 @@ target_link_libraries(spatialaudio PRIVATE runtimeobject.lib)
 # Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager. The Web Account Manager
 # needs the out-of-process token broker; without it its IAsyncOperation is never completed and
 # Solitaire's Xbox sign-in check hangs the whole startup.
-add_library(webauthcore SHARED shims/webauthcore/webauthcore.cpp)
-set_target_properties(webauthcore PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_webauthcore")
-target_link_libraries(webauthcore PRIVATE runtimeobject.lib)
 
 # Windows.Services.Store.StoreContext - a traced stand-in used to find out which Store methods
 # the app actually calls, before implementing any of them.
@@ -115,7 +112,7 @@ set_target_properties(user PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_user")
 target_link_libraries(user PRIVATE runtimeobject.lib advapi32)
 add_library(gameplatform SHARED shims/gameplatform/gameplatform.cpp)
 set_target_properties(gameplatform PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_gameplatform")
-target_link_libraries(gameplatform PRIVATE runtimeobject.lib)
+target_link_libraries(gameplatform PRIVATE runtimeobject.lib advapi32.lib winhttp.lib ole32.lib)
 # Microsoft.GamePlatform.Services.Identity: Xbox sign-in (MSA device code + Xbox Live tokens) for the Xbox app.
 add_library(xboxauth SHARED shims/xboxauth/xboxauth.cpp)
 set_target_properties(xboxauth PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_xboxauth")
