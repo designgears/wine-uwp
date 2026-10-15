@@ -11282,3 +11282,65 @@ to 8 KiB; `probe-xboxauth.exe get` takes `XBL_EXTRA` (extra headers, `|`-separat
 file); `msascope "<scope>|<extra form>"` tests a scope (and lists the id_token's claim names).
 
 Regression (dev prefix, `:97`): Calculator AE 0, Media Player 2242 (the usual focus-rectangle variant), `kb` 0/0/0.
+
+## 2026-10-15 (later): Xbox app - Friends list, dim game pages: React Native's facade expressions
+
+Tested in `uwp-bin/prefix-test3` (a reflink copy of `prefix-test`, which holds the user's session) on Xvfb `:93`,
+started by `/tmp/xbox-t3.sh`; nothing ran a `wineserver -k` on `prefix-test`.
+
+**One cause behind both the dim product page and the Friends panel: dcomp dropped React Native's composition
+expressions.** React Native's native animated driver and its `transform` style start ExpressionAnimations on XAML
+facades with `UIElement.StartAnimation`: `"ValuePropSet.v + ValuePropSet.o"` on Opacity, and
+`"Matrix4x4.CreateFromTranslation(-PS.center) * PS.transform * Matrix4x4.CreateFromTranslation(PS.center)"` on
+TransformMatrix. Measured with `trace+dcompanim`; each layer below was found by the one before:
+
+1. **The expression XAML started was a recording clone.** `StartAnimation` passes `ICompositionAnimationBase`, which the
+   typed ExpressionAnimation answered with a clone (`expr_animation_QueryInterface`'s fallback), and the facade code saw
+   `(not ours)` and bound nothing. Clones now keep their origin (`expr_anim_target` side table, with a reference), and
+   `expr_animation_from_any` resolves them.
+2. **Binding them moved every image 550 px down** (box art vanished from Home). `SetReferenceParameter` *appended*:
+   React Native reuses one transform expression for every view and points `PS` at each view's property set before
+   starting it, so every view read the first set (the Friends panel's `translateY 550`). A name is now replaced, and
+   `StartAnimation` takes a snapshot (`expr_snapshot`), as Windows does - expressions now release their references.
+3. **Scalars did not follow bindings**, and React Native's interpolation nodes bind `"p.v < i0 ? o0 + ... : ..."`. The
+   scalar evaluator follows a property's bound expression and has comparisons, `&&`, `||`, `!` and `?:`.
+4. **The Friends panel then drew collapsed at the bottom - correctly - but after a while jumped back to the top.**
+   XAML wraps each facade animation in a scoped batch and treats Completed as "finished"
+   (`PropertySetListener::OnAnimationCompleted`, then the listener is removed and the element's next visual gets no
+   `PS.TransformMatrix`). Our batch completed at once ("0 animations"). A facade expression now holds its batch open until
+   it is stopped or replaced (`expr_run_start`); React Native's own batches, which hold no facade expression, complete as
+   before (holding those too blanked all images: the app waits for them).
+5. **Holding batches flooded the UI thread with WM_TIMER**: every scheduled batch made its own `SetTimer` that re-armed
+   itself (profile: 55% `PeekMessage`, 32% Set/KillTimer). One completion timer per thread now; 250 ms while only
+   expressions are pending.
+6. **Clicks went where the panel used to be.** XAML hit-tests facades with values the compositor reports through
+   `PropertySetListener` (`SetPropertyChangedListener` on `{fa92376b}`, then `NotifyMatrix4x4PropertyChanged` -> 
+   `CUIElement::OnTransformMatrixForHitTestingChanged`; listener slots 5 = Matrix4x4, 7 = Single, 9 = Vector3, read from
+   the shipping vtable). dcomp kept no listener. It keeps it now and, after each commit, from the message loop, reports
+   what each bound facade expression evaluates to; the property id is the property's index in the set. Notifying from
+   inside the commit (XAML's own frame walk) stopped XAML committing.
+7. `StopAnimation` on a property set now ends the expression at its current value.
+
+**The Friends list was then empty for a separate reason: a layout failure in one TextBlock.** Expanding the panel
+logged `RoReportUnhandledError` with `E_FAIL` originated in React Native's `DefaultYogaSelfMeasureFunc` (the
+`throw_hresult` after `UIElement.Measure`), and XAML stopped laying out. Walked down with `WINE_UWP_BP` on XAML's error
+reporters: `CUIElement::Measure` -> `CFrameworkElement::MeasureCore` -> `CTextBlock::MeasureOverride` ->
+`BlockNode::Measure` (the rich text path, for a row with a gamertag and a real name as two runs). The last DirectWrite
+call before it (`trace+dwrite`, same thread) was `GetKerningPairAdjustments(1 glyph)`, which Wine answers E_INVALIDARG.
+A single glyph has no pair: it now answers S_OK and 0 (a NULL glyph array is still E_INVALIDARG, as the tests require).
+
+Result:
+- Home: box art, the Friends panel collapsed at the bottom (`docs/screenshots/xbox-home-friends-collapsed.png`). A click on
+  its header expands it: "Start a party", "Friend requests", **"Offline (8)"** with gamerpics, gamertags, real names and
+  last-seen presence (`docs/screenshots/xbox-friends-list.png`); the list scrolls, rows highlight on hover, the chevron
+  collapses it again, and XAML keeps repainting afterwards (Game Pass navigates).
+- The product page is no longer dim: description, "Should perform great", thumbnails, **Get Free** in green
+  (`docs/screenshots/xbox-pdp-solitaire-bright.png`).
+
+Regression: Calculator AE 0, Media Player 2250, `kb` 0/0/0, Shapr3D's home screen AE 0 (reflink copy of the dev prefix,
+`/tmp/s3home.sh`).
+
+**The crash on Get (the user's report):** the user's own log (`/tmp/xbox-test.log`, the `prefix-test` run on `:0`) ends in
+a fail-fast at `ReactNativeWebView.dll+0xcff3`, called from `Microsoft.Web.WebView2.Core.dll` through XAML: the purchase
+flow opens the Store's buy-now page (`https://www.microsoft.com/store/purchase/buynowui/buynow`) in a WebView2, and there is
+no WebView2 runtime in the prefix. React Native's WebView handler then dereferences the CoreWebView2 it never got.

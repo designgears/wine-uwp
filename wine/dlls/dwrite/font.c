@@ -1546,10 +1546,18 @@ static HRESULT WINAPI dwritefontface1_GetKerningPairAdjustments(IDWriteFontFace5
     if (!(glyphs || values) || !count)
         return E_INVALIDARG;
 
-    if (!glyphs || count == 1)
+    if (!glyphs)
     {
         memset(values, 0, count * sizeof(*values));
         return E_INVALIDARG;
+    }
+
+    /* A single glyph has no pair to adjust. XAML's text formatter asks for runs of one glyph and treats a failure
+     * as fatal: the Xbox app's Friends list hit a layout cycle on a one-glyph run of a real name. */
+    if (count == 1)
+    {
+        values[0] = 0;
+        return S_OK;
     }
 
     return opentype_get_kerning_pairs(fontface, count, glyphs, values);

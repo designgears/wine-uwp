@@ -2155,12 +2155,15 @@ static struct matrix_transform *manip_matrix_from_animation( void *animation );
 static struct propset_value *expr_resolve_value( void *animation, enum propset_type type );
 static BOOL expr_evaluate_scalar_product( struct expr_animation *expr, float *out );
 static const char *debugstr_animation( void *animation );
+static const WCHAR *debug_bound_opacity( struct expr_animation *expr );
 static BOOL expr_resolve_colorrgb( void *animation, Color *color );
 static HRESULT create_matrix_transform( void **out );
 struct visual;
 static struct visual *impl_from_visual_interop( void *iface );
 static struct visual *visual_from_interop( void *iface );
 static HRESULT create_expr_animation( void **out );
+static struct expr_animation *expr_snapshot( struct expr_animation *src );
+static ULONG WINAPI expr_animation_Release( void *iface );
 static void *matrix_transform_vtbl[COMP_OBJECT_SLOTS];
 static void *manip_transform_vtbl[COMP_OBJECT_SLOTS];
 static void *expr_animation_vtbl[COMP_OBJECT_SLOTS];
@@ -2392,7 +2395,7 @@ static const GUID IID_ICompositionAnimation2_early =
     {0x369b603e,0xa80f,0x4948,{0x93,0xe3,0xed,0x23,0xfb,0x38,0xc6,0xcb}};
 
 /* ExpressionAnimation.Target, in a side table: the struct prefix is shared and must not grow */
-struct expr_anim_target { void *owner; WCHAR target[64]; };
+struct expr_anim_target { void *owner; WCHAR target[64]; IUnknown *origin; };
 static struct expr_anim_target *expr_targets;
 static unsigned int expr_target_count, expr_target_capacity;
 static CRITICAL_SECTION expr_targets_cs = { NULL, -1, 0, 0, 0, 0 };
@@ -2412,16 +2415,35 @@ static struct expr_anim_target *expr_target_find( void *owner, BOOL create )
     }
     expr_targets[expr_target_count].owner = owner;
     expr_targets[expr_target_count].target[0] = 0;
+    expr_targets[expr_target_count].origin = NULL;
     return &expr_targets[expr_target_count++];
 }
 
 static void expr_anim_target_gone( void *owner )
 {
     struct expr_anim_target *t;
+    IUnknown *origin = NULL;
     if (!expr_target_count) return;
     EnterCriticalSection( &expr_targets_cs );
-    if ((t = expr_target_find( owner, FALSE ))) *t = expr_targets[--expr_target_count];
+    if ((t = expr_target_find( owner, FALSE )))
+    {
+        origin = t->origin;
+        *t = expr_targets[--expr_target_count];
+    }
     LeaveCriticalSection( &expr_targets_cs );
+    if (origin) IUnknown_Release( origin );
+}
+
+/* The typed ExpressionAnimation a recording clone was made from (see expr_animation_QueryInterface), or NULL */
+static void *expr_clone_origin( void *clone )
+{
+    struct expr_anim_target *t;
+    void *origin = NULL;
+    if (!expr_target_count) return NULL;
+    EnterCriticalSection( &expr_targets_cs );
+    if ((t = expr_target_find( clone, FALSE ))) origin = t->origin;
+    LeaveCriticalSection( &expr_targets_cs );
+    return origin;
 }
 
 static void expr_anim_target_copy( void *from, void *to )
@@ -2435,6 +2457,10 @@ static void expr_anim_target_copy( void *from, void *to )
         lstrcpynW( target, src->target, ARRAY_SIZE(target) );
         if ((dst = expr_target_find( to, TRUE ))) lstrcpynW( dst->target, target, ARRAY_SIZE(dst->target) );
     }
+    else dst = expr_target_find( to, TRUE );
+    /* the clone keeps its origin alive: UIElement.StartAnimation hands XAML the clone (its
+     * ICompositionAnimationBase), and the facade animation must still run the origin's expression */
+    if (dst && !dst->origin) IUnknown_AddRef( (dst->origin = from) );
     LeaveCriticalSection( &expr_targets_cs );
 }
 
@@ -6233,8 +6259,7 @@ static HRESULT WINAPI dcv_object_StartAnimation( void *iface, HSTRING name, void
      * indicators hide that way; dropping the binding left every indicator ever selected visible. */
     if (prop && !wcsicmp( prop, L"Opacity" ))
     {
-        struct expr_animation *expr = expr_animation_from_any( animation );
-        if (expr) IUnknown_AddRef( (IUnknown *)&expr->vtbl );
+        struct expr_animation *expr = expr_snapshot( expr_animation_from_any( animation ) );
         if (v->opacity_expr) IUnknown_Release( (IUnknown *)&v->opacity_expr->vtbl );
         v->opacity_expr = expr;
     }
@@ -6256,9 +6281,8 @@ static HRESULT WINAPI dcv_object_StartAnimation( void *iface, HSTRING name, void
             v->manip = m;
             TRACE( "visual %p follows manipulation transform %p.\n", v, m );
         }
-        if (expr)
+        if (expr && (expr = expr_snapshot( expr )))
         {
-            IUnknown_AddRef( (IUnknown *)&expr->vtbl );
             if (v->transform_expr) IUnknown_Release( (IUnknown *)&v->transform_expr->vtbl );
             v->transform_expr = expr;
             TRACE( "visual %p transform follows expression %s.\n", v, debugstr_w( expr->expression ) );
@@ -6282,8 +6306,10 @@ static HRESULT WINAPI dcv_object_StopAnimation( void *iface, HSTRING name )
     if (prop && !wcsicmp( prop, L"Opacity" ) && v->opacity_expr)
     {
         /* the animation stops at its current value */
-        struct propset_value *value = expr_resolve_value( &v->opacity_expr->vtbl, PROP_SCALAR );
-        if (value) v->opacity = value->u.scalar;
+        struct propset_value *value;
+        float opacity;
+        if (expr_evaluate_scalar_product( v->opacity_expr, &opacity )) v->opacity = opacity;
+        else if ((value = expr_resolve_value( &v->opacity_expr->vtbl, PROP_SCALAR ))) v->opacity = value->u.scalar;
         dcv_clear_opacity_expr( v );
     }
     return S_OK;
@@ -8334,10 +8360,16 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
     }
     if (v->opacity_expr)
     {
-        struct propset_value *value = expr_resolve_value( &v->opacity_expr->vtbl, PROP_SCALAR );
-        float opacity;
-        if (value) v->opacity = value->u.scalar;
-        else if (expr_evaluate_scalar_product( v->opacity_expr, &opacity )) v->opacity = opacity;
+        struct propset_value *value;
+        float opacity, before = v->opacity;
+        BOOL ok = TRUE;
+        if (expr_evaluate_scalar_product( v->opacity_expr, &opacity )) v->opacity = opacity;
+        else if ((value = expr_resolve_value( &v->opacity_expr->vtbl, PROP_SCALAR ))) v->opacity = value->u.scalar;
+        else ok = FALSE;
+        if (TRACE_ON(dcompanim) && (!ok || before != v->opacity))
+            TRACE_(dcompanim)( "dcomp visual %p opacity %g -> %g from %s%s, bound %s\n", v, before, v->opacity,
+                               debugstr_w( v->opacity_expr->expression ), ok ? "" : " (not evaluated)",
+                               debugstr_w( debug_bound_opacity( v->opacity_expr ) ) );
     }
     /* a transparent visual hides its subtree */
     if (v->opacity <= 0.01f)
@@ -9228,11 +9260,28 @@ static const void *device_partner_vtbl[] =
 static const GUID IID_IDCompositionDevicePartner_local =
     { 0x7bd36c9a, 0x56ee, 0x4fdd, { 0xac, 0x4e, 0x76, 0xbb, 0xd1, 0x6e, 0xc8, 0xe4 } };
 
+static void notify_facade_listeners( void );
+/* the values go to XAML from the message loop, after the commit: notifying from inside XAML's own frame walk
+ * (which calls Commit) left it never committing again */
+static __thread UINT_PTR facade_notify_timer;
+static void CALLBACK facade_notify_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD time )
+{
+    KillTimer( hwnd, id );
+    if (id == facade_notify_timer) facade_notify_timer = 0;
+    notify_facade_listeners();
+}
+static unsigned int listened_count;
+static void schedule_facade_notify( void )
+{
+    if (!listened_count || facade_notify_timer) return;
+    facade_notify_timer = SetTimer( NULL, 0, 0, facade_notify_proc );
+}
 static HRESULT WINAPI device_slot_69( void *iface )
 {
     TRACE( "interop device CommitMainDevice (slot 69).\n" );
     TRACE_(dcompops)( "commit main device, scene generation %ld\n", scene_generation );
     perf.commits++;
+    schedule_facade_notify();
     xaml_batch_commit();
     if (pending_capture_count) run_pending_captures();
     fire_animation_time_events();
@@ -9848,8 +9897,9 @@ struct property_set
     struct propset_value values[PROPSET_VALUES];
     unsigned int value_count;
     /* expressions started on properties of this set (StartAnimation("Matrix", expr)); the evaluator follows them */
-    struct { WCHAR name[48]; struct expr_animation *expr; } bindings[PROPSET_BINDINGS];
+    struct { WCHAR name[48]; struct expr_animation *expr; LONG id; float last[16]; BOOL notified; } bindings[PROPSET_BINDINGS];
     unsigned int binding_count;
+    IUnknown *listener;         /* XAML's PropertySetListener for a facade set, see notify_facade_listeners */
 };
 
 static HRESULT create_property_set( ICompositionPropertySet **out );
@@ -11902,6 +11952,47 @@ static BOOL kf_runs_live( struct kf_animation *kf )
     for (i = 0; i < kf->key_count; i++) if (kf->keys[i].expr == KF_EXPR_OTHER) return FALSE;
     return TRUE;
 }
+/* Expressions bound to property set properties run until they are stopped or replaced: a scoped batch that
+ * started one does not complete before then. XAML treats a facade animation's batch completing as the animation
+ * having finished and forgets it - a React Native view's TransformMatrix expression was then not carried over to
+ * the visual XAML made for the element later, and the Xbox app's Friends panel was drawn without its offset. */
+static __thread BOOL facade_start;    /* inside composition_object_statics_StartAnimationWithIAnimationObject */
+static LONG *expr_run_ids;
+static unsigned int expr_run_count, expr_run_capacity;
+static LONG expr_run_start( void )
+{
+    LONG id = InterlockedIncrement( &live_anim_next_id );
+    EnterCriticalSection( &live_anim_cs );
+    if (expr_run_count == expr_run_capacity)
+    {
+        unsigned int cap = expr_run_capacity ? expr_run_capacity * 2 : 256;
+        LONG *ids = (realloc)( expr_run_ids, cap * sizeof(*ids) );
+        if (ids) { expr_run_ids = ids; expr_run_capacity = cap; }
+    }
+    if (expr_run_count < expr_run_capacity) expr_run_ids[expr_run_count++] = id;
+    LeaveCriticalSection( &live_anim_cs );
+    batch_note_animation( id );
+    return id;
+}
+static void expr_run_end( LONG id )
+{
+    unsigned int i;
+    if (!id) return;
+    EnterCriticalSection( &live_anim_cs );
+    for (i = 0; i < expr_run_count; i++)
+        if (expr_run_ids[i] == id) { expr_run_ids[i] = expr_run_ids[--expr_run_count]; break; }
+    LeaveCriticalSection( &live_anim_cs );
+}
+static BOOL expr_running( LONG id )
+{
+    BOOL running = FALSE;
+    unsigned int i;
+
+    EnterCriticalSection( &live_anim_cs );
+    for (i = 0; i < expr_run_count; i++) if (expr_run_ids[i] == id) { running = TRUE; break; }
+    LeaveCriticalSection( &live_anim_cs );
+    return running;
+}
 static BOOL live_anim_running( LONG id )
 {
     BOOL running = FALSE;
@@ -11909,6 +12000,7 @@ static BOOL live_anim_running( LONG id )
 
     EnterCriticalSection( &live_anim_cs );
     for (i = 0; i < live_anim_count; i++) if (live_anims[i].id == id) { running = TRUE; break; }
+    for (i = 0; !running && i < expr_run_count; i++) if (expr_run_ids[i] == id) running = TRUE;
     LeaveCriticalSection( &live_anim_cs );
     return running;
 }
@@ -12071,10 +12163,52 @@ static ULONG WINAPI change_notifier_Release( void *iface )
     }
     return ref;
 }
+/* Property sets with a listener: on each commit the values their bound expressions produce are reported to it,
+ * as the compositor reports animated facade values to XAML on Windows. XAML hit-tests with them
+ * (PropertySetListener::NotifyMatrix4x4PropertyChanged -> CUIElement::OnTransformMatrixForHitTestingChanged): without
+ * them the Xbox app's Friends panel, moved by a React Native transform, took clicks where it had been before. */
+static const struct ICompositionPropertySetVtbl propset_vtbl;
+static struct property_set **listened_sets;
+static unsigned int listened_capacity;
+static CRITICAL_SECTION listened_cs = { NULL, -1, 0, 0, 0, 0 };
+
+static void listened_remove( struct property_set *set )
+{
+    unsigned int i;
+    EnterCriticalSection( &listened_cs );
+    for (i = 0; i < listened_count; i++)
+        if (listened_sets[i] == set) { listened_sets[i] = listened_sets[--listened_count]; break; }
+    LeaveCriticalSection( &listened_cs );
+}
+
 static HRESULT WINAPI change_notifier_SetPropertyChangedListener( void *iface, UINT32 property, IUnknown *listener )
 {
-    TRACE( "owner %p, property %u, listener %p: nothing animates it, not kept.\n",
-           CONTAINING_RECORD( iface, struct change_notifier, vtbl )->owner, property, listener );
+    struct change_notifier *impl = CONTAINING_RECORD( iface, struct change_notifier, vtbl );
+    struct property_set *set = *(void ***)impl->owner == (void **)&propset_vtbl ?
+            CONTAINING_RECORD( impl->owner, struct property_set, ICompositionPropertySet_iface ) : NULL;
+    IUnknown *old;
+    unsigned int i;
+
+    TRACE_(dcompanim)( "owner %p, property %u, listener %p.\n", impl->owner, property, listener );
+    if (!set) return S_OK;
+    EnterCriticalSection( &listened_cs );
+    if (listener) IUnknown_AddRef( listener );
+    old = set->listener;
+    set->listener = listener;
+    for (i = 0; i < set->binding_count; i++) set->bindings[i].notified = FALSE;
+    if (listener && !old)
+    {
+        if (listened_count == listened_capacity)
+        {
+            unsigned int cap = listened_capacity ? listened_capacity * 2 : 64;
+            struct property_set **sets = (realloc)( listened_sets, cap * sizeof(*sets) );
+            if (sets) { listened_sets = sets; listened_capacity = cap; }
+        }
+        if (listened_count < listened_capacity) listened_sets[listened_count++] = set;
+    }
+    LeaveCriticalSection( &listened_cs );
+    if (!listener && old) listened_remove( set );
+    if (old) IUnknown_Release( old );
     return S_OK;
 }
 #define CHANGE_NOTIFIER_SLOT( n ) \
@@ -12162,7 +12296,15 @@ static ULONG WINAPI propset_Release( ICompositionPropertySet *iface )
     {
         unsigned int i;
         for (i = 0; i < impl->binding_count; i++)
+        {
             if (impl->bindings[i].expr) IUnknown_Release( (IUnknown *)&impl->bindings[i].expr->vtbl );
+            expr_run_end( impl->bindings[i].id );
+        }
+        if (impl->listener)
+        {
+            listened_remove( impl );
+            IUnknown_Release( impl->listener );
+        }
         free( impl );
     }
     return ref;
@@ -12235,6 +12377,11 @@ static HRESULT WINAPI propset_InsertMatrix4x4( ICompositionPropertySet *iface, H
     struct propset_value *v = propset_find( set, name, TRUE );
     TRACE( "set %p %s scale %g,%g offset %g,%g\n", set, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ),
            value.M11, value.M22, value.M41, value.M42 );
+    if (TRACE_ON(dcompanim) && (value.M41 != 0.0f || value.M42 != 0.0f || value.M11 != 1.0f || value.M22 != 1.0f))
+        TRACE_(dcompanim)( "set %p %s: %g %g %g %g / %g %g %g %g / %g %g %g %g / %g %g %g %g\n", set,
+                           debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ), value.M11, value.M12, value.M13, value.M14,
+                           value.M21, value.M22, value.M23, value.M24, value.M31, value.M32, value.M33, value.M34,
+                           value.M41, value.M42, value.M43, value.M44 );
     if (!v) return E_OUTOFMEMORY;
     v->type = PROP_MATRIX4X4; v->u.m44 = value;
     return S_OK;
@@ -13729,25 +13876,41 @@ static void batch_fire_completed( struct comp_batch *batch )
     }
     if (args) IUnknown_Release( (IUnknown *)args );
 }
-static BOOL batch_due( struct comp_batch *batch )
+/* 0: due; 1: waiting for a timed animation; 2: waiting only for an expression to be stopped */
+static int batch_due( struct comp_batch *batch )
 {
     unsigned int i;
 
-    if (GetTickCount64() - batch->ended_at > 10000) return TRUE;   /* Forever animations, a lost tick */
-    for (i = 0; i < batch->anim_count; i++) if (live_anim_running( batch->anims[i] )) return FALSE;
-    return TRUE;
+    /* a bound expression runs until it is stopped, however long that is */
+    for (i = 0; i < batch->anim_count; i++) if (expr_running( batch->anims[i] )) return 2;
+    if (GetTickCount64() - batch->ended_at > 10000) return 0;   /* Forever animations, a lost tick */
+    for (i = 0; i < batch->anim_count; i++) if (live_anim_running( batch->anims[i] )) return 1;
+    return 0;
+}
+/* one completion timer per thread: a timer per scheduled batch, each re-arming itself, flooded the UI thread
+ * with WM_TIMER once batches waited for expressions that run until stopped */
+static __thread UINT_PTR batch_timer;
+static __thread UINT batch_timer_ms;
+static void CALLBACK batch_timer_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD time );
+static void batch_arm_timer( UINT ms )
+{
+    if (batch_timer && batch_timer_ms <= ms) return;   /* an earlier or equal one is armed already */
+    if (batch_timer) KillTimer( NULL, batch_timer );
+    batch_timer = SetTimer( NULL, 0, ms, batch_timer_proc );
+    batch_timer_ms = ms;
 }
 static void CALLBACK batch_timer_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD time )
 {
     struct comp_batch *list = NULL, **tail = &list, *batch, **prev;
-    BOOL waiting = FALSE;
+    int waiting = 0, due;
 
     KillTimer( hwnd, id );
+    if (id == batch_timer) batch_timer = 0;
     EnterCriticalSection( &batch_cs );
     /* take the due ones, in End order; the rest wait for their animations */
     for (prev = &pending_batches; (batch = *prev);)
     {
-        if (batch_due( batch ))
+        if (!(due = batch_due( batch )))
         {
             *prev = batch->next_pending;
             batch->next_pending = NULL;
@@ -13756,12 +13919,12 @@ static void CALLBACK batch_timer_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD t
         }
         else
         {
-            waiting = TRUE;
+            if (due == 1 || !waiting) waiting = due;
             prev = &batch->next_pending;
         }
     }
     LeaveCriticalSection( &batch_cs );
-    if (waiting) SetTimer( NULL, 0, 16, batch_timer_proc );
+    if (waiting) batch_arm_timer( waiting == 1 ? 16 : 250 );
     /* the list was built newest first; complete in the order the batches were ended */
     for (batch = list; batch; )
     {
@@ -13792,7 +13955,7 @@ static void batch_schedule_completion( struct comp_batch *batch )
         tail->next_pending = batch;
     }
     LeaveCriticalSection( &batch_cs );
-    SetTimer( NULL, 0, 16, batch_timer_proc );
+    batch_arm_timer( 16 );
 }
 static void batch_set_active( struct comp_batch *batch, BOOL active )
 {
@@ -14191,6 +14354,25 @@ static const GUID IID_IExpressionAnimation_ =
 static const GUID IID_ICompositionAnimation_ =
     { 0x464c4c2c, 0x1caa, 0x4061, { 0x9b, 0x40, 0xe1, 0x3f, 0xde, 0x15, 0x03, 0xca } };
 
+/* an expression holds its reference parameters, values and Properties until it goes */
+static ULONG WINAPI expr_animation_Release( void *iface )
+{
+    struct expr_animation *impl = CONTAINING_RECORD( iface, struct expr_animation, vtbl );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    unsigned int i;
+
+    if (!ref)
+    {
+        comp_map_owner_gone( &impl->vtbl );
+        expr_anim_target_gone( &impl->vtbl );
+        for (i = 0; i < impl->ref_count; i++) if (impl->refs[i]) IUnknown_Release( impl->refs[i] );
+        if (impl->properties) ICompositionPropertySet_Release( impl->properties );
+        free( impl->params );
+        free( impl );
+    }
+    return ref;
+}
+
 static void init_typed_vtbls( void )
 {
     unsigned int i;
@@ -14198,7 +14380,8 @@ static void init_typed_vtbls( void )
     for (i = 3; i < COMP_OBJECT_SLOTS; i++)
         matrix_transform_vtbl[i] = manip_transform_vtbl[i] = expr_animation_vtbl[i] = comp_object_slot_fn( i );
     matrix_transform_vtbl[1] = manip_transform_vtbl[1] = expr_animation_vtbl[1] = comp_object_AddRef;
-    matrix_transform_vtbl[2] = manip_transform_vtbl[2] = expr_animation_vtbl[2] = comp_object_Release;
+    matrix_transform_vtbl[2] = manip_transform_vtbl[2] = comp_object_Release;
+    expr_animation_vtbl[2] = expr_animation_Release;
     InterlockedExchange( &manip_vtbls_ready, 1 );
 }
 
@@ -14329,7 +14512,7 @@ static ULONG WINAPI expr_view_AddRef( void *iface )
 }
 static ULONG WINAPI expr_view_Release( void *iface )
 {
-    return comp_object_Release( &expr_from_anim_view( iface )->vtbl );
+    return expr_animation_Release( &expr_from_anim_view( iface )->vtbl );
 }
 static HRESULT WINAPI expr_view_GetIids( void *iface, ULONG *count, IID **iids )
 {
@@ -14356,13 +14539,56 @@ static HRESULT WINAPI expr_view_SetReferenceParameter( void *iface, HSTRING key,
     scene_changed();
     struct expr_animation *impl = expr_from_anim_view( iface );
     TRACE( "%p, %s, %p.\n", impl, debugstr_w( WindowsGetStringRawBuffer( key, NULL ) ), object );
-    if (object && impl->ref_count < EXPR_REFS)
+    if (object)
     {
-        IUnknown_AddRef( object );
-        lstrcpynW( impl->ref_names[impl->ref_count], WindowsGetStringRawBuffer( key, NULL ), ARRAY_SIZE(impl->ref_names[0]) );
-        impl->refs[impl->ref_count++] = object;
+        const WCHAR *name = WindowsGetStringRawBuffer( key, NULL );
+        unsigned int i;
+        /* setting a name again replaces it: React Native reuses one expression for every view's transform and
+         * points "PS" at each view's property set before starting it; appending left every view on the first set */
+        for (i = 0; i < impl->ref_count; i++)
+            if (!wcsicmp( impl->ref_names[i], name ))
+            {
+                IUnknown *old = impl->refs[i];
+                IUnknown_AddRef( object );
+                impl->refs[i] = object;
+                IUnknown_Release( old );
+                return S_OK;
+            }
+        if (impl->ref_count < EXPR_REFS)
+        {
+            IUnknown_AddRef( object );
+            lstrcpynW( impl->ref_names[impl->ref_count], name, ARRAY_SIZE(impl->ref_names[0]) );
+            impl->refs[impl->ref_count++] = object;
+        }
     }
     return S_OK;
+}
+
+/* StartAnimation takes the expression as it is at that moment: later parameter changes (the next view's "PS")
+ * must not reach animations already started. A copy holds its own references. */
+static struct expr_animation *expr_snapshot( struct expr_animation *src )
+{
+    struct expr_animation *copy;
+    unsigned int i;
+    void *out;
+
+    if (!src || FAILED( create_expr_animation( &out ) )) return NULL;
+    copy = CONTAINING_RECORD( out, struct expr_animation, vtbl );
+    memcpy( copy->expression, src->expression, sizeof(copy->expression) );
+    for (i = 0; i < src->ref_count; i++)
+    {
+        IUnknown_AddRef( (copy->refs[i] = src->refs[i]) );
+        memcpy( copy->ref_names[i], src->ref_names[i], sizeof(copy->ref_names[i]) );
+    }
+    copy->ref_count = src->ref_count;
+    if (src->param_count && (copy->params = malloc( src->param_count * sizeof(*copy->params) )))
+    {
+        memcpy( copy->params, src->params, src->param_count * sizeof(*copy->params) );
+        copy->param_count = src->param_count;
+    }
+    if ((copy->properties = src->properties)) ICompositionPropertySet_AddRef( copy->properties );
+    expr_anim_target_copy( &src->vtbl, &copy->vtbl );
+    return copy;
 }
 /* Value parameters: XAML's DManip glue binds "transform*manipTransform.Matrix" with
  * SetMatrix4x4Parameter("transform", offset) for the scroll offset it applies itself. */
@@ -14511,6 +14737,17 @@ static struct expr_animation *expr_animation_from_any( void *animation )
     void **vtbl = animation ? *(void ***)animation : NULL;
     if (vtbl == (void **)expr_animation_vtbl) return CONTAINING_RECORD( animation, struct expr_animation, vtbl );
     if (vtbl == (void **)expr_anim_view_vtbl) return CONTAINING_RECORD( animation, struct expr_animation, anim_vtbl );
+    if (vtbl == (void **)expression_animation_vtbl)
+    {
+        void *origin = expr_clone_origin( animation );
+        if (origin && *(void ***)origin == (void **)expr_animation_vtbl)
+        {
+            TRACE_(dcompanim)( "clone %p -> %s, from %p\n", animation,
+                               debugstr_w( CONTAINING_RECORD( origin, struct expr_animation, vtbl )->expression ),
+                               __builtin_return_address( 0 ) );
+            return CONTAINING_RECORD( origin, struct expr_animation, vtbl );
+        }
+    }
     return NULL;
 }
 
@@ -14658,6 +14895,38 @@ static BOOL expr_vector( struct expr_ctx *c, float *x, float *y )
  * "Matrix3x2(cos(PS.RotateAngle * pi / 180.0f), sin(...), -sin(...), cos(...), 0, 0)"; with only numbers and
  * properties understood, a chevron's rotation failed to evaluate and drew unturned while it animated. */
 static BOOL expr_scalar_sum( struct expr_ctx *c, float *out );
+/* A scalar property of a referenced property set that has an expression started on it follows the expression:
+ * React Native's animated driver binds a view's Opacity facade (XAML's "PS.Opacity") to
+ * "ValuePropSet.v + ValuePropSet.o" and animates v; the static value is only where the property started. */
+static BOOL expr_bound_scalar( struct expr_ctx *c, const WCHAR *ref, const WCHAR *prop, float *out )
+{
+    struct property_set *set = NULL;
+    unsigned int i;
+
+    if (c->depth >= 6) return FALSE;
+    if (*ref)
+    {
+        for (i = 0; i < c->expr->ref_count; i++)
+            if (!wcsicmp( c->expr->ref_names[i], ref )) { set = propset_from_object( c->expr->refs[i] ); break; }
+        if (!set && !wcsicmp( ref, L"LOCAL" )) set = c->local;
+    }
+    if (!set) return FALSE;
+    for (i = 0; i < set->binding_count; i++)
+    {
+        struct expr_animation *bound = set->bindings[i].expr;
+        struct expr_ctx sub;
+        if (!bound || bound == c->expr || wcsicmp( set->bindings[i].name, prop )) continue;
+        sub.expr = bound;
+        sub.local = set;
+        sub.dmanip = NULL;
+        sub.p = bound->expression;
+        sub.depth = c->depth + 1;
+        if (!expr_scalar( &sub, out )) return FALSE;
+        expr_skip_space( &sub );
+        return !*sub.p;
+    }
+    return FALSE;
+}
 static BOOL expr_scalar_factor( struct expr_ctx *c, float *out )
 {
     static const struct { const WCHAR *name; unsigned int args; } funcs[] =
@@ -14686,17 +14955,24 @@ static BOOL expr_scalar_factor( struct expr_ctx *c, float *out )
         if (*c->p == 'f' || *c->p == 'F') c->p++;
         return TRUE;
     }
+    if (*c->p == '!' && c->p[1] != '=')
+    {
+        c->p++;
+        if (!expr_scalar_factor( c, out )) return FALSE;
+        *out = *out == 0.0f;
+        return TRUE;
+    }
     if (*c->p == '(')
     {
         c->p++;
-        return expr_scalar_sum( c, out ) && expr_accept( c, L")" );
+        return expr_scalar( c, out ) && expr_accept( c, L")" );
     }
     for (i = 0; i < ARRAY_SIZE(funcs); i++)
     {
         float arg[3];
         if (!expr_accept( c, funcs[i].name )) continue;
         for (k = 0; k < funcs[i].args; k++)
-            if ((k && !expr_accept( c, L"," )) || !expr_scalar_sum( c, &arg[k] )) return FALSE;
+            if ((k && !expr_accept( c, L"," )) || !expr_scalar( c, &arg[k] )) return FALSE;
         if (!expr_accept( c, L")" )) return FALSE;
         switch (i)
         {
@@ -14718,6 +14994,7 @@ static BOOL expr_scalar_factor( struct expr_ctx *c, float *out )
         return TRUE;
     }
     if (!expr_name( c, ref, ARRAY_SIZE(ref), prop, ARRAY_SIZE(prop) )) return FALSE;
+    if (expr_bound_scalar( c, ref, prop, out )) return TRUE;
     v = expr_property( c, ref, prop );
     if (!v || v->type != PROP_SCALAR) return FALSE;
     *out = v->u.scalar;
@@ -14745,9 +15022,71 @@ static BOOL expr_scalar_sum( struct expr_ctx *c, float *out )
         else return TRUE;
     }
 }
+/* the expression the first referenced property set's Opacity follows, for traces */
+static const WCHAR *debug_bound_opacity( struct expr_animation *expr )
+{
+    struct property_set *ps = expr->ref_count ? propset_from_object( expr->refs[0] ) : NULL;
+    unsigned int i;
+    for (i = 0; ps && i < ps->binding_count; i++)
+        if (ps->bindings[i].expr && !wcsicmp( ps->bindings[i].name, L"Opacity" )) return ps->bindings[i].expr->expression;
+    return L"";
+}
+/* comparisons, && and || give 1 or 0, and "cond ? a : b" picks one: React Native's interpolation nodes bind
+ * "p.v < i0 ? o0 + ((o1 - o0) * ((p.v - i0) / (i1 - i0))) : p.v > i6 ? ... : ..." */
+static BOOL expr_scalar_compare( struct expr_ctx *c, float *out )
+{
+    static const WCHAR *ops[] = { L"<=", L">=", L"==", L"!=", L"<", L">" };
+    unsigned int i;
+    float f;
+
+    if (!expr_scalar_sum( c, out )) return FALSE;
+    for (i = 0; i < ARRAY_SIZE(ops); i++)
+    {
+        if (!expr_accept( c, ops[i] )) continue;
+        if (!expr_scalar_sum( c, &f )) return FALSE;
+        switch (i)
+        {
+        case 0: *out = *out <= f; break;
+        case 1: *out = *out >= f; break;
+        case 2: *out = *out == f; break;
+        case 3: *out = *out != f; break;
+        case 4: *out = *out < f; break;
+        default: *out = *out > f; break;
+        }
+        break;
+    }
+    return TRUE;
+}
+static BOOL expr_scalar_and( struct expr_ctx *c, float *out )
+{
+    float f;
+    if (!expr_scalar_compare( c, out )) return FALSE;
+    while (expr_accept( c, L"&&" ))
+    {
+        if (!expr_scalar_compare( c, &f )) return FALSE;
+        *out = *out != 0.0f && f != 0.0f;
+    }
+    return TRUE;
+}
+static BOOL expr_scalar_or( struct expr_ctx *c, float *out )
+{
+    float f;
+    if (!expr_scalar_and( c, out )) return FALSE;
+    while (expr_accept( c, L"||" ))
+    {
+        if (!expr_scalar_and( c, &f )) return FALSE;
+        *out = *out != 0.0f || f != 0.0f;
+    }
+    return TRUE;
+}
 static BOOL expr_scalar( struct expr_ctx *c, float *out )
 {
-    return expr_scalar_sum( c, out );
+    float a, b;
+    if (!expr_scalar_or( c, out )) return FALSE;
+    if (!expr_accept( c, L"?" )) return TRUE;
+    if (!expr_scalar( c, &a ) || !expr_accept( c, L":" ) || !expr_scalar( c, &b )) return FALSE;
+    *out = *out != 0.0f ? a : b;
+    return TRUE;
 }
 static BOOL expr_matrix_product( struct expr_ctx *c, D2D_MATRIX_3X2_F *out );
 static BOOL expr_matrix_term( struct expr_ctx *c, D2D_MATRIX_3X2_F *out )
@@ -14811,9 +15150,11 @@ static BOOL expr_matrix_term( struct expr_ctx *c, D2D_MATRIX_3X2_F *out )
             }
         if (set && c->depth < 4)
             for (i = 0; i < set->binding_count; i++)
-                if (!wcsicmp( set->bindings[i].name, prop ) && set->bindings[i].expr != c->expr)
+            {
+                struct expr_animation *bound = set->bindings[i].expr;
+                if (bound && !wcsicmp( set->bindings[i].name, prop ) && bound != c->expr)
                 {
-                    struct expr_ctx inner = { set->bindings[i].expr, set, c->dmanip, set->bindings[i].expr->expression, c->depth + 1 };
+                    struct expr_ctx inner = { bound, set, c->dmanip, bound->expression, c->depth + 1 };
                     D2D_MATRIX_3X2_F m;
                     if (expr_matrix_product( &inner, &m ))
                     {
@@ -14825,9 +15166,10 @@ static BOOL expr_matrix_term( struct expr_ctx *c, D2D_MATRIX_3X2_F *out )
                         }
                     }
                     TRACE_(dcomptree)( "term %s.%s: binding %s failed at %s\n", debugstr_w( ref ), debugstr_w( prop ),
-                                       debugstr_w( set->bindings[i].expr->expression ), debugstr_w( inner.p ) );
+                                       debugstr_w( bound->expression ), debugstr_w( inner.p ) );
                     break;
                 }
+            }
     }
     if (!(v = expr_property( c, ref, prop )))
     {
@@ -14889,6 +15231,71 @@ static BOOL expr_evaluate_matrix( struct expr_animation *expr, ICompositionPrope
         WARN( "cannot evaluate %s: stopped at %s\n", debugstr_w( expr->expression ), debugstr_w( c.p ) );
     }
     return ok;
+}
+
+/* see listened_sets: report what each facade expression evaluates to now, when it changed */
+static void notify_facade_listeners( void )
+{
+    unsigned int n, i;
+
+    if (!listened_count) return;
+    EnterCriticalSection( &listened_cs );
+    for (n = 0; n < listened_count; n++)
+    {
+        struct property_set *set = listened_sets[n];
+        IUnknown *listener = set->listener;
+        if (!listener) continue;
+        for (i = 0; i < set->binding_count; i++)
+        {
+            struct expr_animation *expr = set->bindings[i].expr;
+            float value[16] = { 0 };
+            unsigned int k, slot, count;
+            struct expr_ctx c;
+            int id = -1;
+
+            if (!expr) continue;
+            for (k = 0; k < set->value_count; k++)
+                if (!wcsicmp( set->values[k].name, set->bindings[i].name )) { id = k; break; }
+            if (id < 0) continue;
+            c.expr = expr; c.local = set; c.dmanip = NULL; c.p = expr->expression; c.depth = 1;
+            /* a value that cannot be evaluated is reported as the static one: XAML counts the reports it waits for */
+            if (set->values[id].type == PROP_MATRIX4X4)
+            {
+                D2D_MATRIX_3X2_F m;
+                if (expr_matrix_product( &c, &m ) && (expr_skip_space( &c ), !*c.p))
+                {
+                    value[0] = m._11; value[1] = m._12; value[4] = m._21; value[5] = m._22;
+                    value[10] = 1.0f; value[12] = m._31; value[13] = m._32; value[15] = 1.0f;
+                }
+                else memcpy( value, &set->values[id].u.m44, sizeof(value) );
+                slot = 5;
+                count = 16;
+            }
+            else if (set->values[id].type == PROP_SCALAR)
+            {
+                if (!expr_scalar( &c, &value[0] ) || (expr_skip_space( &c ), *c.p)) value[0] = set->values[id].u.scalar;
+                slot = 7;
+                count = 1;
+            }
+            else continue;
+            if (set->bindings[i].notified && !memcmp( set->bindings[i].last, value, count * sizeof(float) )) continue;
+            memcpy( set->bindings[i].last, value, sizeof(value) );
+            set->bindings[i].notified = TRUE;
+            TRACE_(dcompanim)( "set %p %s (id %d): notify %g %g %g %g\n", set, debugstr_w( set->bindings[i].name ), id,
+                               value[0], value[5], value[12], value[13] );
+            if (slot == 5)
+            {
+                HRESULT (WINAPI *notify)( IUnknown *, IInspectable *, int, const float * ) = (*(void ***)listener)[5];
+                notify( listener, (IInspectable *)&set->ICompositionPropertySet_iface, id, value );
+            }
+            else
+            {
+                HRESULT (WINAPI *notify)( IUnknown *, IInspectable *, int, float ) = (*(void ***)listener)[7];
+                notify( listener, (IInspectable *)&set->ICompositionPropertySet_iface, id, value[0] );
+            }
+        }
+    }
+    LeaveCriticalSection( &listened_cs );
 }
 
 static struct property_set *propset_from_object( IUnknown *object )
@@ -19928,10 +20335,12 @@ static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, voi
             unsigned int i;
             for (i = 0; i < set->binding_count; i++) if (!wcsicmp( set->bindings[i].name, prop )) break;
             if (i == set->binding_count && i < PROPSET_BINDINGS) set->binding_count++;
-            if (i < PROPSET_BINDINGS)
+            if (i < PROPSET_BINDINGS && (expr = expr_snapshot( expr )))
             {
-                IUnknown_AddRef( (IUnknown *)&expr->vtbl );
                 if (set->bindings[i].expr) IUnknown_Release( (IUnknown *)&set->bindings[i].expr->vtbl );
+                expr_run_end( set->bindings[i].id );
+                set->bindings[i].id = facade_start ? expr_run_start() : 0;
+                set->bindings[i].notified = FALSE;  /* XAML waits for a value after every start */
                 set->bindings[i].expr = expr;
                 lstrcpynW( set->bindings[i].name, prop, ARRAY_SIZE(set->bindings[i].name) );
             }
@@ -19945,6 +20354,30 @@ static HRESULT WINAPI object_view_StopAnimation( void *iface, HSTRING name )
 
     scene_changed();
     TRACE_(dcompanim)( "object %p (owner %p) stop %s\n", view, view->owner, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ) );
+    if (view->owner && *(void ***)view->owner == (void **)&propset_vtbl)
+    {
+        /* an expression stops at its current value */
+        struct property_set *set = CONTAINING_RECORD( view->owner, struct property_set, ICompositionPropertySet_iface );
+        const WCHAR *prop = WindowsGetStringRawBuffer( name, NULL );
+        unsigned int i;
+        for (i = 0; prop && i < set->binding_count; i++)
+        {
+            struct expr_animation *expr = set->bindings[i].expr;
+            struct expr_ctx c;
+            struct propset_value *pv;
+            float value;
+            if (!expr || wcsicmp( set->bindings[i].name, prop )) continue;
+            c.expr = expr; c.local = set; c.dmanip = NULL; c.p = expr->expression; c.depth = 1;
+            if (expr_scalar( &c, &value ) && (expr_skip_space( &c ), !*c.p) && (pv = propset_find( set, name, FALSE )) &&
+                pv->type == PROP_SCALAR)
+                pv->u.scalar = value;
+            set->bindings[i].expr = NULL;
+            expr_run_end( set->bindings[i].id );
+            set->bindings[i].id = 0;
+            IUnknown_Release( (IUnknown *)&expr->vtbl );
+            break;
+        }
+    }
     return S_OK;
 }
 
@@ -21622,7 +22055,9 @@ static HRESULT WINAPI composition_object_statics_StartAnimationWithIAnimationObj
     {
         TRACE_(dcompanim)( "facade %s runs on %p %s.\n", debugstr_hstring( property ), info->resolved,
                            debugstr_hstring( info->property ) );
+        facade_start = TRUE;
         hr = ICompositionObject_StartAnimation( resolved, info->property, (ICompositionAnimation *)animation );
+        facade_start = FALSE;
         ICompositionObject_Release( resolved );
     }
     else TRACE_(dcompanim)( "facade %s: not resolved, hr %#lx.\n", debugstr_hstring( property ), hr );
