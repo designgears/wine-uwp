@@ -10970,3 +10970,23 @@ Task 1, investigated and not fixed. What the measurements ruled out, so the next
 Next measurement: `WINEDEBUG=+dwrite,+d2d` on a run where the nav is hovered or scrolled, to see whether the icon
 text is requested then; and for the banners, compare the banner's alpha/opacity path (`+dcompops`) rather than
 the image decode, which logs no error.
+
+### Xbox nav icons: the measurement after navigating (2026-10-14, late)
+
+- The prefix's `windows.web.dll` is now Wine's build (cmp OK). The Microsoft copy that was there was not the
+  one in `win11` either, so it was kept as `uwp-bin/windows.web.prefix-before-wine-restore.dll`.
+- After **Browse app** and **My Library** (`/tmp/nav-lib.png`, 2365 colours, described honestly): the nav draws the
+  outline icons for Home and Game Pass, the My Library entry is selected, and Cloud Gaming and Store have no icon.
+  A "All your games in one place / Got it" coach mark covers the top of the content. The library body is empty.
+- `+dwrite` over that navigation: `SegoeIcons.ttf` (Segoe Fluent Icons) is opened, `XboxFluent2.ttf` never is, and
+  no text request contains a private-use code point. No `CreateTextFormat` or `FindFamilyName` names the Xbox
+  Fluent family. The icon font has the glyphs (1,296 PUA code points in its cmap), so this is not a missing glyph.
+- So the three blank icons are not text that failed to draw. Either their elements are never laid out, or they
+  reference the icon family through a path XAML never resolves. The next measurement is the XAML side of the nav item
+  template: which `FontFamily` string the item's `FontIcon` carries, and whether XAML parses it. The earlier
+  "UIElementHelpersAssets" path was a string-table artefact and is not the answer.
+- Caution: `+dwrite` over a whole run made a start-up that was blank for the first capture (the log is 1.7M lines).
+  A blank capture is also the loader-lock start-up race. Retrying gave the gate (594 colours), so one blank frame is
+  not evidence.
+
+Tasks 1 (banners), 3 and 4 are not done.
