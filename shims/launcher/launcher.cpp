@@ -40,6 +40,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>
+#include <string>
 
 static const GUID IID_ILauncherStatics_  = {0x277151c3,0x9e3e,0x42f6,{0x91,0xa4,0x5d,0xfd,0xeb,0x23,0x24,0x51}};
 static const GUID IID_ILauncherStatics2_ = {0x59ba2fbb,0x24cb,0x4c02,{0xa4,0xc4,0x82,0x94,0x56,0x9d,0x54,0xf1}};
@@ -47,6 +48,9 @@ static const GUID IID_ILauncherStatics3_ = {0x234261a8,0x9db3,0x4683,{0xaa,0x42,
 static const GUID IID_ILauncherStatics4_ = {0xb9ec819f,0xb5a5,0x41c6,{0xb3,0xb3,0xdd,0x1b,0x31,0x78,0xbc,0xf2}};
 static const GUID IID_ILauncherStatics5_ = {0x5b24ef84,0xd895,0x5fea,{0x91,0x53,0x1a,0xc4,0x9a,0xed,0x9b,0xa9}};
 static const GUID IID_IAsyncOperation_bool_ = {0xcdb5efb3,0x5788,0x509d,{0x9b,0xe1,0x71,0xcc,0xb8,0xa3,0x36,0x2a}};
+/* IAsyncOperation<LaunchQuerySupportStatus>, piid.py --signature
+ * 'pinterface({9fc2b0bb-e446-44e2-aa61-9cab8f636af2};enum(Windows.System.LaunchQuerySupportStatus;i4))' */
+static const GUID IID_IAsyncOperation_status_ = {0xe7539992,0x2220,0x5d2d,{0x82,0xc4,0x3d,0x44,0xf8,0x75,0x0d,0x91}};
 static const GUID IID_IAsyncInfo_   = {0x00000036,0x0000,0x0000,{0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x46}};
 static const GUID IID_IAgileObject_ = {0x94ea2b94,0xe9cc,0x49e0,{0xc0,0xff,0xee,0x64,0xca,0x8f,0x5b,0x90}};
 static const GUID IID_IUriRuntimeClass_ = {0x9e365e57,0x48b2,0x4160,{0x95,0x6f,0xc7,0x38,0x51,0x20,0xbb,0xfc}};
@@ -68,7 +72,8 @@ struct AsyncBool
     const void **op_vtbl;
     const void **info_vtbl;
     LONG ref;
-    boolean result;
+    INT32 result;
+    BOOL status;    /* IAsyncOperation<LaunchQuerySupportStatus> rather than <bool> */
     IUnknown *handler;
 };
 static const void *async_op_vtbl[9];
@@ -81,7 +86,8 @@ static HRESULT async_qi(AsyncBool *a, REFIID iid, void **out)
 {
     if (!out) return E_POINTER;
     if (IsEqualGUID(iid, IID_IUnknown) || IsEqualGUID(iid, IID_IInspectable) ||
-        IsEqualGUID(iid, IID_IAgileObject_) || IsEqualGUID(iid, IID_IAsyncOperation_bool_))
+        IsEqualGUID(iid, IID_IAgileObject_) ||
+        IsEqualGUID(iid, a->status ? IID_IAsyncOperation_status_ : IID_IAsyncOperation_bool_))
     {
         InterlockedIncrement(&a->ref);
         *out = &a->op_vtbl;
@@ -124,7 +130,10 @@ static HRESULT WINAPI async_GetIids(void *i, ULONG *c, IID **ids)
 static HRESULT WINAPI async_GetRuntimeClassName(void *i, HSTRING *name)
 {
     static const WCHAR cls[] = L"Windows.Foundation.IAsyncOperation`1<Boolean>";
-    return WindowsCreateString(cls, ARRAYSIZE(cls) - 1, name);
+    static const WCHAR cls2[] = L"Windows.Foundation.IAsyncOperation`1<Windows.System.LaunchQuerySupportStatus>";
+    /* the same function serves both vtables: i is either the op or the info view, and both start the object */
+    AsyncBool *a = (*(const void ***)i == async_op_vtbl) ? from_op(i) : from_info(i);
+    return a->status ? WindowsCreateString(cls2, ARRAYSIZE(cls2) - 1, name) : WindowsCreateString(cls, ARRAYSIZE(cls) - 1, name);
 }
 static HRESULT WINAPI async_GetTrustLevel(void *i, TrustLevel *l)
 {
@@ -155,10 +164,12 @@ static HRESULT WINAPI aop_get_Completed(void *iface, IUnknown **handler)
     if ((*handler = a->handler)) a->handler->AddRef();
     return S_OK;
 }
-static HRESULT WINAPI aop_GetResults(void *iface, boolean *result)
+static HRESULT WINAPI aop_GetResults(void *iface, void *result)
 {
+    AsyncBool *a = from_op(iface);
     if (!result) return E_POINTER;
-    *result = from_op(iface)->result;
+    if (a->status) *(INT32 *)result = a->result;
+    else *(boolean *)result = !!a->result;
     return S_OK;
 }
 
@@ -194,7 +205,7 @@ static void init_async_vtbls(void)
     async_info_vtbl[10] = (void *)ainfo_Close;
 }
 
-static HRESULT make_completed_async(boolean value, void **out)
+static HRESULT make_completed_async_of(BOOL status, INT32 value, void **out)
 {
     AsyncBool *a;
     if (!out) return E_POINTER;
@@ -205,8 +216,113 @@ static HRESULT make_completed_async(boolean value, void **out)
     a->info_vtbl = async_info_vtbl;
     a->ref = 1;
     a->result = value;
+    a->status = status;
     *out = &a->op_vtbl;
     return S_OK;
+}
+static HRESULT make_completed_async(boolean value, void **out) { return make_completed_async_of(FALSE, value, out); }
+
+/* ---------------------------------------------------------------------------------------------
+ * Games installed through the Xbox app (shims/gameplatform): stage directories under
+ * $WINE_UWP_GAMES_DATA/stage with a .wine-uwp-xbox marker. A URI whose scheme one of them declares
+ * (uap:Protocol in its AppxManifest.xml), or a query naming its package family, is answered by it.
+ * ------------------------------------------------------------------------------------------- */
+static bool read_small_file(const std::wstring &path, std::string &out)
+{
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD size = GetFileSize(f, nullptr), got = 0;
+    if (size > 4 << 20) size = 4 << 20;
+    out.resize(size);
+    ReadFile(f, &out[0], size, &got, nullptr);
+    out.resize(got);
+    CloseHandle(f);
+    return true;
+}
+
+static bool icontains(const std::string &hay, const std::string &needle)
+{
+    if (needle.empty() || needle.size() > hay.size()) return false;
+    for (size_t i = 0; i + needle.size() <= hay.size(); i++)
+        if (!_strnicmp(hay.c_str() + i, needle.c_str(), needle.size())) return true;
+    return false;
+}
+
+static std::string narrow(const WCHAR *w)
+{
+    char buf[1024];
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, sizeof(buf), nullptr, nullptr);
+    return n > 0 ? std::string(buf, n - 1) : std::string();
+}
+
+/* the stage directory of an installed game that is the package family, or handles the scheme */
+static std::wstring game_for(const WCHAR *family, const WCHAR *scheme)
+{
+    WCHAR data[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"WINE_UWP_GAMES_DATA", data, MAX_PATH)) return {};
+    std::wstring stage = std::wstring(L"Z:") + data + L"/stage";
+    for (auto &c : stage) if (c == L'/') c = L'\\';
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((stage + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    std::wstring found;
+    do
+    {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
+        std::wstring dir = stage + L"\\" + fd.cFileName;
+        std::string marker, manifest;
+        if (!read_small_file(dir + L"\\.wine-uwp-xbox", marker)) continue;
+        if (family && *family && icontains(marker, "family=" + narrow(family) + "\n")) { found = dir; break; }
+        if (scheme && *scheme && read_small_file(dir + L"\\AppxManifest.xml", manifest) &&
+            icontains(manifest, "Protocol Name=\"" + narrow(scheme) + "\"")) { found = dir; break; }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return found;
+}
+
+/* A game gets the environment a launcher would give it, not ours: everything that run.sh exported for the
+ * app that starts it (its package identity, DLL overrides, framework path, test switches) is left out, and the
+ * game's wineuwp-launch.exe sets its own from identity.env and launch.env. */
+static std::wstring clean_environment(void)
+{
+    static const wchar_t *drop[] = { L"WINE_UWP_", L"UWP_", L"WINEDLLOVERRIDES=", L"WINEPATH=", L"WINE_D3D_CONFIG=",
+                                     L"WINE_SKIP_NATIVE_THREAD_CALLS=" };
+    std::wstring block;
+    WCHAR *env = GetEnvironmentStringsW();
+    for (WCHAR *p = env; p && *p; p += wcslen(p) + 1)
+    {
+        bool skip = false;
+        for (auto d : drop) if (!_wcsnicmp(p, d, wcslen(d))) skip = true;
+        if (skip) continue;
+        block += p;
+        block += L'\0';
+    }
+    if (env) FreeEnvironmentStringsW(env);
+    block += L'\0';
+    return block;
+}
+
+static bool start_game(const std::wstring &dir, const WCHAR *uri)
+{
+    std::wstring exe = dir + L"\\wineuwp-launch.exe", cmd = L"\"" + exe + L"\"";
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    std::wstring env = clean_environment();
+    if (!CreateProcessW(exe.c_str(), &cmd[0], nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, &env[0], dir.c_str(), &si, &pi))
+    {
+        trace("%ls: starting %ls failed %lu", uri, exe.c_str(), GetLastError());
+        return false;
+    }
+    trace("%ls: started %ls", uri, exe.c_str());
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+static std::wstring scheme_of(const WCHAR *uri)
+{
+    const WCHAR *colon = uri ? wcschr(uri, L':') : nullptr;
+    return colon ? std::wstring(uri, colon - uri) : std::wstring();
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -223,6 +339,13 @@ static HRESULT launch(const WCHAR *what, const WCHAR *target, void **op)
     {
         trace("%ls: nothing to launch", what);
         return make_completed_async(0, op);
+    }
+    if (!wcscmp(what, L"uri"))
+    {
+        std::wstring scheme = scheme_of(target), game;
+        if (!scheme.empty() && _wcsicmp(scheme.c_str(), L"http") && _wcsicmp(scheme.c_str(), L"https") &&
+            !(game = game_for(nullptr, scheme.c_str())).empty())
+            return make_completed_async(start_game(game, target), op);
     }
     if (GetEnvironmentVariableA("WINE_UWP_LAUNCHER", mode, sizeof(mode)) && !strcmp(mode, "log"))
     {
@@ -327,6 +450,40 @@ static HRESULT WINAPI s_LaunchUriAsync(void *i, IUnknown *uri, void **op)       
 static HRESULT WINAPI s_LaunchUriWithOptionsAsync(void *i, IUnknown *uri, IUnknown *o, void **op)   { return launch_uri(uri, op); }
 /* ILauncherStatics2 slot 8 */
 static HRESULT WINAPI s2_LaunchUriWithDataAsync(void *i, IUnknown *uri, IUnknown *o, IUnknown *data, void **op) { return launch_uri(uri, op); }
+/* ILauncherStatics2 slots 9 and 10: QueryUriSupportAsync(uri, type[, packageFamilyName]). LaunchQuerySupportStatus:
+ * Available 0, AppNotInstalled 1, AppUnavailable 2, NotSupported 3, Unknown 4. */
+static HRESULT query_uri(IUnknown *uri, HSTRING family, void **op)
+{
+    typedef HRESULT (WINAPI *get_string)(void *iface, HSTRING *value);
+    void *iface = nullptr;
+    HSTRING str = nullptr;
+    const WCHAR *fam = family ? WindowsGetStringRawBuffer(family, nullptr) : nullptr;
+    INT32 status;
+    HRESULT hr;
+
+    if (!op) return E_POINTER;
+    if (!uri) return E_INVALIDARG;
+    if (FAILED(hr = uri->QueryInterface(IID_IUriRuntimeClass_, &iface))) return hr;
+    hr = ((get_string)(*(void ***)iface)[6])(iface, &str);
+    ((IUnknown *)iface)->Release();
+    if (FAILED(hr)) return hr;
+    const WCHAR *target = WindowsGetStringRawBuffer(str, nullptr);
+    std::wstring scheme = scheme_of(target);
+    if (fam && *fam)
+        status = !game_for(fam, nullptr).empty() ? 0 : 1;
+    else if (!_wcsicmp(scheme.c_str(), L"http") || !_wcsicmp(scheme.c_str(), L"https") || !_wcsicmp(scheme.c_str(), L"mailto"))
+        status = 0;
+    else
+        status = !game_for(nullptr, scheme.c_str()).empty() ? 0 : 3;
+    trace("QueryUriSupport %ls%s%ls -> %d", target, fam ? " for " : "", fam ? fam : L"", status);
+    WindowsDeleteString(str);
+    return make_completed_async_of(TRUE, status, op);
+}
+static HRESULT WINAPI s2_QueryUriSupportAsync(void *i, IUnknown *uri, INT32 type, void **op) { return query_uri(uri, nullptr, op); }
+static HRESULT WINAPI s2_QueryUriSupportWithPackageFamilyNameAsync(void *i, IUnknown *uri, INT32 type, HSTRING pfn, void **op)
+{
+    return query_uri(uri, pfn, op);
+}
 /* ILauncherStatics3 */
 static HRESULT WINAPI s3_LaunchFolderAsync(void *i, IUnknown *folder, void **op)             { return launch_item(folder, op); }
 static HRESULT WINAPI s3_LaunchFolderWithOptionsAsync(void *i, IUnknown *folder, IUnknown *o, void **op) { return launch_item(folder, op); }
@@ -356,7 +513,7 @@ static HRESULT WINAPI s5_LaunchFolderPathForUserWithOptionsAsync(void *i, IUnkno
  * with: traced thunks, so a caller that needs one shows up by name in the log. */
 #define TRACED_SLOT(iface, n) \
     static HRESULT WINAPI iface##_slot##n(void *i) { trace(#iface " slot %d not implemented", n); return E_NOTIMPL; }
-TRACED_SLOT(s2, 6) TRACED_SLOT(s2, 7) TRACED_SLOT(s2, 9) TRACED_SLOT(s2, 10) TRACED_SLOT(s2, 11)
+TRACED_SLOT(s2, 6) TRACED_SLOT(s2, 7) TRACED_SLOT(s2, 11)
 TRACED_SLOT(s2, 12) TRACED_SLOT(s2, 13) TRACED_SLOT(s2, 14) TRACED_SLOT(s2, 15)
 TRACED_SLOT(s4, 6) TRACED_SLOT(s4, 7) TRACED_SLOT(s4, 8) TRACED_SLOT(s4, 12) TRACED_SLOT(s4, 13)
 
@@ -383,8 +540,8 @@ static void init_statics(void)
     statics2_vtbl[6] = (void *)s2_slot6;
     statics2_vtbl[7] = (void *)s2_slot7;
     statics2_vtbl[8] = (void *)s2_LaunchUriWithDataAsync;
-    statics2_vtbl[9] = (void *)s2_slot9;
-    statics2_vtbl[10] = (void *)s2_slot10;
+    statics2_vtbl[9] = (void *)s2_QueryUriSupportAsync;
+    statics2_vtbl[10] = (void *)s2_QueryUriSupportWithPackageFamilyNameAsync;
     statics2_vtbl[11] = (void *)s2_slot11;
     statics2_vtbl[12] = (void *)s2_slot12;
     statics2_vtbl[13] = (void *)s2_slot13;

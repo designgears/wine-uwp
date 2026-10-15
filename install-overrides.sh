@@ -504,6 +504,30 @@ if [ -f "$ADID" ]; then
   echo "installed: advertising-id apiset stand-in"
 fi
 
+# The WebView2 runtime (Edge's EBWebView, from a Windows ISO's install.wim: Program Files (x86)/Microsoft/EdgeWebView),
+# with shims/webview2 in front of its EmbeddedBrowserWebView.dll. The Xbox app's purchase dialog and other React
+# Native WebViews need it; without a runtime the app crashes on Get. The host turns composition-hosted WebViews
+# into a windowed browser in a popup (Wine does not show another process's child windows). Optional: only when
+# the harvested runtime is there.
+WV2_ROOT=${WEBVIEW2_RUNTIME:-${UWP_BIN}/webview2/rt/Program Files (x86)/Microsoft/EdgeWebView}
+WV2_HOST=${SHIM_DIR}/EmbeddedBrowserWebView.dll
+WV2_APP=$(ls -d "$WV2_ROOT"/Application/[0-9]*.[0-9]*.[0-9]*.[0-9]* 2>/dev/null | tail -1)
+if [ -n "$WV2_APP" ] && [ -f "$WV2_HOST" ]; then
+  WV2_VER=$(basename "$WV2_APP")
+  WV2_DST="$WINEPREFIX/drive_c/Program Files (x86)/Microsoft/EdgeWebView/Application"
+  mkdir -p "$WV2_DST"
+  [ -d "$WV2_DST/$WV2_VER" ] || cp -a --reflink=auto "$WV2_APP" "$WV2_DST/"
+  WV2_X="$WV2_DST/$WV2_VER/EBWebView/x64"
+  [ -f "$WV2_X/EmbeddedBrowserWebView.real.dll" ] || mv "$WV2_X/EmbeddedBrowserWebView.dll" "$WV2_X/EmbeddedBrowserWebView.real.dll"
+  cmp -s "$WV2_HOST" "$WV2_X/EmbeddedBrowserWebView.dll" || cp -f "$WV2_HOST" "$WV2_X/EmbeddedBrowserWebView.dll"
+  K='HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate'
+  G='{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+  "${WINE_BIN}wine" reg add "$K\\ClientState\\$G" /v EBWebView /d "C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\$WV2_VER" /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K\\Clients\\$G" /v pv /d "$WV2_VER" /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K\\Clients\\$G" /v name /d "Microsoft Edge WebView2 Runtime" /f >/dev/null 2>&1
+  echo "installed: WebView2 runtime $WV2_VER with the wine-uwp host"
+fi
+
 # Windows.UI.Shell.TaskbarManager: the real implementation reaches for ImmersiveShell
 # ({c2f03a33-...}, not registered under Wine) and, when that fails, never completes the
 # IAsyncOperation the caller is waiting on. Solitaire blocks there forever and its render loop

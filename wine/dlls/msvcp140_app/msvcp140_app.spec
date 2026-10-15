@@ -2523,7 +2523,7 @@
 @ cdecl -arch=arm ?get_monthname@?$time_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@QBA?AV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@2@V32@0AAVios_base@2@AAHPAUtm@@@Z(ptr ptr ptr long ptr long ptr ptr ptr) time_get_wchar_get_monthname
 @ thiscall -arch=i386 ?get_monthname@?$time_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@QBE?AV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@2@V32@0AAVios_base@2@AAHPAUtm@@@Z(ptr ptr ptr long ptr long ptr ptr ptr) time_get_wchar_get_monthname
 @ cdecl -arch=win64 ?get_monthname@?$time_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@QEBA?AV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@2@V32@0AEAVios_base@2@AEAHPEAUtm@@@Z(ptr ptr ptr ptr ptr ptr ptr) time_get_wchar_get_monthname
-@ stub -arch=arm ?get_new_handler@std@@YAP6AXXZXZ
+@ cdecl ?get_new_handler@std@@YAP6AXXZXZ() get_new_handler
 @ cdecl -arch=arm ?get_time@?$time_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@QBA?AV?$istreambuf_iterator@DU?$char_traits@D@std@@@2@V32@0AAVios_base@2@AAHPAUtm@@@Z(ptr ptr ptr long ptr long ptr ptr ptr) time_get_char_get_time
 @ thiscall -arch=i386 ?get_time@?$time_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@QBE?AV?$istreambuf_iterator@DU?$char_traits@D@std@@@2@V32@0AAVios_base@2@AAHPAUtm@@@Z(ptr ptr ptr long ptr long ptr ptr ptr) time_get_char_get_time
 @ cdecl -arch=win64 ?get_time@?$time_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@QEBA?AV?$istreambuf_iterator@DU?$char_traits@D@std@@@2@V32@0AEAVios_base@2@AEAHPEAUtm@@@Z(ptr ptr ptr ptr ptr ptr ptr) time_get_char_get_time

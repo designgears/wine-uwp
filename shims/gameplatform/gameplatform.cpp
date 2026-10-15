@@ -88,9 +88,51 @@ static void log_guid(const char *what, int kind, REFIID g)
            g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
 }
 
+/* IWeakReferenceSource {00000038} / IWeakReference {00000037}: C++/WinRT keeps weak references to objects it gets
+ * (the app's GameCatalog holds a weak_ref to every IPackage, and dereferences the QI without checking). The reference
+ * here holds the object: these objects are small and few. */
+static const GUID IID_IWeakReferenceSource_ = {0x00000038,0x0000,0x0000,{0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x46}};
+static const GUID IID_IWeakReference_ = {0x00000037,0x0000,0x0000,{0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x46}};
+struct WeakRef : IUnknown
+{
+    LONG ref = 1;
+    IUnknown *target;
+    WeakRef(IUnknown *t) : target(t) { target->AddRef(); }
+    ~WeakRef() { target->Release(); }   /* not virtual: a virtual destructor would take vtable slot 3 */
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (IsEqualGUID(iid, IID_IUnknown) || IsEqualGUID(iid, IID_IWeakReference_)) { *out = this; AddRef(); return S_OK; }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    virtual HRESULT STDMETHODCALLTYPE Resolve(REFIID iid, IInspectable **out) { return target->QueryInterface(iid, (void **)out); }
+};
+struct WeakSource : IUnknown
+{
+    LONG ref = 1;
+    IUnknown *target;
+    WeakSource(IUnknown *t) : target(t) { target->AddRef(); }
+    ~WeakSource() { target->Release(); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (IsEqualGUID(iid, IID_IWeakReferenceSource_)) { *out = this; AddRef(); return S_OK; }
+        return target->QueryInterface(iid, out);
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    virtual HRESULT STDMETHODCALLTYPE GetWeakReference(IUnknown **out) { if (!out) return E_POINTER; *out = new WeakRef(target); return S_OK; }
+};
+
 static HRESULT WINAPI f_QueryInterface(Factory *f, REFIID iid, void **out)
 {
     if (!out) return E_POINTER;
+    if (IsEqualGUID(iid, IID_IWeakReferenceSource_))
+    {
+        *out = new WeakSource((IUnknown *)f);
+        return S_OK;
+    }
     if (IsEqualGUID(iid, IID_IUnknown) || IsEqualGUID(iid, IID_IInspectable) || IsEqualGUID(iid, IID_IAgileObject_) ||
         IsEqualGUID(iid, IID_IActivationFactory) || IsEqualGUID(iid, gp_classes[f->kind].statics))
     {
@@ -394,11 +436,28 @@ struct StorageDeviceDetails : IStorageDeviceDetailsAbi
     HRESULT STDMETHODCALLTYPE get_Flags(INT32 *v) override { if (!v) return E_POINTER; *v = 0; return S_OK; }
 };
 
+static bool is_package_instance(const GUID *id);
 static HRESULT WINAPI st_QueryDeviceDetails(Factory *, const GUID *id, IInspectable **out)
 {
     if (!out) return E_POINTER;
     *out = nullptr;
-    if (!id || !IsEqualGUID(*id, DEVICE_ID)) { tracef("Storage.QueryDeviceDetails(unknown device)"); return E_INVALIDARG; }
+    /* GameCatalogGrtsHelpers::GetInstallDriveInfo asks with the id it keeps as the package's "deviceId", which
+     * here is the package instance id (nothing we hand out carries another GUID for it). There is one device,
+     * and every package is on it: answer with it rather than fail the catalog item's state update. */
+    if (id && !IsEqualGUID(*id, DEVICE_ID) && is_package_instance(id))
+    {
+        tracef("Storage.QueryDeviceDetails(a package instance) -> C:");
+        *out = new StorageDeviceDetails();
+        return S_OK;
+    }
+    if (!id || !IsEqualGUID(*id, DEVICE_ID))
+    {
+        if (id)
+            tracef("Storage.QueryDeviceDetails(unknown device {%08lx-%04x-%04x-...}, from %p)", id->Data1, id->Data2, id->Data3,
+                   __builtin_return_address(0));
+        else tracef("Storage.QueryDeviceDetails(NULL)");
+        return E_INVALIDARG;
+    }
     tracef("Storage.QueryDeviceDetails -> C:");
     *out = new StorageDeviceDetails();
     return S_OK;
@@ -412,16 +471,7 @@ static HRESULT WINAPI st_EnumerateDevices(Factory *, IInspectable **out)
     *out = static_cast<IGuidViewAbi *>(v);
     return S_OK;
 }
-static HRESULT WINAPI st_EnumerateContent(Factory *, const GUID *, IInspectable **out)
-{
-    static const GUID IID_IVectorView_String = {0x2f13c006,0xa03a,0x5f69,{0xb0,0x90,0x75,0xa4,0x3e,0x33,0x42,0x3e}};
-    static const GUID IID_IIterable_String = {0xe2fcc7c1,0x3bfc,0x5a0b,{0xb2,0xb0,0x72,0xe7,0x69,0xd1,0xcb,0x7e}};
-    if (!out) return E_POINTER;
-    tracef("Storage.EnumerateContent -> none");
-    *out = static_cast<IEmptyViewAbi *>(new EmptyView(IID_IVectorView_String, IID_IIterable_String,
-                                                       L"Windows.Foundation.Collections.IVectorView`1<String>"));
-    return S_OK;
-}
+static HRESULT WINAPI st_EnumerateContent(Factory *, const GUID *, IInspectable **out);
 static HRESULT WINAPI st_QueryDefaultDevice(Factory *, INT32 category, boolean validate, GUID *out)
 {
     if (!out) return E_POINTER;
@@ -635,7 +685,7 @@ static std::string http_get(const wchar_t *host, const std::wstring &path, DWORD
     return out;
 }
 
-struct ProductDetails { GUID content_id = {}; std::wstring family, store_id; UINT64 size = 0; INT32 type = 2; bool uwp = true; bool found = false; };
+struct ProductDetails { GUID content_id = {}; std::wstring family, store_id, wu_category; UINT64 size = 0; INT32 type = 2; bool uwp = true; bool found = false; };
 
 static std::wstring wide(const std::string &s)
 {
@@ -681,6 +731,7 @@ static ProductDetails query_product(const std::wstring &id)
     for (size_t i = 0; i < skus.a.size() && !d.found; i++)
     {
         const Json &pkgs = skus.at(i)["Sku"]["Properties"]["Packages"];
+        if (d.wu_category.empty()) d.wu_category = wide(skus.at(i)["Sku"]["Properties"]["FulfillmentData"]["WuCategoryId"].str());
         for (size_t k = 0; k < pkgs.a.size(); k++)
         {
             const Json &pk = pkgs.at(k);
@@ -951,6 +1002,19 @@ static HRESULT WINAPI ca_GetRawContentAccessDataAsync(Factory *, IInspectable **
     return S_OK;
 }
 
+#include "install.inc"
+
+/* Storage.EnumerateContent: the games installed through the queue (stage directories with a marker) */
+static HRESULT WINAPI st_EnumerateContent(Factory *, const GUID *, IInspectable **out)
+{
+    if (!out) return E_POINTER;
+    HStringView *v = new HStringView;
+    for (auto &g : installed_games()) v->items.push_back(g.instance);
+    tracef("Storage.EnumerateContent -> %zu", v->items.size());
+    *out = static_cast<IHStringViewAbi *>(v);
+    return S_OK;
+}
+
 struct special { const wchar_t *cls; int slot; const void *fn; };
 static const special specials[] =
 {
@@ -972,6 +1036,48 @@ static const special specials[] =
     { L"Microsoft.GamePlatform.Services.Store", 8, (void *)store_QueryProductDetails },
     { L"Microsoft.GamePlatform.Services.ContentAccess", 6, (void *)ca_GetRawContentAccessDataAsync },
     { L"Microsoft.GamePlatform.Services.Store", 9, (void *)store_QueryProductType },
+    { L"Microsoft.GamePlatform.Services.PackageRequest", 6, (void *)rq_CreateForSource },
+    { L"Microsoft.GamePlatform.Services.PackageRequest", 7, (void *)rq_CreateForSourceDevice },
+    { L"Microsoft.GamePlatform.Services.PackageRequest", 8, (void *)rq_CreateForStoreId },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 6, (void *)pq_SubmitRequestAsync },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 8, (void *)pq_ok_instance },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 9, (void *)pq_ok_instance },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 10, (void *)pq_CancelInstance },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 11, (void *)pq_ok_id },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 12, (void *)pq_ok_id },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 13, (void *)pq_CancelId },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 14, (void *)pq_ok },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 15, (void *)pq_ok },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 16, (void *)pq_CancelAll },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 17, (void *)pq_Enumerate },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 18, (void *)pq_EnumerateId },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 19, (void *)pq_QueryInstallationInfo },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 20, (void *)pq_QueryInstallationSummary },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 23, (void *)pq_CreateViewInstance },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 24, (void *)pq_CreateViewId },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 25, (void *)pq_add_InstallationChanged },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 26, (void *)pq_remove_InstallationChanged },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 27, (void *)pq_add_QueueChanged },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 28, (void *)pq_remove_QueueChanged },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 29, (void *)pq_add_ItemAdded },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 30, (void *)pq_remove_ItemAdded },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 31, (void *)pq_add_ItemRemoved },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 32, (void *)pq_remove_ItemRemoved },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 6, (void *)pi_QueryInstallPath },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 7, (void *)pi_QueryInstanceId },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 8, (void *)pi_QueryIdentity },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 9, (void *)pi_QuerySize },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 10, (void *)pi_QuerySize },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 11, (void *)pi_QueryStorageCategory },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 12, (void *)pi_QueryHeader },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 13, (void *)pi_QueryDetails },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 24, (void *)pi_IsFlatStreamed },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 25, (void *)pi_IsLaunchable },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 27, (void *)pi_GetRunningProcessId },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 28, (void *)pi_Activate },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 29, (void *)pi_ActivateAumid },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 37, (void *)pi_add_InstallationChanged },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 38, (void *)pi_remove_InstallationChanged },
 };
 
 static void init(void)

@@ -1857,11 +1857,22 @@ static HRESULT create_compositor( REFIID iid, void **out );
 
 /* Used by DCompositionCreateDevice* so the public IDCompositionDevice path shares
  * the same object as the WinRT interop device. */
+static const GUID IID_IDCompositionDevice_;
 HRESULT dcomp_create_device( IUnknown *rendering_device, REFIID iid, void **out )
 {
     TRACE( "rendering_device %p, iid %s.\n", rendering_device, debugstr_guid(iid) );
     (void)rendering_device;
     if (!out) return E_POINTER;
+    /* The compositor's table is IDCompositionDevice2's layout (slot 6 CreateVisual, 7 CreateSurfaceFactory);
+     * IDCompositionDevice has CreateTargetForHwnd and CreateVisual there. Chromium's GPU process (WebView2)
+     * probes DCompositionCreateDevice(NULL, IDCompositionDevice), called CreateVisual and landed in
+     * CreateSurfaceFactory with a stack pointer for a device, and crashed. Refusing it makes Chromium do
+     * without DirectComposition. */
+    if (IsEqualGUID( iid, &IID_IDCompositionDevice_ ))
+    {
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
     return create_compositor( iid, out );
 }
 static const void *compositor_islands_vtbl[];
@@ -2499,7 +2510,11 @@ static HRESULT WINAPI expr_anim2_get_Target( void *iface, HSTRING *value )
     if (!value) return E_POINTER;
     *value = NULL;  /* a NULL HSTRING is the empty string */
     EnterCriticalSection( &expr_targets_cs );
-    if ((t = expr_target_find( impl->owner, FALSE )) && t->target[0])
+    /* a clone made before the Target was set reads its origin's: React Native sets Target after UIElement.StartAnimation
+     * has already asked for the animation's ICompositionAnimationBase, and XAML refuses an animation with no Target */
+    if ((t = expr_target_find( impl->owner, FALSE )) && !t->target[0] && t->origin)
+        t = expr_target_find( t->origin, FALSE );
+    if (t && t->target[0])
         hr = WindowsCreateString( t->target, wcslen( t->target ), value );
     LeaveCriticalSection( &expr_targets_cs );
     TRACE_(dcompanim)( "expression %p: Target read -> %s, from %p\n", impl->owner, debugstr_hstring( *value ),

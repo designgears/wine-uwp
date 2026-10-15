@@ -183,3 +183,21 @@ set_target_properties(probe-a8perf PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
 # launch environment from the files next to it, the AppContainer key, CoreMessagingRegistrar, then the app.
 add_executable(wineuwp-launch WIN32 shims/launch/wineuwp-launch.cpp)
 target_link_libraries(wineuwp-launch PRIVATE advapi32.lib user32.lib)
+add_executable(probe-xchild probes/probe-xchild.cpp)
+target_link_libraries(probe-xchild PRIVATE user32.lib gdi32.lib)
+set_target_properties(probe-xchild PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
+# WebView2 under Wine, windowed hosting. Needs the WebView2 SDK headers, which are Microsoft's and stay out of git:
+# -DWEBVIEW2_SDK=<dir with WebView2.h> (build.sh passes $UWP_BIN/webview2/sdk/pkg/build/native/include if present).
+if(WEBVIEW2_SDK)
+  add_executable(probe-webview2 probes/probe-webview2.cpp)
+  target_include_directories(probe-webview2 PRIVATE ${WEBVIEW2_SDK})
+  target_link_libraries(probe-webview2 PRIVATE ole32.lib user32.lib shlwapi.lib)
+  set_target_properties(probe-webview2 PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
+endif()
+# The WebView2 runtime host (EmbeddedBrowserWebView.dll stand-in over the real runtime), also needs WebView2.h.
+if(WEBVIEW2_SDK)
+  add_library(webview2host SHARED shims/webview2/webview2.cpp)
+  target_include_directories(webview2host PRIVATE ${WEBVIEW2_SDK})
+  target_link_libraries(webview2host PRIVATE ole32.lib user32.lib gdi32.lib windowscodecs.lib)
+  set_target_properties(webview2host PROPERTIES PREFIX "" OUTPUT_NAME "EmbeddedBrowserWebView")
+endif()

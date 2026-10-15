@@ -91,6 +91,12 @@ if ! grep -qF "[$APPC\\\\$WINE_UWP_PACKAGE_FAMILY_NAME\\\\ResourcesConfig]" "$WI
     echo "run.sh: could not create the AppContainer storage key for $WINE_UWP_PACKAGE_FAMILY_NAME" >&2
 fi
 
+# Where an app that installs others (the Xbox app, through shims/gameplatform) puts them: wine-uwp's installer, a
+# data directory of its own (stage/, as install-app.py lays it out) and the Windows files the frameworks come from.
+export WINE_UWP_INSTALLER=${WINE_UWP_INSTALLER:-${WINE_UWP_ROOT}/packaging/install-app.py}
+export WINE_UWP_GAMES_DATA=${WINE_UWP_GAMES_DATA:-${UWP_BIN}/xbox-games}
+export WINE_UWP_WINDOWS_TREE=${WINE_UWP_WINDOWS_TREE:-${WIN11:-${UWP_BIN}/win11}}
+
 exe=${1:-${UWP_EXE:-CalculatorApp.exe}}; shift || true
 # Full unfiltered log always goes to $UWP_LOG for post-mortem (module map, SEH context).
 UWP_LOG=${UWP_LOG:-/tmp/wine-uwp-last.log}

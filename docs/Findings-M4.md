@@ -11344,3 +11344,125 @@ Regression: Calculator AE 0, Media Player 2250, `kb` 0/0/0, Shapr3D's home scree
 a fail-fast at `ReactNativeWebView.dll+0xcff3`, called from `Microsoft.Web.WebView2.Core.dll` through XAML: the purchase
 flow opens the Store's buy-now page (`https://www.microsoft.com/store/purchase/buynowui/buynow`) in a WebView2, and there is
 no WebView2 runtime in the prefix. React Native's WebView handler then dereferences the CoreWebView2 it never got.
+
+## 2026-10-15 (night): Xbox app installs and plays Microsoft Solitaire Collection
+
+Goal (A) of the session: install a game from the Xbox app and start it with Play. Done for Microsoft Solitaire
+Collection (9WZDNCRFHWD2, 4.27.9181.0), end to end in `prefix-test3` on `:93`:
+
+- **Get** opens the real Store purchase dialog inside the app (`docs/screenshots/xbox-purchase-dialog-webview2.png`) and
+  takes the free licence; the page then offers Install (`xbox-pdp-solitaire-owned-install.png`).
+- **Install** -> drive -> confirm (`xbox-install-choose-drive.png`, `xbox-install-confirm.png`): the page and the sidebar
+  show **Downloading 0% / View progress** and "Downloading (1/1)" with the game's icon (`xbox-install-downloading.png`);
+  about 4 s later the button is a green **Play**, the toast says "Ready to play!" and Most Recent lists it as "Recently
+  updated" (`xbox-install-ready-to-play.png`). My Library lists it (`xbox-my-library-solitaire.png`).
+- **Play** starts it: Solitaire's main menu with its usual Sign In Error popup (`xbox-play-launches-solitaire.png`), and
+  Cancel -> Klondike is a game (`xbox-launched-solitaire-klondike.png`). The Xbox app stays up.
+
+### The WebView2 runtime (the crash on Get)
+
+The purchase flow is a React Native WebView, i.e. WebView2, and there was no runtime. The runtime now comes from the
+Windows ISO (`install.wim`'s `Program Files (x86)/Microsoft/EdgeWebView`, Edge 140.0.3485.66; the standalone Edge MSI
+payload is obfuscated and was not usable), unpacked into `uwp-bin/webview2/rt`. It runs under Wine with
+`--disable-gpu --disable-gpu-compositing`. Three things were needed around it:
+
+- **`shims/webview2`, a stand-in `EmbeddedBrowserWebView.dll`** in front of the real one (renamed `.real.dll`). React
+  Native asks for a *composition* controller (`CreateCoreWebView2CompositionController`), which needs DirectComposition
+  visuals from another process; the stand-in creates a windowed controller in a popup owned by the app's window instead,
+  places it from `put_Bounds`/`put_IsVisible`, and forwards input. **Wine does not show a child window that belongs to
+  another process** (`probes/probe-xchild.cpp`: GDI painting in a cross-process child never reaches the screen), so the
+  popup shows `CapturePreview` frames (PNG -> WIC -> DIB, on a timer). The stand-in pins itself (Core.dll unloads it),
+  and must not wrap an environment twice. `WINE_UWP_WEBVIEW2_DUMP=1` writes the last frame to
+  `C:\users\Public\webview2-frame.png`. `probes/probe-webview2.cpp` is the windowed control: create, navigate,
+  `ExecuteScript`, `CapturePreview`, and `PROBE_CLICK=x,y[,class]` posts clicks to Chromium's windows.
+- **dcomp answered the v1 `IDCompositionDevice` IID with our v2-layout object**, and Chromium's GPU process crashed in it.
+  `DCompositionCreateDevice` now returns a small v1 device whose objects accept every call (`dlls/dcomp/device.c`), and
+  `dcomp_create_device` refuses the v1 IID.
+- **iertutil's Uri lacked `IUriRuntimeClassWithAbsoluteCanonicalUri`**, which the RN WebView reads.
+
+`install-overrides.sh` installs the runtime and the stand-in when `uwp-bin/webview2/rt` exists (`WEBVIEW2_RUNTIME`
+overrides the path) and registers it under `EdgeUpdate\ClientState\{F3017226-...}`. The WebView2 SDK header the build
+needs stays in `uwp-bin/webview2/sdk` (`build.sh` passes `-DWEBVIEW2_SDK` only when it is there).
+
+### Installing: the Gaming Services stand-in does the install itself
+
+`shims/gameplatform/install.inc`. `PackageQueue.SubmitRequestAsync` starts an install thread:
+
+1. The Store catalog gives the product's `WuCategoryId` (Sku `FulfillmentData`).
+2. **FE3** (the Store's delivery service, anonymous, over TLS from inside Wine): `GetCookie`, then a `SyncUpdates` loop
+   that reports every non-leaf update id it is handed as installed until the packages appear (three passes), then
+   `GetExtendedUpdateInfo2` for the file URL of the chosen package (the x64 or neutral bundle).
+3. `packaging/install-app.py` (run as a Unix process from the shim: `Z:\bin\sh -c "python3 ..."`; CreateProcess of a Unix
+   program works) streams the bundle with range requests, unpacks the right package, adds the frameworks and writes a
+   stage under `uwp-bin/xbox-games/stage/<name>` with `identity.env`, `launch.env` and `wineuwp-launch.exe`. Its
+   `PROGRESS`/`STAGE` lines drive the installation's progress; **a Unix child's process handle cannot be waited on
+   reliably here**, so the command appends `EXIT n` to its log and the shim reads that. `pick_from_bundle` must skip the
+   bundle's `AppxMetadata` stub packages.
+4. A `.wine-uwp-xbox` marker (store id, family, full name, AUMID, title, size) makes the stage an installed game: it is
+   what `Storage.EnumerateContent`, `QueryInstallationInfo` and the package instance answer from.
+
+Package instance ids must be GUID strings (the app parses them; "value is not a valid GUID string" aborted it); the
+shim derives one from the family name, so the queued and the installed package are the same instance.
+
+What it took for the app to follow the install live, each found from its own `LogMsg` lines (`trace+tracelogging`):
+- `PackageInstance.IsLaunchable` for a package still in the queue: FALSE, not "not implemented" (that failed
+  `GameCatalogGrtsPackage::OnInitializeAsync` and the item went to `ProviderIssue`).
+- `GameCatalogGrtsHelpers::GetInstallDriveInfo` calls `Storage.QueryDeviceDetails` with **the package instance id** as
+  the device (`WINE_UWP_BP=XboxPcApp.exe+6acafc@stk:10` named the caller; Source/TargetInstanceId were tried and are not
+  where it comes from). There is one device: an instance id is answered with it.
+- Every object here answers `IWeakReferenceSource`: C++/WinRT takes `weak_ref<IPackageQueueView>` and dereferences the
+  QueryInterface result unchecked (a NULL read in `XboxPcApp.exe+0x691c8b`).
+- **A C++ trap:** a `virtual` destructor declared before the COM methods takes vtable slot 3; `WeakRef`/`WeakSource` have
+  non-virtual destructors for that reason (the symptom was a garbage HRESULT from `GetWeakReference`).
+- `PackageDetails.Registerable` FALSE: TRUE put the finished game under "Ready to install - we found these games on your
+  PC" with a second Install button.
+
+### Play: four separate blockers, then two in the game
+
+1. **`RPC_E_WRONG_THREAD` on the full-trust TitleMonitor.** The app makes `XboxPcAppFT`'s TitleMonitor (an out-of-process
+   object) on its UI thread and calls `GetRunningTitlesAsync` from the thread pool. On Windows a proxy for an *agile*
+   object is agile; Wine's client channel refused any other apartment. combase now marks an out-of-process OBJREF with a
+   private flag (`SORFP_AGILE`, `SORF_OXRES3`) when the object answers `IAgileObject`, and the client channel accepts any
+   apartment for it. In-process marshaling is unchanged.
+2. **`MainView.CoreWindow` was NULL**, and the app reads `CoreApplication.MainView.CoreWindow.Dispatcher` from the thread
+   pool when a game starts (NULL read in `consume_ICoreWindow::Dispatcher`, `XboxPcApp.exe+0x349c4`; the Xbox app vanished
+   on every Play). A BP on twinapi's `CoreApplicationView::get_CoreWindow` showed two views: the main view (thread 0384,
+   no window) and the activation's view (the UI thread, with the window). combase's `RoGetActivationFactory` now hands
+   out `ICoreImmersiveApplication` through a wrapper whose `get_MainView` answers the first view that has a CoreWindow
+   when the main view has none (public API only: `get_Views`, `ICoreApplicationView.CoreWindow`).
+3. **The launcher shim** answered `ILauncherStatics2.QueryUriSupportAsync` (slots 9 and 10) `E_NOTIMPL`, which the app
+   turns into a fail-fast. They now return a completed `IAsyncOperation<LaunchQuerySupportStatus>` (PIID `e7539992-...`,
+   from `piid.py --signature`): Available for http(s)/mailto and for schemes or package families of installed games,
+   AppNotInstalled / NotSupported otherwise. A `LaunchUriAsync` whose scheme an installed game declares starts that game.
+4. **The game must not inherit the Xbox app's environment.** Package identity, `WINEDLLOVERRIDES`, `WINEPATH` and test
+   switches (`WINE_UWP_BP` fired inside Solitaire) all leaked through. The launch now builds a clean environment block
+   (drops `WINE_UWP_*`, `UWP_*`, `WINEDLLOVERRIDES`, `WINEPATH`, `WINE_D3D_CONFIG`, `WINE_SKIP_NATIVE_THREAD_CALLS`) and
+   `wineuwp-launch.exe` sets its own from the stage. `WINEDEBUG` is kept - and **an Xbox app run with
+   `trace+tracelogging` makes the game it starts fault** (`Solitaire.exe+0x621387`, a NULL member); run the Xbox app
+   with plain `err+all` when testing Play.
+
+Then Solitaire 4.27 itself (the version the Store serves; the regression suite's stage is 4.22):
+5. **`msvcp140_app=b` lacked `std::get_new_handler`** (an ARM-only stub in our spec): `EXCEPTION_WINE_STUB` at start-up,
+   in 4.22 too. That is the 10-12 "`regress.sh sol` fails" note in AGENTS.md: `sol` passes again.
+6. **`AdvertisingManager.GetForUser` failed** through our advertising-id apiset stand-in (`E_NOTIMPL`), and 4.27 throws on
+   it inside `AppHost::EngineAppStartup`, which then never ends (the bootstrap waits forever, every thread idle). From
+   twinapi's one caller the signature is `QueryAdvertisingIdStatusForUser(PCWSTR sid, DWORD *status, DWORD *flags)` with
+   status 1 = on; the stand-in answers S_OK, status 2 (turned off), which is what Windows says when the user switched the
+   advertising ID off. Found with `trace+tracelogging` (twinapi's wil `FallbackError` names
+   `advertisingmanager.cpp` line 0x59) after `WINE_UWP_TRACE_ORIGINATE` had named the AdvertisingManager call.
+7. `LampArray.GetDeviceSelector()`'s AQS filter names `System.DeviceInterface.Hid.UsagePage/UsageId`, which propsys did
+   not know (`E_INVALIDARG` from `CreateWatcher`); the six HID keys are in its table now.
+
+Also seen: a `LocalState\Cache` written by 4.22 makes 4.27 stop at `Inventory: UNRECOVERABLE ERROR loading
+[mcgappconfig/tests_v2]`; prefix-test3's was moved aside (`Cache.from-4.22`). A real install starts without one.
+
+Still open, none of them blocking: My Library and Most Recent show placeholder art for installed games;
+`PackageUpdate.QueryUpdatesAsync` and `PackageInstance.QueryExecutables` are unimplemented (logged); the Install queue
+page lists nothing while a download runs (it reads the queue differently; an install here takes ~4 s); Solitaire's own
+Xbox sign-in reports error 1170000.
+
+Regression after the combase, msvcp and propsys changes: Calculator AE 0, Media Player 2250, `kb` 0/0/0, Shapr3D's home
+screen AE 0 (`prefix-s3`), `regress.sh sol` passes (front end, 0 critical).
+
+The new shims were not applied to `uwp-bin/prefix-test`: the user's own Xbox app session is running from it on `:0`
+(its wineserver). Run `./install-overrides.sh` there once that session is closed.

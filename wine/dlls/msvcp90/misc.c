@@ -508,6 +508,13 @@ MSVCP_new_handler_func __cdecl set_new_handler(MSVCP_new_handler_func new_handle
     return old_handler;
 }
 
+/* ?get_new_handler@std@@YAP6AXXZXZ */
+MSVCP_new_handler_func __cdecl get_new_handler(void)
+{
+    TRACE("\n");
+    return MSVCP_new_handler;
+}
+
 /* ?set_new_handler@std@@YAP6AXXZH@Z */
 MSVCP_new_handler_func __cdecl set_new_handler_reset(int unused)
 {

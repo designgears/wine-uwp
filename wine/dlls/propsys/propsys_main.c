@@ -852,6 +852,13 @@ static struct system_property_description system_properties[] =
     {L"System.Devices.GlyphIcon", &PKEY_Devices_GlyphIcon, VT_LPWSTR},
     {L"System.Devices.DevObjectType", &PKEY_Devices_DevObjectType, VT_UI4},
     {L"System.DeviceInterface.Bluetooth.DeviceAddress", &PKEY_DeviceInterface_Bluetooth_DeviceAddress, VT_LPWSTR},
+    /* HID selectors, e.g. LampArray.GetDeviceSelector() */
+    {L"System.DeviceInterface.Hid.UsagePage", &PKEY_DeviceInterface_Hid_UsagePage, VT_UI2},
+    {L"System.DeviceInterface.Hid.UsageId", &PKEY_DeviceInterface_Hid_UsageId, VT_UI2},
+    {L"System.DeviceInterface.Hid.VendorId", &PKEY_DeviceInterface_Hid_VendorId, VT_UI2},
+    {L"System.DeviceInterface.Hid.ProductId", &PKEY_DeviceInterface_Hid_ProductId, VT_UI2},
+    {L"System.DeviceInterface.Hid.VersionNumber", &PKEY_DeviceInterface_Hid_VersionNumber, VT_UI2},
+    {L"System.DeviceInterface.Hid.IsReadOnly", &PKEY_DeviceInterface_Hid_IsReadOnly, VT_BOOL},
     {L"System.Devices.Aep.AepId", &PKEY_Devices_Aep_AepId, VT_LPWSTR},
     {L"System.Devices.Aep.ProtocolId", &PKEY_Devices_Aep_ProtocolId, VT_CLSID},
     {L"System.Devices.Aep.IsPaired", &PKEY_Devices_Aep_IsPaired, VT_BOOL},

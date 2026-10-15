@@ -477,6 +477,123 @@ static BOOL library_cache_add( const WCHAR *library, PFNGETACTIVATIONFACTORY fn 
     return TRUE;
 }
 
+/* CoreApplication.MainView for a hosted app. The app's window can belong to a view other than the one
+ * CoreApplication.Run made first (the activation stands its own view up), which leaves MainView with no
+ * CoreWindow; the Xbox app reads MainView.CoreWindow.Dispatcher from the thread pool and faults on the NULL.
+ * On Windows the main view is the one with the window, so when MainView has none, answer the first view
+ * that does. Everything else goes to CoreApplication itself. */
+DEFINE_GUID(IID_ICoreImmersiveApplication_, 0x1ada0e3e, 0xe4a2, 0x4123, 0xb4, 0x51, 0xdc, 0x96, 0xbf, 0x80, 0x04, 0x19);
+DEFINE_GUID(IID_ICoreApplicationView_, 0x638bb2db, 0x451d, 0x4661, 0xb0, 0x99, 0x41, 0x4f, 0x34, 0xff, 0xb9, 0xf1);
+
+struct slots { HRESULT (WINAPI *slot[16])(); };
+
+struct main_view_app
+{
+    const void **vtbl;
+    LONG refs;
+    IInspectable *real;   /* ICoreImmersiveApplication */
+};
+
+static HRESULT view_has_window( IInspectable *view )
+{
+    struct slots **cav;
+    IUnknown *window = NULL;
+    HRESULT hr;
+
+    if (FAILED(hr = IInspectable_QueryInterface( view, &IID_ICoreApplicationView_, (void **)&cav ))) return hr;
+    hr = ((HRESULT (WINAPI *)(void *, IUnknown **))(*cav)->slot[6])( cav, &window );   /* get_CoreWindow */
+    IUnknown_Release( (IUnknown *)cav );
+    if (window) IUnknown_Release( window );
+    return SUCCEEDED(hr) && window ? S_OK : S_FALSE;
+}
+
+static HRESULT WINAPI mva_QueryInterface( struct main_view_app *app, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_ICoreImmersiveApplication_ ))
+    {
+        InterlockedIncrement( &app->refs );
+        *out = app;
+        return S_OK;
+    }
+    return IInspectable_QueryInterface( app->real, iid, out );
+}
+static ULONG WINAPI mva_AddRef( struct main_view_app *app ) { return InterlockedIncrement( &app->refs ); }
+static ULONG WINAPI mva_Release( struct main_view_app *app )
+{
+    ULONG refs = InterlockedDecrement( &app->refs );
+    if (!refs)
+    {
+        IInspectable_Release( app->real );
+        free( app );
+    }
+    return refs;
+}
+static HRESULT WINAPI mva_GetIids( struct main_view_app *app, ULONG *count, IID **iids )
+{
+    return IInspectable_GetIids( app->real, count, iids );
+}
+static HRESULT WINAPI mva_GetRuntimeClassName( struct main_view_app *app, HSTRING *name )
+{
+    return IInspectable_GetRuntimeClassName( app->real, name );
+}
+static HRESULT WINAPI mva_GetTrustLevel( struct main_view_app *app, TrustLevel *level )
+{
+    return IInspectable_GetTrustLevel( app->real, level );
+}
+static HRESULT WINAPI mva_get_Views( struct main_view_app *app, void **views )
+{
+    return ((HRESULT (WINAPI *)(void *, void **))(*(struct slots **)app->real)->slot[6])( app->real, views );
+}
+static HRESULT WINAPI mva_CreateNewView( struct main_view_app *app, HSTRING type, HSTRING entry, void **view )
+{
+    return ((HRESULT (WINAPI *)(void *, HSTRING, HSTRING, void **))(*(struct slots **)app->real)->slot[7])( app->real, type, entry, view );
+}
+static HRESULT WINAPI mva_get_MainView( struct main_view_app *app, IInspectable **out )
+{
+    struct slots **views = NULL;
+    IInspectable *view = NULL;
+    UINT32 count = 0, i;
+    HRESULT hr;
+
+    hr = ((HRESULT (WINAPI *)(void *, IInspectable **))(*(struct slots **)app->real)->slot[8])( app->real, out );
+    if (FAILED(hr) || !*out || view_has_window( *out ) == S_OK) return hr;
+    if (FAILED(mva_get_Views( app, (void **)&views )) || !views) return hr;
+    ((HRESULT (WINAPI *)(void *, UINT32 *))(*views)->slot[7])( views, &count );   /* get_Size */
+    for (i = 0; i < count; i++)
+    {
+        if (FAILED(((HRESULT (WINAPI *)(void *, UINT32, IInspectable **))(*views)->slot[6])( views, i, &view )) || !view) continue;
+        if (view_has_window( view ) == S_OK)
+        {
+            TRACE( "main view %p has no window, answering view %u (%p)\n", *out, i, view );
+            IInspectable_Release( *out );
+            *out = view;
+            break;
+        }
+        IInspectable_Release( view );
+    }
+    IUnknown_Release( (IUnknown *)views );
+    return hr;
+}
+
+static const void *main_view_app_vtbl[] =
+{
+    mva_QueryInterface, mva_AddRef, mva_Release, mva_GetIids, mva_GetRuntimeClassName, mva_GetTrustLevel,
+    mva_get_Views, mva_CreateNewView, mva_get_MainView,
+};
+
+static void wrap_core_application( const WCHAR *name, REFIID iid, void **factory )
+{
+    struct main_view_app *app;
+
+    if (!name || wcscmp( name, L"Windows.ApplicationModel.Core.CoreApplication" )) return;
+    if (!IsEqualGUID( iid, &IID_ICoreImmersiveApplication_ )) return;
+    if (!(app = malloc( sizeof(*app) ))) return;
+    app->vtbl = main_view_app_vtbl;
+    app->refs = 1;
+    app->real = *factory;
+    *factory = app;
+}
+
 /***********************************************************************
  *      RoGetActivationFactory (combase.@)
  */
@@ -499,6 +616,7 @@ HRESULT WINAPI DECLSPEC_HOTPATCH RoGetActivationFactory(HSTRING classid, REFIID 
     {
         hr = IActivationFactory_QueryInterface(factory, iid, class_factory);
         IActivationFactory_Release(factory);
+        if (SUCCEEDED(hr)) wrap_core_application(name, iid, class_factory);
         return hr;
     }
 
@@ -538,6 +656,7 @@ HRESULT WINAPI DECLSPEC_HOTPATCH RoGetActivationFactory(HSTRING classid, REFIID 
         if (SUCCEEDED(hr))
         {
             TRACE("Created interface %p\n", *class_factory);
+            wrap_core_application(name, iid, class_factory);
             if (name) factory_cache_add(name, factory);
             /* the module stays loaded, as before: the cached factory lives in it */
             if (module) library_cache_add(library, pDllGetActivationFactory);

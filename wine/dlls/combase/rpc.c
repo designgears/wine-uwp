@@ -97,6 +97,7 @@ typedef struct
     DWORD                  server_pid; /* id of server process */
     HANDLE                 event; /* cached event handle */
     IID                    iid; /* IID of the proxy this belongs to */
+    BOOL                   agile; /* the object is agile, so any apartment may call */
 } ClientRpcChannelBuffer;
 
 struct dispatch_params
@@ -1398,6 +1399,8 @@ static inline HRESULT ClientRpcChannelBuffer_IsCorrectApartment(ClientRpcChannel
 {
     if (!apt)
         return S_FALSE;
+    if (This->agile)
+        return S_OK;
     if (This->oxid != apartment_getoxid(apt))
         return S_FALSE;
     return S_OK;
@@ -1693,7 +1696,7 @@ static const IRpcChannelBufferVtbl ServerRpcChannelBufferVtbl =
 
 /* returns a channel buffer for proxies */
 HRESULT rpc_create_clientchannel(const OXID *oxid, const IPID *ipid,
-                                const OXID_INFO *oxid_info, const IID *iid,
+                                const OXID_INFO *oxid_info, const IID *iid, BOOL agile,
                                 DWORD dest_context, void *dest_context_data,
                                 IRpcChannelBuffer **chan, struct apartment *apt)
 {
@@ -1753,6 +1756,7 @@ HRESULT rpc_create_clientchannel(const OXID *oxid, const IPID *ipid,
     This->server_pid = oxid_info->dwPid;
     This->event = NULL;
     This->iid = *iid;
+    This->agile = agile;
 
     *chan = &This->super.IRpcChannelBuffer_iface;
 

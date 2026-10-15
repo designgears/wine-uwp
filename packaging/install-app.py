@@ -211,8 +211,11 @@ def pick_from_bundle(path, bundle, tmp):
     root = ET.fromstring(bundle.read(manifest))
     candidates = []
     for pkg in children(root, "Package"):
+        # a bundle may also carry the Store's stub packages (AppxMetadata\Stub\...), small installers of the real one
+        if pkg.get("FileName", "").replace("\\", "/").lower().startswith("appxmetadata/"):
+            continue
         if pkg.get("Type", "application").lower() == "application" and pkg.get("Architecture", "").lower() == ARCH:
-            candidates.append(pkg.get("FileName"))
+            candidates.append(pkg.get("FileName").replace("\\", "/"))
     if not candidates:
         archs = sorted({p.get("Architecture", "?") for p in children(root, "Package")})
         raise SystemExit(f"this bundle has no {ARCH} application package (it has: {', '.join(archs)})")

@@ -23,7 +23,8 @@
 #include "winbase.h"
 #include "objidl.h"
 #include "winternl.h"
-#include "dxgi.h"
+#include "dxgi1_2.h"
+#include "dcomp.h"
 #include <stdlib.h>
 #define COBJMACROS
 #include "winstring.h"
@@ -49,9 +50,150 @@ BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, LPVOID reserved )
 
 extern HRESULT dcomp_create_device(IUnknown *rendering_device, REFIID iid, void **out);
 
+/* IDCompositionDevice, the original public device, for programs that present through it rather than paint with it.
+ * Chromium (the WebView2 runtime) presents its software-composited frames through
+ * DCompositionCreateDevice(NULL, IDCompositionDevice) -> CreateTargetForHwnd -> CreateVisual -> SetRoot ->
+ * SetContent(composition swap chain) -> Commit, and without a device it produces no frames at all (nothing to
+ * capture, nothing to show). The objects accept every call and keep nothing: what Chromium draws reaches the
+ * swap chain, which is where a host that captures the page reads it. */
+static const GUID IID_IDCompositionDevice_v1 =
+    { 0xc37ea93a, 0xe7aa, 0x450d, { 0xb1, 0x6f, 0x97, 0x46, 0xcb, 0x04, 0x07, 0xf3 } };
+
+struct v1_object
+{
+    const void **vtbl;
+    LONG ref;
+};
+
+static HRESULT WINAPI v1_sink_QueryInterface(void *iface, REFIID iid, void **out)
+{
+    struct v1_object *object = iface;
+    TRACE("%p, %s.\n", iface, debugstr_guid(iid));
+    InterlockedIncrement(&object->ref);
+    *out = iface;
+    return S_OK;
+}
+static ULONG WINAPI v1_AddRef(void *iface) { return InterlockedIncrement(&((struct v1_object *)iface)->ref); }
+static ULONG WINAPI v1_Release(void *iface)
+{
+    struct v1_object *object = iface;
+    ULONG ref = InterlockedDecrement(&object->ref);
+    if (!ref) free(object);
+    return ref;
+}
+static HRESULT WINAPI v1_ok(void *iface) { return S_OK; }
+
+#define V1_SLOTS 64
+static const void *v1_sink_vtbl[V1_SLOTS];
+
+static HRESULT v1_create(const void **vtbl, void **out)
+{
+    struct v1_object *object;
+    if (!out) return E_POINTER;
+    if (!(object = calloc(1, sizeof(*object)))) return E_OUTOFMEMORY;
+    object->vtbl = vtbl;
+    object->ref = 1;
+    *out = object;
+    return S_OK;
+}
+static HRESULT v1_sink(void **out)
+{
+    unsigned int i;
+    if (!v1_sink_vtbl[0])
+    {
+        for (i = 3; i < V1_SLOTS; i++) v1_sink_vtbl[i] = v1_ok;
+        v1_sink_vtbl[1] = v1_AddRef;
+        v1_sink_vtbl[2] = v1_Release;
+        v1_sink_vtbl[0] = v1_sink_QueryInterface;
+    }
+    return v1_create(v1_sink_vtbl, out);
+}
+
+static HRESULT WINAPI v1_device_QueryInterface(void *iface, REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IDCompositionDevice_v1))
+    {
+        v1_AddRef(iface);
+        *out = iface;
+        return S_OK;
+    }
+    TRACE("%s not supported.\n", debugstr_guid(iid));
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static HRESULT WINAPI v1_device_GetFrameStatistics(void *iface, DCOMPOSITION_FRAME_STATISTICS *stats)
+{
+    LARGE_INTEGER now, freq;
+    if (!stats) return E_POINTER;
+    memset(stats, 0, sizeof(*stats));
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    stats->lastFrameTime = now;
+    stats->currentCompositionRate.Numerator = 60;
+    stats->currentCompositionRate.Denominator = 1;
+    stats->currentTime = now;
+    stats->timeFrequency = freq;
+    stats->nextEstimatedFrameTime.QuadPart = now.QuadPart + freq.QuadPart / 60;
+    return S_OK;
+}
+static HRESULT WINAPI v1_device_CreateTargetForHwnd(void *iface, HWND hwnd, BOOL topmost, void **out)
+{
+    TRACE("hwnd %p, topmost %d.\n", hwnd, topmost);
+    return v1_sink(out);
+}
+static HRESULT WINAPI v1_device_create1(void *iface, void **out) { return v1_sink(out); }
+static HRESULT WINAPI v1_device_CreateSurface(void *iface, UINT w, UINT h, DXGI_FORMAT format, DXGI_ALPHA_MODE alpha, void **out)
+{
+    FIXME("%ux%u, format %u: not supported.\n", w, h, format);
+    if (out) *out = NULL;
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI v1_device_from_handle(void *iface, void *handle, void **out)
+{
+    FIXME("%p: not supported.\n", handle);
+    if (out) *out = NULL;
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI v1_device_CreateGroup(void *iface, void *items, UINT count, void **out) { return v1_sink(out); }
+static HRESULT WINAPI v1_device_CheckDeviceState(void *iface, BOOL *valid)
+{
+    if (!valid) return E_POINTER;
+    *valid = TRUE;
+    return S_OK;
+}
+static const void *v1_device_vtbl[] =
+{
+    v1_device_QueryInterface, v1_AddRef, v1_Release,
+    v1_ok,                          /* Commit */
+    v1_ok,                          /* WaitForCommitCompletion */
+    v1_device_GetFrameStatistics,
+    v1_device_CreateTargetForHwnd,
+    v1_device_create1,              /* CreateVisual */
+    v1_device_CreateSurface,
+    v1_device_CreateSurface,        /* CreateVirtualSurface */
+    v1_device_from_handle,          /* CreateSurfaceFromHandle */
+    v1_device_from_handle,          /* CreateSurfaceFromHwnd */
+    v1_device_create1,              /* CreateTranslateTransform */
+    v1_device_create1,              /* CreateScaleTransform */
+    v1_device_create1,              /* CreateRotateTransform */
+    v1_device_create1,              /* CreateSkewTransform */
+    v1_device_create1,              /* CreateMatrixTransform */
+    v1_device_CreateGroup,          /* CreateTransformGroup */
+    v1_device_create1,              /* CreateTranslateTransform3D */
+    v1_device_create1,              /* CreateScaleTransform3D */
+    v1_device_create1,              /* CreateRotateTransform3D */
+    v1_device_create1,              /* CreateMatrixTransform3D */
+    v1_device_CreateGroup,          /* CreateTransform3DGroup */
+    v1_device_create1,              /* CreateEffectGroup */
+    v1_device_create1,              /* CreateRectangleClip */
+    v1_device_create1,              /* CreateAnimation */
+    v1_device_CheckDeviceState,
+};
+
 HRESULT WINAPI DCompositionCreateDevice(IDXGIDevice *dxgi_device, REFIID iid, void **device)
 {
     TRACE("%p, %s, %p.\n", dxgi_device, debugstr_guid(iid), device);
+    if (IsEqualGUID(iid, &IID_IDCompositionDevice_v1)) return v1_create(v1_device_vtbl, device);
     return dcomp_create_device((IUnknown *)dxgi_device, iid, device);
 }
 

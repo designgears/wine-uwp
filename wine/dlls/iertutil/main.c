@@ -25,6 +25,7 @@ struct uri
 {
     IUriRuntimeClass IUriRuntimeClass_iface;
     IStringable IStringable_iface;
+    IUriRuntimeClassWithAbsoluteCanonicalUri IUriRuntimeClassWithAbsoluteCanonicalUri_iface;
     IUri *uri;
     LONG ref;
 };
@@ -51,6 +52,14 @@ static HRESULT STDMETHODCALLTYPE uri_QueryInterface(IUriRuntimeClass *iface, REF
     {
         IUnknown_AddRef(iface);
         *out = &impl_from_IUriRuntimeClass(iface)->IStringable_iface;
+        return S_OK;
+    }
+
+    /* React Native's WebView reads the canonical form of every source URI and does not check the QI */
+    if (IsEqualGUID(iid, &IID_IUriRuntimeClassWithAbsoluteCanonicalUri))
+    {
+        IUnknown_AddRef(iface);
+        *out = &impl_from_IUriRuntimeClass(iface)->IUriRuntimeClassWithAbsoluteCanonicalUri_iface;
         return S_OK;
     }
 
@@ -290,6 +299,68 @@ static const struct IStringableVtbl uri_stringable_vtbl =
     uri_stringable_ToString,
 };
 
+static inline struct uri *impl_from_IUriRuntimeClassWithAbsoluteCanonicalUri(IUriRuntimeClassWithAbsoluteCanonicalUri *iface)
+{
+    return CONTAINING_RECORD(iface, struct uri, IUriRuntimeClassWithAbsoluteCanonicalUri_iface);
+}
+
+static HRESULT STDMETHODCALLTYPE uri_canonical_QueryInterface(IUriRuntimeClassWithAbsoluteCanonicalUri *iface, REFIID iid, void **out)
+{
+    return IUriRuntimeClass_QueryInterface(&impl_from_IUriRuntimeClassWithAbsoluteCanonicalUri(iface)->IUriRuntimeClass_iface, iid, out);
+}
+
+static ULONG STDMETHODCALLTYPE uri_canonical_AddRef(IUriRuntimeClassWithAbsoluteCanonicalUri *iface)
+{
+    return IUriRuntimeClass_AddRef(&impl_from_IUriRuntimeClassWithAbsoluteCanonicalUri(iface)->IUriRuntimeClass_iface);
+}
+
+static ULONG STDMETHODCALLTYPE uri_canonical_Release(IUriRuntimeClassWithAbsoluteCanonicalUri *iface)
+{
+    return IUriRuntimeClass_Release(&impl_from_IUriRuntimeClassWithAbsoluteCanonicalUri(iface)->IUriRuntimeClass_iface);
+}
+
+static HRESULT STDMETHODCALLTYPE uri_canonical_GetIids(IUriRuntimeClassWithAbsoluteCanonicalUri *iface, ULONG *count, IID **iids)
+{
+    return IUriRuntimeClass_GetIids(&impl_from_IUriRuntimeClassWithAbsoluteCanonicalUri(iface)->IUriRuntimeClass_iface, count, iids);
+}
+
+static HRESULT STDMETHODCALLTYPE uri_canonical_GetRuntimeClassName(IUriRuntimeClassWithAbsoluteCanonicalUri *iface, HSTRING *name)
+{
+    return IUriRuntimeClass_GetRuntimeClassName(&impl_from_IUriRuntimeClassWithAbsoluteCanonicalUri(iface)->IUriRuntimeClass_iface, name);
+}
+
+static HRESULT STDMETHODCALLTYPE uri_canonical_GetTrustLevel(IUriRuntimeClassWithAbsoluteCanonicalUri *iface, TrustLevel *level)
+{
+    return IUriRuntimeClass_GetTrustLevel(&impl_from_IUriRuntimeClassWithAbsoluteCanonicalUri(iface)->IUriRuntimeClass_iface, level);
+}
+
+/* urlmon's IUri is canonicalized when created, so its absolute form is the canonical one */
+static HRESULT STDMETHODCALLTYPE uri_canonical_get_AbsoluteCanonicalUri(IUriRuntimeClassWithAbsoluteCanonicalUri *iface, HSTRING *value)
+{
+    struct uri *impl = impl_from_IUriRuntimeClassWithAbsoluteCanonicalUri(iface);
+    TRACE("iface %p, value %p.\n", iface, value);
+    return uri_prop_to_hstring(impl->uri, Uri_PROPERTY_ABSOLUTE_URI, value);
+}
+
+static HRESULT STDMETHODCALLTYPE uri_canonical_get_DisplayIri(IUriRuntimeClassWithAbsoluteCanonicalUri *iface, HSTRING *value)
+{
+    struct uri *impl = impl_from_IUriRuntimeClassWithAbsoluteCanonicalUri(iface);
+    TRACE("iface %p, value %p.\n", iface, value);
+    return uri_prop_to_hstring(impl->uri, Uri_PROPERTY_DISPLAY_URI, value);
+}
+
+static const struct IUriRuntimeClassWithAbsoluteCanonicalUriVtbl uri_canonical_vtbl =
+{
+    uri_canonical_QueryInterface,
+    uri_canonical_AddRef,
+    uri_canonical_Release,
+    uri_canonical_GetIids,
+    uri_canonical_GetRuntimeClassName,
+    uri_canonical_GetTrustLevel,
+    uri_canonical_get_AbsoluteCanonicalUri,
+    uri_canonical_get_DisplayIri,
+};
+
 static HRESULT STDMETHODCALLTYPE uri_SchemeName(IUriRuntimeClass *iface, HSTRING *value)
 {
     struct uri *impl = impl_from_IUriRuntimeClass(iface);
@@ -348,6 +419,7 @@ static HRESULT uri_object_create(IUri *uri, IUriRuntimeClass **instance)
     }
     uri_impl->IUriRuntimeClass_iface.lpVtbl = &uri_vtbl;
     uri_impl->IStringable_iface.lpVtbl = &uri_stringable_vtbl;
+    uri_impl->IUriRuntimeClassWithAbsoluteCanonicalUri_iface.lpVtbl = &uri_canonical_vtbl;
     uri_impl->uri = uri;
     uri_impl->ref = 1;
     *instance = &uri_impl->IUriRuntimeClass_iface;
@@ -568,6 +640,7 @@ static HRESULT STDMETHODCALLTYPE uri_factory_CreateUri(IUriRuntimeClassFactory *
 
     uri_impl->IUriRuntimeClass_iface.lpVtbl = &uri_vtbl;
     uri_impl->IStringable_iface.lpVtbl = &uri_stringable_vtbl;
+    uri_impl->IUriRuntimeClassWithAbsoluteCanonicalUri_iface.lpVtbl = &uri_canonical_vtbl;
     uri_impl->uri = uri;
     uri_impl->ref = 1;
 

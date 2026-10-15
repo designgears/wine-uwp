@@ -1153,6 +1153,17 @@ HRESULT marshal_object(struct apartment *apt, STDOBJREF *stdobjref, REFIID riid,
         stdobjref->flags |= SORFP_TABLEWEAK;
     if (mshlflags & MSHLFLAGS_NOPING)
         stdobjref->flags |= SORF_NOPING;
+    if (dest_context != MSHCTX_INPROC && dest_context != MSHCTX_CROSSCTX)
+    {
+        /* Windows hands out agile proxies for agile objects: the Xbox app makes an out-of-process
+         * object on its UI thread and calls it from the thread pool. */
+        IUnknown *agile;
+        if (SUCCEEDED(IUnknown_QueryInterface(object, &IID_IAgileObject, (void **)&agile)))
+        {
+            IUnknown_Release(agile);
+            stdobjref->flags |= SORFP_AGILE;
+        }
+    }
     stdobjref->oid = manager->oid;
 
     tablemarshal = ((mshlflags & MSHLFLAGS_TABLESTRONG) || (mshlflags & MSHLFLAGS_TABLEWEAK));
@@ -2406,7 +2417,8 @@ HRESULT unmarshal_object(const STDOBJREF *stdobjref, struct apartment *apt, MSHC
         {
             IRpcChannelBuffer *chanbuf;
             hr = rpc_create_clientchannel(&stdobjref->oxid, &stdobjref->ipid,
-                    &proxy_manager->oxid_info, riid, proxy_manager->dest_context,
+                    &proxy_manager->oxid_info, riid,
+                    !!((stdobjref->flags | proxy_manager->sorflags) & SORFP_AGILE), proxy_manager->dest_context,
                     proxy_manager->dest_context_data, &chanbuf, apt);
             if (hr == S_OK)
                 hr = proxy_manager_create_ifproxy(proxy_manager, stdobjref, riid, chanbuf, &ifproxy);

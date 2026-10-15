@@ -296,6 +296,7 @@ dlls/wined3d/surface.c
 dlls/wined3d/texture_vk.c
 dlls/msvcp140_app/Makefile.in
 dlls/msvcp140_app/msvcp140_app.spec
+dlls/msvcp140/msvcp140.spec
 dlls/appxdeploymentclient/appxdeploymentclient.spec
 dlls/ole32/ole32_activation.idl
 dlls/rpcrt4/ndr_typelib.c

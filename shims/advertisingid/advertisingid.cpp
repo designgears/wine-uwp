@@ -43,10 +43,19 @@ extern "C" __declspec(dllexport) HRESULT WINAPI QueryAdvertisingId(void)
     return E_NOTIMPL;
 }
 
-extern "C" __declspec(dllexport) HRESULT WINAPI QueryAdvertisingIdStatusForUser(void)
+/* QueryAdvertisingIdStatusForUser(PCWSTR user_sid, DWORD *status, DWORD *flags), read from its one caller,
+ * twinapi.appcore's AdvertisingManagerHelperImpl::GetAdvertisingIdTurnedOnForUser: it passes the SID (or NULL) in
+ * rcx, a status preset to 2 in rdx and flags preset to 0 in r8, and treats status 1 as "turned on". Answering S_OK
+ * with the advertising ID turned off is what Windows says when the user has switched it off, and the manager then
+ * hands out an empty AdvertisingId. E_NOTIMPL here made AdvertisingManager.GetForUser fail, and Solitaire 4.27
+ * throws on that during start-up and never finishes AppHost::EngineAppStartup. */
+extern "C" __declspec(dllexport) HRESULT WINAPI QueryAdvertisingIdStatusForUser(const WCHAR *user_sid, DWORD *status, DWORD *flags)
 {
-    trace("QueryAdvertisingIdStatusForUser");
-    return E_NOTIMPL;
+    if (getenv("WINE_UWP_ADVERTISINGID_TRACE"))
+        fprintf(stderr, "[advertisingid] QueryAdvertisingIdStatusForUser -> turned off\n");
+    if (status) *status = 2;
+    if (flags) *flags = 0;
+    return S_OK;
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
