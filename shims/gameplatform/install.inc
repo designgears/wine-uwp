@@ -623,10 +623,11 @@ static HRESULT fe3_packages(const std::string &category, std::vector<Fe3Update> 
     return out.empty() ? HRESULT_FROM_WIN32(ERROR_NOT_FOUND) : S_OK;
 }
 
-/* the file name the delivery server gives a download (Content-Disposition), from a HEAD request */
-static std::wstring http_head_filename(const std::string &url)
+/* the first bytes of a download (a ranged GET): a package is a zip ("PK"), its block map a cabinet ("MSCF") */
+static std::string http_head_bytes(const std::string &url)
 {
-    std::wstring w(url.begin(), url.end()), host(256, 0), path(4096, 0), out;
+    std::wstring w(url.begin(), url.end()), host(256, 0), path(4096, 0);
+    std::string out;
     URL_COMPONENTS uc = {sizeof(uc)};
     uc.lpszHostName = &host[0]; uc.dwHostNameLength = (DWORD)host.size();
     uc.lpszUrlPath = &path[0]; uc.dwUrlPathLength = (DWORD)path.size();
@@ -636,19 +637,15 @@ static std::wstring http_head_filename(const std::string &url)
     HINTERNET s = WinHttpOpen(L"Microsoft-Delivery-Optimization/10.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
                               WINHTTP_NO_PROXY_BYPASS, 0), c = nullptr, r = nullptr;
     if (s && (c = WinHttpConnect(s, host.c_str(), uc.nPort, 0)) &&
-        (r = WinHttpOpenRequest(c, L"HEAD", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        (r = WinHttpOpenRequest(c, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                 uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0)))
     {
         WinHttpSetTimeouts(r, 20000, 20000, 20000, 20000);
-        wchar_t buf[1024];
-        DWORD size = sizeof(buf);
-        if (WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr) &&
-            WinHttpQueryHeaders(r, WINHTTP_QUERY_CONTENT_DISPOSITION, nullptr, buf, &size, nullptr))
-        {
-            out = buf;
-            size_t f = out.find(L"filename=");
-            if (f != std::wstring::npos) out = out.substr(f + 9);
-        }
+        char buf[4];
+        DWORD got = 0;
+        if (WinHttpSendRequest(r, L"Range: bytes=0-3\r\n", (DWORD)-1, nullptr, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr) &&
+            WinHttpReadData(r, buf, sizeof(buf), &got))
+            out.assign(buf, got);
     }
     if (r) WinHttpCloseHandle(r);
     if (c) WinHttpCloseHandle(c);
@@ -670,11 +667,10 @@ static std::string fe3_file_url(const Fe3Update &u)
     {
         std::string url = r.substr(p + 5, r.find("</Url>", p) - p - 5);
         if (url.find("filestreamingservice") == std::string::npos) continue;
-        /* both URLs look alike; only the server's file name tells the block map (a cabinet) from the package */
-        std::wstring name = http_head_filename(url);
-        size_t dot = name.rfind(L'.');
-        if (dot != std::wstring::npos && !_wcsicmp(name.c_str() + dot, L".BlockMap")) continue;
-        tracef("FE3 file %ls", name.c_str());
+        /* both URLs look alike; only the first bytes tell the block map (a cabinet) from the package */
+        std::string magic = http_head_bytes(url);
+        tracef("FE3 file starts %02x %02x", magic.size() > 0 ? (BYTE)magic[0] : 0, magic.size() > 1 ? (BYTE)magic[1] : 0);
+        if (!magic.compare(0, 4, "MSCF")) continue;
         return url;
     }
     tracef("FE3 GetExtendedUpdateInfo2: HTTP %lu, no file URL", status);
