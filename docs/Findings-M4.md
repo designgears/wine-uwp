@@ -10949,3 +10949,24 @@ The launcher, `/tmp/xbox.sh`, now uses `windows.web=b`. The prefix still holds M
 `system32` (no override reaches it). Nothing loads it.
 
 Regression after the three fixes: Calculator AE 0, Media Player 2250, `kb` enter/bs/esc 0/0/0.
+
+### Xbox app: nav icons and banners, first look (2026-10-14, night; not solved)
+
+Task 1, investigated and not fixed. What the measurements ruled out, so the next session starts further on:
+
+- **Not a missing icon font file.** `Assets/Fonts/XboxFluent2.ttf` (and `XboxFluent.ttf`, `SegMDL2.ttf`) are staged.
+  The bundle's font table reads `UIElementHelpersAssets/Fonts/XboxFluent2.ttf#Xbox Fluent v2`, but that string is
+  a concatenation artefact: `UIElementHelpers` is the preceding string in the table, and the real path is
+  `Assets/Fonts/XboxFluent2.ttf`.
+- **The icon font is never asked for.** `+dwrite` over a whole run shows CreateTextFormat / FindFamilyName / file
+  opens only for `ms-appx:///Assets/Fonts/Segoe-Sans-Text*.ttf` and the system fonts. Neither `Xbox Fluent v2` nor
+  `Segoe Fluent Icons` / `Segoe MDL2 Assets` ever reaches a text format. So the missing icons are not glyphs that
+  failed to load: nothing asked to draw them in that run.
+- **No decode or drawing error.** A grep of `err:`/`fixme:` for wic, d2d, bitmap, image, png, svg, dwrite, dcomp
+  and xaml shows only the known stubs (dcomp slot 17, animation stats, d2d device options, dwrite remote fonts).
+- Home and Game Pass render, so the nav is drawn; the three missing entries are the ones whose icon is not in the
+  first-screen state the run reaches (not yet checked against the bundle's nav code, which is minified).
+
+Next measurement: `WINEDEBUG=+dwrite,+d2d` on a run where the nav is hovered or scrolled, to see whether the icon
+text is requested then; and for the banners, compare the banner's alpha/opacity path (`+dcompops`) rather than
+the image decode, which logs no error.
