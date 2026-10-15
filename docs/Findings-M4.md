@@ -11504,3 +11504,24 @@ in-process client and its COM server). Nothing in this tree implements it; Xodus
 `xodus-gaming/xgameruntime` (LGPL-2.1, clean-room per Wine's guidelines, `uwp-bin/ext/xgameruntime`) are the starting
 point. Running even the demo is a separate project: `XGameRuntimeInitialize`, XUser on top of our xboxauth, XStore,
 XPackage, title storage.
+
+## 2026-10-15 - Candy Crush Saga: abort() on the loading screen (StateRepository vtable)
+
+Symptom (`/tmp/xbox-user8.log`): Candy Crush reached its loading screen and died with `err:msvcrt:abort`.
+Root cause: the crash was `call [rax+0x3d0]` in `Windows.ApplicationModel.Store.dll` (RVA 0xb86ec). The
+object is our `wineuwp_staterepository` generic row for `Windows.Internal.StateRepository.Package`.
+`0x3d0` is slot 122, `PackageServer::get_TargetDeviceFamily(INT64 *)` in `Windows.StateRepository.pdb`.
+The PackageServer vtable is 151 slots (`??_7PackageServer...@6B@` at RVA 0x28d910, bounded by the next
+vtable). `generic_vtbl` had 64 entries, so the call read past the array into `.data` and jumped through
+garbage. dcomp's NX handler reported it, and the noexcept check turned it into `abort()`.
+
+Fix (commit on this repo):
+- `gen-staterepository.py`: vtable reads limited to 160 slots (was 96); regenerated the slot table
+  (Package now has 151 slots covered; superset of the old table, verified).
+- `shims/staterepository/staterepository.cpp`: `SR_GENERIC_SLOTS` 64 -> 160 with ten thunk rows.
+- `install-overrides.sh`: `TargetDeviceFamily` added to the registered StateRepository classes. Store.dll then
+  failed with "Failed to find library for Windows.Internal.StateRepository.TargetDeviceFamily" until it was.
+
+Open: `get_TargetDeviceFamily` still answers 0 (the generic zero-out). Whether the Store needs a real row id
+is not known yet. The loading screen now runs, the game downloads its OTA content into LocalCache (ota grows
+327 -> 364 files in 20 s), and wininet logs a loop of `InternetSetOptionW` stubs. See the run record below.
