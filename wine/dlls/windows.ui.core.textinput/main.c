@@ -337,6 +337,7 @@ struct core_input_view_statics
 {
     IActivationFactory IActivationFactory_iface;
     ICoreInputViewStatics ICoreInputViewStatics_iface;
+    ICoreInputViewStatics2 ICoreInputViewStatics2_iface;
     LONG ref;
 };
 
@@ -364,6 +365,13 @@ static HRESULT WINAPI factory_QueryInterface(IActivationFactory *iface, REFIID i
     {
         *out = &impl->ICoreInputViewStatics_iface;
         ICoreInputViewStatics_AddRef(*out);
+        return S_OK;
+    }
+
+    if (IsEqualGUID(iid, &IID_ICoreInputViewStatics2))
+    {
+        *out = &impl->ICoreInputViewStatics2_iface;
+        ICoreInputViewStatics2_AddRef(*out);
         return S_OK;
     }
 
@@ -428,13 +436,10 @@ static const struct IActivationFactoryVtbl factory_vtbl =
 DEFINE_IINSPECTABLE(core_input_view_statics, ICoreInputViewStatics, struct core_input_view_statics,
                     IActivationFactory_iface)
 
-static HRESULT WINAPI core_input_view_statics_GetForCurrentView(ICoreInputViewStatics *iface,
-                                                                ICoreInputView **result)
+static HRESULT create_core_input_view(ICoreInputView **result)
 {
     struct core_input_view *view;
     HRESULT hr;
-
-    FIXME("iface %p, result %p semi-stub.\n", iface, result);
 
     if (!(view = calloc(1, sizeof(*view))))
     {
@@ -459,6 +464,13 @@ static HRESULT WINAPI core_input_view_statics_GetForCurrentView(ICoreInputViewSt
     return S_OK;
 }
 
+static HRESULT WINAPI core_input_view_statics_GetForCurrentView(ICoreInputViewStatics *iface,
+                                                                ICoreInputView **result)
+{
+    FIXME("iface %p, result %p semi-stub.\n", iface, result);
+    return create_core_input_view(result);
+}
+
 static const struct ICoreInputViewStaticsVtbl core_input_view_statics_vtbl =
 {
     core_input_view_statics_QueryInterface,
@@ -472,10 +484,37 @@ static const struct ICoreInputViewStaticsVtbl core_input_view_statics_vtbl =
     core_input_view_statics_GetForCurrentView,
 };
 
+DEFINE_IINSPECTABLE(core_input_view_statics2, ICoreInputViewStatics2, struct core_input_view_statics,
+                    IActivationFactory_iface)
+
+/* The input view of a UIContext (a XAML island's or a window's); React Native for Windows asks
+ * for it with its root view's context. There is no touch keyboard, so it is the same inert view
+ * GetForCurrentView hands out. */
+static HRESULT WINAPI core_input_view_statics2_GetForUIContext(ICoreInputViewStatics2 *iface,
+                                                               __x_ABI_CWindows_CUI_CIUIContext *context, ICoreInputView **result)
+{
+    FIXME("iface %p, context %p, result %p semi-stub.\n", iface, context, result);
+    return create_core_input_view(result);
+}
+
+static const struct ICoreInputViewStatics2Vtbl core_input_view_statics2_vtbl =
+{
+    core_input_view_statics2_QueryInterface,
+    core_input_view_statics2_AddRef,
+    core_input_view_statics2_Release,
+    /* IInspectable methods */
+    core_input_view_statics2_GetIids,
+    core_input_view_statics2_GetRuntimeClassName,
+    core_input_view_statics2_GetTrustLevel,
+    /* ICoreInputViewStatics2 methods */
+    core_input_view_statics2_GetForUIContext,
+};
+
 static struct core_input_view_statics core_input_view_statics =
 {
     {&factory_vtbl},
     {&core_input_view_statics_vtbl},
+    {&core_input_view_statics2_vtbl},
     1,
 };
 

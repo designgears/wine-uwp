@@ -33,6 +33,7 @@ SOURCES = \
 	nodrop.svg \
 	ole2.c \
 	ole2stubs.c \
+	ole32_activation.idl \
 	ole32_inspectable.idl \
 	ole32_main.c \
 	ole32_objidl.idl \
@@ -47,4 +48,4 @@ SOURCES = \
 	storage32.c \
 	usrmarshal.c
 
-dlldata_EXTRADEFS = -DENTRY_PREFIX=OLE32_ -DPROXY_CLSID=CLSID_PSFactoryBuffer -DWINE_REGISTER_DLL
+dlldata_EXTRADEFS = -DENTRY_PREFIX=OLE32_ -DPROXY_CLSID=CLSID_PSFactoryBuffer -DWINE_REGISTER_DLL -DPROXY_DELEGATION

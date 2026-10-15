@@ -622,8 +622,39 @@ static HRESULT create_surrogate_server(REFCLSID rclsid, HANDLE *process)
     return S_OK;
 }
 
+/* One launch per class at a time, across processes. Windows' RPCSS starts a server once and makes
+ * concurrent activations wait for its registration; without this three threads of the Xbox app each
+ * started their own XboxPcAppFT.exe, and the activations bound to the ones that then quit got
+ * RPC_E_DISCONNECTED. */
+static HANDLE acquire_launch_lock(REFCLSID rclsid)
+{
+    WCHAR name[80];
+    HANDLE mutex;
+    DWORD index;
+
+    swprintf(name, ARRAY_SIZE(name), L"__wine_com_server_launch_{%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
+             rclsid->Data1, rclsid->Data2, rclsid->Data3, rclsid->Data4[0], rclsid->Data4[1], rclsid->Data4[2],
+             rclsid->Data4[3], rclsid->Data4[4], rclsid->Data4[5], rclsid->Data4[6], rclsid->Data4[7]);
+    if (!(mutex = CreateMutexW(NULL, FALSE, name))) return NULL;
+    /* a server that never registers releases us after the 30 s an activation waits anyway */
+    if (FAILED(CoWaitForMultipleHandles(0, 30000, 1, &mutex, &index)))
+    {
+        CloseHandle(mutex);
+        return NULL;
+    }
+    return mutex;
+}
+
+static void release_launch_lock(HANDLE mutex)
+{
+    if (!mutex) return;
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+}
+
 HRESULT rpc_get_local_class_object(REFCLSID rclsid, REFIID riid, void **obj)
 {
+    HANDLE launch_lock = NULL;
     PMInterfacePointer objref = NULL;
     IServiceProvider *local_server;
     IStream *stream = NULL;
@@ -646,9 +677,16 @@ HRESULT rpc_get_local_class_object(REFCLSID rclsid, REFIID riid, void **obj)
 
         if (tries == 1)
         {
+            launch_lock = acquire_launch_lock(rclsid);
+            /* whoever held the lock may have started the server for us */
+            if (SUCCEEDED(hr = rpcss_get_class_object(rclsid, &objref)))
+                break;
             if ((hr = create_local_service(rclsid)) && (hr = create_server(rclsid, &process)) &&
                 (hr = create_surrogate_server(rclsid, &process)) )
+            {
+                release_launch_lock(launch_lock);
                 return hr;
+            }
         }
 
         /* Wait for one second, even if messages arrive. */
@@ -659,12 +697,15 @@ HRESULT rpc_get_local_class_object(REFCLSID rclsid, REFIID riid, void **obj)
             {
                 WARN("Server for %s failed to start.\n", debugstr_guid(rclsid));
                 CloseHandle(process);
+                release_launch_lock(launch_lock);
                 return E_NOINTERFACE;
             }
         } while (GetTickCount() - start_ticks < 1000);
 
         if (process) CloseHandle(process);
     }
+
+    release_launch_lock(launch_lock);
 
     if (!objref || tries >= MAXTRIES)
         return E_NOINTERFACE;

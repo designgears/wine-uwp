@@ -103,7 +103,8 @@ HRESULT CStdStubBuffer_Construct(REFIID riid,
 }
 
 
-BOOL fill_delegated_proxy_table(IUnknownVtbl *vtbl, DWORD num)
+/* offsets: the proxy's MIDL_STUBLESS_PROXY_INFO FormatStringOffset table indexed by vtable slot, or NULL */
+BOOL fill_delegated_proxy_table(IUnknownVtbl *vtbl, DWORD num, const unsigned short *offsets)
 {
     const void **entry = (const void **)(vtbl + 1);
     DWORD i;
@@ -116,9 +117,17 @@ BOOL fill_delegated_proxy_table(IUnknownVtbl *vtbl, DWORD num)
     vtbl->QueryInterface = IUnknown_QueryInterface_Proxy;
     vtbl->AddRef = IUnknown_AddRef_Proxy;
     vtbl->Release = IUnknown_Release_Proxy;
-    /* MIDL marks methods delegated to the base interface with NULL or, in newer output, (void *)-1 */
+    /* MIDL marks methods delegated to the base interface with NULL or, in newer output, (void *)-1.
+     * But -1 is also the stubless marker for the interface's own methods, so when there is a format
+     * string offset table it decides: an inherited method has offset 0xffff. Delegating an own
+     * method sends it to the base proxy, which has no such slot (IActivationFactory::ActivateInstance
+     * jumped into ole32's data through IInspectable's proxy vtable). */
     for (i = 0; i < num - 3; i++)
-        if (!entry[i] || entry[i] == (const void *)-1) entry[i] = delegating_vtbl.methods[i];
+    {
+        if (entry[i] && entry[i] != (const void *)-1) continue;
+        if (entry[i] && offsets && offsets[i + 3] != 0xffff) continue;
+        entry[i] = delegating_vtbl.methods[i];
+    }
     return TRUE;
 }
 

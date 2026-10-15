@@ -55,6 +55,8 @@
 @ stdcall EtwEventRegister(ptr ptr ptr ptr)
 @ stdcall EtwEventSetInformation(int64 long ptr long)
 @ stdcall EtwEventUnregister(int64)
+@ stdcall EtwNotificationRegister(ptr long ptr ptr ptr)
+@ stdcall EtwNotificationUnregister(int64 ptr)
 @ stdcall EtwEventWrite(int64 ptr long ptr)
 @ stdcall EtwEventWriteEx(int64 ptr int64 long ptr ptr long ptr)
 @ stdcall EtwEventWriteString(int64 long int64 wstr)

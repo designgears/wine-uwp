@@ -1,0 +1,18 @@
+/*
+ * Proxy/stub for IActivationFactory. Windows registers it under the standard PSFactoryBuffer
+ * CLSID, so a WinRT class served out of process (a packaged com:ExeServer such as the Xbox app's
+ * XboxPcAppFT.exe) can hand its activation factory across the apartment boundary.
+ *
+ * Copyright 2026 wine-uwp contributors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ */
+
+#pragma makedep ident
+#pragma makedep proxy
+#pragma makedep register
+
+#include "activation.idl"

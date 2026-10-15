@@ -527,7 +527,7 @@
 # @ stub GetDurationFormatEx
 @ stdcall GetDynamicTimeZoneInformation(ptr)
 @ stdcall GetDynamicTimeZoneInformationEffectiveYears(ptr ptr ptr)
-@ stdcall GetEffectivePackageStatusForUser(wstr long ptr)
+@ stdcall GetEffectivePackageStatusForUser(ptr wstr ptr)
 # @ stub GetEightBitStringToUnicodeSizeRoutine
 # @ stub GetEightBitStringToUnicodeStringRoutine
 @ stdcall -ret64 -arch=i386,x86_64 GetEnabledXStateFeatures()

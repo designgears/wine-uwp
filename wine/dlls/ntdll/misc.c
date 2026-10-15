@@ -323,6 +323,32 @@ ULONG WINAPI EtwEventUnregister( REGHANDLE handle )
     return ERROR_SUCCESS;
 }
 
+/******************************************************************************
+ *                  EtwNotificationRegister (NTDLL.@)
+ *
+ * Registers for ETW notifications (provider enable/disable and the like). There is no ETW session
+ * here to send any, so the registration succeeds and the callback is never called. The Xbox app
+ * calls this at start-up; the missing export aborted it.
+ */
+ULONG WINAPI EtwNotificationRegister( const GUID *guid, ULONG type, void *callback, void *context,
+                                      REGHANDLE *handle )
+{
+    FIXME( "(%s, %lu, %p, %p, %p) stub\n", debugstr_guid(guid), type, callback, context, handle );
+    if (!handle) return ERROR_INVALID_PARAMETER;
+    *handle = 0xdeadbeef;
+    return ERROR_SUCCESS;
+}
+
+/******************************************************************************
+ *                  EtwNotificationUnregister (NTDLL.@)
+ */
+ULONG WINAPI EtwNotificationUnregister( REGHANDLE handle, void **context )
+{
+    FIXME( "(%s, %p) stub\n", wine_dbgstr_longlong(handle), context );
+    if (context) *context = NULL;
+    return ERROR_SUCCESS;
+}
+
 /*********************************************************************
  *                  EtwEventSetInformation   (NTDLL.@)
  */

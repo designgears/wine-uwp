@@ -2191,8 +2191,10 @@ LONG WINAPI GetPackageStatusForUser(const WCHAR *name, PSID sid, UINT32 *status)
 /***********************************************************************
  *         GetEffectivePackageStatusForUser   (kernelbase.@)
  */
-LONG WINAPI GetEffectivePackageStatusForUser(const WCHAR *name, PSID sid, UINT32 *status)
+LONG WINAPI GetEffectivePackageStatusForUser(PSID sid, const WCHAR *name, UINT32 *status)
 {
+    /* The user comes first here, unlike GetPackageStatusForUser: Windows.ApplicationModel's
+     * Package.Status and AppXDeploymentClient both call it as (NULL, full name, &status). */
     return GetPackageStatusForUser( name, sid, status );
 }
 

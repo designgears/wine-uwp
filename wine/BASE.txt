@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     02a4bc36c64d3cb027c553aeaedf8a23d7acc107
-                 ntdll: run native modules' TLS callbacks when skipping their thread DllMain calls
+  wine HEAD:     2e830eaca70778ff4cedf245ae3943f89d46dfd5
+                 wine-uwp: Xbox app start-up fixes
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-13T05:48:41Z
+  captured:      2026-10-15T01:12:17Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

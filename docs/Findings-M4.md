@@ -10654,3 +10654,65 @@ low half).
 - Ruled out first, at some cost: the C++ runtime (it crashed with Wine's whole VC runtime set as builtins), and a race
   (all nine unsubscribe calls on one UI thread). `warn+heap` saw nothing - this is a read of reused memory, not a write
   after free.
+
+## 2026-10-14: the Xbox app (Microsoft.GamingApp 2608.1001.17.0) - blocked on metadata-based marshaling
+
+Staged as `uwp-bin/stage/xbox` (AUMID `...!Microsoft.Xbox.AppL`, `XboxPcApp.exe`; `XboxPcAppCE.exe` is only a
+full-trust launcher stub). React Native for Windows (hermes) on WinUI 2, plus an out-of-process full-trust COM server,
+`XboxPcAppFT.exe` (the manifest's `com:ExeServer`, CLSIDs `{2DE3095A-...}`/`{B0B875DB-...}`, registered by hand in the
+dev prefix as `LocalServer32`). Microsoft's `Windows.Web.dll` was tried (`windows.web=n`) because Wine's
+`JsonObject` lacks `IJsonValue`/`IStringable` and the app crashed in `JsonObject.ToString`. It was not adopted, and
+the prefix copy is restored.
+
+Each blocker, in the order the runs met them:
+
+1. **ntdll `EtwNotificationRegister`/`Unregister`** and **appxdeploymentclient
+   `RegisterNotificationForUser`/`UnregisterNotificationForUser`/`CheckComCallerHasCapabilities`**: unimplemented
+   imports. Stubs that succeed (the caller only records success; capabilities are all granted).
+2. **The FT server aborted at start: `GetEffectivePackageStatusForUser` had its first two arguments swapped.** The
+   abort was an uncaught C++/WinRT throw (`kernelbase+0x15157` from ucrtbase is `_CxxThrowException`, not the
+   delay-load resolver), E_INVALIDARG from `Package.Status`. Native `Windows.ApplicationModel`'s
+   `PackageServer::get_Status` calls it as `(NULL, fullName, &status)`, and so does AppXDeploymentClient: user first,
+   unlike `GetPackageStatusForUser`. Fixed in `dlls/kernelbase/version.c` and the `.spec`.
+3. **`CoreInputView` refused `ICoreInputViewStatics2` `{7ebc0862}`**, and React Native's root view calls
+   `GetForUIContext` inside a noexcept frame. Added to `dlls/windows.ui.core.textinput/main.c`, returning the same
+   inert view as `GetForCurrentView`.
+4. **`IActivationFactory` had no proxy/stub**, so the FT server could not hand its factory out (`Failed to create an
+   IRpcStubBuffer ... {00000035}`). Added `dlls/ole32/ole32_activation.idl` beside `ole32_inspectable.idl` (it needs
+   `ident` for the IID and `-DPROXY_DELEGATION` for `CStdStubBuffer2_Release`).
+5. **That proxy then jumped into ole32's data: rpcrt4 delegated `ActivateInstance` to the IInspectable base proxy.**
+   `fill_delegated_proxy_table` took every `(void *)-1` slot as delegated (added earlier for newer MIDL output), but
+   in a TableVersion 2 table `-1` is also the *stubless* marker for the interface's own methods. Slot 6 went to the
+   base proxy's slot 6, past IInspectable's end, which held the next proxy's `ProxyInfo` pointer: an NX fault at
+   ole32+0x6bcc0. Now a `-1` slot is delegated only when the proxy's format-string offset is `0xffff` (inherited),
+   the test the compact-table path already used; with no offset table the old rule stands (`dlls/rpcrt4/cstub.c`,
+   `cpsf.c`).
+6. **Three concurrent activations started three FT servers**, and the ones bound to servers that quit got
+   `RPC_E_DISCONNECTED`. `rpc_get_local_class_object` now holds a per-CLSID named mutex across the launch, and
+   re-asks rpcss once it has it, so later callers wait for the first server's registration (`dlls/combase/rpc.c`).
+   One `XboxPcAppFT.exe` per run since.
+
+**Where it stops.** `XboxPcAppFT::FullTrustServer::TryCreateFactory` does `.as<XpaftFactory>()` (IID
+`IXpaftFactory` `{b05f4313-8bb4-582e-b7df-96fa5b183ff3}`, 45 `Create*` methods) on the factory proxy, and gets
+E_NOINTERFACE: nothing can marshal the app's own WinRT interfaces. `GameCatalogManager::Initialize` awaits that
+work, and its coroutine fail-fasts with 0x80004002 about 6 s in. The window is then a solid splash-blue 1280x800
+"XBOX" window with no logo or UI.
+
+On Windows this is the `MetadataPSFactory`, CLSID `{00000355-0000-0000-C000-000000000046}`. It lives inside
+Windows' own **combase** (`CMetadataProxyStubFactory<MetadataFormatStringDataSource<...>>`, `TypeCache`) and
+generates NDR format strings from `.winmd` metadata, so there is no native DLL to borrow while combase is builtin.
+The manifest names it only for the Game Bar interfaces. `IXpaftFactory` is in no manifest entry, so Windows must
+also resolve an unregistered WinRT IID from the package's winmds. The FT surface (`XboxPcAppFT.winmd`, 128 types)
+uses `IAsyncAction`, `IAsyncOperation<T>`, `IAsyncOperationWithProgress<T,P>`, `IVector<T>`, `IVectorView<T>`,
+`IMapView<K,V>`, `IReference<T>`, `DateTime` and `Guid` over the app's own types. So the job is a
+metadata-to-NDR proxy/stub generator in Wine's combase. It needs:
+- an IID -> type lookup over the package's and the system's winmds, including PIIDs of generic instances;
+- HSTRING as user-marshalled;
+- the completion-handler delegates marshalled in the other direction.
+
+`dlls/rpcrt4/ndr_typelib.c` already builds proxies and stubs from generated format strings (for typelibs), which
+is the closest model. Further known gaps after it: Gaming Services (`Microsoft.GamePlatform.Services.*`, shipped as
+`gamingservices-signed.appxbundle` inside the package), `ExtendedExecutionForegroundSession`, and the
+`XboxPcAppFT.RequestFetchIfNeededResult` activatable class.
+
+Regression after the six fixes: Calculator AE 0, Media Player 2250 colours, `kb` enter/bs/esc 0/0/0.

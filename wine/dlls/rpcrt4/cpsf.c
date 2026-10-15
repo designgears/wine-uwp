@@ -38,6 +38,8 @@
 #include "cpsf.h"
 
 #define PROXY_TABLE_VERSION_COMPACT 0x10   /* TableVersion of the compact OS proxy format */
+
+static const unsigned short *proxy_format_offsets( const ProxyFileInfo *info, const CInterfaceProxyVtbl *vtbl );
 #define IS_MARKER(p) ((ULONG_PTR)(p) >= (ULONG_PTR)-16)
 
 WINE_DEFAULT_DEBUG_CHANNEL(ole);
@@ -191,7 +193,8 @@ static void init_psfactory( CStdPSFactoryBuffer *psfac, const ProxyFileInfo **fi
                 void **vtbl = proxies[j]->Vtbl;
                 if (file_list[i]->TableVersion > 1) vtbl++;
                 if (is_writable( vtbl ))
-                    fill_delegated_proxy_table( (IUnknownVtbl *)vtbl, stubs[j]->header.DispatchTableCount );
+                    fill_delegated_proxy_table( (IUnknownVtbl *)vtbl, stubs[j]->header.DispatchTableCount,
+                                                proxy_format_offsets( file_list[i], proxies[j] ) );
                 pSrcRpcStubVtbl = (void * const *)&CStdStubBuffer_Delegating_Vtbl;
             }
 
@@ -282,6 +285,17 @@ static BOOL is_compact( const ProxyFileInfo *info )
     return info->TableVersion >= PROXY_TABLE_VERSION_COMPACT;
 }
 
+/* format string offsets of a non-compact stubless proxy, indexed by vtable slot: the
+ * MIDL_STUBLESS_PROXY_INFO pointer is the word before the CInterfaceProxyHeader we see */
+static const unsigned short *proxy_format_offsets( const ProxyFileInfo *info, const CInterfaceProxyVtbl *vtbl )
+{
+    const MIDL_STUBLESS_PROXY_INFO *proxy_info;
+
+    if (info->TableVersion <= 1) return NULL;
+    if (!(proxy_info = *(const MIDL_STUBLESS_PROXY_INFO * const *)vtbl)) return NULL;
+    return proxy_info->FormatStringOffset;
+}
+
 static BOOL method_is_inherited( const unsigned short *offsets, DWORD i )
 {
     return offsets && offsets[i] == 0xffff;
@@ -367,7 +381,7 @@ const CInterfaceProxyVtbl *get_proxy_vtbl( const ProxyFileInfo *info, int index 
             if (delegating)
             {
                 /* IUnknown and every inherited method go to the base proxy, the rest stay stubless (-1) */
-                fill_delegated_proxy_table( (IUnknownVtbl *)slots, 3 );
+                fill_delegated_proxy_table( (IUnknownVtbl *)slots, 3, NULL );
                 for (k = 3; k < count; k++)
                     if (slots[k] == (void *)-1 && method_is_inherited( offsets, k ))
                         slots[k] = get_delegating_vtbl_method( k - 3 );
@@ -391,7 +405,7 @@ const CInterfaceProxyVtbl *get_proxy_vtbl( const ProxyFileInfo *info, int index 
     if (is_writable( orig->Vtbl )) return orig;
     EnterCriticalSection( &ro_factories_cs );
     if (!(copy = find_shadow( orig )) && (copy = add_shadow( orig, sizeof(*orig) + (count + extra) * sizeof(void *) )))
-        fill_delegated_proxy_table( (IUnknownVtbl *)(copy->Vtbl + extra), count );
+        fill_delegated_proxy_table( (IUnknownVtbl *)(copy->Vtbl + extra), count, proxy_format_offsets( info, orig ) );
     LeaveCriticalSection( &ro_factories_cs );
     return copy ? copy : orig;
 }

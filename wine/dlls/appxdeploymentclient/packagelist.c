@@ -268,3 +268,36 @@ HRESULT package_list_create( IPackage *package, IIterable_Package **out )
     *out = &impl->IIterable_Package_iface;
     return S_OK;
 }
+
+/* Package change notifications (ordinals 39 and 40). Windows.ApplicationModel registers with three
+ * strings and a flags word and only records that it is registered; nothing installs or removes
+ * packages behind an app's back here, so there is never a notification to deliver. */
+HRESULT WINAPI RegisterNotificationForUser( const void *id, const WCHAR *a, const WCHAR *b, const WCHAR *c,
+                                            DWORD flags )
+{
+    FIXME( "(%p, %s, %s, %s, %#lx) stub\n", id, debugstr_w(a), debugstr_w(b), debugstr_w(c), flags );
+    return S_OK;
+}
+
+HRESULT WINAPI UnregisterNotificationForUser( const void *id, const WCHAR *a, const WCHAR *b, const WCHAR *c,
+                                              DWORD flags )
+{
+    FIXME( "(%p) stub\n", id );
+    return S_OK;
+}
+
+/* Ordinal 47. Windows.ApplicationModel asks whether the COM caller holds `count` capabilities,
+ * with a zeroed BOOL per capability and an "all of them" BOOL. A hosted app is its own caller
+ * here, in-process, and runs with the capabilities its manifest declares, so all are granted. */
+HRESULT WINAPI CheckComCallerHasCapabilities( DWORD count, const WCHAR **names, BOOL *has, BOOL *all )
+{
+    DWORD i;
+    TRACE( "(%lu, %p, %p, %p)\n", count, names, has, all );
+    for (i = 0; i < count; i++)
+    {
+        TRACE( "  %s\n", debugstr_w(names ? names[i] : NULL) );
+        if (has) has[i] = TRUE;
+    }
+    if (all) *all = TRUE;
+    return S_OK;
+}
