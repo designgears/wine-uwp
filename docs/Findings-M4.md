@@ -11466,3 +11466,41 @@ screen AE 0 (`prefix-s3`), `regress.sh sol` passes (front end, 0 critical).
 
 The new shims were not applied to `uwp-bin/prefix-test`: the user's own Xbox app session is running from it on `:0`
 (its wineserver). Run `./install-overrides.sh` there once that session is closed.
+
+## 2026-10-15 (night): encrypted GDK packages (MSIXVC) - where it stops
+
+Target: a small GDK title this account owns. The library lists **Taiko no Tatsujin: Rhythm Festival Demo**
+(9NN6FJ5KZCD4, owned, free); its Windows.Desktop package is MSIXVC, content id `c9cb9fe7-b998-428f-b212-25299a898afc`,
+2.36 GB (display catalog `Packages[]`). The account has no PC Game Pass (the app logs it), so nothing larger was tried.
+
+**Download: works with our own tokens.** `probe-xboxauth.exe get https://packagespc.xboxlive.com/GetBasePackage/<content
+id>` (the endpoint is knowledge from Xodus's docs; xboxauth's title-endpoints table maps it to the relying party
+`http://update.xboxlive.com` and signs the request) answers HTTP 200 `PackageFound: true` with the `.msixvc` and its
+`.xsp` update files and their CDN roots. The CDN serves the file to a plain HTTP client (`Content-Length: 2357477376`,
+`Accept-Ranges: bytes`); the first 64 KiB are an XVD (`msft-xvd` at 0x200), its content encrypted. `KeyBlob` is empty: the
+keys come from the licence.
+
+**Licence: needs Xodus's own sign-in, which needs the account holder.** Xodus (studied in
+`uwp-bin/ext/xodus`, GPL-3.0, not copied; built there with `cargo build --release -p xodus-cli`, 1m20s) gets the content
+keys the way Windows does: a Windows *device* identity provisioned at `login.live.com/ppsecure/deviceaddcredential.srf`
+(its request carries the machine's MAC address, disk serials, SMBIOS board/serial/UUID and CLEP challenge blobs built
+from them), a device STS token from `RST2.srf` signed with the key in that device licence, a *user* STS token from the
+Windows inline sign-in page (`InlineLogin.srf` in Xodus's own WebKit window, presenting as CloudExperienceHost), then
+`licensing.mp.microsoft.com` returns an `SPLicenseBlock` whose packed content keys only the device licence's derived key
+opens. Our xboxauth identity is an Android-flavoured Xbox device token and an OAuth refresh token; neither is a Windows
+device licence, so it cannot open that block.
+
+So the next steps are the user's, not mine:
+1. `xodus-cli login` once, signing in with the Microsoft account in its window (password, possibly 2FA/captcha - the
+   same human step as the Xbox app's own sign-in). It provisions the device first, which **sends this machine's
+   hardware identifiers to Microsoft and adds a device to the account**; I did not run it without the user's say-so.
+   Its tokens go to the system keychain (Secret Service), which can prompt on the user's desktop.
+2. Then, all legitimate and for this account only: `xodus-cli license c9cb9fe7-... ciks/` (the content keys issued to
+   this account and device), `xodus-cli download 9NN6FJ5KZCD4`, `xodus-cli extract ...`. The gameplatform stand-in can
+   run those as an external process the way it runs `install-app.py`, keeping Xodus out of this repo.
+
+**And after that, the game itself needs the GDK runtime.** A GDK title calls `XGameRuntime.dll` (the Gaming Services
+in-process client and its COM server). Nothing in this tree implements it; Xodus's `xodus-service` and
+`xodus-gaming/xgameruntime` (LGPL-2.1, clean-room per Wine's guidelines, `uwp-bin/ext/xgameruntime`) are the starting
+point. Running even the demo is a separate project: `XGameRuntimeInitialize`, XUser on top of our xboxauth, XStore,
+XPackage, title storage.
