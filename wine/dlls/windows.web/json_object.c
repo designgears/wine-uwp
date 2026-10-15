@@ -27,6 +27,9 @@ struct json_object
 {
     IJsonObject IJsonObject_iface;
     IStringable IStringable_iface;
+    IMap_HSTRING_IJsonValue IMap_iface;
+    IIterable_IKeyValuePair_HSTRING_IJsonValue IIterable_iface;
+    IJsonValue IJsonValue_iface;
     LONG ref;
     IMap_HSTRING_IInspectable *members;
 };
@@ -50,6 +53,10 @@ static const struct IStringableVtbl json_object_stringable_vtbl =
     json_object_stringable_ToString,
 };
 
+static const struct IMap_HSTRING_IJsonValueVtbl json_object_map_vtbl;
+static const struct IJsonValueVtbl json_object_value_vtbl;
+static const struct IIterable_IKeyValuePair_HSTRING_IJsonValueVtbl json_object_iterable_vtbl;
+
 static HRESULT WINAPI json_object_QueryInterface( IJsonObject *iface, REFIID iid, void **out )
 {
     struct json_object *impl = impl_from_IJsonObject( iface );
@@ -68,6 +75,24 @@ static HRESULT WINAPI json_object_QueryInterface( IJsonObject *iface, REFIID iid
     if (IsEqualGUID( iid, &IID_IStringable ))
     {
         *out = &impl->IStringable_iface;
+        IInspectable_AddRef( *out );
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IJsonValue ))
+    {
+        *out = &impl->IJsonValue_iface;
+        IInspectable_AddRef( *out );
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IMap_HSTRING_IJsonValue ))
+    {
+        *out = &impl->IMap_iface;
+        IInspectable_AddRef( *out );
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IIterable_IKeyValuePair_HSTRING_IJsonValue ))
+    {
+        *out = &impl->IIterable_iface;
         IInspectable_AddRef( *out );
         return S_OK;
     }
@@ -346,6 +371,9 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
 
     impl->IJsonObject_iface.lpVtbl = &json_object_vtbl;
     impl->IStringable_iface.lpVtbl = &json_object_stringable_vtbl;
+    impl->IMap_iface.lpVtbl = &json_object_map_vtbl;
+    impl->IIterable_iface.lpVtbl = &json_object_iterable_vtbl;
+    impl->IJsonValue_iface.lpVtbl = &json_object_value_vtbl;
     impl->ref = 1;
 
     WindowsCreateStringReference( RuntimeClass_Windows_Foundation_Collections_PropertySet, wcslen( RuntimeClass_Windows_Foundation_Collections_PropertySet ),
@@ -363,6 +391,61 @@ failed:
     free( impl );
     return hr;
 }
+
+/* IJsonValue on a JsonObject: Windows' JsonObject derives from JsonValue, so Stringify and get_ValueType are
+ * reached through it. The other getters are illegal for an object, as they are on the JsonValue of one. */
+DEFINE_IINSPECTABLE_( json_object_value, IJsonValue, struct json_object, impl_from_json_object_value,
+                      IJsonValue_iface, &impl->IJsonObject_iface )
+
+static HRESULT WINAPI json_object_value_get_ValueType( IJsonValue *iface, JsonValueType *value )
+{
+    if (!value) return E_POINTER;
+    *value = JsonValueType_Object;
+    return S_OK;
+}
+
+static HRESULT WINAPI json_object_value_Stringify( IJsonValue *iface, HSTRING *value )
+{
+    struct json_object *impl = impl_from_json_object_value( iface );
+    struct json_buf buf = {0};
+    HRESULT hr;
+
+    if (!value) return E_POINTER;
+    if (FAILED(hr = json_write_object( &impl->IJsonObject_iface, &buf ))) { json_buf_free( &buf ); return hr; }
+    return json_buf_to_hstring( &buf, value );
+}
+
+static HRESULT WINAPI json_object_value_GetString( IJsonValue *iface, HSTRING *value ) { return E_ILLEGAL_METHOD_CALL; }
+static HRESULT WINAPI json_object_value_GetNumber( IJsonValue *iface, DOUBLE *value ) { return E_ILLEGAL_METHOD_CALL; }
+static HRESULT WINAPI json_object_value_GetBoolean( IJsonValue *iface, boolean *value ) { return E_ILLEGAL_METHOD_CALL; }
+static HRESULT WINAPI json_object_value_GetArray( IJsonValue *iface, IJsonArray **value ) { return E_ILLEGAL_METHOD_CALL; }
+
+static HRESULT WINAPI json_object_value_GetObject( IJsonValue *iface, IJsonObject **value )
+{
+    struct json_object *impl = impl_from_json_object_value( iface );
+
+    if (!value) return E_POINTER;
+    *value = &impl->IJsonObject_iface;
+    IJsonObject_AddRef( *value );
+    return S_OK;
+}
+
+static const struct IJsonValueVtbl json_object_value_vtbl =
+{
+    json_object_value_QueryInterface,
+    json_object_value_AddRef,
+    json_object_value_Release,
+    json_object_value_GetIids,
+    json_object_value_GetRuntimeClassName,
+    json_object_value_GetTrustLevel,
+    json_object_value_get_ValueType,
+    json_object_value_Stringify,
+    json_object_value_GetString,
+    json_object_value_GetNumber,
+    json_object_value_GetBoolean,
+    json_object_value_GetArray,
+    json_object_value_GetObject,
+};
 
 static HRESULT WINAPI json_object_stringable_ToString( IStringable *iface, HSTRING *value )
 {
@@ -421,6 +504,412 @@ HRESULT json_object_for_each( IJsonObject *iface, HRESULT (*callback)( HSTRING k
     }
     IIterator_IKeyValuePair_HSTRING_IInspectable_Release( iterator );
     return hr;
+}
+
+/* IMap<HSTRING, IJsonValue> and IIterable<IKeyValuePair<HSTRING, IJsonValue>>: the typed faces of the same members.
+ * C++/WinRT's consume_IMap asks for these from a JsonObject, and Windows' JsonObject answers them. The members
+ * hold IJsonValue objects as IInspectable, so the typed values are the same objects read through IJsonValue. */
+
+#define JSON_NOTIMPL_IINSPECTABLE( pfx, T ) \
+    static HRESULT WINAPI pfx##_GetIids( T *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; } \
+    static HRESULT WINAPI pfx##_GetRuntimeClassName( T *iface, HSTRING *name ) { return E_NOTIMPL; } \
+    static HRESULT WINAPI pfx##_GetTrustLevel( T *iface, TrustLevel *level ) { return E_NOTIMPL; }
+
+static HRESULT WINAPI json_object_map_Lookup( IMap_HSTRING_IJsonValue *iface, HSTRING key, IJsonValue **value );
+static HRESULT WINAPI json_object_map_get_Size( IMap_HSTRING_IJsonValue *iface, UINT32 *size );
+static HRESULT WINAPI json_object_map_HasKey( IMap_HSTRING_IJsonValue *iface, HSTRING key, boolean *found );
+static HRESULT WINAPI json_object_map_GetView( IMap_HSTRING_IJsonValue *iface, IMapView_HSTRING_IJsonValue **view );
+static HRESULT WINAPI json_object_map_Insert( IMap_HSTRING_IJsonValue *iface, HSTRING key, IJsonValue *value, boolean *replaced );
+static HRESULT WINAPI json_object_map_Remove( IMap_HSTRING_IJsonValue *iface, HSTRING key );
+static HRESULT WINAPI json_object_map_Clear( IMap_HSTRING_IJsonValue *iface );
+static HRESULT WINAPI json_object_iterable_First( IIterable_IKeyValuePair_HSTRING_IJsonValue *iface,
+                                                  IIterator_IKeyValuePair_HSTRING_IJsonValue **value );
+
+DEFINE_IINSPECTABLE_( json_object_map, IMap_HSTRING_IJsonValue, struct json_object, impl_from_json_object_map,
+                      IMap_iface, &impl->IJsonObject_iface )
+static const struct IMap_HSTRING_IJsonValueVtbl json_object_map_vtbl =
+{
+    json_object_map_QueryInterface,
+    json_object_map_AddRef,
+    json_object_map_Release,
+    json_object_map_GetIids,
+    json_object_map_GetRuntimeClassName,
+    json_object_map_GetTrustLevel,
+    json_object_map_Lookup,
+    json_object_map_get_Size,
+    json_object_map_HasKey,
+    json_object_map_GetView,
+    json_object_map_Insert,
+    json_object_map_Remove,
+    json_object_map_Clear,
+};
+
+DEFINE_IINSPECTABLE_( json_object_iterable, IIterable_IKeyValuePair_HSTRING_IJsonValue, struct json_object,
+                      impl_from_json_object_iterable, IIterable_iface, &impl->IJsonObject_iface )
+static const struct IIterable_IKeyValuePair_HSTRING_IJsonValueVtbl json_object_iterable_vtbl =
+{
+    json_object_iterable_QueryInterface,
+    json_object_iterable_AddRef,
+    json_object_iterable_Release,
+    json_object_iterable_GetIids,
+    json_object_iterable_GetRuntimeClassName,
+    json_object_iterable_GetTrustLevel,
+    json_object_iterable_First,
+};
+
+static HRESULT WINAPI json_object_map_Lookup( IMap_HSTRING_IJsonValue *iface, HSTRING key, IJsonValue **value )
+{
+    struct json_object *impl = impl_from_json_object_map( iface );
+    return json_object_GetNamedValue( &impl->IJsonObject_iface, key, value );
+}
+
+static HRESULT WINAPI json_object_map_get_Size( IMap_HSTRING_IJsonValue *iface, UINT32 *size )
+{
+    struct json_object *impl = impl_from_json_object_map( iface );
+    return IMap_HSTRING_IInspectable_get_Size( impl->members, size );
+}
+
+static HRESULT WINAPI json_object_map_HasKey( IMap_HSTRING_IJsonValue *iface, HSTRING key, boolean *found )
+{
+    struct json_object *impl = impl_from_json_object_map( iface );
+    return IMap_HSTRING_IInspectable_HasKey( impl->members, key, found );
+}
+
+static HRESULT WINAPI json_object_map_Insert( IMap_HSTRING_IJsonValue *iface, HSTRING key, IJsonValue *value, boolean *replaced )
+{
+    struct json_object *impl = impl_from_json_object_map( iface );
+    return IMap_HSTRING_IInspectable_Insert( impl->members, key, (IInspectable *)value, replaced );
+}
+
+static HRESULT WINAPI json_object_map_Remove( IMap_HSTRING_IJsonValue *iface, HSTRING key )
+{
+    struct json_object *impl = impl_from_json_object_map( iface );
+    return IMap_HSTRING_IInspectable_Remove( impl->members, key );
+}
+
+static HRESULT WINAPI json_object_map_Clear( IMap_HSTRING_IJsonValue *iface )
+{
+    struct json_object *impl = impl_from_json_object_map( iface );
+    return IMap_HSTRING_IInspectable_Clear( impl->members );
+}
+
+/* A live read-only view of the object, IMapView<HSTRING, IJsonValue>. */
+struct json_mapview
+{
+    IMapView_HSTRING_IJsonValue iface;
+    LONG ref;
+    IJsonObject *owner;
+};
+
+static inline struct json_mapview *impl_from_json_mapview( IMapView_HSTRING_IJsonValue *iface )
+{
+    return CONTAINING_RECORD( iface, struct json_mapview, iface );
+}
+
+static HRESULT WINAPI json_mapview_QueryInterface( IMapView_HSTRING_IJsonValue *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IMapView_HSTRING_IJsonValue ))
+    {
+        *out = iface;
+        IMapView_HSTRING_IJsonValue_AddRef( iface );
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI json_mapview_AddRef( IMapView_HSTRING_IJsonValue *iface )
+{
+    struct json_mapview *impl = impl_from_json_mapview( iface );
+    return InterlockedIncrement( &impl->ref );
+}
+
+static ULONG WINAPI json_mapview_Release( IMapView_HSTRING_IJsonValue *iface )
+{
+    struct json_mapview *impl = impl_from_json_mapview( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+
+    if (!ref)
+    {
+        IJsonObject_Release( impl->owner );
+        free( impl );
+    }
+    return ref;
+}
+
+JSON_NOTIMPL_IINSPECTABLE( json_mapview, IMapView_HSTRING_IJsonValue )
+
+static HRESULT WINAPI json_mapview_Lookup( IMapView_HSTRING_IJsonValue *iface, HSTRING key, IJsonValue **value )
+{
+    struct json_mapview *impl = impl_from_json_mapview( iface );
+    return json_object_GetNamedValue( impl->owner, key, value );
+}
+
+static HRESULT WINAPI json_mapview_get_Size( IMapView_HSTRING_IJsonValue *iface, UINT32 *size )
+{
+    struct json_mapview *impl = impl_from_json_mapview( iface );
+    IMap_HSTRING_IJsonValue *map;
+    HRESULT hr;
+
+    if (FAILED(hr = IJsonObject_QueryInterface( impl->owner, &IID_IMap_HSTRING_IJsonValue, (void **)&map ))) return hr;
+    hr = IMap_HSTRING_IJsonValue_get_Size( map, size );
+    IMap_HSTRING_IJsonValue_Release( map );
+    return hr;
+}
+
+static HRESULT WINAPI json_mapview_HasKey( IMapView_HSTRING_IJsonValue *iface, HSTRING key, boolean *found )
+{
+    struct json_mapview *impl = impl_from_json_mapview( iface );
+    IMap_HSTRING_IJsonValue *map;
+    HRESULT hr;
+
+    if (FAILED(hr = IJsonObject_QueryInterface( impl->owner, &IID_IMap_HSTRING_IJsonValue, (void **)&map ))) return hr;
+    hr = IMap_HSTRING_IJsonValue_HasKey( map, key, found );
+    IMap_HSTRING_IJsonValue_Release( map );
+    return hr;
+}
+
+static HRESULT WINAPI json_mapview_Split( IMapView_HSTRING_IJsonValue *iface, IMapView_HSTRING_IJsonValue **first,
+                                          IMapView_HSTRING_IJsonValue **second )
+{
+    FIXME( "iface %p stub!\n", iface );
+    return E_NOTIMPL;
+}
+
+static const struct IMapView_HSTRING_IJsonValueVtbl json_mapview_vtbl =
+{
+    json_mapview_QueryInterface,
+    json_mapview_AddRef,
+    json_mapview_Release,
+    json_mapview_GetIids,
+    json_mapview_GetRuntimeClassName,
+    json_mapview_GetTrustLevel,
+    json_mapview_Lookup,
+    json_mapview_get_Size,
+    json_mapview_HasKey,
+    json_mapview_Split,
+};
+
+static HRESULT WINAPI json_object_map_GetView( IMap_HSTRING_IJsonValue *iface, IMapView_HSTRING_IJsonValue **view )
+{
+    struct json_object *impl = impl_from_json_object_map( iface );
+    struct json_mapview *mapview;
+
+    if (!view) return E_POINTER;
+    *view = NULL;
+    if (!(mapview = calloc( 1, sizeof(*mapview) ))) return E_OUTOFMEMORY;
+    mapview->iface.lpVtbl = &json_mapview_vtbl;
+    mapview->ref = 1;
+    mapview->owner = &impl->IJsonObject_iface;
+    IJsonObject_AddRef( mapview->owner );
+    *view = &mapview->iface;
+    return S_OK;
+}
+
+/* IKeyValuePair<HSTRING, IJsonValue> over an IKeyValuePair<HSTRING, IInspectable> from the members. */
+struct json_pair
+{
+    IKeyValuePair_HSTRING_IJsonValue iface;
+    LONG ref;
+    IKeyValuePair_HSTRING_IInspectable *inner;
+};
+
+static inline struct json_pair *impl_from_json_pair( IKeyValuePair_HSTRING_IJsonValue *iface )
+{
+    return CONTAINING_RECORD( iface, struct json_pair, iface );
+}
+
+static HRESULT WINAPI json_pair_QueryInterface( IKeyValuePair_HSTRING_IJsonValue *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IKeyValuePair_HSTRING_IJsonValue ))
+    {
+        *out = iface;
+        IKeyValuePair_HSTRING_IJsonValue_AddRef( iface );
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI json_pair_AddRef( IKeyValuePair_HSTRING_IJsonValue *iface )
+{
+    return InterlockedIncrement( &impl_from_json_pair( iface )->ref );
+}
+
+static ULONG WINAPI json_pair_Release( IKeyValuePair_HSTRING_IJsonValue *iface )
+{
+    struct json_pair *impl = impl_from_json_pair( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+
+    if (!ref)
+    {
+        IKeyValuePair_HSTRING_IInspectable_Release( impl->inner );
+        free( impl );
+    }
+    return ref;
+}
+
+JSON_NOTIMPL_IINSPECTABLE( json_pair, IKeyValuePair_HSTRING_IJsonValue )
+
+static HRESULT WINAPI json_pair_get_Key( IKeyValuePair_HSTRING_IJsonValue *iface, HSTRING *key )
+{
+    return IKeyValuePair_HSTRING_IInspectable_get_Key( impl_from_json_pair( iface )->inner, key );
+}
+
+static HRESULT WINAPI json_pair_get_Value( IKeyValuePair_HSTRING_IJsonValue *iface, IJsonValue **value )
+{
+    IInspectable *inspectable;
+    HRESULT hr;
+
+    if (!value) return E_POINTER;
+    *value = NULL;
+    if (FAILED(hr = IKeyValuePair_HSTRING_IInspectable_get_Value( impl_from_json_pair( iface )->inner, &inspectable )))
+        return hr;
+    hr = IInspectable_QueryInterface( inspectable, &IID_IJsonValue, (void **)value );
+    IInspectable_Release( inspectable );
+    return hr;
+}
+
+static const struct IKeyValuePair_HSTRING_IJsonValueVtbl json_pair_vtbl =
+{
+    json_pair_QueryInterface,
+    json_pair_AddRef,
+    json_pair_Release,
+    json_pair_GetIids,
+    json_pair_GetRuntimeClassName,
+    json_pair_GetTrustLevel,
+    json_pair_get_Key,
+    json_pair_get_Value,
+};
+
+/* IIterator<IKeyValuePair<HSTRING, IJsonValue>> over the members' iterator. */
+struct json_pair_iterator
+{
+    IIterator_IKeyValuePair_HSTRING_IJsonValue iface;
+    LONG ref;
+    IIterator_IKeyValuePair_HSTRING_IInspectable *inner;
+};
+
+static inline struct json_pair_iterator *impl_from_json_pair_iterator( IIterator_IKeyValuePair_HSTRING_IJsonValue *iface )
+{
+    return CONTAINING_RECORD( iface, struct json_pair_iterator, iface );
+}
+
+static HRESULT WINAPI json_pair_iterator_QueryInterface( IIterator_IKeyValuePair_HSTRING_IJsonValue *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IIterator_IKeyValuePair_HSTRING_IJsonValue ))
+    {
+        *out = iface;
+        IIterator_IKeyValuePair_HSTRING_IJsonValue_AddRef( iface );
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI json_pair_iterator_AddRef( IIterator_IKeyValuePair_HSTRING_IJsonValue *iface )
+{
+    return InterlockedIncrement( &impl_from_json_pair_iterator( iface )->ref );
+}
+
+static ULONG WINAPI json_pair_iterator_Release( IIterator_IKeyValuePair_HSTRING_IJsonValue *iface )
+{
+    struct json_pair_iterator *impl = impl_from_json_pair_iterator( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+
+    if (!ref)
+    {
+        IIterator_IKeyValuePair_HSTRING_IInspectable_Release( impl->inner );
+        free( impl );
+    }
+    return ref;
+}
+
+JSON_NOTIMPL_IINSPECTABLE( json_pair_iterator, IIterator_IKeyValuePair_HSTRING_IJsonValue )
+
+static HRESULT WINAPI json_pair_iterator_get_Current( IIterator_IKeyValuePair_HSTRING_IJsonValue *iface,
+                                                      IKeyValuePair_HSTRING_IJsonValue **value )
+{
+    struct json_pair_iterator *impl = impl_from_json_pair_iterator( iface );
+    IKeyValuePair_HSTRING_IInspectable *inner;
+    struct json_pair *pair;
+    HRESULT hr;
+
+    if (!value) return E_POINTER;
+    *value = NULL;
+    if (FAILED(hr = IIterator_IKeyValuePair_HSTRING_IInspectable_get_Current( impl->inner, &inner ))) return hr;
+    if (!(pair = calloc( 1, sizeof(*pair) )))
+    {
+        IKeyValuePair_HSTRING_IInspectable_Release( inner );
+        return E_OUTOFMEMORY;
+    }
+    pair->iface.lpVtbl = &json_pair_vtbl;
+    pair->ref = 1;
+    pair->inner = inner;
+    *value = &pair->iface;
+    return S_OK;
+}
+
+static HRESULT WINAPI json_pair_iterator_get_HasCurrent( IIterator_IKeyValuePair_HSTRING_IJsonValue *iface, boolean *value )
+{
+    return IIterator_IKeyValuePair_HSTRING_IInspectable_get_HasCurrent( impl_from_json_pair_iterator( iface )->inner, value );
+}
+
+static HRESULT WINAPI json_pair_iterator_MoveNext( IIterator_IKeyValuePair_HSTRING_IJsonValue *iface, boolean *value )
+{
+    return IIterator_IKeyValuePair_HSTRING_IInspectable_MoveNext( impl_from_json_pair_iterator( iface )->inner, value );
+}
+
+static HRESULT WINAPI json_pair_iterator_GetMany( IIterator_IKeyValuePair_HSTRING_IJsonValue *iface, UINT32 size,
+                                                  IKeyValuePair_HSTRING_IJsonValue **items, UINT32 *count )
+{
+    FIXME( "iface %p stub!\n", iface );
+    return E_NOTIMPL;
+}
+
+static const struct IIterator_IKeyValuePair_HSTRING_IJsonValueVtbl json_pair_iterator_vtbl =
+{
+    json_pair_iterator_QueryInterface,
+    json_pair_iterator_AddRef,
+    json_pair_iterator_Release,
+    json_pair_iterator_GetIids,
+    json_pair_iterator_GetRuntimeClassName,
+    json_pair_iterator_GetTrustLevel,
+    json_pair_iterator_get_Current,
+    json_pair_iterator_get_HasCurrent,
+    json_pair_iterator_MoveNext,
+    json_pair_iterator_GetMany,
+};
+
+static HRESULT WINAPI json_object_iterable_First( IIterable_IKeyValuePair_HSTRING_IJsonValue *iface,
+                                                  IIterator_IKeyValuePair_HSTRING_IJsonValue **value )
+{
+    struct json_object *impl = impl_from_json_object_iterable( iface );
+    IIterable_IKeyValuePair_HSTRING_IInspectable *iterable;
+    IIterator_IKeyValuePair_HSTRING_IInspectable *inner;
+    struct json_pair_iterator *iter;
+    HRESULT hr;
+
+    if (!value) return E_POINTER;
+    *value = NULL;
+    if (FAILED(hr = IMap_HSTRING_IInspectable_QueryInterface( impl->members, &IID_IIterable_IKeyValuePair_HSTRING_IInspectable,
+                                                              (void **)&iterable ))) return hr;
+    hr = IIterable_IKeyValuePair_HSTRING_IInspectable_First( iterable, &inner );
+    IIterable_IKeyValuePair_HSTRING_IInspectable_Release( iterable );
+    if (FAILED(hr)) return hr;
+    if (!(iter = calloc( 1, sizeof(*iter) )))
+    {
+        IIterator_IKeyValuePair_HSTRING_IInspectable_Release( inner );
+        return E_OUTOFMEMORY;
+    }
+    iter->iface.lpVtbl = &json_pair_iterator_vtbl;
+    iter->ref = 1;
+    iter->inner = inner;
+    *value = &iter->iface;
+    return S_OK;
 }
 
 static const struct IActivationFactoryVtbl factory_vtbl =

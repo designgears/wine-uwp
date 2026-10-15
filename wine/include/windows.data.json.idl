@@ -130,6 +130,16 @@ namespace Windows.Data.Json {
 
     [
         contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Data.Json.JsonValue),
+        uuid(1d9ecbe4-3fe8-4335-8392-93d8e36865f0)
+    ]
+    interface IJsonValueStatics2 : IInspectable
+    {
+        HRESULT CreateNullValue([out, retval] Windows.Data.Json.JsonValue **value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
         exclusiveto(Windows.Data.Json.JsonArray),
         uuid(db1434a9-e164-499f-93e2-8a8f49bb90ba)
     ]
@@ -187,7 +197,7 @@ namespace Windows.Data.Json {
         contract(Windows.Foundation.UniversalApiContract, 1.0),
         marshaling_behavior(agile),
         static(Windows.Data.Json.IJsonValueStatics, Windows.Foundation.UniversalApiContract, 1.0),
-        /* static(Windows.Data.Json.IJsonValueStatics2, Windows.Foundation.UniversalApiContract, 1.0), */
+        static(Windows.Data.Json.IJsonValueStatics2, Windows.Foundation.UniversalApiContract, 1.0),
         threading(both)
     ]
     runtimeclass JsonValue

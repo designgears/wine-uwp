@@ -31,6 +31,7 @@ struct json_value_statics
 {
     IActivationFactory IActivationFactory_iface;
     IJsonValueStatics IJsonValueStatics_iface;
+    IJsonValueStatics2 IJsonValueStatics2_iface;
     LONG ref;
 };
 
@@ -58,6 +59,12 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID 
     if (IsEqualGUID( iid, &IID_IJsonValueStatics ))
     {
         *out = &impl->IJsonValueStatics_iface;
+        IInspectable_AddRef( *out );
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IJsonValueStatics2 ))
+    {
+        *out = &impl->IJsonValueStatics2_iface;
         IInspectable_AddRef( *out );
         return S_OK;
     }
@@ -695,10 +702,42 @@ static const struct IJsonValueStaticsVtbl json_value_statics_vtbl =
     json_value_statics_CreateStringValue,
 };
 
+static HRESULT WINAPI json_value_statics2_CreateNullValue( IJsonValueStatics2 *iface, IJsonValue **value )
+{
+    struct json_value *impl;
+
+    TRACE( "iface %p, value %p\n", iface, value );
+
+    if (!value) return E_POINTER;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+
+    impl->IJsonValue_iface.lpVtbl = &json_value_vtbl;
+    impl->IStringable_iface.lpVtbl = &json_value_stringable_vtbl;
+    impl->ref = 1;
+    impl->json_value_type = JsonValueType_Null;
+
+    *value = &impl->IJsonValue_iface;
+    return S_OK;
+}
+
+DEFINE_IINSPECTABLE( json_value_statics2, IJsonValueStatics2, struct json_value_statics, IActivationFactory_iface )
+
+static const struct IJsonValueStatics2Vtbl json_value_statics2_vtbl =
+{
+    json_value_statics2_QueryInterface,
+    json_value_statics2_AddRef,
+    json_value_statics2_Release,
+    json_value_statics2_GetIids,
+    json_value_statics2_GetRuntimeClassName,
+    json_value_statics2_GetTrustLevel,
+    json_value_statics2_CreateNullValue,
+};
+
 static struct json_value_statics json_value_statics =
 {
     {&factory_vtbl},
     {&json_value_statics_vtbl},
+    {&json_value_statics2_vtbl},
     1,
 };
 

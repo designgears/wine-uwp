@@ -10920,3 +10920,32 @@ above, so there is no new picture to show.
 
 Not started in this round: task 1 (nav icons and washed banners), task 3 (sign-in identity classes), task 4 (Store
 hero video). Task 4 is the same blocker family as the hero video: media playback is needed for it.
+
+### Xbox app on the builtin windows.web: home screen (2026-10-14, night)
+
+The coordinator's follow-up: no native `Windows.Web.dll`. Three faults on the builtin, each found by the log, in order:
+
+1. `IMap<HSTRING, IJsonValue>` (`{c9d9a725}`) on `JsonObject`, asked by `consume_IMap<JsonObject, hstring, IJsonValue>`
+   (`XboxPcApp.exe` +0x9cd8d / +0x21209, named with `whatfn.py`). Now a forwarding view on the members: Lookup, Size,
+   HasKey, GetView (a live `IMapView`), Insert, Remove, Clear, and `First` over a wrapper that presents each
+   `IKeyValuePair<HSTRING, IInspectable>` as `IKeyValuePair<HSTRING, IJsonValue>`.
+2. `IJsonValue` (`{a3219ecb}`) on `JsonObject`: C++/WinRT calls `consume_IJsonValue<IJsonObject>::Stringify`
+   (+0x18491). Windows' `JsonObject` derives from `JsonValue`, so it answers `IJsonValue` as a view of itself
+   (`ValueType` = Object, `Stringify`, `GetObject`; the other getters are illegal, as on an object's JsonValue).
+3. `IJsonValueStatics2` (`{1d9ecbe4}`, `CreateNullValue`): the IDL had the interface forward-declared and its
+   `static(...)` line commented out, but no definition. Defined from the winmd (uuid and slot 6), and the factory
+   answers it. Before this, the app fail-fasted `E_NOINTERFACE` and then aborted.
+
+**Result: the home screen on the builtin** (`docs/screenshots/xbox-home-builtin-windows-web.png`, 152k colours at
+1280x800; the log shows `windows.web.dll ... builtin`). The window is the app's own signed-out home: navigation pane
+(Sign in, Home, Game Pass, My Library, Cloud Gaming, Store, Most Recent, Install queue), a search box, the "Sign in /
+Play hundreds of games" tiles, Metro 2039 and Flight Simulator 2024 banners, and "Top paid games" with box art. Reached
+by clicking **Browse app** on the first screen, which is the sign-in gate
+(`/tmp/xbox-b2.png`, 594 colours, unchanged for a minute: "Sign in with your Microsoft Account to continue").
+Not the same picture as `xbox-home.png` in one respect: the navigation icons for My Library, Cloud Gaming and Store
+are still missing, and the banners look faded (task 1).
+
+The launcher, `/tmp/xbox.sh`, now uses `windows.web=b`. The prefix still holds Microsoft's `windows.web.dll` file in
+`system32` (no override reaches it). Nothing loads it.
+
+Regression after the three fixes: Calculator AE 0, Media Player 2250, `kb` enter/bs/esc 0/0/0.
