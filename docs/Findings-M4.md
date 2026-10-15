@@ -11525,3 +11525,33 @@ Fix (commit on this repo):
 Open: `get_TargetDeviceFamily` still answers 0 (the generic zero-out). Whether the Store needs a real row id
 is not known yet. The loading screen now runs, the game downloads its OTA content into LocalCache (ota grows
 327 -> 364 files in 20 s), and wininet logs a loop of `InternetSetOptionW` stubs. See the run record below.
+
+### Candy Crush Saga: the D3D11 NULL-device loop (10-15, second half)
+
+With the StateRepository fix the game reached its loading screen and stayed there. Measured, not guessed:
+- `probe-threads.exe` sampled every thread: most parked; the loading screen was animating.
+- The wininet trace showed live HTTP to `candycrush-live.midasplayer.net` (OTA crates, manifest.json) and to
+  `candycrush-live.ext.p.midasplayer.cloud/rpc/ClientApi`, so networking was not the blocker.
+- `WINE_UWP_PROFILE` put 85% of one thread's samples in `LdrLoadDll` -> `find_dll_file` -> `NtOpenFile`,
+  called from `d3d11!d3d11_create_device` through `LoadLibraryExA`.
+- `WINEDEBUG=warn+d3d11,fixme+d3d11`: 590 `D3D11CreateDevice(D3D_DRIVER_TYPE_NULL)` calls a minute, each
+  `Failed to load refrast, returning E_FAIL`. `d3d11ref.dll` (refrast) is not shipped anywhere in this tree.
+  The game retried the failed create in a loop and never got its device.
+
+Fix (`~/src/wine` 9b801ebf, vendored as 3ce19c8): the NULL driver type uses the hardware adapter. Windows
+gives a real null device there and the API is all the app wants; refrast is not a supported fallback here.
+After it, the create succeeds once (`NULL device not implemented, falling back to hardware`) and the game
+goes on to its title screen. Built in a private copy `uwp-bin/wine-build-ccs` (only `dlls/d3d11`), with the
+same DLL copied into `prefix-ccs`. **The shared `~/src/wine-build` still has the old d3d11.dll** - rebuild
+`dlls/d3d11/all` there when nothing is running.
+
+Result, measured on `:90` with a private prefix (`uwp-bin/prefix-ccs`, not the user's):
+- loading screen (still animating, 2 min after launch): `docs/screenshots/candycrush-loading-screen.png`
+- title screen with Play and Retrieve My Progress: `docs/screenshots/candycrush-title-screen.png`
+- after clicking Play, a level board (8x8 candies): `docs/screenshots/candycrush-level-board.png`
+- regression: Calculator root capture against `docs/baselines/calc-regress.png` is AE 0 with the new d3d11
+  (the kb suite and Feedback Hub were not re-run for this change).
+
+Still open: `get_TargetDeviceFamily` answers 0 (generic zero-out); the game also logs a `netprofm` loop and
+`InternetSetOptionW` stubs, both benign so far. The shared Wine build and the user's prefix are untouched by
+this work, except that the StateRepository shim is installed into any prefix the next time its app starts.
