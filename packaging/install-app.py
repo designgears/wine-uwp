@@ -265,24 +265,39 @@ def _eappx_tweak(name, family):
     return q[0] ^ q[1] ^ q[2] ^ q[3]
 
 
+_KEYS = {}     # read once: --keys-once deletes its file, and both a bundle and its package ask
+
+
 def content_keys():
     """The content keys handed to the installer: "keyid:key;..." (hex) in WINE_UWP_CONTENT_KEYS, or --keys FILE with
     "keyid key" lines. Key ids are the 16 bytes the licence names them by."""
+    if _KEYS:
+        return dict(_KEYS)
     keys = {}
     text = os.environ.pop("WINE_UWP_CONTENT_KEYS", "")
     for item in text.split(";"):
         if ":" in item:
             kid, key = item.split(":", 1)
             keys[bytes.fromhex(kid)] = bytes.fromhex(key)
-    if "--keys" in sys.argv:
-        src = sys.argv[sys.argv.index("--keys") + 1]
-        # "-": one "keyid:key;..." line on stdin (how the Xbox app's Gaming Services stand-in passes them)
-        lines = [sys.stdin.readline()] if src == "-" else open(src).read().splitlines()
+    for opt in ("--keys", "--keys-once"):
+        if opt not in sys.argv:
+            continue
+        src = sys.argv[sys.argv.index(opt) + 1]
+        if src == "-":
+            lines = [sys.stdin.readline()]
+        else:
+            with open(src) as f:
+                lines = f.read().splitlines()
+            if opt == "--keys-once":
+                # the Xbox app's Gaming Services stand-in leaves them in $XDG_RUNTIME_DIR for this one read
+                os.unlink(src)
         for line in lines:
             for item in line.replace(";", "\n").splitlines():
                 parts = item.replace(":", " ").split()
                 if len(parts) >= 2:
                     keys[bytes.fromhex(parts[0])] = bytes.fromhex(parts[1])
+    _KEYS.update(keys)
+    keys.update(_KEYS)
     return keys
 
 
@@ -844,6 +859,7 @@ def main():
     ap.add_argument("--latest", action="store_true",
                     help="PACKAGE is an .appinstaller (file or URL): print the version it offers, install nothing")
     ap.add_argument("--stage", help="stage directory name (default: the package name's last part, lowercased)")
+    ap.add_argument("--keys-once", help="like --keys, and the file is deleted once read")
     ap.add_argument("--keys", help="an encrypted package's content keys: a file of \"keyid key\" hex lines, or - for "
                     "one \"keyid:key;...\" line on stdin")
     args = ap.parse_args()

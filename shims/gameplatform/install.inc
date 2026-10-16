@@ -792,29 +792,29 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
                        L"' --stage '" + stage_name + L"' > '" + log_unix + L"' 2>&1; echo EXIT $? >> '" + log_unix + L"'\"";
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi;
-    /* an encrypted package's content keys go to the installer on its stdin (`--keys -`): Wine starts a Unix program
-     * with its own Unix environment, not this process's, and nothing here should write them to a file */
-    HANDLE key_read = nullptr, key_write = nullptr;
+    /* an encrypted package's content keys go to the installer in a file in $XDG_RUNTIME_DIR (in memory, the user's
+     * alone), which it deletes as it reads it. Not on a pipe to its stdin: that never arrived in the Unix process. */
+    std::wstring key_file;
     if (!keys.empty())
     {
-        SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
-        if (!CreatePipe(&key_read, &key_write, &sa, 0)) return HRESULT_FROM_WIN32(GetLastError());
-        SetHandleInformation(key_write, HANDLE_FLAG_INHERIT, 0);
-        si.dwFlags |= STARTF_USESTDHANDLES;
-        si.hStdInput = key_read;
-        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
-        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-        cmd.insert(cmd.find(L" --stage '"), L" --keys -");
+        WCHAR rt[MAX_PATH];
+        DWORD n = GetEnvironmentVariableW(L"XDG_RUNTIME_DIR", rt, MAX_PATH);
+        if (!n || n >= MAX_PATH) { tracef("install: no XDG_RUNTIME_DIR for the content keys"); return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND); }
+        GUID g;
+        CoCreateGuid(&g);
+        WCHAR name[64];
+        swprintf(name, 64, L"/wine-uwp-keys-%08lx%04x", g.Data1, g.Data2);
+        std::wstring unix_path = std::wstring(rt) + name;
+        key_file = unix_to_windows(unix_path);
+        HANDLE f = CreateFileW(key_file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        DWORD written = 0;
+        if (f == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+        WriteFile(f, keys.data(), (DWORD)keys.size(), &written, nullptr);
+        CloseHandle(f);
+        cmd.insert(cmd.find(L" --stage '"), L" --keys-once '" + unix_path + L"'");
     }
-    BOOL started = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, key_read != nullptr, CREATE_NO_WINDOW, nullptr, nullptr,
-                                  &si, &pi);
-    if (key_read)
-    {
-        DWORD written;
-        CloseHandle(key_read);
-        if (started) { std::string line = keys + "\n"; WriteFile(key_write, line.data(), (DWORD)line.size(), &written, nullptr); SecureZeroMemory(&line[0], line.size()); }
-        CloseHandle(key_write);
-    }
+    BOOL started = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (!started && !key_file.empty()) DeleteFileW(key_file.c_str());
     if (!started)
     {
         tracef("install: cannot start the installer (%lu)", GetLastError());
@@ -871,6 +871,7 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
         if (in->cancel) { TerminateProcess(pi.hProcess, 1); break; }
     }
     CloseHandle(pi.hProcess);
+    if (!key_file.empty()) DeleteFileW(key_file.c_str());   /* normally the installer has, as it read them */
     tracef("install: installer exited %d%s", exit_code, installed ? ", installed" : "");
     if (!installed)
     {
