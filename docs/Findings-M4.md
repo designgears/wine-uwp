@@ -11555,3 +11555,31 @@ Result, measured on `:90` with a private prefix (`uwp-bin/prefix-ccs`, not the u
 Still open: `get_TargetDeviceFamily` answers 0 (generic zero-out); the game also logs a `netprofm` loop and
 `InternetSetOptionW` stubs, both benign so far. The shared Wine build and the user's prefix are untouched by
 this work, except that the StateRepository shim is installed into any prefix the next time its app starts.
+
+### Candy Crush Saga: the half-window panel in landscape (10-15, night)
+
+The user saw a "stuck texture" after a level: the left half of the window showed a blurry, hugely scaled
+pink shop icon and the letters "ap", the right half the live saga map, with a sharp seam at exactly half the
+width. Reproduced on a private prefix (`prefix-ccs`, Xvfb `:90`), measured rather than guessed:
+- It is there on the saga map from the first capture after Play, in every landscape run (4/4), and it is the
+  same with `WINE_D3D_CONFIG=renderer=vulkan` and `renderer=gl` (2 runs each, the renderer confirmed in the
+  log and the process environment). So it is not a wined3d backend bug.
+- `WINE_DCOMP_VERIFY_DAMAGE=1` reported nothing in ~25k swap chain frames, and a resize does not clear it.
+  The pink HUD bar is drawn across the full width on top of it with a live lives timer, so this is not dcomp
+  leaving old pixels: the game draws that panel every frame (the panel itself is pixel-identical, AE 0,
+  between 3 s and 20 s).
+- **It depends only on the window's shape.** Client 792x966 and 592x966 (portrait): a correct full map with
+  the bottom nav bar (`docs/screenshots/candycrush-portrait-600x1000-no-seam.png`). 1272x766 and 1592x866
+  (landscape): the panel, seam at half the width (`candycrush-seam-1600x900.png`,
+  `candycrush-renderer-vulkan.png`, `candycrush-renderer-gl.png`).
+- The panel's content is the portrait **bottom nav bar**, enormously scaled: its last tab's pink-awning shop
+  icon and the "ap" of its first tab's "Map" label. So the landscape layout puts the nav bar in a left side
+  panel and sizes it wrong.
+- The game sets `DisplayInformation.AutoRotationPreferences = 0xa` (Portrait | PortraitFlipped) and reads
+  `LogicalDpi`, `RawDpiX/Y`, `ScreenWidthInRawPixels`, `UIViewSettings.UserInteractionMode` and
+  `AnalyticsInfo` `DeviceFamily` (strings in the exe). Ours: Raw DPI = logical DPI (96), DeviceFamily
+  `Windows.Desktop`. Windows.UI is the native one, so UserInteractionMode is Microsoft's.
+
+Not yet known: which input picks that size. Workaround: a portrait-shaped window plays correctly (the user's
+890x944 level, captured on `:0`). Next: find what sizes the side panel - trace the layout inputs
+(`trace+display`, `CoreWindow.Bounds`, `SwapChainPanel` sizes) and try a non-96 raw DPI in a private build.
