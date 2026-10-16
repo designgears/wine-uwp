@@ -14,6 +14,7 @@
 //
 // Every class with an I<Class>Statics interface is covered: the class and slot table (slots.h) is generated from
 // Microsoft.GamePlatform.Services.winmd by gen-gameplatform.py, and install-overrides.sh registers them all.
+#define NOMINMAX
 #include <windows.h>
 #include <roapi.h>
 #include <winstring.h>
@@ -24,6 +25,10 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
+#include <memory>
+#include <functional>
+#include <algorithm>
 #include <winhttp.h>
 #include "../common/json.h"
 
@@ -622,20 +627,6 @@ static HRESULT WINAPI pm_EnumerateRunningGames(Factory *, IInspectable **out)
     return S_OK;
 }
 
-/* PackageInstance.QueryFeatures: a package's optional parts (Halo Infinite's campaign, its high-resolution textures).
- * The install dialog of a game that has them asks before it offers Install; "not implemented" closed it with error
- * 50253 and Install did nothing. None here: the whole package is installed. */
-static HRESULT WINAPI pi_QueryFeatures(Factory *, IInspectable **out)
-{
-    static const GUID IID_IVectorView_PackageFeature = {0xe8024431,0xb448,0x5d50,{0xb8,0xc3,0x71,0x1d,0x18,0xe7,0xd8,0x66}};
-    static const GUID IID_IIterable_PackageFeature = {0x4d32f49a,0xd606,0x51c9,{0xbf,0x36,0x2d,0x76,0xbb,0x63,0xb3,0xaf}};
-    if (!out) return E_POINTER;
-    tracef("PackageInstance.QueryFeatures -> none");
-    *out = static_cast<IEmptyViewAbi *>(new EmptyView(IID_IVectorView_PackageFeature, IID_IIterable_PackageFeature,
-        L"Windows.Foundation.Collections.IVectorView`1<Microsoft.GamePlatform.Services.PackageFeature>"));
-    return S_OK;
-}
-
 /* Package.Create(source, sourceType): no game is installed, so no source names a package here.
  * (experiment: WINE_UWP_GP_CREATE_HR picks the HRESULT) */
 static HRESULT WINAPI pk_Create(Factory *, HSTRING source, INT32 type, IInspectable **out)
@@ -971,12 +962,15 @@ struct RawContentAccessData : IRawContentAccessDataResultAbi
     HRESULT STDMETHODCALLTYPE GetData(UINT32 len, BYTE *buf, UINT64 size) override
     {
         if (len && !buf) return E_POINTER;
-        UINT32 n = (UINT32)min((UINT64)data.size(), min((UINT64)len, size));
+        UINT32 n = (UINT32)std::min((UINT64)data.size(), std::min((UINT64)len, size));
         memcpy(buf, data.data(), n);
         tracef("RawContentAccessDataResult.GetData(%u, %llu) -> %u bytes", len, (unsigned long long)size, n);
         return S_OK;
     }
 };
+
+static SRWLOCK content_access_lock = SRWLOCK_INIT;
+static std::string content_access_blob;   /* the last content access data the app fetched (protobuf) */
 
 static HRESULT WINAPI ca_GetRawContentAccessDataAsync(Factory *, IInspectable **out)
 {
@@ -1009,6 +1003,10 @@ static HRESULT WINAPI ca_GetRawContentAccessDataAsync(Factory *, IInspectable **
         }
         RawContentAccessData *r = new RawContentAccessData();
         r->data.assign((const char *)body, len);
+        /* kept: which products the subscription includes, for install features that need one (gdkpackage.inc) */
+        AcquireSRWLockExclusive(&content_access_lock);
+        content_access_blob = r->data;
+        ReleaseSRWLockExclusive(&content_access_lock);
         r->cv = std::wstring(cv, cv + strlen(cv));
         CoTaskMemFree(body);
         tracef("ContentAccess.GetRawContentAccessDataAsync -> %u bytes", len);
@@ -1019,6 +1017,7 @@ static HRESULT WINAPI ca_GetRawContentAccessDataAsync(Factory *, IInspectable **
 }
 
 #include "install.inc"
+#include "gdkpackage.inc"
 
 /* Storage.EnumerateContent: the games installed through the queue (stage directories with a marker) */
 static HRESULT WINAPI st_EnumerateContent(Factory *, const GUID *, IInspectable **out)
@@ -1088,6 +1087,8 @@ static const special specials[] =
     { L"Microsoft.GamePlatform.Services.PackageInstance", 12, (void *)pi_QueryHeader },
     { L"Microsoft.GamePlatform.Services.PackageInstance", 13, (void *)pi_QueryDetails },
     { L"Microsoft.GamePlatform.Services.PackageInstance", 15, (void *)pi_QueryFeatures },
+    { L"Microsoft.GamePlatform.Services.PackageInstance", 16, (void *)pi_QueryRecipes },
+    { L"Microsoft.GamePlatform.Services.PackagePreview", 6, (void *)pv_Create },
     { L"Microsoft.GamePlatform.Services.PackageInstance", 24, (void *)pi_IsFlatStreamed },
     { L"Microsoft.GamePlatform.Services.PackageInstance", 25, (void *)pi_IsLaunchable },
     { L"Microsoft.GamePlatform.Services.PackageInstance", 27, (void *)pi_GetRunningProcessId },

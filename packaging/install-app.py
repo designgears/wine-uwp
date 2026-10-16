@@ -562,6 +562,20 @@ class MsixvcPackage:
             off, length = struct.unpack_from("<QQ", r, 0x50)
             self.regions[rid] = (kidx, off // XVD_PAGE, length // XVD_PAGE)
             order.append((first, rid))
+        # region specifiers, after 12 bytes per update segment: "Tags" (the install features a region belongs to,
+        # "a#b" when it needs both) and "Languages"
+        updates, nspecs = struct.unpack_from("<I", info, 0xD3C)[0], struct.unpack_from("<I", info, 0xD50)[0]
+        specs = 0xDA8 + 0x80 * count + 12 * updates
+        self.region_tags, self.region_langs = {}, {}
+        for i in range(nspecs):
+            s = info[specs + 392 * i:specs + 392 * (i + 1)]
+            rid = struct.unpack_from("<I", s, 0)[0]
+            key = s[8:136].decode("utf-16le").split("\0")[0]
+            value = s[136:392].decode("utf-16le").split("\0")[0]
+            if key == "Tags":
+                self.region_tags.setdefault(rid, []).append(value)
+            elif key == "Languages":
+                self.region_langs.setdefault(rid, []).extend(v for v in value.split(";") if v)
         ud = self._read(self.user * XVD_PAGE, user)
         table = struct.unpack_from("<I", ud, 0)[0]
         t = ud[table:]
@@ -580,10 +594,15 @@ class MsixvcPackage:
         for i in range(segs):
             flags, plen, poff, size = struct.unpack_from("<HHIQ", seg, hlen + 16 * i)
             entries.append((seg[names + poff:names + poff + 2 * plen].decode("utf-16le"), size))
-        # each content region takes its segments in order, page after page from its start
+        # each content region takes its segments in order, page after page from its start; a region the chosen
+        # features or languages do not need is left out (--tags, --languages, from the install dialog)
         self.members = []
+        self.skipped = 0
         for rid, (kidx, first_page, npages) in self.regions.items():
             if rid >= 0x40000000 and rid != 0x40000003:
+                continue
+            if not self._wanted(rid):
+                self.skipped += npages * XVD_PAGE
                 continue
             first = next(f for f, r in order if r == rid)
             page, i = first_page, first
@@ -598,6 +617,18 @@ class MsixvcPackage:
         # the L0 hash level, read once: fetching it beside each run of data pages made a download from the CDN
         # alternate between two parts of the file, and HttpFile keeps one block, so it fetched each block over again
         self.l0_data = self._read(self.l0 * XVD_PAGE, levels[0] * XVD_PAGE)
+
+    def _wanted(self, rid):
+        tags = option_list("--tags")
+        if tags is not None and rid in self.region_tags:
+            if not any(all(t.lower() in tags for t in spec.split("#")) for spec in self.region_tags[rid]):
+                return False
+        langs = option_list("--languages")
+        if langs is not None and rid in self.region_langs:
+            base = {l.split("-")[0] for l in langs}
+            if not any(l.lower() in langs or l.lower().split("-")[0] in base for l in self.region_langs[rid]):
+                return False
+        return True
 
     def _read(self, off, n):
         self.f.seek(off)
@@ -650,6 +681,13 @@ class MsixvcPackage:
 
     def __exit__(self, *a):
         self.close()
+
+
+def option_list(opt):
+    """A ;-separated option's values, lower-cased, or None when it was not given."""
+    if opt not in sys.argv:
+        return None
+    return {v.strip().lower() for v in sys.argv[sys.argv.index(opt) + 1].split(";") if v.strip()}
 
 
 def open_msixvc(path):
@@ -868,6 +906,8 @@ def main():
                     help="PACKAGE is an .appinstaller (file or URL): print the version it offers, install nothing")
     ap.add_argument("--stage", help="stage directory name (default: the package name's last part, lowercased)")
     ap.add_argument("--keys-once", help="like --keys, and the file is deleted once read")
+    ap.add_argument("--tags", help="a GDK package's install feature tags to install (a;b), from the install dialog")
+    ap.add_argument("--languages", help="the user's languages (en-US;en): a GDK package's other language regions are left out")
     ap.add_argument("--keys", help="an encrypted package's content keys: a file of \"keyid key\" hex lines, or - for "
                     "one \"keyid:key;...\" line on stdin")
     args = ap.parse_args()

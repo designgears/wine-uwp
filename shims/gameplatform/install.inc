@@ -45,6 +45,8 @@ struct Install
     UINT64 total = 0, done = 0;
     UINT32 rate = 0;                    /* bytes a second, over the last few seconds */
     bool cancel = false;
+    bool features_chosen = false;       /* the app called ConfigureFeatures; otherwise the default recipe */
+    std::vector<std::string> features;
 };
 
 static SRWLOCK installs_lock = SRWLOCK_INIT;
@@ -720,6 +722,12 @@ static bool pick_package(const std::vector<Fe3Update> &all, const std::wstring &
 
 /* ---- the install worker ---- */
 
+/* gdkpackage.inc: a GDK package's install size and installer arguments for a choice of features */
+static UINT64 gdk_request_size(const std::wstring &store_id, const std::vector<std::string> *features, UINT64 fallback);
+struct PackageRequest;
+static void request_features_from_specifiers(PackageRequest *r, std::vector<std::string> &features, bool &chosen);
+static std::wstring gdk_installer_args(const std::wstring &store_id, const std::vector<std::string> *features);
+
 /* An encrypted package's content keys, from the Store licence (shims/xboxauth/windevice.inc), as the installer
  * takes them: "keyid:key;..." in hex. They go to it in its environment, never into a file or a log. */
 static HRESULT encrypted_package_keys(const GUID &content_id, std::string &keys)
@@ -776,7 +784,7 @@ static HRESULT msixvc_url(const GUID &content_id, std::string &url)
 }
 
 static HRESULT run_installer(Install *in, const std::string &url, const std::wstring &stage_name, std::wstring &log_out,
-                             const std::string &keys = std::string())
+                             const std::string &keys = std::string(), const std::wstring &extra_args = std::wstring())
 {
     std::wstring data = games_data_unix(), script = env_w(L"WINE_UWP_INSTALLER"), tree = env_w(L"WINE_UWP_WINDOWS_TREE");
     if (data.empty() || script.empty() || tree.empty())
@@ -791,7 +799,7 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
     /* the host's Python runs wine-uwp's installer; Wine starts a Unix program given by its path */
     /* the exit status goes to the log too: a Unix child's process handle is not something to rely on */
     std::wstring cmd = L"\"Z:\\bin\\sh\" -c \"python3 '" + script + L"' '" + wide(url) + L"' '" + data + L"' --windows '" + tree +
-                       L"' --stage '" + stage_name + L"' > '" + log_unix + L"' 2>&1; echo EXIT $? >> '" + log_unix + L"'\"";
+                       L"' --stage '" + stage_name + L"'" + extra_args + L" > '" + log_unix + L"' 2>&1; echo EXIT $? >> '" + log_unix + L"'\"";
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi;
     /* an encrypted package's content keys go to the installer in a file in $XDG_RUNTIME_DIR (in memory, the user's
@@ -862,7 +870,7 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
                         if (!rate_t0) { rate_t0 = now; rate_b0 = in->done; }
                         else if (now - rate_t0 >= 2000)
                         {
-                            in->rate = (UINT32)min((in->done - rate_b0) * 1000 / (now - rate_t0), (UINT64)0xffffffff);
+                            in->rate = (UINT32)std::min((in->done - rate_b0) * 1000 / (now - rate_t0), (UINT64)0xffffffff);
                             rate_t0 = now; rate_b0 = in->done;
                         }
                         in->state = ST_STREAMING;
@@ -949,7 +957,7 @@ static DWORD WINAPI install_thread(void *param)
         for (auto &c : stage_name) c = towlower(c);
         if (FAILED(hr = msixvc_url(d.content_id, url))) goto done;
         if (FAILED(hr = encrypted_package_keys(d.content_id, keys))) goto done;
-        hr = run_installer(in, url, stage_name, log, keys);
+        hr = run_installer(in, url, stage_name, log, keys, gdk_installer_args(in->store_id, in->features_chosen ? &in->features : nullptr));
         SecureZeroMemory(&keys[0], keys.size());
         if (FAILED(hr)) goto done;
         goto installed;
@@ -1060,7 +1068,7 @@ struct PackageRequest : IPackageRequestAbi
     INT32 source_type = 1, type = 0;
     UINT32 options = 0;
     IInspectable *metadata = nullptr;
-    ~PackageRequest() { if (metadata) metadata->Release(); }
+    ~PackageRequest() { if (metadata) metadata->Release(); if (specs) specs->Release(); }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
     {
         if (!out) return E_POINTER;
@@ -1096,14 +1104,44 @@ struct PackageRequest : IPackageRequestAbi
     HRESULT STDMETHODCALLTYPE get_Type(INT32 *v) override { if (!v) return E_POINTER; *v = type; return S_OK; }
     HRESULT STDMETHODCALLTYPE put_Type(INT32 v) override { type = v; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_Sources(IInspectable **v) override { tracef("PackageRequest.Sources: not implemented"); if (v) *v = nullptr; return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE get_Specifiers(IInspectable **v) override { tracef("PackageRequest.Specifiers: not implemented"); if (v) *v = nullptr; return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE ConfigureFeatures(IInspectable *) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE QuerySize(IInspectable **v) override
+    HRESULT STDMETHODCALLTYPE get_Specifiers(IInspectable **v) override;   /* gdkpackage.inc */
+    IUnknown *specs = nullptr;   /* a SpecVector, made on first use */
+    /* the features to install, as an IIterable<String> of feature ids */
+    HRESULT STDMETHODCALLTYPE ConfigureFeatures(IInspectable *iterable) override
     {
-        if (!v) return E_POINTER;
-        *v = static_cast<IPackageRequestSizeAbi *>(new PackageRequestSize(query_product(store_id).size));
+        struct IStrIterableAbi : IInspectable { virtual HRESULT STDMETHODCALLTYPE First(IInspectable **) = 0; };
+        struct IStrIteratorAbi : IInspectable
+        {
+            virtual HRESULT STDMETHODCALLTYPE get_Current(HSTRING *) = 0;
+            virtual HRESULT STDMETHODCALLTYPE get_HasCurrent(boolean *) = 0;
+            virtual HRESULT STDMETHODCALLTYPE MoveNext(boolean *) = 0;
+        };
+        static const GUID IID_IIterable_HString_ = {0xe2fcc7c1,0x3bfc,0x5a0b,{0xb2,0xb0,0x72,0xe7,0x69,0xd1,0xcb,0x7e}};
+        IStrIterableAbi *it = nullptr;
+        IInspectable *first = nullptr;
+        features.clear();
+        features_chosen = true;
+        if (!iterable || FAILED(iterable->QueryInterface(IID_IIterable_HString_, (void **)&it)) || !it) { tracef("PackageRequest.ConfigureFeatures: no IIterable<String>"); return S_OK; }
+        if (SUCCEEDED(it->First(&first)) && first)
+        {
+            IStrIteratorAbi *iter = (IStrIteratorAbi *)first;
+            boolean has = FALSE;
+            for (iter->get_HasCurrent(&has); has; iter->MoveNext(&has))
+            {
+                HSTRING h = nullptr;
+                if (SUCCEEDED(iter->get_Current(&h)) && h) { features.push_back(utf8(WindowsGetStringRawBuffer(h, nullptr))); WindowsDeleteString(h); }
+            }
+            first->Release();
+        }
+        it->Release();
+        std::string list;
+        for (auto &f : features) list += (list.empty() ? "" : ";") + f;
+        tracef("PackageRequest.ConfigureFeatures(%s)", list.c_str());
         return S_OK;
     }
+    HRESULT STDMETHODCALLTYPE QuerySize(IInspectable **v) override;
+    std::vector<std::string> features;
+    bool features_chosen = false;
 };
 
 static HRESULT WINAPI rq_CreateForSource(Factory *, HSTRING source, INT32 type, IInspectable **out)
@@ -1192,11 +1230,15 @@ static HRESULT WINAPI pq_SubmitRequestAsync(Factory *, IInspectable *request, IN
     Install *in = new Install;
     CoCreateGuid(&in->id);
     in->store_id = r->store_id;
+    in->features = r->features;
+    in->features_chosen = r->features_chosen;
+    request_features_from_specifiers(r, in->features, in->features_chosen);
     req->Release();
     ProductDetails d = query_product(in->store_id);
     in->family = d.family;
     in->instance = instance_for(d.family.empty() ? in->store_id : d.family);
     in->total = d.size;
+    if (!d.uwp) in->total = gdk_request_size(in->store_id, in->features_chosen ? &in->features : nullptr, d.size);
     tracef("PackageQueue.SubmitRequestAsync(%ls, priority %d) -> installation %08lx", in->store_id.c_str(), priority, (unsigned long)in->id.Data1);
     AcquireSRWLockExclusive(&installs_lock);
     installs.push_back(in);

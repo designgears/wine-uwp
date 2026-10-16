@@ -11640,3 +11640,29 @@ the key handoff (a stdin pipe never reached the Unix installer; Wine shows `XDG_
 installer-watch loop spinning when a Unix child's handle is not waitable (45% CPU plus the wineserver), and a
 0.6 MB/s download (HttpFile's one-block cache thrashed between the hash tree and the data; now 34 s for 653 MB).
 No XGameRuntime stand-in was needed for it to reach the game.
+
+### GDK install features: Halo Infinite's "Choose what to install" (10-16)
+
+Halo Infinite's Install did nothing until its install dialog got real answers. What a GDK package's install features
+are, and where Gaming Services reads them before anything is downloaded (all from the remote `.msixvc`, by range
+requests: `shims/gameplatform/gdkpackage.inc`):
+- **The user data's `Metadata.json`**: `InstallFeatures` (Id, DisplayName as `ms-resource:`, Image, Tags, Hidden) and
+  `InstallRecipes` (IncludedFeatures, StoreIds). Halo: hidden Launch and Game, HD1 (`hd1`, high-res textures),
+  CampaignS1 (`spr1`, recipe needs product 9PD22XJDR74N). The default recipe is Launch;Game;HD1.
+- **Display names** come from the user data's `Resources.pri` (MRT `mrm_pri2`): the hierarchical schema names the item
+  (`resources/featureHighRes`; 12-byte entries, flag 0x10 scope, 0x20 ASCII name), the resource map gives its candidates
+  (data-item section and string index) in the order of a decision's qualifier sets, the decision info gives each set's
+  Language, and the value type table's second word is the encoding (0 UTF-16, 3 ASCII, 4 UTF-8). All 18 languages decode.
+- **The region specifiers** in the XVC info come after 12 bytes per update segment, 392 bytes each (region id, a
+  64-character key, a 128-character value). `Tags` gives a region's features, `a#b` needing both (game#hd1 is the base
+  game's high-res textures); `Languages` its languages. Halo: launch 37 GB, game 27 GB, hd1 parts 20 GB, spr1 50 GB, and
+  about 2.4 GB per language.
+- **Entitlement**: owned outright (collections.mp.microsoft.com v7.0 `collections/query` with the account as
+  beneficiary; controls: owned products listed, RE7 empty) or in the subscription's content access data (a
+  length-prefixed product id in its protobuf). The campaign is the second for this account.
+- The dialog needs `PackageInstance.QueryFeatures`/`QueryRecipes`, `PackagePreview.Create` with `QuerySize`,
+  `QueryFeatureSizes` and `ConfigureFeatures`; the request's `ConfigureFeatures`, `Specifiers` and `QuerySize`. The
+  choice goes to `install-app.py` as `--tags` and `--languages`, which installs only the regions it needs.
+Result: `docs/screenshots/xbox-halo-choose-what-to-install.png` - base game required, Campaign suggested, "Requires
+99.26 GB" instead of the whole 134 GB package. Along the way XAML needed `IDWriteTextLayout::HitTestTextRange` (it was a
+stub) to draw the dialog's text at all.

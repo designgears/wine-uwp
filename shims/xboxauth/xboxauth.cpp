@@ -3443,6 +3443,50 @@ extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthHttpGet(const char *url,
     return S_OK;
 }
 
+/* Does the signed-in account own Store product ARG outright? collections.mp.microsoft.com's v7.0 query with the
+ * account as beneficiary: S_OK owned, S_FALSE not (subscription access is not ownership; gameplatform checks that
+ * from the content access data). Controls on 10-16: owned Bad Magpie Demo and Halo Infinite listed, Resident Evil 7
+ * (Game Pass only) empty. */
+static HRESULT collections_owns(const std::string &product)
+{
+    std::string ticket, resp, puid;
+    HRESULT hr;
+    account_init();
+    {
+        EnterCriticalSection(&account.cs);
+        bool have = !account.refresh_token.empty();
+        puid = account.puid;
+        LeaveCriticalSection(&account.cs);
+        auto kv = store_read();
+        if (!have)
+        {
+            EnterCriticalSection(&account.cs);
+            if (account.refresh_token.empty()) account.refresh_token = kv["refresh_token"];
+            LeaveCriticalSection(&account.cs);
+        }
+        if (puid.empty()) puid = kv["puid"];
+    }
+    EnterCriticalSection(&account.signin_cs);
+    hr = msa_refresh("service::collections.mp.microsoft.com::MBI_SSL", &ticket);
+    LeaveCriticalSection(&account.signin_cs);
+    if (FAILED(hr)) return hr;
+    std::string body = "{\"beneficiaries\":[{\"identityType\":\"msa\",\"identityValue\":\"" + json_escape(ticket) +
+                       "\",\"localTicketReference\":\"" + json_escape(puid) + "\"}],\"maxPageSize\":25,\"market\":\"US\","
+                       "\"productSkuIds\":[{\"productId\":\"" + json_escape(product) + "\"}],\"validityType\":\"Valid\"}";
+    DWORD status = http_request(L"POST", "https://collections.mp.microsoft.com/v7.0/collections/query",
+                                { "Content-Type: application/json", "Authorization: WLID1.0=\"t=" + ticket + "\"" }, body, resp);
+    if (status != 200) { trace("collections query for %s: HTTP %lu", product.c_str(), status); return XA_E_NETWORK; }
+    Json j = parse_json(resp);
+    bool owned = j["items"].type == Json::ARR && !j["items"].a.empty();
+    trace("collections: %s %s", product.c_str(), owned ? "owned" : "not owned");
+    return owned ? S_OK : S_FALSE;
+}
+
+extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthOwnsProduct(const char *product)
+{
+    return collections_owns(product ? product : "");
+}
+
 /* The content keys of an encrypted Store package (content id from the catalogue, e.g.
  * "98e628bf-0441-9750-8acb-c7414a14911c"), as "keyid:key;..." in hex for wine-uwp's installer. Used by
  * shims/gameplatform when the Xbox app installs an EAppx/EMsix package. */
@@ -3611,6 +3655,12 @@ extern "C" __declspec(dllexport) int WINAPI XboxAuthSelfTest(const char *what, c
         trace("msa ticket for \"%s\" -> %#lx: %zu chars, starts \"%.2s\"", arg ? arg : "", (unsigned long)hr, token.size(),
               token.c_str());
         return SUCCEEDED(hr) ? 0 : 1;
+    }
+    if (!strcmp(what, "owns"))
+    {
+        HRESULT hr = collections_owns(arg ? arg : "");
+        trace("owns %s -> %#lx", arg ? arg : "", (unsigned long)hr);
+        return 0;
     }
     if (!strcmp(what, "windev"))
     {
