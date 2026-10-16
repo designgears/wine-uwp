@@ -11496,8 +11496,11 @@ So the next steps are the user's, not mine:
    hardware identifiers to Microsoft and adds a device to the account**; I did not run it without the user's say-so.
    Its tokens go to the system keychain (Secret Service), which can prompt on the user's desktop.
 2. Then, all legitimate and for this account only: `xodus-cli license c9cb9fe7-... ciks/` (the content keys issued to
-   this account and device), `xodus-cli download 9NN6FJ5KZCD4`, `xodus-cli extract ...`. The gameplatform stand-in can
-   run those as an external process the way it runs `install-app.py`, keeping Xodus out of this repo.
+   this account and device), `xodus-cli download 9NN6FJ5KZCD4`, `xodus-cli extract ...`. **Correction (10-15,
+   later): not by running Xodus.** The user wants this in our own code - Xodus is a protocol reference only. Device
+   provisioning, the licence request and EAppx/MSIXVC decryption get implemented in our shims/Wine. (I started
+   `xodus-cli login` on `:0` once and stopped it at the user's word; it had already provisioned a device identity,
+   kept in the keyring under "Xodus Service", before any account sign-in.)
 
 **And after that, the game itself needs the GDK runtime.** A GDK title calls `XGameRuntime.dll` (the Gaming Services
 in-process client and its COM server). Nothing in this tree implements it; Xodus's `xodus-service` and
