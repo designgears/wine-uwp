@@ -18905,12 +18905,19 @@ struct gradient_brush
     INT32 extend, interpolation, mapping;
     BOOL radial;                /* CompositionRadialGradientBrush: the ellipse below, not start/end */
     Vector2 ellipse_center, ellipse_radius, origin_offset;
-    /* the rendered pixels, for sprites painted with this brush */
-    HBITMAP cache_bmp;
-    BYTE *cache_bits;
-    unsigned int cache_w, cache_h;
-    LONG cache_gen;
-    ULONG cache_serial;
+    /* the rendered pixels, for sprites painted with this brush, at the last few sizes: one brush is often shared by
+     * sprites of different sizes (the Xbox app's page backgrounds), and a single cached size was rendered again for
+     * each of them on every frame, alternately */
+    struct gradient_cache
+    {
+        HBITMAP bmp;
+        BYTE *bits;
+        unsigned int w, h;
+        LONG gen;
+        ULONG serial;
+        UINT64 sig;             /* what the pixels were rendered from: gradient_signature() */
+        ULONG used;             /* when last painted, for replacing the least recently used */
+    } cache[4];
 };
 static void *gradient_brush_vtbl[COMP_OBJECT_SLOTS];
 static void *gradient_radial_vtbl[COMP_OBJECT_SLOTS];
@@ -18944,8 +18951,9 @@ static ULONG WINAPI gradient_brush_Release( void *iface )
 
     if (!ref)
     {
+        unsigned int i;
         if (impl->stops) stop_collection_Release( &impl->stops->vtbl );
-        retire_bitmap( impl->cache_bmp );
+        for (i = 0; i < ARRAY_SIZE(impl->cache); i++) retire_bitmap( impl->cache[i].bmp );
         free( impl );
     }
     return ref;
@@ -19375,38 +19383,85 @@ static void gradient_render( struct gradient_brush *brush, BYTE *out, unsigned i
     }
 }
 
+/* Everything gradient_render() draws from: the brush's geometry and mapping, its stops' offsets and colours, and the
+ * size. gradient_generation moves whenever any stop or brush anywhere changes (stops do not know their brushes), and
+ * the Xbox app animates some gradients all the time, so without this every gradient on screen was rendered again,
+ * pixel by pixel, on every frame: 15% of its UI thread while a page opened. */
+static UINT64 gradient_signature( struct gradient_brush *brush, unsigned int w, unsigned int h )
+{
+    UINT64 sig = 0xcbf29ce484222325ull;
+    const BYTE *p = (const BYTE *)&brush->start, *end = (const BYTE *)(&brush->origin_offset + 1);
+    unsigned int i;
+
+#define SIG_MIX(v) do { sig ^= (UINT64)(v); sig *= 0x100000001b3ull; } while (0)
+    for (; p < end; p++) SIG_MIX( *p );
+    SIG_MIX( w ); SIG_MIX( h );
+    for (i = 0; brush->stops && i < brush->stops->count; i++)
+    {
+        struct color_stop *stop = color_stop_from( brush->stops->stops[i] );
+        UINT32 bits[5] = { 0 };
+        if (!stop) continue;
+        memcpy( &bits[0], &stop->offset, 4 );
+        memcpy( &bits[1], &stop->color, sizeof(stop->color) < 16 ? sizeof(stop->color) : 16 );
+        SIG_MIX( bits[0] ); SIG_MIX( bits[1] ); SIG_MIX( bits[2] ); SIG_MIX( bits[3] ); SIG_MIX( bits[4] );
+    }
+#undef SIG_MIX
+    return sig;
+}
+
 /* A sprite painted with a gradient brush. */
 static BOOL paint_gradient_sprite( HDC hdc, void *brush_iface, int x, int y, int width, int height, float opacity )
 {
     struct gradient_brush *brush = gradient_brush_from( brush_iface );
+    static LONG paint_clock;
+    struct gradient_cache *c = NULL;
+    unsigned int i;
 
     if (!brush || width <= 0 || height <= 0) return FALSE;
-    if (!brush->cache_bmp || brush->cache_w != (unsigned int)width || brush->cache_h != (unsigned int)height ||
-        brush->cache_gen != gradient_generation)
+    for (i = 0; i < ARRAY_SIZE(brush->cache) && !c; i++)
+        if (brush->cache[i].bmp && brush->cache[i].w == (unsigned int)width && brush->cache[i].h == (unsigned int)height)
+            c = &brush->cache[i];
+    if (c && c->gen != gradient_generation && c->sig == gradient_signature( brush, width, height ))
+        c->gen = gradient_generation;   /* something else changed: these pixels still stand */
+    if (!c || c->gen != gradient_generation)
     {
         BITMAPINFO info = { { 0 } };
         void *bits;
 
-        retire_bitmap( brush->cache_bmp );
-        brush->cache_bmp = NULL;
+        if (!c)
+        {
+            /* an empty slot, or the least recently painted */
+            c = &brush->cache[0];
+            for (i = 0; i < ARRAY_SIZE(brush->cache); i++)
+            {
+                if (!brush->cache[i].bmp) { c = &brush->cache[i]; break; }
+                if ((LONG)(brush->cache[i].used - c->used) < 0) c = &brush->cache[i];
+            }
+        }
+        TRACE_(dcompperf)( "gradient %p rendered at %dx%d (%s)\n", brush, width, height,
+                           c->bmp && c->w == (unsigned int)width && c->h == (unsigned int)height ? "changed" : "new size" );
+        retire_bitmap( c->bmp );
+        c->bmp = NULL;
         info.bmiHeader.biSize = sizeof(info.bmiHeader);
         info.bmiHeader.biWidth = width;
         info.bmiHeader.biHeight = -height;
         info.bmiHeader.biPlanes = 1;
         info.bmiHeader.biBitCount = 32;
         info.bmiHeader.biCompression = BI_RGB;
-        if (!(brush->cache_bmp = CreateDIBSection( NULL, &info, DIB_RGB_COLORS, &bits, NULL, 0 ))) return FALSE;
-        brush->cache_bits = bits;
-        gradient_render( brush, brush->cache_bits, width, height );
-        brush->cache_w = width;
-        brush->cache_h = height;
-        brush->cache_gen = gradient_generation;
-        brush->cache_serial = InterlockedIncrement( &content_generation );
+        if (!(c->bmp = CreateDIBSection( NULL, &info, DIB_RGB_COLORS, &bits, NULL, 0 ))) return FALSE;
+        c->bits = bits;
+        gradient_render( brush, c->bits, width, height );
+        c->w = width;
+        c->h = height;
+        c->gen = gradient_generation;
+        c->sig = gradient_signature( brush, width, height );
+        c->serial = InterlockedIncrement( &content_generation );
     }
+    c->used = InterlockedIncrement( &paint_clock );
     if (opacity < 0.0f) opacity = 0.0f;
     if (opacity > 1.0f) opacity = 1.0f;
-    return soft_blend( hdc, x, y, width, height, brush->cache_bits, width * 4, (BYTE)(opacity * 255.0f + 0.5f),
-                       brush, brush->cache_serial );
+    return soft_blend( hdc, x, y, width, height, c->bits, width * 4, (BYTE)(opacity * 255.0f + 0.5f),
+                       brush, c->serial );
 }
 
 /* A surface brush whose layout is not a plain Fill: the picture resampled through the brush's
