@@ -4620,14 +4620,107 @@ static HRESULT WINAPI dwritetextlayout_HitTestTextPosition(IDWriteTextLayout4 *i
     return S_OK;
 }
 
+/* One box per piece of the range in each effective run, joined with the previous box when it continues it on the same
+ * line at the same level. XAML asks for these to lay out its text (link and selection rectangles); E_NOTIMPL made it
+ * fail-fast on every frame of the Xbox app's install dialog, which then never appeared. */
 static HRESULT WINAPI dwritetextlayout_HitTestTextRange(IDWriteTextLayout4 *iface,
     UINT32 textPosition, UINT32 textLength, FLOAT originX, FLOAT originY,
     DWRITE_HIT_TEST_METRICS *metrics, UINT32 max_metricscount, UINT32* actual_metricscount)
 {
-    FIXME("%p, %u, %u, %f, %f, %p, %u, %p): stub\n", iface, textPosition, textLength, originX, originY, metrics,
-        max_metricscount, actual_metricscount);
+    struct dwrite_textlayout *layout = impl_from_IDWriteTextLayout4(iface);
+    struct layout_effective_run *run;
+    UINT32 end, count = 0;
+    DWRITE_HIT_TEST_METRICS box, last = { 0 };
+    struct layout_line *last_line = NULL;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("%p, %u, %u, %f, %f, %p, %u, %p.\n", iface, textPosition, textLength, originX, originY, metrics,
+            max_metricscount, actual_metricscount);
+
+    if (!actual_metricscount) return E_INVALIDARG;
+    *actual_metricscount = 0;
+
+    if (FAILED(hr = layout_compute_effective_runs(layout)))
+        return hr;
+
+    if (!textLength || textPosition >= layout->length)
+    {
+        float x, y;
+
+        if (FAILED(hr = IDWriteTextLayout4_HitTestTextPosition(iface, textPosition, FALSE, &x, &y, &box)))
+            return hr;
+        box.length = 0;
+        box.width = 0.0f;
+        box.left += originX;
+        box.top += originY;
+        *actual_metricscount = 1;
+        if (!metrics || max_metricscount < 1) return E_NOT_SUFFICIENT_BUFFER;
+        metrics[0] = box;
+        return S_OK;
+    }
+
+    end = textPosition + min(textLength, layout->length - textPosition);
+    LIST_FOR_EACH_ENTRY(run, &layout->effective_runs, struct layout_effective_run, entry)
+    {
+        UINT32 run_end = run->start_position + run->length, from, to;
+
+        if (run_end <= textPosition || run->start_position >= end) continue;
+        from = max(run->start_position, textPosition);
+        to = min(run_end, end);
+
+        box.textPosition = from;
+        box.length = to - from;
+        box.top = run->origin.y - run->line->baseline + originY;
+        box.height = run->line->height;
+        box.isTrimmed = run->trimming;
+        if (run->object)
+        {
+            box.left = run->origin.x + run->align_dx + originX;
+            box.width = run->width;
+            box.bidiLevel = run->bidi_level;
+            box.isText = run->trimming;
+        }
+        else
+        {
+            UINT32 cluster, cursor = run->start_position, first = ~0u, past = run->first_cluster;
+            float before, width;
+
+            /* the clusters that hold any of [from, to) */
+            for (cluster = run->first_cluster; cluster < layout->cluster_count && cursor < run_end; ++cluster)
+            {
+                UINT32 len = layout->clustermetrics[cluster].length;
+                if (cursor + len > from && cursor < to)
+                {
+                    if (first == ~0u) first = cluster;
+                    past = cluster + 1;
+                }
+                cursor += len;
+            }
+            if (first == ~0u) continue;
+            before = get_cluster_range_width(layout, run->first_cluster, first);
+            width = get_cluster_range_width(layout, first, past);
+            box.bidiLevel = run->run->u.regular.run.bidiLevel;
+            box.left = run->left + run->align_dx + originX + ((box.bidiLevel & 1) ? run->width - before - width : before);
+            box.width = width;
+            box.isText = TRUE;
+        }
+
+        if (count && last_line == run->line && last.bidiLevel == box.bidiLevel &&
+            fabsf(last.left + last.width - box.left) < 0.01f && last.textPosition + last.length == box.textPosition)
+        {
+            last.width += box.width;
+            last.length += box.length;
+            if (metrics && count <= max_metricscount) metrics[count - 1] = last;
+            continue;
+        }
+        if (metrics && count < max_metricscount) metrics[count] = box;
+        last = box;
+        last_line = run->line;
+        count++;
+    }
+
+    *actual_metricscount = count;
+    return metrics && count <= max_metricscount ? S_OK : E_NOT_SUFFICIENT_BUFFER;
 }
 
 static HRESULT WINAPI dwritetextlayout1_SetPairKerning(IDWriteTextLayout4 *iface, BOOL is_pairkerning_enabled,
