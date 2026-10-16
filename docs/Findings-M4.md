@@ -11586,3 +11586,34 @@ width. Reproduced on a private prefix (`prefix-ccs`, Xvfb `:90`), measured rathe
 Not yet known: which input picks that size. Workaround: a portrait-shaped window plays correctly (the user's
 890x944 level, captured on `:0`). Next: find what sizes the side panel - trace the layout inputs
 (`trace+display`, `CoreWindow.Bounds`, `SwapChainPanel` sizes) and try a non-96 raw DPI in a private build.
+
+### Encrypted packages: our own Windows device identity and licence client (10-15, night)
+
+Game Pass's Resident Evil 7 (9NBLGGH4SPK6, content id `98e628bf-0441-9750-8acb-c7414a14911c`) is a 25 GB
+**EAppxBundle** (magic `EXBH`, XTS-AES): FE3 delivers it fine (`FE3 file starts 45 58`), install-app.py then says
+"not an app package" and the page shows "Content failed to load". It is a plain UWP package once decrypted, not GDK.
+
+`shims/xboxauth/windevice.inc` is our own implementation of what Windows does for the keys (Xodus read as a
+protocol reference only, no code taken, and never run against the account - see the correction above):
+1. `deviceaddcredential.srf` with a random member name/password and **synthetic** hardware components (a made-up
+   SMBIOS type 1 entry, vendor "Wine", random serial and UUID, kept per prefix; the CLEP V2/V4 challenges built from
+   it with the keyless Feistel obfuscation). The service accepts it: `Success "true"`, an 8480-byte SPLicenseBlock
+   with the RSA sign state (0x12d) and the EncryptedDeviceKey (0x01).
+2. `RST2.srf` for `http://Passport.NET/tb`, XML-DSig rsa-sha256 over exclusive-c14n digests of `#RST0`,
+   `#Timestamp`, `#PPAuthInfo`. Every signed element is written already in its canonical form, so its bytes are
+   the digest input and no c14n implementation is needed. Answer: the device STS token (972-char EncryptedData,
+   valid ~60 days) and its 4096-byte proof key.
+3. `RST2.srf` again with that token, hmac-sha256 under an SP800-108 key from the proof key and our nonce, for
+   `www.microsoft.com` / `mbi_ssl`: the answer's body is EncryptedData (AES-256-CBC under a key from the server's
+   nonce) and decrypts to a 1873-char `t=` device ticket. All three worked on the first try.
+4. **The user ticket needs no Windows sign-in page**: our MSA refresh token (client 000000004C12AE6F) gives a
+   ticket for `service::www.microsoft.com::MBI_SSL` (1376 chars, `Ew...`). Without a device ticket the licensing
+   service says `DeviceIdRequired` (400).
+5. `licensing.mp.microsoft.com/v7.0/licenses/content` with both: **HTTP 200 `satisfactionFailure` 501 "Device
+   group is full, please remove a device and try again."** The account's device limit for Store licences; the
+   account holder has to remove a device (account.microsoft.com/devices). Every provisioning makes a *new*
+   device, so a prefix must keep its identity (it is stored in `xboxauth.bin`, `windev_*`) - never re-provision
+   casually, and a fresh prefix should not get a fresh device each time.
+
+Self-tests: `probe-xboxauth.exe windev` (steps 1-3) and `license <content id>` (step 5 plus the key unwrap),
+which print shapes only, never a token or key.

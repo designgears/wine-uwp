@@ -3408,6 +3408,8 @@ extern "C" __declspec(dllexport) HRESULT WINAPI DllCanUnloadNow(void) { return S
 /* An authenticated GET for the other stand-ins (shims/gameplatform answers Gaming Services' content access with it):
  * the Xbox Live token for the URL's relying party, its Signature when the endpoint has a policy, and extra headers
  * ('|'-separated). *body is CoTaskMemAlloc'ed. Returns S_OK when a response arrived, whatever its status. */
+#include "windevice.inc"
+
 extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthHttpGet(const char *url, const char *extra, const char *contract,
                                                                 unsigned char **body, UINT32 *len, DWORD *status)
 {
@@ -3559,6 +3561,49 @@ extern "C" __declspec(dllexport) int WINAPI XboxAuthSelfTest(const char *what, c
         HRESULT hr = xbl_sisu_authorize("invalid", u, e, x, xui);
         trace("sisu/authorize with an invalid ticket -> %#lx", (unsigned long)hr);
         return 0;
+    }
+    if (!strcmp(what, "msaticket"))
+    {
+        /* an MSA ticket for another scope from the stored sign-in; prints only its shape, never the token */
+        std::string token;
+        account_init();
+        auto kv = store_read();
+        account.refresh_token = kv["refresh_token"];
+        HRESULT hr = msa_refresh(arg ? arg : "", &token);
+        trace("msa ticket for \"%s\" -> %#lx: %zu chars, starts \"%.2s\"", arg ? arg : "", (unsigned long)hr, token.size(),
+              token.c_str());
+        return SUCCEEDED(hr) ? 0 : 1;
+    }
+    if (!strcmp(what, "windev"))
+    {
+        /* provision this prefix's Windows device (once) and get its tokens; prints shapes, never a token */
+        HRESULT hr = windev_ready();
+        trace("windev_ready -> %#lx", (unsigned long)hr);
+        if (FAILED(hr)) return 1;
+        std::string t;
+        EnterCriticalSection(&windev_cs);
+        hr = windev_exchange("{d6d5a677-0872-4ab0-9442-bb792fce85c5}", "www.microsoft.com", "mbi_ssl", t);
+        LeaveCriticalSection(&windev_cs);
+        trace("device ticket for www.microsoft.com -> %#lx: %zu chars, starts \"%.2s\"", (unsigned long)hr, t.size(), t.c_str());
+        return SUCCEEDED(hr) ? 0 : 1;
+    }
+    if (!strcmp(what, "license"))
+    {
+        /* the content keys for content id ARG; prints their ids and lengths, never a key */
+        std::vector<ContentKey> keys;
+        std::string pfn;
+        account_init();
+        auto kv = store_read();
+        account.refresh_token = kv["refresh_token"];
+        HRESULT hr = content_keys(arg ? arg : "", "US", keys, &pfn);
+        trace("content_keys -> %#lx, %zu keys, package %s", (unsigned long)hr, keys.size(), pfn.c_str());
+        for (auto &k : keys)
+        {
+            GUID g;
+            memcpy(&g, k.id.data(), 16);
+            trace("  key {%08lx-%04x-%04x-...} %zu bytes", g.Data1, g.Data2, g.Data3, k.key.size());
+        }
+        return SUCCEEDED(hr) ? 0 : 1;
     }
     if (!strcmp(what, "policy"))
     {
