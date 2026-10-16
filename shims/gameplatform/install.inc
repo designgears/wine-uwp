@@ -798,7 +798,9 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
     if (!keys.empty())
     {
         WCHAR rt[MAX_PATH];
-        DWORD n = GetEnvironmentVariableW(L"XDG_RUNTIME_DIR", rt, MAX_PATH);
+        /* Wine hands XDG_* to Windows programs renamed WINE_HOST_XDG_* */
+        DWORD n = GetEnvironmentVariableW(L"WINE_HOST_XDG_RUNTIME_DIR", rt, MAX_PATH);
+        if (!n || n >= MAX_PATH) n = GetEnvironmentVariableW(L"XDG_RUNTIME_DIR", rt, MAX_PATH);
         if (!n || n >= MAX_PATH) { tracef("install: no XDG_RUNTIME_DIR for the content keys"); return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND); }
         GUID g;
         CoCreateGuid(&g);
