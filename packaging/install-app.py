@@ -437,6 +437,212 @@ class EAppxPackage:
         self.close()
 
 
+# ---- GDK packages (.msixvc): an XVD container ------------------------------------------------------------------
+#
+# 4096-byte pages. At 0x200 "msft-xvd", then (little-endian) flags at 0x208, the drive size at 0x218, the VDUID at
+# 0x220, the lengths of the embedded XVD, user data, XVC info and dynamic header at 0x288..0x297 and the mutable data
+# page count at 0x470. The file is laid out as header (3 pages), embedded XVD, mutable data, hash tree, user data, XVC
+# info, dynamic header, drive, each rounded up to whole pages. The hash tree has levels L3 L2 L1 L0 in that order;
+# L0 has an entry per page from the user data on (170 entries of 24 bytes a page, the last 4 bytes of an entry the
+# page's XTS data unit), each level above one entry per page of the level below.
+#
+# The XVC info holds the content id, a table of 192 key ids (GUIDs) and, from 0xDA8, 0x80-byte region headers: id,
+# key index (0xffff = plain), first segment, byte offset and length. The user data has a table of named files; its
+# SegmentMetadata.bin (" PFX") lists the package's files in order, each filling whole pages one after the other
+# from the start of the region whose first segment it is. An encrypted page is XTS-AES-128 with the content key's
+# second half as the data key and its first as the tweak key, tweak = data unit (u32), region id (u32), first 8
+# bytes of the VDUID.
+
+XVD_PAGE = 4096
+
+
+class _XtsPages:
+    """XVD page decryption through the host's libcrypto."""
+
+    def __init__(self, key):
+        self.x = _Xts(key[16:] + key[:16])   # OpenSSL takes the data key first
+
+    def decrypt(self, data, ivs):
+        x = self.x
+        ct, lc, ctx = x.ct, x.lc, x.ctx
+        src = bytearray(data)
+        out = bytearray(len(src))
+        sbase = ct.addressof((ct.c_char * len(src)).from_buffer(src))
+        obase = ct.addressof((ct.c_char * len(out)).from_buffer(out))
+        n = ct.byref(x.n)
+        for i, iv in enumerate(ivs):
+            off = i * XVD_PAGE
+            if lc.EVP_DecryptInit_ex(ctx, None, None, None, iv) != 1 or \
+                    lc.EVP_DecryptUpdate(ctx, obase + off, n, sbase + off, XVD_PAGE) != 1:
+                raise SystemExit("decryption failed")
+        return bytes(out)
+
+
+class _XvdMember:
+    def __init__(self, name, size, region, page):
+        self.name, self.file_size, self.region, self.page = name, size, region, page
+        self.filename = name.replace("\\", "/").replace("%", "%25")
+
+    def is_dir(self):
+        return False
+
+
+class _XvdReader(io.RawIOBase):
+    """One file of a package: its pages, decrypted when its region is, cut to its size."""
+
+    PAGES = 1024
+
+    def __init__(self, pkg, m):
+        self.pkg, self.m, self.page, self.left, self.out = pkg, m, m.page, m.file_size, b""
+        self.pages_left = max(1, -(-m.file_size // XVD_PAGE))
+
+    def readable(self):
+        return True
+
+    def readinto(self, buf):
+        if not self.out and self.left:
+            n = min(self.PAGES, self.pages_left)
+            self.out = self.pkg.read_pages(self.m.region, self.page, n)
+            self.page += n
+            self.pages_left -= n
+        k = min(len(buf), len(self.out), self.left)
+        buf[:k] = self.out[:k]
+        self.out = self.out[k:]
+        self.left -= k
+        return k
+
+
+class MsixvcPackage:
+    """A GDK package (.msixvc, a file or URL) with the zipfile methods install-app.py uses."""
+
+    def __init__(self, path):
+        self.path = path
+        self.f = open_raw(path)
+        h = self._read(0, XVD_PAGE)
+        if h[0x200:0x208] != b"msft-xvd":
+            raise SystemExit("not a GDK package")
+        drive = struct.unpack_from("<Q", h, 0x218)[0]
+        self.vduid = h[0x220:0x228]
+        emb, user, xvc, dyn = struct.unpack_from("<IIII", h, 0x288)
+        pages = lambda n: -(-n // XVD_PAGE)
+        n = pages(user) + pages(xvc) + pages(dyn) + pages(drive)
+        levels = [max(1, -(-n // 170))]
+        for _ in range(3):
+            below = levels[-1]
+            levels.append(-(-(0 if below == 1 else below) // 170))
+        self.tree = 3 + pages(emb) + h[0x470]
+        self.l0 = self.tree + sum(levels[1:])          # L3, L2 and L1 come first
+        self.user = self.tree + sum(levels)
+        xvc_at = self.user + pages(user)
+        info = self._read(xvc_at * XVD_PAGE, pages(xvc) * XVD_PAGE)
+        self.key_ids = [info[16 + 16 * i:32 + 16 * i] for i in range(192)]
+        version, count = struct.unpack_from("<II", info, 0xD10)
+        if version < 1:
+            raise SystemExit("this GDK package has no region table (XVC info version 0)")
+        self.regions = {}
+        order = []
+        for i in range(count):
+            r = info[0xDA8 + 0x80 * i:0xDA8 + 0x80 * (i + 1)]
+            rid, kidx, _, flags, first = struct.unpack_from("<IHHII", r, 0)
+            off, length = struct.unpack_from("<QQ", r, 0x50)
+            self.regions[rid] = (kidx, off // XVD_PAGE, length // XVD_PAGE)
+            order.append((first, rid))
+        ud = self._read(self.user * XVD_PAGE, user)
+        table = struct.unpack_from("<I", ud, 0)[0]
+        t = ud[table:]
+        self.full_name = t[4:524].decode("utf-16le").split("\0")[0]
+        files = {}
+        for i in range(struct.unpack_from("<I", t, 524)[0]):
+            e = t[528 + 528 * i:528 * (i + 2)]
+            size, off = struct.unpack_from("<II", e, 520)
+            files[e[:520].decode("utf-16le").split("\0")[0].lower()] = ud[16 + off:16 + off + size]
+        seg = files.get("segmentmetadata.bin")
+        if not seg or seg[:4] != b" PFX":
+            raise SystemExit("this GDK package has no segment table; only packages with one are supported")
+        hlen, segs = struct.unpack_from("<II", seg, 12)
+        names = hlen + 16 * segs
+        entries = []
+        for i in range(segs):
+            flags, plen, poff, size = struct.unpack_from("<HHIQ", seg, hlen + 16 * i)
+            entries.append((seg[names + poff:names + poff + 2 * plen].decode("utf-16le"), size))
+        # each content region takes its segments in order, page after page from its start
+        self.members = []
+        for rid, (kidx, first_page, npages) in self.regions.items():
+            if rid >= 0x40000000 and rid != 0x40000003:
+                continue
+            first = next(f for f, r in order if r == rid)
+            page, i = first_page, first
+            while i < len(entries) and page < first_page + npages:
+                name, size = entries[i]
+                if name.startswith(("\\", "/")) or ".." in name.replace("\\", "/").split("/"):
+                    raise SystemExit(f"refusing unsafe path in package: {name}")
+                self.members.append(_XvdMember(name, size, rid, page))
+                page += max(1, -(-size // XVD_PAGE))
+                i += 1
+        self.keys, self.ciphers = content_keys(), {}
+
+    def _read(self, off, n):
+        self.f.seek(off)
+        return self.f.read(n)
+
+    def read_pages(self, rid, page, n):
+        data = self._read(page * XVD_PAGE, n * XVD_PAGE)
+        kidx = self.regions[rid][0]
+        if kidx >= 192:
+            return data
+        if kidx not in self.ciphers:
+            kid = self.key_ids[kidx]
+            if kid not in self.keys:
+                raise SystemExit(f"{self.full_name} is encrypted and its content key ({kid.hex()}) was not given; "
+                                 "it comes with the Store licence")
+            self.ciphers[kidx] = _XtsPages(self.keys[kid])
+        # the data units, from the L0 hash entries of these pages (170 to a tree page)
+        b = page - self.user
+        first, last = b // 170, (b + n - 1) // 170
+        tree = self._read((self.l0 + first) * XVD_PAGE, (last - first + 1) * XVD_PAGE)
+        rid_bytes = struct.pack("<I", rid)
+        ivs = []
+        for k in range(b, b + n):
+            e = (k // 170 - first) * XVD_PAGE + (k % 170) * 24
+            ivs.append(tree[e + 20:e + 24] + rid_bytes + self.vduid)
+        return self.ciphers[kidx].decrypt(data, ivs)
+
+    def namelist(self):
+        return [m.filename for m in self.members]
+
+    def infolist(self):
+        return list(self.members)
+
+    def getinfo(self, name):
+        return next(m for m in self.members if m.filename == name)
+
+    def open(self, m):
+        if isinstance(m, str):
+            m = self.getinfo(m)
+        return io.BufferedReader(_XvdReader(self, m), 1 << 20)
+
+    def read(self, name):
+        with self.open(name) as f:
+            return f.read()
+
+    def close(self):
+        self.f.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+def open_msixvc(path):
+    with open_raw(path) as f:
+        f.seek(0x200)
+        if f.read(8) != b"msft-xvd":
+            return None
+    return MsixvcPackage(path)
+
+
 def open_eappx(path):
     """An encrypted package or bundle: the bundle's x64 application package. None if `path` is not one."""
     with open_raw(path) as f:
@@ -588,9 +794,9 @@ def find_framework(dirs, name, min_version, publisher, older=False):
 
 
 def open_package(path, tmp):
-    eappx = open_eappx(path)
-    if eappx:
-        return eappx
+    encrypted = open_eappx(path) or open_msixvc(path)
+    if encrypted:
+        return encrypted
     try:
         outer = zipfile.ZipFile(open_raw(path))
     except (zipfile.BadZipFile, FileNotFoundError, IsADirectoryError):

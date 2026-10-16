@@ -3443,12 +3443,6 @@ extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthHttpGet(const char *url,
     return S_OK;
 }
 
-/* For probes/probe-xboxauth.cpp: exercises the HTTP paths without an app.
- *   "endpoints <url>"   relying party lookup for a URL
- *   "xbl <rps>"         user/authenticate with a deliberately invalid ticket (request shape, error path)
- *   "devicecode"        obtains a device code and stops (no browser, no polling)
- *   "silent"            silent sign-in from the stored refresh token, then the profile claims
- *   "msascope <scope>"  a Microsoft account token for a scope (WebAuthenticationCoreManager's path) */
 /* The content keys of an encrypted Store package (content id from the catalogue, e.g.
  * "98e628bf-0441-9750-8acb-c7414a14911c"), as "keyid:key;..." in hex for wine-uwp's installer. Used by
  * shims/gameplatform when the Xbox app installs an EAppx/EMsix package. */
@@ -3487,6 +3481,12 @@ extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthContentKeys(const char *
     return S_OK;
 }
 
+/* For probes/probe-xboxauth.cpp: exercises the HTTP paths without an app.
+ *   "endpoints <url>"   relying party lookup for a URL
+ *   "xbl <rps>"         user/authenticate with a deliberately invalid ticket (request shape, error path)
+ *   "devicecode"        obtains a device code and stops (no browser, no polling)
+ *   "silent"            silent sign-in from the stored refresh token, then the profile claims
+ *   "msascope <scope>"  a Microsoft account token for a scope (WebAuthenticationCoreManager's path) */
 extern "C" __declspec(dllexport) int WINAPI XboxAuthSelfTest(const char *what, const char *arg)
 {
     account_init();

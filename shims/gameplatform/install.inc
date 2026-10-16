@@ -737,6 +737,42 @@ static HRESULT encrypted_package_keys(const GUID &content_id, std::string &keys)
     return hr;
 }
 
+/* A GDK title's package (.msixvc) address: packagespc.xboxlive.com's GetBasePackage for its content id, signed and
+ * authorized like any Xbox Live call (http://update.xboxlive.com). The first CDN root plus the file's relative URL. */
+static HRESULT msixvc_url(const GUID &content_id, std::string &url)
+{
+    typedef HRESULT (WINAPI *get_fn)(const char *, const char *, const char *, unsigned char **, UINT32 *, DWORD *);
+    HMODULE xa = LoadLibraryW(L"wineuwp_xboxauth.dll");
+    get_fn get = xa ? (get_fn)GetProcAddress(xa, "XboxAuthHttpGet") : nullptr;
+    char req[128];
+    unsigned char *body = nullptr;
+    UINT32 len = 0;
+    DWORD status = 0;
+    if (!get) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    snprintf(req, sizeof(req), "https://packagespc.xboxlive.com/GetBasePackage/%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             content_id.Data1, content_id.Data2, content_id.Data3, content_id.Data4[0], content_id.Data4[1], content_id.Data4[2],
+             content_id.Data4[3], content_id.Data4[4], content_id.Data4[5], content_id.Data4[6], content_id.Data4[7]);
+    HRESULT hr = get(req, "Accept: application/json", "3", &body, &len, &status);
+    if (FAILED(hr) || status != 200)
+    {
+        tracef("install: GetBasePackage -> %#lx, HTTP %lu", (unsigned long)hr, status);
+        if (body) CoTaskMemFree(body);
+        return FAILED(hr) ? hr : HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+    Json j = parse_json(std::string((char *)body, len));
+    CoTaskMemFree(body);
+    for (auto &f : j["PackageFiles"].a)
+    {
+        std::string name = f["FileName"].str();
+        if (name.size() < 7 || _stricmp(name.c_str() + name.size() - 7, ".msixvc")) continue;
+        url = f["CdnRootPaths"].at(0).str() + f["RelativeUrl"].str();
+        tracef("install: GDK package %s, %.0f bytes", name.c_str(), f["FileSize"].n);
+        return url.empty() ? HRESULT_FROM_WIN32(ERROR_NOT_FOUND) : S_OK;
+    }
+    tracef("install: GetBasePackage lists no .msixvc (found %d)", j["PackageFound"].b);
+    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+}
+
 static HRESULT run_installer(Install *in, const std::string &url, const std::wstring &stage_name, std::wstring &log_out,
                              const std::string &keys = std::string())
 {
@@ -888,9 +924,17 @@ static DWORD WINAPI install_thread(void *param)
     report(in);
     if (!d.uwp)
     {
-        tracef("install %ls: an MSIXVC title; it needs Gaming Services' encrypted package support", in->store_id.c_str());
-        hr = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-        goto done;
+        /* a GDK title: its .msixvc from the Xbox CDN, decrypted with the licence's content key */
+        std::string keys;
+        stage_name = d.family.substr(0, d.family.find(L'_'));
+        stage_name = stage_name.substr(stage_name.rfind(L'.') + 1);
+        for (auto &c : stage_name) c = towlower(c);
+        if (FAILED(hr = msixvc_url(d.content_id, url))) goto done;
+        if (FAILED(hr = encrypted_package_keys(d.content_id, keys))) goto done;
+        hr = run_installer(in, url, stage_name, log, keys);
+        SecureZeroMemory(&keys[0], keys.size());
+        if (FAILED(hr)) goto done;
+        goto installed;
     }
     if (d.wu_category.empty()) { tracef("install %ls: no Store category in the catalogue", in->store_id.c_str()); hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND); goto done; }
     if (FAILED(hr = fe3_packages(utf8(d.wu_category), updates))) goto done;
@@ -910,6 +954,7 @@ static DWORD WINAPI install_thread(void *param)
         if (FAILED(hr)) goto done;
     }
     else if (FAILED(hr = run_installer(in, url, stage_name, log))) goto done;
+installed:
     {
         std::wstring dir = unix_to_windows(games_data_unix()) + L"\\stage\\" + stage_name, full, aumid, title;
         read_identity(dir, full, aumid, title);
