@@ -43,6 +43,7 @@ struct Install
     INT32 state = ST_WAITING;
     HRESULT error = S_OK;
     UINT64 total = 0, done = 0;
+    UINT32 rate = 0;                    /* bytes a second, over the last few seconds */
     bool cancel = false;
 };
 
@@ -262,6 +263,7 @@ static InstallProgress progress_of(const Install &in)
     p.package.streamed = p.install.streamed = p.network.streamed = in.done;
     /* launchable once it is all there */
     p.launch.streamed = in.state == ST_COMPLETED ? in.total : 0;
+    p.data_rate = in.state == ST_STREAMING ? in.rate : 0;
     return p;
 }
 
@@ -825,6 +827,8 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
     CloseHandle(pi.hThread);
     tracef("install: installer started for %ls", stage_name.c_str());
     std::string seen;
+    ULONGLONG rate_t0 = 0;
+    UINT64 rate_b0 = 0;
     bool installed = false, exited = false;
     int exit_code = -1, grace = 0;
     for (;;)
@@ -851,8 +855,16 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
                     unsigned pct, total;
                     if (sscanf(line.c_str(), "PROGRESS %u %u", &pct, &total) == 2 && total)
                     {
+                        ULONGLONG now = GetTickCount64();
                         AcquireSRWLockExclusive(&installs_lock);
                         in->done = in->total * pct / total;
+                        /* the rate over the last 2 s or more */
+                        if (!rate_t0) { rate_t0 = now; rate_b0 = in->done; }
+                        else if (now - rate_t0 >= 2000)
+                        {
+                            in->rate = (UINT32)min((in->done - rate_b0) * 1000 / (now - rate_t0), (UINT64)0xffffffff);
+                            rate_t0 = now; rate_b0 = in->done;
+                        }
                         in->state = ST_STREAMING;
                         ReleaseSRWLockExclusive(&installs_lock);
                         report(in);
@@ -864,6 +876,9 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
             }
         }
         if (exited) break;
+        /* a Unix child's handle may not be waitable at all (WAIT_FAILED at once): without this the loop re-read the
+         * log as fast as it could, 45% of a core here and as much again in the wineserver, and the whole app dragged */
+        if (wait != WAIT_TIMEOUT && wait != WAIT_OBJECT_0) Sleep(500);
         if (wait == WAIT_OBJECT_0)
         {
             /* the shell is gone; its last words may still be on their way to the log */

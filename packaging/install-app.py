@@ -595,6 +595,9 @@ class MsixvcPackage:
                 page += max(1, -(-size // XVD_PAGE))
                 i += 1
         self.keys, self.ciphers = content_keys(), {}
+        # the L0 hash level, read once: fetching it beside each run of data pages made a download from the CDN
+        # alternate between two parts of the file, and HttpFile keeps one block, so it fetched each block over again
+        self.l0_data = self._read(self.l0 * XVD_PAGE, levels[0] * XVD_PAGE)
 
     def _read(self, off, n):
         self.f.seek(off)
@@ -613,12 +616,11 @@ class MsixvcPackage:
             self.ciphers[kidx] = _XtsPages(self.keys[kid])
         # the data units, from the L0 hash entries of these pages (170 to a tree page)
         b = page - self.user
-        first, last = b // 170, (b + n - 1) // 170
-        tree = self._read((self.l0 + first) * XVD_PAGE, (last - first + 1) * XVD_PAGE)
+        tree = self.l0_data
         rid_bytes = struct.pack("<I", rid)
         ivs = []
         for k in range(b, b + n):
-            e = (k // 170 - first) * XVD_PAGE + (k % 170) * 24
+            e = (k // 170) * XVD_PAGE + (k % 170) * 24
             ivs.append(tree[e + 20:e + 24] + rid_bytes + self.vduid)
         return self.ciphers[kidx].decrypt(data, ivs)
 
@@ -784,9 +786,15 @@ def extract(pkg, dest):
         out = os.path.join(dest, rel)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with pkg.open(m) as src, open(out, "wb") as dst:
-            shutil.copyfileobj(src, dst, 1 << 20)
-        done += m.file_size
-        say(f"PROGRESS {done * 100 // total} 100")
+            # progress in a large file too, so a download that is mostly one file does not look stalled
+            while True:
+                chunk = src.read(8 << 20)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                done += len(chunk)
+                say(f"PROGRESS {done * 1000 // total} 1000")
+        say(f"PROGRESS {done * 1000 // total} 1000")
 
 
 def find_framework(dirs, name, min_version, publisher, older=False):
