@@ -11631,3 +11631,12 @@ Inspected in place (`probe-threads.exe`, `probe-peek.exe`, XAML's PDB `.syms`), 
 Fix (`dlls/combase/roapi.c`): cache `DllGetActivationFactory` as soon as it is found, keeping the module loaded.
 Regression on the private build: calc AE 0, mp 2250, sol 0/3. The Wine-side root (LdrLoadDll / LdrGetDllHandle taking
 `loader_section` for an already-loaded module) is still there for any other caller.
+
+### First GDK game: Bad Magpie Demo installs and runs (10-15, night)
+
+Bad Magpie Demo (9NRL353V9VPM, MSIXVC, 653 MB) installed from the Xbox app's Install button and runs into its
+game world (`docs/screenshots/badmagpie-gdk-running.png`, 1920x1080, in game). Three bugs on the way, all ours:
+the key handoff (a stdin pipe never reached the Unix installer; Wine shows `XDG_*` as `WINE_HOST_XDG_*`), the
+installer-watch loop spinning when a Unix child's handle is not waitable (45% CPU plus the wineserver), and a
+0.6 MB/s download (HttpFile's one-block cache thrashed between the hash tree and the data; now 34 s for 653 MB).
+No XGameRuntime stand-in was needed for it to reach the game.
