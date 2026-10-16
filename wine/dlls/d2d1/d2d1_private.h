@@ -219,6 +219,7 @@ struct d2d_device_context
     D2D1_RENDER_TARGET_PROPERTIES desc;
     D2D1_SIZE_U pixel_size;
     struct d2d_clip_stack clip_stack;
+    BOOL antialias_rendering;
 
     struct d2d_indexed_objects vertex_buffers;
 };
@@ -1126,5 +1127,8 @@ static inline const char *debug_d2d_ellipse(const D2D1_ELLIPSE *ellipse)
 HRESULT d2d_svg_document_create(ID2D1Factory *factory, IStream *stream, D2D1_SIZE_F viewport,
         ID2D1SvgDocument **out);
 void d2d_svg_document_draw(ID2D1DeviceContext *context, ID2D1SvgDocument *document);
+
+void d2d_device_context_draw_antialiased(struct d2d_device_context *context,
+        void (*draw)(struct d2d_device_context *, void *), void *data);
 
 #endif /* __WINE_D2D1_PRIVATE_H */

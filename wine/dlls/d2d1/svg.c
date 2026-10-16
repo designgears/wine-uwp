@@ -1635,21 +1635,14 @@ static void draw_node(struct svg_draw *draw, const struct svg_node *node, struct
     end_clip(draw, &clip, &transform);
 }
 
-void d2d_svg_document_draw(ID2D1DeviceContext *context, ID2D1SvgDocument *iface)
+static void d2d_svg_document_draw_direct(ID2D1DeviceContext *context, struct d2d_svg_document *document)
 {
-    struct d2d_svg_document *document;
     D2D1_MATRIX_3X2_F saved, viewbox_transform = identity, transform;
     struct svg_style style;
     struct svg_draw draw;
     const WCHAR *value;
     float vb[4], width, height;
 
-    if (!iface || iface->lpVtbl != &d2d_svg_document_vtbl)
-    {
-        WARN("not our document %p.\n", iface);
-        return;
-    }
-    document = impl_from_ID2D1SvgDocument(iface);
     if (!document->root) return;
 
     /* the viewBox is fitted into the viewport: xMidYMid meet, the default preserveAspectRatio */
@@ -1698,6 +1691,25 @@ void d2d_svg_document_draw(ID2D1DeviceContext *context, ID2D1SvgDocument *iface)
     ID2D1DeviceContext_SetTransform(context, &saved);
 }
 
+static void d2d_svg_draw_callback(struct d2d_device_context *context, void *data)
+{
+    d2d_svg_document_draw_direct((ID2D1DeviceContext *)&context->ID2D1DeviceContext6_iface, data);
+}
+
+void d2d_svg_document_draw(ID2D1DeviceContext *context, ID2D1SvgDocument *iface)
+{
+    struct d2d_svg_document *document;
+
+    if (!iface || iface->lpVtbl != &d2d_svg_document_vtbl)
+    {
+        WARN("not our document %p.\n", iface);
+        return;
+    }
+    document = impl_from_ID2D1SvgDocument(iface);
+    if (document->root)
+        d2d_device_context_draw_antialiased(CONTAINING_RECORD(context, struct d2d_device_context, ID2D1DeviceContext6_iface),
+                d2d_svg_draw_callback, document);
+}
 
 /* ---------------------------------------------------------------------------------------------
  * ID2D1SvgElement: a read-only view of a parsed node. Win2D wraps the root in its own

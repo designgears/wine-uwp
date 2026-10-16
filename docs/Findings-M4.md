@@ -11666,3 +11666,101 @@ requests: `shims/gameplatform/gdkpackage.inc`):
 Result: `docs/screenshots/xbox-halo-choose-what-to-install.png` - base game required, Campaign suggested, "Requires
 99.26 GB" instead of the whole 134 GB package. Along the way XAML needed `IDWriteTextLayout::HitTestTextRange` (it was a
 stub) to draw the dialog's text at all.
+
+### Blocky scaled composition surfaces (10-16)
+
+The user's Xbox crops show stair-stepped edges on both line icons and text. In `wine/dlls/dcomp/composition.c`,
+the fallback painter already had a bilinear path for non-swapchain surfaces, but only when the destination stayed
+within 10% of the source size (the UI animation case). Actual icon and thumbnail resizes fell through to
+`GdiAlphaBlend`, whose sampling is nearest-neighbor. Expanded the existing premultiplied-alpha bilinear path to all
+scaled non-swapchain 32-bit surfaces; the near-1:1 snap remains to preserve text rasterization, and swap chains
+retain the fast path. The changed `dcomp.dll` compiled successfully in an isolated reflinked build tree. A first
+launch on the default prefix reached sign-in; a second launch on a copy of the signed-in prefix displayed Xbox Home
+with the new build. That capture shows the small Home and Game Pass line icons without obvious stair-stepping, but it
+is not a before/after of the user's Halo page. The desktop's shared Wine build remains untouched; regression suite not
+run.
+
+The desktop Xbox process was later checked in place: its `/proc/<pid>/maps` showed
+`/home/bobby/src/wine-build/dlls/dcomp/x86_64-windows/dcomp.dll`, confirming that the prior isolated build had not
+reached the app. A requested custom-build launch against the same prefix started a separate wineserver, so it was
+stopped rather than run beside the existing prefix server. The ordinary desktop launch is open again, still on the
+shared build. The isolated regression run compiled the change but Calculator differed from its baseline by 49 pixels;
+the difference image localizes them to Calculator's small app icon. The four-app suite was interrupted before it
+could explain that difference or check the remaining apps. Do not copy the isolated DLL into the shared build yet.
+
+Follow-up on 10-16: Calculator reproduced the same 49-pixel difference twice with the isolated bilinear path. The
+difference is confined to the small app icon, which is exactly the scaled surface affected by the change. The
+Calculator baseline was updated from that capture and two subsequent runs returned AE 0. Media Player reached 2,826
+colours, and Solitaire reached its front end in all three runs. Feedback Hub stayed black with 16 fail-fasts on the
+new build; a run on the old build also stayed black with 17 fail-fasts. Both logs identify the unrelated missing
+`msvcp140_app.dll` export `Concurrency::details::GetNextAsyncId`, so this is pre-existing and not caused by DComp.
+
+The subsequent desktop reload command reported exit 137, but the Xbox process remained alive on `:0` and its log
+continued past startup. The WinINet date-parse errors in that tail are server date-header parsing, not an Xbox process
+exit. The restart also left three host installer workers for the same Halo package asleep (`S`) behind the existing
+pause marker; the queue is already orphaned, so do not restart again or kill these workers as part of the rendering
+investigation.
+
+Follow-up: the first change addressed the DIB stretch operation, but XAML's UI imagery uses composition surface brushes.
+Wine's `surface_sample()` was nearest-neighbor unconditionally, and new brushes inherited enum zero. Microsoft documents
+that XAML uses `CompositionSurfaceBrush.BitmapInterpolationMode=Linear`; the corresponding enum value is 1, while 0 is
+nearest-neighbor. Changed the sampler to honor the property with premultiplied BGRA bilinear filtering, set new brushes
+to linear, and invalidate the mapped-surface cache when the property changes. The build compiled in an isolated
+reflinked Wine build tree. On a copied prefix, Xbox Home and Halo Infinite's detail page rendered with this build
+(capture: `/tmp/xbox-linear-halo-detail.png`). The detail-page icons and game images are smoothly filtered; small text
+retains its native raster edges. The copied-prefix regression run passed Calculator exactly (AE 0), Media Player at
+2,834 colours, and Solitaire's front end in 3/3 runs with no critical errors. The changed build is ready to promote to
+the shared Wine build and reload on the desktop. Promoted the tested DComp build, restarted Xbox on the desktop, and
+confirmed the active Xbox process maps `/home/bobby/src/wine-build/dlls/dcomp/x86_64-windows/dcomp.dll`. The current
+desktop capture is `/tmp/xbox-linear-desktop.png` (Xbox Home); the isolated Halo detail capture remains available for
+the exact page with the scaled art.
+
+### Game Pass bypasses the Premium SVG drawing path (10-16)
+
+On the virtual desktop, tracing DrawSvgDocument and FillGeometry separately shows Premium goes through
+DrawSvgDocument at 67x14, while several other marks come from native Win2D directly into 150x150 and
+1000x1000 geometry targets. The SVG-only supersampling wrapper cannot affect those calls. Applying the
+same bounded supersampling to direct geometry changes only 14 pixels in the 250x175 sidebar crop;
+the Game Pass letters remain visibly stair-stepped. That experiment rules out treating source geometry
+antialiasing alone as a complete fix: the composition painter's four-texel bilinear reduction skips
+most texels when these surfaces are shrunk. Baseline `/tmp/xbox-geometry-before-crop.png`, geometry-only
+result `/tmp/xbox-geometry-aa-crop.png`. Testing source-footprint filtering next, in the isolated
+`wine-build-premium` build and `prefix-pause-test25` on :97; desktop :0 and its Wine build are untouched.
+
+The composition source-footprint filter fixes the final reduction: the virtual sidebar badge now has
+fractional coverage instead of square on/off GAME PASS glyph pixels, and Halo's Xbox Game Pass wordmark
+is clean at its displayed size (`docs/screenshots/xbox-gamepass-filtered.png`). The geometry and SVG
+paths now share one bounded antialias helper, with stepped reductions, caller clips preserved in a
+separate stack, and a device-space final composite (the earlier SVG wrapper incorrectly reapplied a
+nonidentity world transform). Explicit aliased drawing bypasses it. Scratch allocation failure falls
+back before rendering; the largest scratch level is bounded to 8M pixels.
+
+`probe-svg.exe Z:\\tmp 64 --geometry` exercises direct fill/stroke calls with translation, a caller clip,
+96/192 DPI and explicit aliasing. All three cases pass: fractional pixels 68 / 0 / 59 respectively,
+target/transform preserved, correct placement and clipping. `python3 probes/check-area-sampler.py`
+passes thin-stroke, anisotropic, fractional, premultiplied-border and 1:1 checks using the actual C sampler.
+
+The first regression attempt spent its 60-second Calculator deadline in copied-prefix override setup;
+prime a freshly copied prefix before interpreting that timeout. The primed run displays Calculator.
+Its visual difference is confined to the app icon and hamburger (236 RGB pixels, bounds x20..37,
+y36..91). A separate isolated build with old DComp and new D2D changes only 20 hamburger pixels;
+toggling the new area sampler accounts for the icon change. The new capture is the baseline after
+inspecting both crops; no text, layout or calculator button pixels changed. Repeat baseline checks
+and remaining suite results follow below.
+
+A negative control using the original shared D2D DLL fails the geometry probe at 96 DPI (0 partial
+pixels versus 68 with the fix); the explicitly aliased control remains correct. At 192 DPI the
+final WIC DrawImage minification itself supplies coverage, so that case checks DPI/placement/clip
+correctness rather than independently proving geometry antialiasing.
+
+Final rendering regressions: Calculator matches the revised baseline twice (AE 0, 3 s / 4 s);
+Media Player displays Home (2,826 colours); Solitaire reaches FEState in 3/3 runs with no critical
+errors. The suite's early 151,118-colour captures are still splash artwork, so a separate longer
+run was inspected: the actual game-selection screen renders after dismissing the pre-existing Xbox
+Live sign-in error 1170000, matching the old renderer control. Feedback Hub remains black with 16
+fail-fasts on the already documented missing `msvcp140_app.dll.?GetNextAsyncId...` export.
+
+The tested `d2d1.dll` and `dcomp.dll` were promoted atomically to the standard Wine build; original
+DLLs retained under ignored `uwp-bin/vector-shared-backup`. Other relevant build DLLs (ntdll, combase,
+wineuwp, dwrite, dxgi, d3d11, wined3d) compare identical between the tested and standard builds.
+The running desktop session was not controlled or restarted; new launches pick up the rendering fix.

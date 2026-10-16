@@ -972,6 +972,109 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
     }
 }
 
+/* Geometry edges have no coverage information in the triangle shaders. Supersample bounded
+ * bitmap targets and reduce in 2:1 steps; a single large linear reduction skips most samples.
+ * Share this path between SVG documents and Win2D callers that submit geometries directly. */
+void d2d_device_context_draw_antialiased(struct d2d_device_context *context,
+        void (*draw)(struct d2d_device_context *, void *), void *data)
+{
+    ID2D1DeviceContext6 *iface = &context->ID2D1DeviceContext6_iface;
+    ID2D1Bitmap1 *levels[3] = {0};
+    ID2D1Image *target;
+    D2D1_BITMAP_PROPERTIES1 props = {0};
+    D2D1_MATRIX_3X2_F transform, scaled;
+    D2D1_SIZE_U size = context->pixel_size;
+    D2D1_RECT_F destination;
+    unsigned int scale, count, i;
+    struct d2d_clip_stack saved_clip, scratch_clip;
+    float dip_width, dip_height;
+
+    if (context->antialias_rendering || context->target.type != D2D_TARGET_BITMAP
+            || context->drawing_state.antialiasMode == D2D1_ANTIALIAS_MODE_ALIASED
+            || context->drawing_state.primitiveBlend != D2D1_PRIMITIVE_BLEND_SOURCE_OVER
+            || !size.width || !size.height || context->desc.dpiX <= 0 || context->desc.dpiY <= 0)
+        goto direct;
+
+    scale = size.width <= 512 && size.height <= 512 ? 8 : 2;
+    while (scale > 1 && (UINT64)size.width * size.height * scale * scale > 8 * 1024 * 1024)
+        scale /= 2;
+    if (scale == 1) goto direct;
+    count = scale == 8 ? 3 : scale == 4 ? 2 : 1;
+
+    props.pixelFormat = context->desc.pixelFormat;
+    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    props.dpiX = context->desc.dpiX;
+    props.dpiY = context->desc.dpiY;
+    props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+    /* Allocate every level before drawing, so allocation failure can fall back without painting twice. */
+    for (i = 0; i < count; i++)
+        if (FAILED(ID2D1DeviceContext6_CreateBitmap(iface,
+                (D2D1_SIZE_U){size.width * (scale >> i), size.height * (scale >> i)},
+                NULL, 0, &props, &levels[i])))
+            goto direct;
+
+    if (!d2d_clip_stack_init(&scratch_clip)) goto direct;
+    target = context->target.object;
+    ID2D1Image_AddRef(target);
+    transform = context->drawing_state.transform;
+    saved_clip = context->clip_stack;
+    dip_width = size.width * 96.0f / context->desc.dpiX;
+    dip_height = size.height * 96.0f / context->desc.dpiY;
+    scaled = transform;
+    scaled._11 *= scale; scaled._12 *= scale;
+    scaled._21 *= scale; scaled._22 *= scale;
+    scaled._31 *= scale; scaled._32 *= scale;
+    context->antialias_rendering = TRUE;
+    /* Caller clips are in destination pixels. Apply them only when compositing the result;
+     * SVG's own balanced clip pushes/pops still operate on the enlarged target. */
+    context->clip_stack = scratch_clip;
+    ID2D1DeviceContext6_SetTarget(iface, (ID2D1Image *)levels[0]);
+    ID2D1DeviceContext6_Clear(iface, &(D2D1_COLOR_F){0});
+    ID2D1DeviceContext6_SetTransform(iface, &scaled);
+    draw(context, data);
+
+    ID2D1DeviceContext6_SetTransform(iface, &identity);
+    for (i = 0; i < count; i++)
+    {
+        unsigned int next_scale = scale >> (i + 1);
+        ID2D1DeviceContext6_SetTarget(iface, i + 1 < count ? (ID2D1Image *)levels[i + 1] : target);
+        if (i + 1 < count)
+            ID2D1DeviceContext6_Clear(iface, &(D2D1_COLOR_F){0});
+        else
+        {
+            d2d_clip_stack_cleanup(&context->clip_stack);
+            context->clip_stack = saved_clip;
+        }
+        destination = (D2D1_RECT_F){0, 0, dip_width * next_scale, dip_height * next_scale};
+        ID2D1DeviceContext6_DrawBitmap(iface, (ID2D1Bitmap *)levels[i], &destination, 1.0f,
+                D2D1_INTERPOLATION_MODE_LINEAR, NULL, NULL);
+    }
+    /* The original world transform is already baked into the scratch pixels. */
+    ID2D1DeviceContext6_SetTransform(iface, &transform);
+    context->antialias_rendering = FALSE;
+    ID2D1Image_Release(target);
+    for (i = 0; i < count; i++) ID2D1Bitmap1_Release(levels[i]);
+    return;
+
+direct:
+    for (i = 0; i < ARRAY_SIZE(levels); i++)
+        if (levels[i]) ID2D1Bitmap1_Release(levels[i]);
+    draw(context, data);
+}
+
+struct d2d_antialiased_geometry
+{
+    const struct d2d_geometry *geometry;
+    struct d2d_brush *brush, *opacity_brush;
+    float stroke_width;
+};
+
+static void d2d_draw_geometry_callback(struct d2d_device_context *context, void *data)
+{
+    struct d2d_antialiased_geometry *args = data;
+    d2d_device_context_draw_geometry(context, args->geometry, args->brush, args->stroke_width);
+}
+
 static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext6 *iface,
         ID2D1Geometry *geometry, ID2D1Brush *brush, float stroke_width, ID2D1StrokeStyle *stroke_style)
 {
@@ -1008,7 +1111,13 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext
             stroke_width /= context->drawing_state.transform.m11;
     }
 
-    d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, stroke_width);
+    if (brush_impl && brush_impl->type != D2D_BRUSH_TYPE_BITMAP)
+    {
+        struct d2d_antialiased_geometry args = {geometry_impl, brush_impl, NULL, stroke_width};
+        d2d_device_context_draw_antialiased(context, d2d_draw_geometry_callback, &args);
+    }
+    else
+        d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, stroke_width);
 }
 
 static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
@@ -1106,6 +1215,12 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
     }
 }
 
+static void d2d_fill_geometry_callback(struct d2d_device_context *context, void *data)
+{
+    struct d2d_antialiased_geometry *args = data;
+    d2d_device_context_fill_geometry(context, args->geometry, args->brush, args->opacity_brush);
+}
+
 static void STDMETHODCALLTYPE d2d_device_context_FillGeometry(ID2D1DeviceContext6 *iface,
         ID2D1Geometry *geometry, ID2D1Brush *brush, ID2D1Brush *opacity_brush)
 {
@@ -1133,6 +1248,11 @@ static void STDMETHODCALLTYPE d2d_device_context_FillGeometry(ID2D1DeviceContext
 
     if (context->target.type == D2D_TARGET_COMMAND_LIST)
         d2d_command_list_fill_geometry(context->target.command_list, context, geometry, brush, opacity_brush);
+    else if (brush_impl && brush_impl->type != D2D_BRUSH_TYPE_BITMAP)
+    {
+        struct d2d_antialiased_geometry args = {geometry_impl, brush_impl, opacity_brush_impl, 0};
+        d2d_device_context_draw_antialiased(context, d2d_fill_geometry_callback, &args);
+    }
     else
         d2d_device_context_fill_geometry(context, geometry_impl, brush_impl, opacity_brush_impl);
 }
@@ -1740,7 +1860,7 @@ static void STDMETHODCALLTYPE d2d_device_context_SetAntialiasMode(ID2D1DeviceCon
 {
     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
 
-    TRACE("iface %p, antialias_mode %#x stub!\n", iface, antialias_mode);
+    TRACE("iface %p, antialias_mode %#x.\n", iface, antialias_mode);
 
     if (context->target.type == D2D_TARGET_COMMAND_LIST)
         d2d_command_list_set_antialias_mode(context->target.command_list, antialias_mode);

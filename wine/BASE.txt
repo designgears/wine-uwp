@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     09917a4f7afce3febd7c5aacec669c83ed2f3f6f
-                 msvcp140: export std::get_new_handler on every architecture; propsys: HID device interface keys
+  wine HEAD:     c1c46c4126fd28e4e06f4d33a8fd45c2b27f7108
+                 Antialias SVG and Win2D geometry and filter reduced composition surfaces
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-15T14:30:52Z
+  captured:      2026-10-16T23:31:01Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

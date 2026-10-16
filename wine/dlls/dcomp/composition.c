@@ -635,6 +635,39 @@ static BOOL affine_source( const struct paint_op *op, int px, int py, float *x, 
     return TRUE;
 }
 
+/* Integrate a source pixel footprint when shrinking a surface. Bilinear sampling alone
+ * examines four texels even for a 5:1 reduction, dropping thin strokes and glyph columns.
+ * Keep premultiplied colour and alpha together so transparent edges do not acquire halos. */
+static void sample_bgra_area( const BYTE *bits, int width, int height, int stride,
+                             float cx, float cy, float fw, float fh, BOOL clamp, float out[4] )
+{
+    float left = cx - fw * 0.5f, top = cy - fh * 0.5f;
+    int x0 = fw > 1.0f ? floorf( left ) : floorf( cx - 0.5f );
+    int y0 = fh > 1.0f ? floorf( top ) : floorf( cy - 0.5f );
+    int x1 = fw > 1.0f ? ceilf( left + fw ) : x0 + 2;
+    int y1 = fh > 1.0f ? ceilf( top + fh ) : y0 + 2;
+    int x, y, c;
+
+    memset( out, 0, 4 * sizeof(*out) );
+    for (y = y0; y < y1; y++)
+    {
+        float wy = fh > 1.0f ? (min( y + 1.0f, top + fh ) - max( (float)y, top )) / fh
+                             : (y == y0 ? 1.0f - (cy - 0.5f - y0) : cy - 0.5f - y0);
+        int sy = clamp ? max( 0, min( height - 1, y ) ) : y;
+        if (sy < 0 || sy >= height || wy <= 0.0f) continue;
+        for (x = x0; x < x1; x++)
+        {
+            float wx = fw > 1.0f ? (min( x + 1.0f, left + fw ) - max( (float)x, left )) / fw
+                                 : (x == x0 ? 1.0f - (cx - 0.5f - x0) : cx - 0.5f - x0);
+            int sx = clamp ? max( 0, min( width - 1, x ) ) : x;
+            const BYTE *pixel;
+            if (sx < 0 || sx >= width || wx <= 0.0f) continue;
+            pixel = bits + (size_t)sy * stride + (size_t)sx * 4;
+            for (c = 0; c < 4; c++) out[c] += pixel[c] * wx * wy;
+        }
+    }
+}
+
 /* OP_BLEND under a general rotation: bilinear samples of the premultiplied source, rows stride bytes apart */
 static void raster_blend_affine( BYTE *target, int target_w, const struct paint_op *op, const RECT *clip, int stride )
 {
@@ -654,18 +687,29 @@ static void raster_blend_affine( BYTE *target, int target_w, const struct paint_
             u = (lx - op->odest.left) * kx - 0.5f;
             v = (ly - op->odest.top) * ky - 0.5f;
             if (u < -1.0f || v < -1.0f || u >= op->src_w || v >= op->src_h) continue;
-            iu = (int)floorf( u ); iv = (int)floorf( v );
-            fu = u - iu; fv = v - iv;
-            for (j = 0; j < 2; j++)
-                for (k = 0; k < 2; k++)
-                {
-                    int sx = iu + k, sy = iv + j;
-                    float wgt = (k ? fu : 1.0f - fu) * (j ? fv : 1.0f - fv);
-                    const BYTE *in;
-                    if (sx < 0 || sy < 0 || sx >= op->src_w || sy >= op->src_h || wgt <= 0.0f) continue;
-                    in = op->bits + (size_t)sy * stride + (size_t)sx * 4;
-                    acc[0] += in[0] * wgt; acc[1] += in[1] * wgt; acc[2] += in[2] * wgt; acc[3] += in[3] * wgt;
-                }
+            /* Axis-aligned minification needs the complete source footprint. Keep the
+             * existing bilinear path for rotations, magnification and very large footprints. */
+            if (fabsf( op->xf[1] ) < 1e-6f && fabsf( op->xf[2] ) < 1e-6f
+                    && fabsf( op->xf[0] ) > 1e-6f && fabsf( op->xf[3] ) > 1e-6f
+                    && (kx / fabsf( op->xf[0] ) > 1.25f || ky / fabsf( op->xf[3] ) > 1.25f)
+                    && kx / fabsf( op->xf[0] ) <= 64.0f && ky / fabsf( op->xf[3] ) <= 64.0f)
+                sample_bgra_area( op->bits, op->src_w, op->src_h, stride, u + 0.5f, v + 0.5f,
+                        kx / fabsf( op->xf[0] ), ky / fabsf( op->xf[3] ), FALSE, acc );
+            else
+            {
+                iu = (int)floorf( u ); iv = (int)floorf( v );
+                fu = u - iu; fv = v - iv;
+                for (j = 0; j < 2; j++)
+                    for (k = 0; k < 2; k++)
+                    {
+                        int sx = iu + k, sy = iv + j;
+                        float wgt = (k ? fu : 1.0f - fu) * (j ? fv : 1.0f - fv);
+                        const BYTE *in;
+                        if (sx < 0 || sy < 0 || sx >= op->src_w || sy >= op->src_h || wgt <= 0.0f) continue;
+                        in = op->bits + (size_t)sy * stride + (size_t)sx * 4;
+                        acc[0] += in[0] * wgt; acc[1] += in[1] * wgt; acc[2] += in[2] * wgt; acc[3] += in[3] * wgt;
+                    }
+            }
             a = DIV255( (unsigned int)(acc[3] + 0.5f) * op->alpha );
             if (!a) continue;
             inv = 255 - a;
@@ -1013,14 +1057,11 @@ static void raster_ops( HDC dc, BYTE *target, int target_w, const struct paint_l
                                        (int)dib.dsBm.bmWidth, (int)dib.dsBm.bmHeight );
                 break;
             }
-            /* A real scale is sampled bilinearly, as DWM does: GdiAlphaBlend picks the nearest pixel, and text drawn at
-             * a scale near 1 lost whole columns of its glyphs - Settings' labels read "Languagc" and "Shaor3D" for the
-             * half second its open animation eased from 0.99 to 1. Swap chain frames keep the fast path. */
+            /* GdiAlphaBlend picks the nearest pixel. Bilinear sampling keeps scaled icons and images smooth, and also
+             * avoids dropping whole glyph columns as text surfaces pass through an animated scale. Near-1:1 animation
+             * sizes are snapped above to preserve the text's original rasterization. Swap-chain frames keep the fast
+             * path because their contents are already rendered at the target size. */
             if (!op->swapchain && (op->dest.right - op->dest.left != op->src_w || op->dest.bottom - op->dest.top != op->src_h) &&
-                /* only the scales an open or close animation passes through; real resizes (icons, thumbnails) keep
-                 * the sampling they have always had */
-                (op->snap || (op->dest.right - op->dest.left >= op->src_w * 9 / 10 && op->dest.right - op->dest.left <= op->src_w * 11 / 10 &&
-                              op->dest.bottom - op->dest.top >= op->src_h * 9 / 10 && op->dest.bottom - op->dest.top <= op->src_h * 11 / 10)) &&
                 GetObjectW( op->bmp, sizeof(dib), &dib ) == sizeof(dib) && dib.dsBm.bmBits && dib.dsBm.bmBitsPixel == 32 &&
                 dib.dsBm.bmWidth >= op->src_w && dib.dsBm.bmHeight >= op->src_h)
             {
@@ -4776,7 +4817,9 @@ static HRESULT WINAPI surface_brush_get_BitmapInterpolationMode( void *iface, in
 }
 static HRESULT WINAPI surface_brush_put_BitmapInterpolationMode( void *iface, int value )
 {
-    surface_brush_from( iface )->interpolation = value;
+    struct surface_brush *brush = surface_brush_from( iface );
+    brush->interpolation = value;
+    surface_brush_changed( brush );
     return S_OK;
 }
 static HRESULT WINAPI surface_brush_get_HorizontalAlignmentRatio( void *iface, float *value )
@@ -4974,15 +5017,49 @@ static BOOL surface_brush_mapping( void *brush_iface, float w, float h, UINT sw,
 }
 
 /* A premultiplied BGRA sample of the surface at a mapped point, or transparent outside it. */
-static inline const BYTE *surface_sample( const BYTE *pixels, UINT sw, UINT sh, const float m[6], unsigned int dx,
-                                          unsigned int dy )
+static inline void surface_sample( const BYTE *pixels, UINT sw, UINT sh, const float m[6], unsigned int dx,
+                                   unsigned int dy, int interpolation, BYTE out[4] )
 {
-    static const BYTE clear[4];
     float fx = m[0] * (dx + 0.5f) + m[2] * (dy + 0.5f) + m[4], fy = m[1] * (dx + 0.5f) + m[3] * (dy + 0.5f) + m[5];
-    int sx = (int)floorf( fx ), sy = (int)floorf( fy );
+    int sx, sy, i;
 
-    if (sx < 0 || sy < 0 || sx >= (int)sw || sy >= (int)sh) return clear;
-    return pixels + ((size_t)sy * sw + sx) * 4;
+    if (fx < 0.0f || fy < 0.0f || fx >= sw || fy >= sh || !sw || !sh)
+    {
+        memset( out, 0, 4 );
+        return;
+    }
+    if (interpolation != 1) /* CompositionBitmapInterpolationMode_Linear */
+    {
+        sx = (int)floorf( fx ); sy = (int)floorf( fy );
+        memcpy( out, pixels + ((size_t)sy * sw + sx) * 4, 4 );
+        return;
+    }
+    if (fabsf( m[1] ) < 1e-6f && fabsf( m[2] ) < 1e-6f
+            && (fabsf( m[0] ) > 1.25f || fabsf( m[3] ) > 1.25f)
+            && fabsf( m[0] ) <= 64.0f && fabsf( m[3] ) <= 64.0f)
+    {
+        float accum[4];
+        sample_bgra_area( pixels, sw, sh, sw * 4, fx, fy, fabsf( m[0] ), fabsf( m[3] ), TRUE, accum );
+        for (i = 0; i < 4; i++) out[i] = (BYTE)(accum[i] + 0.5f);
+        return;
+    }
+    {
+        float u = fx - 0.5f, v = fy - 0.5f, accum[4] = { 0 };
+        int x0 = (int)floorf( u ), y0 = (int)floorf( v ), x, y, n = 0;
+        float tx = u - x0, ty = v - y0;
+        for (y = 0; y < 2; y++)
+            for (x = 0; x < 2; x++, n++)
+            {
+                int px = x0 + x, py = y0 + y, c;
+                float weight = (x ? tx : 1.0f - tx) * (y ? ty : 1.0f - ty);
+                const BYTE *sample;
+                if (px < 0) px = 0; else if (px >= (int)sw) px = sw - 1;
+                if (py < 0) py = 0; else if (py >= (int)sh) py = sh - 1;
+                sample = pixels + ((size_t)py * sw + px) * 4;
+                for (c = 0; c < 4; c++) accum[c] += sample[c] * weight;
+            }
+        for (i = 0; i < 4; i++) out[i] = (BYTE)(accum[i] + 0.5f);
+    }
 }
 
 /* A DropShadow with real property storage. IDropShadow {cb977c07-a154-4851-85e7-a8924c84fad8} slots:
@@ -5110,6 +5187,7 @@ static HRESULT create_surface_brush( void *surface_iface, void **out )
     brush->kind = "SurfaceBrush";
     brush->ref = 1;
     brush->stretch = 1;
+    brush->interpolation = 1; /* XAML's CompositionSurfaceBrush default is linear. */
     brush->halign = brush->valign = 0.5f;
     brush->scale.X = brush->scale.Y = 1.0f;
     brush->transform.M11 = brush->transform.M22 = 1.0f;
@@ -19499,8 +19577,8 @@ static BOOL paint_mapped_surface( HDC hdc, void *brush_iface, struct drawing_sur
         brush->cache_bits = bits;
         for (py = 0; py < (unsigned int)height; py++)
             for (px = 0; px < (unsigned int)width; px++)
-                memcpy( brush->cache_bits + ((size_t)py * width + px) * 4,
-                        surface_sample( pixels, desc.Width, desc.Height, m, px, py ), 4 );
+                surface_sample( pixels, desc.Width, desc.Height, m, px, py, brush->interpolation,
+                                brush->cache_bits + ((size_t)py * width + px) * 4 );
         brush->cache_w = width;
         brush->cache_h = height;
         brush->cache_source_gen = surface->generation;
@@ -19649,8 +19727,16 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
                 else if (mapped || (px < source_desc.Width && py < source_desc.Height))
                 {
                     /* source surfaces hold premultiplied BGRA */
-                    const BYTE *in = mapped ? surface_sample( source, source_desc.Width, source_desc.Height, smap, px, py )
-                                            : source + ((size_t)py * source_desc.Width + px) * 4;
+                    BYTE sampled[4];
+                    const BYTE *in = source + ((size_t)py * source_desc.Width + px) * 4;
+                    if (mapped)
+                    {
+                        int interpolation = (*(void ***)src == (void **)surface_brush_vtbl)
+                                                ? surface_brush_from( src )->interpolation : 1;
+                        surface_sample( source, source_desc.Width, source_desc.Height, smap, px, py, interpolation,
+                                        sampled );
+                        in = sampled;
+                    }
                     BYTE blended[4];
                     if (have_blend)
                     {
