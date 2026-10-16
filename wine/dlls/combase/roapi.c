@@ -645,6 +645,14 @@ HRESULT WINAPI DECLSPEC_HOTPATCH RoGetActivationFactory(HSTRING classid, REFIID 
             hr = E_FAIL;
             goto done;
         }
+        /* Cached before the factory is made, and the module kept loaded: a factory's creation can activate another
+         * class of the same module (Windows.UI.Xaml.Controls' CommandBarFlyout asks for TextCommandBarFlyout, holding
+         * XAML's g_csStatic). That nested request then went to LoadLibraryW again, which takes the loader lock even
+         * for a loaded module, while another thread held the loader lock in a DllMain waiting for g_csStatic: the
+         * Xbox app's intermittent blue start-up (ReactNativeGameStreaming.dll's DllMain). Windows does not take the
+         * loader lock for a module that is already loaded. */
+        if (!library_cache_add(library, pDllGetActivationFactory)) FreeLibrary(module);
+        module = NULL;
     }
 
     TRACE("Found library %s for class %s\n", debugstr_w(library), debugstr_hstring(classid));
@@ -658,9 +666,6 @@ HRESULT WINAPI DECLSPEC_HOTPATCH RoGetActivationFactory(HSTRING classid, REFIID 
             TRACE("Created interface %p\n", *class_factory);
             wrap_core_application(name, iid, class_factory);
             if (name) factory_cache_add(name, factory);
-            /* the module stays loaded, as before: the cached factory lives in it */
-            if (module) library_cache_add(library, pDllGetActivationFactory);
-            module = NULL;
         }
         IActivationFactory_Release(factory);
     }

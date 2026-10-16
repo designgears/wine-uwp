@@ -11617,3 +11617,17 @@ protocol reference only, no code taken, and never run against the account - see 
 
 Self-tests: `probe-xboxauth.exe windev` (steps 1-3) and `license <content id>` (step 5 plus the key unwrap),
 which print shapes only, never a token or key.
+
+### The Xbox app's blue start-up: a combase/loader-lock deadlock (10-15, night)
+
+Two start-ups in a few came up blue with `blocked by <tid> (in DllMain of L"ReactNativeGameStreaming.dll")`.
+Inspected in place (`probe-threads.exe`, `probe-peek.exe`, XAML's PDB `.syms`), not restarted away:
+- `0508` was in `ReactNativeGameStreaming.dll`'s DllMain (activating `ReactNativeGameStreaming.ReactPackageProvider`
+  loaded it), holding the loader lock, waiting in `RtlWaitOnAddress` on XAML's `g_csStatic` (+0xfd05f0).
+- `g_csStatic`'s owner was `03f4`, React Native's UI thread: `CommandBarFlyout`'s factory in
+  `Windows.UI.Xaml.Controls.dll`, holding `g_csStatic`, activated `TextCommandBarFlyout` from the same module.
+- Our combase put a library in its cache only after the outer activation finished, so the nested one called
+  `LoadLibraryW` on the loaded module, and Wine's loader takes the loader lock even then (Windows does not).
+Fix (`dlls/combase/roapi.c`): cache `DllGetActivationFactory` as soon as it is found, keeping the module loaded.
+Regression on the private build: calc AE 0, mp 2250, sol 0/3. The Wine-side root (LdrLoadDll / LdrGetDllHandle taking
+`loader_section` for an already-loaded module) is still there for any other caller.
