@@ -43,6 +43,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 
 ARCH = "x64"
 
@@ -201,6 +202,275 @@ class Slice(io.RawIOBase):
         super().close()
 
 
+# ---- encrypted packages (EAppx / EMsix): the Store's DRM container -------------------------------------------------
+#
+# Layout (little-endian): a header (magic EXPH for a package, EXBH for a bundle; offsets of a footer table, the
+# signature and code integrity blobs, the block map's file id, the key ids, the package full name), the files back to
+# back, and the footer table: 40 bytes per file with its key index (0xffff = not encrypted), compression (1 = raw
+# DEFLATE), file id, offset, and uncompressed and stored lengths. The block map (AppxBlockMap.xml, never encrypted)
+# names the files; its Id attributes are the file ids in hex. A bundle's members are EXPH packages stored whole.
+#
+# An encrypted file is XTS-AES-128 in 512-byte data units, padded on disk to a whole unit, and DEFLATE-compressed
+# after encryption when compressed. The 32-byte content key is the data key then the tweak key; unit i of a file has
+# the tweak (T + i) as a 128-bit little-endian number, T being the four 8-byte quarters of SHA-256("\" + name, then
+# the lower-case family name "<name>_<publisher id>", both UTF-16LE) XORed together. Content keys come from the
+# Store's licence for the package (shims/xboxauth/windevice.inc fetches them for the Xbox app).
+
+EAPPX_MAGICS = (b"EXPH", b"EXBH")
+EAPPX_HEADER = struct.Struct("<4sHQQQQQHIIQHIIQIH")
+EAPPX_FOOTER = struct.Struct("<HHHHQQQQ")
+
+
+class _Xts:
+    """XTS-AES-128 decryption through the host's libcrypto (OpenSSL), one call per 512-byte unit."""
+
+    def __init__(self, key):
+        import ctypes
+        import ctypes.util
+        name = ctypes.util.find_library("crypto")
+        if not name:
+            raise SystemExit("decrypting this package needs the host's OpenSSL (libcrypto), which was not found")
+        lc = ctypes.CDLL(name)
+        lc.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
+        lc.EVP_aes_128_xts.restype = ctypes.c_void_p
+        lc.EVP_DecryptInit_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p,
+                                          ctypes.c_char_p]
+        lc.EVP_DecryptUpdate.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+                                         ctypes.c_void_p, ctypes.c_int]
+        self.ct, self.lc = ctypes, lc
+        self.ctx = lc.EVP_CIPHER_CTX_new()
+        if lc.EVP_DecryptInit_ex(self.ctx, lc.EVP_aes_128_xts(), None, key, None) != 1:
+            raise SystemExit("libcrypto refused the content key")
+        self.n = ctypes.c_int()
+
+    def decrypt(self, data, tweak, unit):
+        """data: whole 512-byte units, the first being unit number `unit` of a file with tweak base `tweak`."""
+        ct, lc, ctx = self.ct, self.lc, self.ctx
+        src = bytearray(data)
+        out = bytearray(len(src))
+        sbase = ct.addressof((ct.c_char * len(src)).from_buffer(src))
+        obase = ct.addressof((ct.c_char * len(out)).from_buffer(out))
+        init, update, n = lc.EVP_DecryptInit_ex, lc.EVP_DecryptUpdate, ct.byref(self.n)
+        mask = (1 << 128) - 1
+        for off in range(0, len(src), 512):
+            iv = ((tweak + unit + off // 512) & mask).to_bytes(16, "little")
+            if init(ctx, None, None, None, iv) != 1 or update(ctx, obase + off, n, sbase + off, min(512, len(src) - off)) != 1:
+                raise SystemExit("decryption failed")
+        return bytes(out)
+
+
+def _eappx_tweak(name, family):
+    h = hashlib.sha256(("\\" + name.lstrip("\\")).encode("utf-16le") + family.lower().encode("utf-16le")).digest()
+    q = [int.from_bytes(h[i:i + 8], "little") for i in range(0, 32, 8)]
+    return q[0] ^ q[1] ^ q[2] ^ q[3]
+
+
+def content_keys():
+    """The content keys handed to the installer: "keyid:key;..." (hex) in WINE_UWP_CONTENT_KEYS, or --keys FILE with
+    "keyid key" lines. Key ids are the 16 bytes the licence names them by."""
+    keys = {}
+    text = os.environ.pop("WINE_UWP_CONTENT_KEYS", "")
+    for item in text.split(";"):
+        if ":" in item:
+            kid, key = item.split(":", 1)
+            keys[bytes.fromhex(kid)] = bytes.fromhex(key)
+    if "--keys" in sys.argv:
+        src = sys.argv[sys.argv.index("--keys") + 1]
+        # "-": one "keyid:key;..." line on stdin (how the Xbox app's Gaming Services stand-in passes them)
+        lines = [sys.stdin.readline()] if src == "-" else open(src).read().splitlines()
+        for line in lines:
+            for item in line.replace(";", "\n").splitlines():
+                parts = item.replace(":", " ").split()
+                if len(parts) >= 2:
+                    keys[bytes.fromhex(parts[0])] = bytes.fromhex(parts[1])
+    return keys
+
+
+class _EAppxMember:
+    def __init__(self, name, size, footer, encrypted):
+        self.name, self.file_size, self.footer, self.encrypted = name, size, footer, encrypted
+        # what install-app.py's zip code expects: names with "/" and percent-encoding undone by extract()
+        self.filename = name.replace("\\", "/").replace("%", "%25")
+
+    def is_dir(self):
+        return False
+
+
+class _EAppxReader(io.RawIOBase):
+    """One file of an EAppx package, read sequentially: stored bytes, inflated, decrypted, cut to its size."""
+
+    CHUNK = 4 << 20
+
+    def __init__(self, pkg, m):
+        self.pkg, self.m = pkg, m
+        fid, off, ulen, slen, kidx, comp = m.footer
+        self.left = m.file_size
+        stored = slen
+        if kidx != 0xFFFF and comp != 1:
+            stored = (slen + 511) // 512 * 512      # an encrypted file is padded to a whole unit
+        self.src = Slice(pkg.path, pkg.base + off, stored) if pkg.path is not None else None
+        self.inflate = zlib.decompressobj(-15) if comp == 1 else None
+        self.xts = pkg.cipher(kidx) if kidx != 0xFFFF else None
+        self.tweak = _eappx_tweak(m.name, pkg.family) if self.xts else 0
+        self.unit = 0
+        self.pending = b""      # inflated or stored bytes not yet decrypted (less than a unit)
+        self.out = b""
+
+    def readable(self):
+        return True
+
+    def _more(self):
+        raw = self.src.read(self.CHUNK)
+        if not raw:
+            if self.inflate:
+                raw = self.inflate.flush()
+                self.inflate = None
+            if not raw:
+                if self.pending and self.xts:
+                    data, self.pending = self.pending + b"\0" * (-len(self.pending) % 512), b""
+                    self.out += self.xts.decrypt(data, self.tweak, self.unit)
+                    return True
+                return False
+        elif self.inflate:
+            raw = self.inflate.decompress(raw)
+        if not self.xts:
+            self.out += raw
+            return True
+        data = self.pending + raw
+        whole = len(data) // 512 * 512
+        self.pending = data[whole:]
+        if whole:
+            self.out += self.xts.decrypt(data[:whole], self.tweak, self.unit)
+            self.unit += whole // 512
+        return True
+
+    def readinto(self, buf):
+        while not self.out and self.left and self._more():
+            pass
+        n = min(len(buf), len(self.out), self.left)
+        buf[:n] = self.out[:n]
+        self.out = self.out[n:]
+        self.left -= n
+        return n
+
+    def close(self):
+        if self.src:
+            self.src.close()
+        super().close()
+
+
+class EAppxPackage:
+    """An EXPH package, at `base` inside `path` (a file or URL), with the zipfile methods install-app.py uses."""
+
+    def __init__(self, path, base=0):
+        self.path, self.base = path, base
+        with open_raw(path) as f:
+            f.seek(base)
+            head = f.read(8192)
+            h = EAPPX_HEADER.unpack_from(head, 0)
+            magic, foff, flen, bm_id, kcount = h[0], h[3], h[4], h[14], h[16]
+            if magic != b"EXPH":
+                raise SystemExit(f"not an encrypted package (magic {magic!r})")
+            self.key_ids = [head[88 + 32 * i:120 + 32 * i] for i in range(kcount)]
+            p = 88 + 32 * kcount
+            _, nbytes = struct.unpack_from("<HH", head, p)
+            self.full_name = head[p + 4:p + 4 + nbytes].decode("utf-16le")
+            parts = self.full_name.split("_")
+            self.family = f"{parts[0]}_{parts[-1]}"
+            f.seek(base + foff)
+            table = f.read(flen)
+        self.footers = {}
+        for i in range(flen // EAPPX_FOOTER.size):
+            _, _, kidx, comp, fid, off, ulen, slen = EAPPX_FOOTER.unpack_from(table, i * EAPPX_FOOTER.size)
+            self.footers[fid] = (fid, off, ulen, slen, kidx, comp)
+        self.keys, self.ciphers = content_keys(), {}
+        bm = self._read_raw(self.footers[bm_id])
+        self.blockmap = bm
+        self.members = []
+        for e in ET.fromstring(bm):
+            if local(e.tag) != "File":
+                continue
+            fid = int(e.get("Id"), 16)
+            self.members.append(_EAppxMember(e.get("Name"), int(e.get("Size")), self.footers[fid],
+                                             e.get("Encrypted", "false") == "true"))
+
+    def _read_raw(self, footer):
+        fid, off, ulen, slen, kidx, comp = footer
+        with Slice(self.path, self.base + off, slen) as s:
+            data = s.read()
+        return zlib.decompress(data, -15) if comp == 1 else data
+
+    def cipher(self, kidx):
+        if kidx not in self.ciphers:
+            kid = self.key_ids[kidx][:16]
+            if kid not in self.keys:
+                raise SystemExit(f"{self.full_name} is encrypted and its content key ({kid.hex()}) was not given; "
+                                 "it comes with the Store licence")
+            self.ciphers[kidx] = _Xts(self.keys[kid])
+        return self.ciphers[kidx]
+
+    def namelist(self):
+        return [m.filename for m in self.members]
+
+    def infolist(self):
+        return list(self.members)
+
+    def getinfo(self, name):
+        return next(m for m in self.members if m.filename == name)
+
+    def open(self, m):
+        if isinstance(m, str):
+            m = self.getinfo(m)
+        return io.BufferedReader(_EAppxReader(self, m), 1 << 20)
+
+    def read(self, name):
+        with self.open(name) as f:
+            return f.read()
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+def open_eappx(path):
+    """An encrypted package or bundle: the bundle's x64 application package. None if `path` is not one."""
+    with open_raw(path) as f:
+        head = f.read(8192)
+    if head[:4] not in EAPPX_MAGICS:
+        return None
+    if head[:4] == b"EXPH":
+        return EAppxPackage(path)
+    h = EAPPX_HEADER.unpack_from(head, 0)
+    foff, flen, bm_id = h[3], h[4], h[14]
+    with open_raw(path) as f:
+        f.seek(foff)
+        table = f.read(flen)
+        footers = [EAPPX_FOOTER.unpack(table[i:i + 40]) for i in range(0, flen, 40)]
+        files = {}
+        for _, _, kidx, comp, fid, off, ulen, slen in footers:
+            files[fid] = (off, slen, comp)
+        off, slen, comp = files[bm_id]
+        f.seek(off)
+        bm = f.read(slen)
+        bm = zlib.decompress(bm, -15) if comp == 1 else bm
+        manifest_id = next(int(e.get("Id"), 16) for e in ET.fromstring(bm)
+                           if local(e.tag) == "File" and e.get("Name", "").lower() == "appxmetadata\\appxbundlemanifest.xml")
+        off, slen, comp = files[manifest_id]
+        f.seek(off)
+        data = f.read(slen)
+    root = ET.fromstring(zlib.decompress(data, -15) if comp == 1 else data)
+    for pkg in children(root, "Package"):
+        if pkg.get("Type", "application").lower() == "application" and pkg.get("Architecture", "").lower() == ARCH:
+            return EAppxPackage(path, int(pkg.get("Offset")))
+    archs = sorted({p.get("Architecture", "?") for p in children(root, "Package")})
+    raise SystemExit(f"this bundle has no {ARCH} application package (it has: {', '.join(archs)})")
+
+
 def pick_from_bundle(path, bundle, tmp):
     """The x64 application package inside a bundle: read in place when it is stored uncompressed (bundles store
     their packages that way), extracted to tmp otherwise. A file-like object or path, or None if not a bundle."""
@@ -318,6 +588,9 @@ def find_framework(dirs, name, min_version, publisher, older=False):
 
 
 def open_package(path, tmp):
+    eappx = open_eappx(path)
+    if eappx:
+        return eappx
     try:
         outer = zipfile.ZipFile(open_raw(path))
     except (zipfile.BadZipFile, FileNotFoundError, IsADirectoryError):
@@ -365,6 +638,8 @@ def main():
     ap.add_argument("--latest", action="store_true",
                     help="PACKAGE is an .appinstaller (file or URL): print the version it offers, install nothing")
     ap.add_argument("--stage", help="stage directory name (default: the package name's last part, lowercased)")
+    ap.add_argument("--keys", help="an encrypted package's content keys: a file of \"keyid key\" hex lines, or - for "
+                    "one \"keyid:key;...\" line on stdin")
     args = ap.parse_args()
     if args.latest:
         print(read_appinstaller(args.package)["version"] or "")

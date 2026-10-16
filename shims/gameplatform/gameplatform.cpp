@@ -685,7 +685,7 @@ static std::string http_get(const wchar_t *host, const std::wstring &path, DWORD
     return out;
 }
 
-struct ProductDetails { GUID content_id = {}; std::wstring family, store_id, wu_category; UINT64 size = 0; INT32 type = 2; bool uwp = true; bool found = false; };
+struct ProductDetails { GUID content_id = {}; std::wstring family, store_id, wu_category; UINT64 size = 0; INT32 type = 2; bool uwp = true, encrypted = false; bool found = false; };
 
 static std::wstring wide(const std::string &s)
 {
@@ -745,13 +745,15 @@ static ProductDetails query_product(const std::wstring &id)
             if (!d.size) d.size = (UINT64)pk["MaxDownloadSizeInBytes"].n;
             std::string fmt = pk["PackageFormat"].str();
             d.uwp = fmt.find("Xvc") == std::string::npos && fmt.find("XVC") == std::string::npos;
+            /* EAppx, EAppxBundle, EMsix, EMsixBundle: DRM-encrypted, the keys come with the licence */
+            d.encrypted = d.uwp && (fmt.compare(0, 5, "EAppx") == 0 || fmt.compare(0, 5, "EMsix") == 0);
             d.found = true;
             break;
         }
     }
     if (!d.found) { d.found = true; tracef("Store.QueryProductDetails(%ls): no package for the desktop", id.c_str()); }
-    tracef("Store.QueryProductDetails(%ls) -> %s, family %ls, %llu bytes, %s", id.c_str(), kind.c_str(), d.family.c_str(),
-           (unsigned long long)d.size, d.uwp ? "UWP" : "not UWP");
+    tracef("Store.QueryProductDetails(%ls) -> %s, family %ls, %llu bytes, %s%s", id.c_str(), kind.c_str(), d.family.c_str(),
+           (unsigned long long)d.size, d.uwp ? "UWP" : "not UWP", d.encrypted ? ", encrypted" : "");
     AcquireSRWLockExclusive(&lock);
     cache[id] = d;
     ReleaseSRWLockExclusive(&lock);

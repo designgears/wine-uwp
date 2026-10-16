@@ -759,7 +759,7 @@ static HRESULT content_keys(const std::string &content_id, const std::string &ma
                                   "User-Agent: XboxLm-PC/Microsoft.GamingServices_32.107.4002.0_x64__8wekyb3d8bbwe" },
                                 body, resp);
     Json j = parse_json(resp);
-    const Json &value = j["license"]["keys"][0]["value"];
+    const Json &value = j["license"]["keys"].at(0)["value"];
     if (status != 200 || value.str().empty())
     {
         trace("windev: licence for %s: HTTP %lu: %.500s", content_id.c_str(), status, resp.c_str());

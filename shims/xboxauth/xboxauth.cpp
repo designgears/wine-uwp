@@ -3449,6 +3449,44 @@ extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthHttpGet(const char *url,
  *   "devicecode"        obtains a device code and stops (no browser, no polling)
  *   "silent"            silent sign-in from the stored refresh token, then the profile claims
  *   "msascope <scope>"  a Microsoft account token for a scope (WebAuthenticationCoreManager's path) */
+/* The content keys of an encrypted Store package (content id from the catalogue, e.g.
+ * "98e628bf-0441-9750-8acb-c7414a14911c"), as "keyid:key;..." in hex for wine-uwp's installer. Used by
+ * shims/gameplatform when the Xbox app installs an EAppx/EMsix package. */
+extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthContentKeys(const char *content_id, const char *market, char *out,
+                                                                     UINT32 size)
+{
+    std::vector<ContentKey> keys;
+    std::string s;
+    account_init();
+    {
+        EnterCriticalSection(&account.cs);
+        bool have = !account.refresh_token.empty();
+        LeaveCriticalSection(&account.cs);
+        if (!have)
+        {
+            auto kv = store_read();
+            EnterCriticalSection(&account.cs);
+            if (account.refresh_token.empty()) account.refresh_token = kv["refresh_token"];
+            LeaveCriticalSection(&account.cs);
+        }
+    }
+    HRESULT hr = content_keys(content_id ? content_id : "", market && *market ? market : "US", keys, nullptr);
+    if (FAILED(hr)) return hr;
+    for (auto &k : keys)
+    {
+        char b[3];
+        for (unsigned char c : k.id) { sprintf(b, "%02x", c); s += b; }
+        s += ':';
+        for (unsigned char c : k.key) { sprintf(b, "%02x", c); s += b; }
+        s += ';';
+        SecureZeroMemory(&k.key[0], k.key.size());
+    }
+    if (!out || s.size() + 1 > size) { SecureZeroMemory(&s[0], s.size()); return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER); }
+    memcpy(out, s.c_str(), s.size() + 1);
+    SecureZeroMemory(&s[0], s.size());
+    return S_OK;
+}
+
 extern "C" __declspec(dllexport) int WINAPI XboxAuthSelfTest(const char *what, const char *arg)
 {
     account_init();
@@ -3602,6 +3640,22 @@ extern "C" __declspec(dllexport) int WINAPI XboxAuthSelfTest(const char *what, c
             GUID g;
             memcpy(&g, k.id.data(), 16);
             trace("  key {%08lx-%04x-%04x-...} %zu bytes", g.Data1, g.Data2, g.Data3, k.key.size());
+        }
+        if (const char *out = getenv("WINE_UWP_KEYFILE"))
+        {
+            /* for testing the decryption only: "keyid key" in hex, one line per key, into a new file */
+            FILE *f = fopen(out, "wx");
+            if (f)
+            {
+                for (auto &k : keys)
+                {
+                    for (unsigned char c : k.id) fprintf(f, "%02x", c);
+                    fputc(' ', f);
+                    for (unsigned char c : k.key) fprintf(f, "%02x", c);
+                    fputc('\n', f);
+                }
+                fclose(f);
+            }
         }
         return SUCCEEDED(hr) ? 0 : 1;
     }

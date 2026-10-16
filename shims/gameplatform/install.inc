@@ -718,7 +718,27 @@ static bool pick_package(const std::vector<Fe3Update> &all, const std::wstring &
 
 /* ---- the install worker ---- */
 
-static HRESULT run_installer(Install *in, const std::string &url, const std::wstring &stage_name, std::wstring &log_out)
+/* An encrypted package's content keys, from the Store licence (shims/xboxauth/windevice.inc), as the installer
+ * takes them: "keyid:key;..." in hex. They go to it in its environment, never into a file or a log. */
+static HRESULT encrypted_package_keys(const GUID &content_id, std::string &keys)
+{
+    typedef HRESULT (WINAPI *content_keys_fn)(const char *, const char *, char *, UINT32);
+    HMODULE auth = LoadLibraryW(L"wineuwp_xboxauth.dll");
+    content_keys_fn fn = auth ? (content_keys_fn)GetProcAddress(auth, "XboxAuthContentKeys") : nullptr;
+    char id[40], buf[4096];
+    if (!fn) { tracef("install: no wineuwp_xboxauth.dll with XboxAuthContentKeys"); return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED); }
+    sprintf(id, "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x", content_id.Data1, content_id.Data2, content_id.Data3,
+            content_id.Data4[0], content_id.Data4[1], content_id.Data4[2], content_id.Data4[3], content_id.Data4[4],
+            content_id.Data4[5], content_id.Data4[6], content_id.Data4[7]);
+    HRESULT hr = fn(id, "US", buf, sizeof(buf));
+    tracef("install: content keys for %s -> %#lx", id, (unsigned long)hr);
+    if (SUCCEEDED(hr)) keys = buf;
+    SecureZeroMemory(buf, sizeof(buf));
+    return hr;
+}
+
+static HRESULT run_installer(Install *in, const std::string &url, const std::wstring &stage_name, std::wstring &log_out,
+                             const std::string &keys = std::string())
 {
     std::wstring data = games_data_unix(), script = env_w(L"WINE_UWP_INSTALLER"), tree = env_w(L"WINE_UWP_WINDOWS_TREE");
     if (data.empty() || script.empty() || tree.empty())
@@ -736,7 +756,30 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
                        L"' --stage '" + stage_name + L"' > '" + log_unix + L"' 2>&1; echo EXIT $? >> '" + log_unix + L"'\"";
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi;
-    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    /* an encrypted package's content keys go to the installer on its stdin (`--keys -`): Wine starts a Unix program
+     * with its own Unix environment, not this process's, and nothing here should write them to a file */
+    HANDLE key_read = nullptr, key_write = nullptr;
+    if (!keys.empty())
+    {
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+        if (!CreatePipe(&key_read, &key_write, &sa, 0)) return HRESULT_FROM_WIN32(GetLastError());
+        SetHandleInformation(key_write, HANDLE_FLAG_INHERIT, 0);
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdInput = key_read;
+        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        cmd.insert(cmd.find(L" --stage '"), L" --keys -");
+    }
+    BOOL started = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, key_read != nullptr, CREATE_NO_WINDOW, nullptr, nullptr,
+                                  &si, &pi);
+    if (key_read)
+    {
+        DWORD written;
+        CloseHandle(key_read);
+        if (started) { std::string line = keys + "\n"; WriteFile(key_write, line.data(), (DWORD)line.size(), &written, nullptr); SecureZeroMemory(&line[0], line.size()); }
+        CloseHandle(key_write);
+    }
+    if (!started)
     {
         tracef("install: cannot start the installer (%lu)", GetLastError());
         return HRESULT_FROM_WIN32(GetLastError());
@@ -858,7 +901,15 @@ static DWORD WINAPI install_thread(void *param)
     stage_name = d.family.substr(0, d.family.find(L'_'));
     stage_name = stage_name.substr(stage_name.rfind(L'.') + 1);
     for (auto &c : stage_name) c = towlower(c);
-    if (FAILED(hr = run_installer(in, url, stage_name, log))) goto done;
+    if (d.encrypted)
+    {
+        std::string keys;
+        if (FAILED(hr = encrypted_package_keys(d.content_id, keys))) goto done;
+        hr = run_installer(in, url, stage_name, log, keys);
+        SecureZeroMemory(&keys[0], keys.size());
+        if (FAILED(hr)) goto done;
+    }
+    else if (FAILED(hr = run_installer(in, url, stage_name, log))) goto done;
     {
         std::wstring dir = unix_to_windows(games_data_unix()) + L"\\stage\\" + stage_name, full, aumid, title;
         read_identity(dir, full, aumid, title);
