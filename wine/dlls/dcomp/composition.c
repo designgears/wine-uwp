@@ -2083,7 +2083,9 @@ static void *expression_animation_vtbl[COMP_OBJECT_SLOTS];
 static ICompositor *last_created_compositor;
 static HRESULT create_composition_object_view( IUnknown *owner, void **out );
 static LONG comp_object_vtbl_ready;
+#ifdef __x86_64__
 static PVOID comp_object_veh;
+#endif
 
 static HRESULT create_comp_object( const char *kind, void **out );
 
@@ -2277,6 +2279,7 @@ static const GUID IID_IAnimationObject_local =
 static HRESULT create_anim_prop_info( void **out );
 static HRESULT create_anim_object_view( IUnknown *owner, void **out );
 
+#ifdef __x86_64__
 /* Soft-return target for execute-at-nullish NX faults (rip < 0x10000). The call already
  * pushed a return address; jumping here with rax=0 makes COM-style callers see S_OK and
  * lets runaway CreateThread(start=2) workers exit cleanly. */
@@ -2352,6 +2355,7 @@ static LONG CALLBACK comp_object_nx_veh( EXCEPTION_POINTERS *info )
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
+#endif
 
 /* ICompositionObject4 {0bb3784c-346b-4a7c-966b-7310966553d5}: slot 6 TryGetAnimationController(name, out).
  * AnimatedIcon calls IAnimationController::Pause (slot 12) on the result without a NULL check, so hand out a
@@ -3644,8 +3648,10 @@ static void *comp_object_slot_fn( unsigned slot )
 /* Install the fault logger once. Also called from DllMain so faults before the first composition object are seen. */
 void dcomp_install_fault_logger(void)
 {
+#ifdef __x86_64__
     if (!comp_object_veh)
         comp_object_veh = AddVectoredExceptionHandler( 1, comp_object_nx_veh );
+#endif
 }
 
 static BOOL is_out_pointer( void *a );
