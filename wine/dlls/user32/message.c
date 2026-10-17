@@ -1240,6 +1240,7 @@ DWORD WINAPI GetQueueStatusForCoreMessaging( UINT flags )
 /* Debugging aid: arm a hardware write watchpoint on WINE_UWP_WATCH for this thread. The UWP view
  * thread reaches here early, before XAML builds its frames, so a stack slot corrupted later reports
  * the writing instruction as a single-step exception in the +seh log. */
+#ifdef __x86_64__
 static ULONG_PTR uwp_watch_addr;
 
 static LONG CALLBACK uwp_watch_handler( EXCEPTION_POINTERS *info )
@@ -1305,6 +1306,11 @@ static void arm_uwp_watchpoint(void)
     if (!n) return;
     if (!SetThreadContext( GetCurrentThread(), &ctx )) ERR( "could not arm breakpoints\n" );
 }
+#else
+static void arm_uwp_watchpoint(void)
+{
+}
+#endif
 
 UINT WINAPI ScheduleCoreMessagingDispatch( HWND hwnd, DWORD priority, WPARAM wparam, LPARAM lparam, UINT *error )
 {
