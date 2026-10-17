@@ -472,7 +472,7 @@ static inline struct stream_socket *impl_from_IStreamSocket( IStreamSocket *ifac
     return CONTAINING_RECORD( iface, struct stream_socket, IStreamSocket_iface );
 }
 
-static HRESULT WINAPI connect_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+static HRESULT connect_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
 {
     struct stream_socket *impl = impl_from_IStreamSocket( (IStreamSocket *)invoker );
     struct socket_op *op = impl_from_IUnknown( param );
@@ -556,7 +556,7 @@ static HRESULT WINAPI connect_callback( IUnknown *invoker, IUnknown *param, PROP
     return hr;
 }
 
-static HRESULT WINAPI read_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+static HRESULT read_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
 {
     struct stream_socket *impl = CONTAINING_RECORD( (IInputStream *)invoker, struct stream_socket, IInputStream_iface );
     struct socket_op *op = impl_from_IUnknown( param );
@@ -585,7 +585,7 @@ static HRESULT WINAPI read_callback( IUnknown *invoker, IUnknown *param, PROPVAR
     return S_OK;
 }
 
-static HRESULT WINAPI write_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+static HRESULT write_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
 {
     struct stream_socket *impl = CONTAINING_RECORD( (IOutputStream *)invoker, struct stream_socket, IOutputStream_iface );
     struct socket_op *op = impl_from_IUnknown( param );
@@ -613,7 +613,7 @@ static HRESULT WINAPI write_callback( IUnknown *invoker, IUnknown *param, PROPVA
     return S_OK;
 }
 
-static HRESULT WINAPI flush_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+static HRESULT flush_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
 {
     result->vt = VT_BOOL;
     result->boolVal = VARIANT_TRUE;
@@ -1175,7 +1175,7 @@ static HRESULT WINAPI stream_socket_ConnectWithProtectionLevelAsync( IStreamSock
     return start_connect( iface, host, service, level, operation );
 }
 
-static HRESULT WINAPI upgrade_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+static HRESULT upgrade_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
 {
     struct stream_socket *impl = impl_from_IStreamSocket( (IStreamSocket *)invoker );
     struct socket_op *op = impl_from_IUnknown( param );
