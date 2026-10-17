@@ -2210,6 +2210,7 @@ NTSTATUS WINAPI NtQueryWnfStateData( const ULONGLONG *state_name, const void *ty
 /* Debugging aid: WINE_UWP_BREAK_WATCH=<hex> turns a breakpoint into "single-step from here until
  * rax holds this value, then say where". It is the only practical way to find which instruction
  * inside a large native function first produces a failing HRESULT. */
+#ifdef __x86_64__
 #define UWP_STEP_HISTORY 256
 
 static ULONG_PTR uwp_step_history[UWP_STEP_HISTORY];
@@ -2397,6 +2398,11 @@ static void arm_uwp_breaks( void )
     }
     if (n) NtSetContextThread( GetCurrentThread(), &ctx );
 }
+#else
+static void arm_uwp_breaks( void )
+{
+}
+#endif
 
 void uwp_rearm_breaks( void )
 {
