@@ -76,6 +76,7 @@ dlls/ntdll/ntsyscalls.h
 dlls/ntdll/resource.c
 dlls/ntdll/rtl.c
 dlls/ntdll/signal_x86_64.c
+dlls/ntdll/unix/signal_x86_64.c
 dlls/ntdll/sync.c
 dlls/ntdll/threadpool.c
 dlls/ntdll/unix/alpc.c

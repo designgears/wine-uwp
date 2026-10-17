@@ -47,6 +47,11 @@ fi
 # only make sense for the calculator, so a different stage carries its own identity file.
 S=${UWP_BIN}/stage/${UWP_STAGE:-calculator}
 cd "$S"
+# EOS's Linux bootstrapper issues native Linux syscalls from its high-address
+# helper. Enable Wine's opt-in interop path before the application process starts.
+if [ -f "$S/EasyAntiCheat/Settings.json" ]; then
+  export WINE_HACK_NATIVE_SYSCALLS=${WINE_HACK_NATIVE_SYSCALLS:-1}
+fi
 # stage-app.sh writes identity.env for packages staged straight out of a Windows install.
 if [ -f "$S/identity.env" ]; then . "$S/identity.env"; fi
 # Package identity consumed by the patched Wine (ntdll/kernelbase read these).

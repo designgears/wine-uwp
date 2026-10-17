@@ -1003,6 +1003,9 @@ def main():
     with open(os.path.join(dest, "launch.env"), "w") as f:
         if os.path.exists(defaults):
             f.write(open(defaults).read())
+        if os.path.isfile(os.path.join(dest, "EasyAntiCheat", "Settings.json")):
+            # Applied by wineuwp-launch before it creates the game process.
+            f.write("export WINE_HACK_NATIVE_SYSCALLS=1\n")
         deps = "".join(f"{d}|{d.split('_')[0]}_{d.rsplit('__', 1)[1]}|{winpath(os.path.join(fw_root, d))};"
                        for d in frameworks)
         f.write(f"export WINE_UWP_PACKAGE_DEPENDENCIES='{deps}'\n")
