@@ -2309,13 +2309,15 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             goto done;
         }
 
-        if (start > address_space_start || end < host_addr_space_limit || top_down)
+        /* Preserve Windows allocation order after exhausting the preloader reservation.
+         * An unconstrained Unix mmap normally returns a high address even for bottom-up allocations. */
+        if ((ptr = map_free_area( start, end, host_size, top_down, unix_prot, align_mask )))
         {
-            if (!(ptr = map_free_area( start, end, host_size, top_down, unix_prot, align_mask )))
-                return STATUS_NO_MEMORY;
             TRACE( "got mem with map_free_area %p-%p\n", ptr, (char *)ptr + size );
             goto done;
         }
+        if (start > address_space_start || end < host_addr_space_limit || top_down)
+            return STATUS_NO_MEMORY;
 
         for (;;)
         {
