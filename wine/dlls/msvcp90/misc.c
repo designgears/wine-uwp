@@ -720,6 +720,9 @@ unsigned int __cdecl _Random_device(void)
 #define MTX_TIMED 0x4
 #define MTX_RECURSIVE 0x100
 #define MTX_LOCKED 3
+#if _MSVCP_VER >= 140
+#define MTX_CS_STORAGE_SIZE (sizeof(void *) == 8 ? 64 : 36)
+#endif
 typedef struct _Mtx_internal
 {
     DWORD flags;
@@ -728,16 +731,16 @@ typedef struct _Mtx_internal
 #endif
     cs cs;
 #if _MSVCP_VER >= 140
-    /* Microsoft's STL reserves 64 bytes after 'flags' for the critical section, so thread_id is at
-     * offset 72 and count at 76 of the 80-byte _Mtx_internal_imp_t. */
-    BYTE pad_to_windows_layout[64 - sizeof(ULONG_PTR) - sizeof(cs)];
+    /* STL's pointer-aligned critical-section storage is 64 bytes on x64 and 36 on x86.
+     * This includes 'unknown' and 'cs' above. */
+    BYTE pad_to_windows_layout[MTX_CS_STORAGE_SIZE - sizeof(ULONG_PTR) - sizeof(cs)];
 #endif
     DWORD thread_id;
     DWORD count;
 } *_Mtx_t;
 #if _MSVCP_VER >= 140
-C_ASSERT(FIELD_OFFSET(struct _Mtx_internal, thread_id) == 72);
-C_ASSERT(sizeof(struct _Mtx_internal) == 80);
+C_ASSERT(FIELD_OFFSET(struct _Mtx_internal, thread_id) == sizeof(void *) + MTX_CS_STORAGE_SIZE);
+C_ASSERT(sizeof(struct _Mtx_internal) == sizeof(void *) + MTX_CS_STORAGE_SIZE + 2 * sizeof(DWORD));
 #endif
 
 #if _MSVCP_VER >= 140
