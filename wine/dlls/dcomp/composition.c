@@ -35,6 +35,7 @@
 #include "windef.h"
 #include "winbase.h"
 #include "wingdi.h"
+#include "winternl.h"
 #include "winuser.h"
 #include "ntuser.h"
 #include "winstring.h"
@@ -9014,7 +9015,14 @@ static void paint_hwnd_targets( void )
         hwnd_target_Release( &list[i]->vtbl );
     }
 }
-DEVICE_CREATE2( CreateSurfaceFromHandle )
+static HRESULT surface_for_handle( HANDLE handle, void **out );
+static HRESULT WINAPI device_CreateSurfaceFromHandle( void *iface, HANDLE handle, void **out )
+{
+    TRACE( "handle %p.\n", handle );
+    if (!out) return E_POINTER;
+    if (SUCCEEDED(surface_for_handle( handle, out ))) return S_OK;
+    return create_comp_object( "CreateSurfaceFromHandle", out );
+}
 DEVICE_CREATE2( CreateSurfaceFromHwnd )
 DEVICE_STUB( CreateSharedResource, ( void *iface, void *a, void *b, void **out ) )
 DEVICE_STUB( OpenSharedResourceHandle, ( void *iface, void *a, void *b ) )
@@ -17169,6 +17177,8 @@ static HRESULT WINAPI compositor_interop_CreateCompositionSurfaceForHandle( ICom
                                                                             HANDLE handle, ICompositionSurface **result )
 {
     TRACE( "handle %p.\n", handle );
+    if (!result) return E_POINTER;
+    if (SUCCEEDED(surface_for_handle( handle, (void **)result ))) return S_OK;
     return create_comp_object( "SurfaceForHandle", (void **)result );
 }
 static HRESULT WINAPI compositor_interop_CreateCompositionSurfaceForSwapChain( ICompositorInterop *iface,
@@ -17491,10 +17501,93 @@ HRESULT WINAPI DCompositionCreateTargetForHandle( HANDLE handle, void **target )
  */
 HRESULT WINAPI DCompositionCreateSurfaceHandle( DWORD access, SECURITY_ATTRIBUTES *sa, HANDLE *handle )
 {
-    FIXME( "access %#lx, sa %p, handle %p: semi-stub.\n", access, sa, handle );
+    TRACE( "access %#lx, sa %p, handle %p.\n", access, sa, handle );
     if (!handle) return E_INVALIDARG;
     if (!(*handle = CreateEventW( sa, TRUE, FALSE, NULL ))) return HRESULT_FROM_WIN32( GetLastError() );
     return S_OK;
+}
+
+/* A surface handle stands for whatever is presented into it. On Windows a producer binds one with
+ * IDXGIFactoryMedia::CreateSwapChainForCompositionSurfaceHandle; Wine's media player makes an
+ * ordinary composition swap chain and binds it here instead. The consumer (XAML's
+ * MediaPlayerPresenter) holds a duplicate of the handle, so lookups compare kernel objects, not
+ * handle values. */
+static struct
+{
+    HANDLE handle;          /* our own duplicate, kept open so the object stays comparable */
+    IUnknown *swapchain;
+} *surface_handles;
+static unsigned int surface_handle_count;
+static CRITICAL_SECTION surface_handle_cs = { NULL, -1, 0, 0, 0, 0 };
+
+/***********************************************************************
+ *      wine_dcomp_bind_surface_handle (dcomp.@)
+ *
+ * Wine-private. Binds (or, with a NULL swapchain, unbinds) a DCompositionCreateSurfaceHandle
+ * handle to a composition swap chain.
+ */
+HRESULT WINAPI wine_dcomp_bind_surface_handle( HANDLE handle, IUnknown *swapchain )
+{
+    HANDLE dup = NULL;
+    unsigned int i;
+    void *list;
+
+    TRACE( "handle %p, swapchain %p.\n", handle, swapchain );
+
+    EnterCriticalSection( &surface_handle_cs );
+    for (i = 0; i < surface_handle_count; i++)
+    {
+        if (NtCompareObjects( surface_handles[i].handle, handle )) continue;
+        CloseHandle( surface_handles[i].handle );
+        IUnknown_Release( surface_handles[i].swapchain );
+        surface_handles[i] = surface_handles[--surface_handle_count];
+        break;
+    }
+    if (swapchain)
+    {
+        if (!DuplicateHandle( GetCurrentProcess(), handle, GetCurrentProcess(), &dup, 0, FALSE,
+                              DUPLICATE_SAME_ACCESS ) ||
+            !(list = realloc( surface_handles, (surface_handle_count + 1) * sizeof(*surface_handles) )))
+        {
+            if (dup) CloseHandle( dup );
+            LeaveCriticalSection( &surface_handle_cs );
+            return E_OUTOFMEMORY;
+        }
+        surface_handles = list;
+        surface_handles[surface_handle_count].handle = dup;
+        surface_handles[surface_handle_count].swapchain = swapchain;
+        IUnknown_AddRef( swapchain );
+        surface_handle_count++;
+    }
+    LeaveCriticalSection( &surface_handle_cs );
+    return S_OK;
+}
+
+static HRESULT surface_for_handle( HANDLE handle, void **out )
+{
+    IUnknown *swapchain = NULL;
+    unsigned int i;
+    HRESULT hr;
+
+    EnterCriticalSection( &surface_handle_cs );
+    for (i = 0; i < surface_handle_count; i++)
+    {
+        if (NtCompareObjects( surface_handles[i].handle, handle )) continue;
+        swapchain = surface_handles[i].swapchain;
+        IUnknown_AddRef( swapchain );
+        break;
+    }
+    LeaveCriticalSection( &surface_handle_cs );
+
+    if (!swapchain)
+    {
+        FIXME( "handle %p is bound to nothing.\n", handle );
+        return E_INVALIDARG;
+    }
+    hr = create_swapchain_surface( swapchain, out );
+    IUnknown_Release( swapchain );
+    TRACE( "handle %p -> surface %p, hr %#lx.\n", handle, *out, hr );
+    return hr;
 }
 
 
