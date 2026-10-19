@@ -9713,6 +9713,124 @@ static inline struct compositor *impl_from_ICompositor( ICompositor *iface )
     return CONTAINING_RECORD( iface, struct compositor, ICompositor_iface );
 }
 
+/* ICompositorRestricted {36af3eb2-0371-49d7-9bb8-9c9414a9229c}: a private compositor interface (Windows' dcomp,
+ * CompositorCommon::Restricted): 3 CreateHoverPointerSource(IVisual *, IHoverPointerSourcePartner **),
+ * 4 GetCommitDeferral(ICompositionCommitDeferralPartner **). XAML's PointerSourceWrapper::Initialize (behind
+ * ElementCompositionPreview.GetPointerPositionPropertySet) asks for a hover pointer source, queries it for
+ * ICompositionObject and references it as "hover" in Vector3(hover.Position). Refusing it failed the call, and the
+ * Microsoft Store's hover light threw InvalidCastException on its UI thread.
+ *
+ * The hover source is backed by one of our property sets holding Position, so the expression has something to read.
+ * Position is not yet updated from the pointer: the light stays at the visual's origin.
+ * IHoverPointerSourcePartner {e38dce56-b424-445d-bc46-04a76960c242}: IUnknown + 3 get_Point(D2D_VECTOR_2F *). */
+static const GUID IID_ICompositorRestricted_private =
+    { 0x36af3eb2, 0x0371, 0x49d7, { 0x9b, 0xb8, 0x9c, 0x94, 0x14, 0xa9, 0x22, 0x9c } };
+static const GUID IID_IHoverPointerSourcePartner_private =
+    { 0xe38dce56, 0xb424, 0x445d, { 0xbc, 0x46, 0x04, 0xa7, 0x69, 0x60, 0xc2, 0x42 } };
+
+struct hover_source
+{
+    const void **vtbl;
+    LONG ref;
+    ICompositionPropertySet *props;
+};
+
+static HRESULT WINAPI hover_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct hover_source *impl = iface;
+
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IHoverPointerSourcePartner_private ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = impl;
+        return S_OK;
+    }
+    /* everything a composition object answers, the backing property set answers */
+    return ICompositionPropertySet_QueryInterface( impl->props, iid, out );
+}
+static ULONG WINAPI hover_AddRef( void *iface ) { return InterlockedIncrement( &((struct hover_source *)iface)->ref ); }
+static ULONG WINAPI hover_Release( void *iface )
+{
+    struct hover_source *impl = iface;
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref)
+    {
+        ICompositionPropertySet_Release( impl->props );
+        free( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI hover_get_Point( void *iface, D2D_VECTOR_2F *value )
+{
+    if (!value) return E_POINTER;
+    value->x = value->y = 0.0f;
+    return S_OK;
+}
+static const void *hover_source_vtbl[] = { hover_QueryInterface, hover_AddRef, hover_Release, hover_get_Point };
+
+struct restricted_compositor
+{
+    const void **vtbl;
+    LONG ref;
+};
+static HRESULT WINAPI restricted_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct restricted_compositor *impl = iface;
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_ICompositorRestricted_private ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = impl;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI restricted_AddRef( void *iface ) { return InterlockedIncrement( &((struct restricted_compositor *)iface)->ref ); }
+static ULONG WINAPI restricted_Release( void *iface )
+{
+    struct restricted_compositor *impl = iface;
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref) free( impl );
+    return ref;
+}
+static HRESULT WINAPI restricted_CreateHoverPointerSource( void *iface, IUnknown *visual, void **out )
+{
+    static const WCHAR position[] = L"Position";
+    struct hover_source *hover;
+    HSTRING_HEADER header;
+    Vector3 origin = { 0 };
+    HSTRING name;
+    HRESULT hr;
+
+    TRACE( "visual %p.\n", visual );
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!(hover = calloc( 1, sizeof(*hover) ))) return E_OUTOFMEMORY;
+    hover->vtbl = hover_source_vtbl;
+    hover->ref = 1;
+    if (FAILED(hr = create_property_set( &hover->props )))
+    {
+        free( hover );
+        return hr;
+    }
+    if (SUCCEEDED(WindowsCreateStringReference( position, ARRAY_SIZE(position) - 1, &header, &name )))
+        ICompositionPropertySet_InsertVector3( hover->props, name, origin );
+    *out = hover;
+    return S_OK;
+}
+static HRESULT WINAPI restricted_GetCommitDeferral( void *iface, void **out )
+{
+    FIXME( "GetCommitDeferral: not implemented\n" );
+    if (out) *out = NULL;
+    return E_NOTIMPL;
+}
+static const void *restricted_compositor_vtbl[] =
+{
+    restricted_QueryInterface, restricted_AddRef, restricted_Release,
+    restricted_CreateHoverPointerSource, restricted_GetCommitDeferral,
+};
+
 static HRESULT WINAPI compositor_QueryInterface( ICompositor *iface, REFIID iid, void **out )
 {
     struct compositor *impl = impl_from_ICompositor( iface );
@@ -9763,6 +9881,15 @@ static HRESULT WINAPI compositor_QueryInterface( ICompositor *iface, REFIID iid,
     {
         InterlockedIncrement( &impl->ref );
         *out = &impl->ICompositorInterop_iface;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_ICompositorRestricted_private ))
+    {
+        struct restricted_compositor *restricted;
+        if (!(restricted = calloc( 1, sizeof(*restricted) ))) return E_OUTOFMEMORY;
+        restricted->vtbl = restricted_compositor_vtbl;
+        restricted->ref = 1;
+        *out = restricted;
         return S_OK;
     }
 
@@ -18848,6 +18975,7 @@ struct color_stop
     LONG ref;
     Color color;
     float offset;
+    const void **closable_vtbl; /* IClosable, see color_stop_closable_vtbl */
 };
 static void *color_stop_vtbl[COMP_OBJECT_SLOTS];
 static LONG gradient_generation;
@@ -18883,6 +19011,60 @@ static HRESULT WINAPI color_stop_put_Offset( void *iface, float value )
     scene_changed();
     return S_OK;
 }
+/* A color stop's own QueryInterface. The generic catch-all handed out this table for IClosable, and .NET's
+ * Dispose (Close, slot 6) landed on get_Color, which wrote the stop's colour through a code address (the Microsoft
+ * Store, disposing its hover light's gradient). ICompositionObject's slot 6 is get_Compositor, so that gets the
+ * shared view too. */
+static struct color_stop *color_stop_from_closable( void *iface ) { return CONTAINING_RECORD( iface, struct color_stop, closable_vtbl ); }
+static HRESULT WINAPI color_stop_closable_QueryInterface( void *iface, REFIID iid, void **out );
+static ULONG WINAPI color_stop_closable_AddRef( void *iface ) { return comp_object_AddRef( &color_stop_from_closable( iface )->vtbl ); }
+static ULONG WINAPI color_stop_closable_Release( void *iface ) { return comp_object_Release( &color_stop_from_closable( iface )->vtbl ); }
+static HRESULT WINAPI color_stop_closable_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    if (!count || !iids) return E_POINTER;
+    *count = 0; *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI color_stop_closable_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionColorGradientStop";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI color_stop_closable_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    if (!level) return E_POINTER;
+    *level = BaseTrust;
+    return S_OK;
+}
+static HRESULT WINAPI color_stop_closable_Close( void *iface ) { return S_OK; }
+static const void *color_stop_closable_vtbl[] =
+{
+    color_stop_closable_QueryInterface, color_stop_closable_AddRef, color_stop_closable_Release,
+    color_stop_closable_GetIids, color_stop_closable_GetRuntimeClassName, color_stop_closable_GetTrustLevel,
+    color_stop_closable_Close,
+};
+static HRESULT WINAPI color_stop_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct color_stop *stop = CONTAINING_RECORD( iface, struct color_stop, vtbl );
+
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+    if (IsEqualGUID( iid, &IID_IClosable ))
+    {
+        InterlockedIncrement( &stop->ref );
+        *out = &stop->closable_vtbl;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&stop->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
+        return create_object4_view( (IUnknown *)&stop->vtbl, out );
+    return comp_object_QueryInterface( iface, iid, out );
+}
+static HRESULT WINAPI color_stop_closable_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return color_stop_QueryInterface( &color_stop_from_closable( iface )->vtbl, iid, out );
+}
+
 static HRESULT create_color_stop( float offset, Color color, void **out )
 {
     struct color_stop *stop;
@@ -18899,10 +19081,11 @@ static HRESULT create_color_stop( float offset, Color color, void **out )
         color_stop_vtbl[7] = color_stop_put_Color;
         color_stop_vtbl[8] = color_stop_get_Offset;
         color_stop_vtbl[9] = color_stop_put_Offset;
-        InterlockedExchangePointer( &color_stop_vtbl[0], comp_object_QueryInterface );
+        InterlockedExchangePointer( &color_stop_vtbl[0], color_stop_QueryInterface );
     }
     if (!(stop = calloc( 1, sizeof(*stop) ))) return E_OUTOFMEMORY;
     stop->vtbl = (const void **)color_stop_vtbl;
+    stop->closable_vtbl = color_stop_closable_vtbl;
     stop->kind = "ColorGradientStop";
     stop->ref = 1;
     stop->offset = offset;
