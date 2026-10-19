@@ -37,6 +37,7 @@ struct media_source
 {
     IMediaSource2Internal IMediaSource2Internal_iface;
     IWineMediaPath IWineMediaPath_iface;
+    IMediaPlaybackSource IMediaPlaybackSource_iface;
     LONG ref;
     HSTRING path;
     /* A source made from a binder has no path of its own: the binder only learns the file when
@@ -68,6 +69,15 @@ static HRESULT WINAPI media_source_QueryInterface( IMediaSource2Internal *iface,
     if (IsEqualGUID( iid, &IID_IWineMediaPath ))
     {
         IInspectable_AddRef( (*out = &impl->IWineMediaPath_iface) );
+        return S_OK;
+    }
+
+    /* MediaSource and MediaPlaybackItem are both IMediaPlaybackSource on Windows, and assigning
+     * either to MediaPlayer.Source casts to it. Without it the app's cast failed and it assigned
+     * null, so the player never learned what to play. */
+    if (IsEqualGUID( iid, &IID_IMediaPlaybackSource ))
+    {
+        IInspectable_AddRef( (*out = &impl->IMediaPlaybackSource_iface) );
         return S_OK;
     }
 
@@ -228,6 +238,20 @@ static const struct IWineMediaPathVtbl media_source_path_vtbl =
     media_source_path_get_Path,
 };
 
+DEFINE_IINSPECTABLE_( media_source_playback_source, IMediaPlaybackSource, struct media_source, media_source_playback_source_impl_from,
+                      IMediaPlaybackSource_iface, &impl->IMediaSource2Internal_iface )
+
+static const struct IMediaPlaybackSourceVtbl media_source_playback_source_vtbl =
+{
+    media_source_playback_source_QueryInterface,
+    media_source_playback_source_AddRef,
+    media_source_playback_source_Release,
+    /* IInspectable methods */
+    media_source_playback_source_GetIids,
+    media_source_playback_source_GetRuntimeClassName,
+    media_source_playback_source_GetTrustLevel,
+};
+
 static HRESULT media_source_create( HSTRING path, IMediaSource2Internal **out )
 {
     struct media_source *impl;
@@ -236,6 +260,7 @@ static HRESULT media_source_create( HSTRING path, IMediaSource2Internal **out )
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
     impl->IMediaSource2Internal_iface.lpVtbl = &media_source_vtbl;
     impl->IWineMediaPath_iface.lpVtbl = &media_source_path_vtbl;
+    impl->IMediaPlaybackSource_iface.lpVtbl = &media_source_playback_source_vtbl;
     impl->ref = 1;
     if (FAILED(hr = WindowsDuplicateString( path, &impl->path )))
     {
@@ -254,6 +279,7 @@ struct playback_item
 {
     IMediaPlaybackItemInternal IMediaPlaybackItemInternal_iface;
     IWineMediaPath IWineMediaPath_iface;
+    IMediaPlaybackSource IMediaPlaybackSource_iface;
     LONG ref;
     IMediaSource2Internal *source;
 };
@@ -281,6 +307,15 @@ static HRESULT WINAPI playback_item_QueryInterface( IMediaPlaybackItemInternal *
     if (IsEqualGUID( iid, &IID_IWineMediaPath ))
     {
         IInspectable_AddRef( (*out = &impl->IWineMediaPath_iface) );
+        return S_OK;
+    }
+
+    /* MediaSource and MediaPlaybackItem are both IMediaPlaybackSource on Windows, and assigning
+     * either to MediaPlayer.Source casts to it. Without it the app's cast failed and it assigned
+     * null, so the player never learned what to play. */
+    if (IsEqualGUID( iid, &IID_IMediaPlaybackSource ))
+    {
+        IInspectable_AddRef( (*out = &impl->IMediaPlaybackSource_iface) );
         return S_OK;
     }
 
@@ -428,6 +463,20 @@ static const struct IWineMediaPathVtbl playback_item_path_vtbl =
     playback_item_path_GetRuntimeClassName,
     playback_item_path_GetTrustLevel,
     playback_item_path_get_Path,
+};
+
+DEFINE_IINSPECTABLE_( playback_item_playback_source, IMediaPlaybackSource, struct playback_item, playback_item_playback_source_impl_from,
+                      IMediaPlaybackSource_iface, &impl->IMediaPlaybackItemInternal_iface )
+
+static const struct IMediaPlaybackSourceVtbl playback_item_playback_source_vtbl =
+{
+    playback_item_playback_source_QueryInterface,
+    playback_item_playback_source_AddRef,
+    playback_item_playback_source_Release,
+    /* IInspectable methods */
+    playback_item_playback_source_GetIids,
+    playback_item_playback_source_GetRuntimeClassName,
+    playback_item_playback_source_GetTrustLevel,
 };
 
 /* A TypedEventHandler<A*, B*> is a delegate: three IUnknown slots and Invoke. We only ever call
@@ -1450,6 +1499,7 @@ static HRESULT WINAPI playback_item_statics_Create( IMediaPlaybackItemFactoryInt
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
     impl->IMediaPlaybackItemInternal_iface.lpVtbl = &playback_item_vtbl;
     impl->IWineMediaPath_iface.lpVtbl = &playback_item_path_vtbl;
+    impl->IMediaPlaybackSource_iface.lpVtbl = &playback_item_playback_source_vtbl;
     impl->ref = 1;
     IMediaSource2Internal_AddRef( (impl->source = source) );
 
