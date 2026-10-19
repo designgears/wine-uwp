@@ -38,12 +38,14 @@ struct media_source
     IMediaSource2Internal IMediaSource2Internal_iface;
     IWineMediaPath IWineMediaPath_iface;
     IMediaPlaybackSource IMediaPlaybackSource_iface;
+    IWineMediaOpened IWineMediaOpened_iface;
     LONG ref;
     HSTRING path;
     /* A source made from a binder has no path of its own: the binder only learns the file when
      * the player asks for it, which is the whole point of a binder. Snapshotting the path at
      * creation time left the source permanently empty. */
     IMediaBinderInternal *binder;
+    IInspectable *external_timed_text;  /* IObservableVector<TimedTextSource>, made on first use */
 };
 
 static inline struct media_source *impl_from_IMediaSource2Internal( IMediaSource2Internal *iface )
@@ -69,6 +71,12 @@ static HRESULT WINAPI media_source_QueryInterface( IMediaSource2Internal *iface,
     if (IsEqualGUID( iid, &IID_IWineMediaPath ))
     {
         IInspectable_AddRef( (*out = &impl->IWineMediaPath_iface) );
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_IWineMediaOpened ))
+    {
+        IInspectable_AddRef( (*out = &impl->IWineMediaOpened_iface) );
         return S_OK;
     }
 
@@ -99,6 +107,7 @@ static ULONG WINAPI media_source_Release( IMediaSource2Internal *iface )
     if (!ref)
     {
         if (impl->binder) IMediaBinderInternal_Release( impl->binder );
+        if (impl->external_timed_text) IInspectable_Release( impl->external_timed_text );
         WindowsDeleteString( impl->path );
         free( impl );
     }
@@ -165,11 +174,25 @@ static HRESULT WINAPI media_source_get_IsOpen( IMediaSource2Internal *iface, boo
     return S_OK;
 }
 
+/* The app appends a TimedTextSource per subtitle file, and they raise Resolved when the player
+ * opens the media (IWineMediaOpened). The stub's E_NOTIMPL threw out of Shapr3D's tutorial setup. */
 static HRESULT WINAPI media_source_get_ExternalTimedTextSources( IMediaSource2Internal *iface, IInspectable **value )
 {
-    FIXME( "iface %p, value %p stub!\n", iface, value );
-    if (value) *value = NULL;
-    return E_NOTIMPL;
+    struct media_source *impl = impl_from_IMediaSource2Internal( iface );
+    IInspectable *vector;
+    HRESULT hr;
+
+    TRACE( "iface %p, value %p.\n", iface, value );
+
+    if (!value) return E_POINTER;
+    if (!impl->external_timed_text)
+    {
+        if (FAILED(hr = timed_text_source_vector_create( &vector ))) return hr;
+        if (InterlockedCompareExchangePointer( (void **)&impl->external_timed_text, vector, NULL ))
+            IInspectable_Release( vector );
+    }
+    IInspectable_AddRef( (*value = impl->external_timed_text) );
+    return S_OK;
 }
 
 static HRESULT WINAPI media_source_get_ExternalTimedMetadataTracks( IMediaSource2Internal *iface, IInspectable **value )
@@ -252,6 +275,33 @@ static const struct IMediaPlaybackSourceVtbl media_source_playback_source_vtbl =
     media_source_playback_source_GetTrustLevel,
 };
 
+DEFINE_IINSPECTABLE_( media_source_opened, IWineMediaOpened, struct media_source, media_source_opened_impl_from,
+                      IWineMediaOpened_iface, &impl->IMediaSource2Internal_iface )
+
+/* Opening resolves the external timed text sources, as the Windows pipeline does while it opens. */
+static HRESULT WINAPI media_source_opened_NotifyOpened( IWineMediaOpened *iface )
+{
+    struct media_source *impl = media_source_opened_impl_from( iface );
+
+    TRACE( "iface %p.\n", iface );
+
+    if (impl->external_timed_text) timed_text_source_vector_resolve( impl->external_timed_text );
+    return S_OK;
+}
+
+static const struct IWineMediaOpenedVtbl media_source_opened_vtbl =
+{
+    media_source_opened_QueryInterface,
+    media_source_opened_AddRef,
+    media_source_opened_Release,
+    /* IInspectable methods */
+    media_source_opened_GetIids,
+    media_source_opened_GetRuntimeClassName,
+    media_source_opened_GetTrustLevel,
+    /* IWineMediaOpened methods */
+    media_source_opened_NotifyOpened,
+};
+
 static HRESULT media_source_create( HSTRING path, IMediaSource2Internal **out )
 {
     struct media_source *impl;
@@ -261,6 +311,7 @@ static HRESULT media_source_create( HSTRING path, IMediaSource2Internal **out )
     impl->IMediaSource2Internal_iface.lpVtbl = &media_source_vtbl;
     impl->IWineMediaPath_iface.lpVtbl = &media_source_path_vtbl;
     impl->IMediaPlaybackSource_iface.lpVtbl = &media_source_playback_source_vtbl;
+    impl->IWineMediaOpened_iface.lpVtbl = &media_source_opened_vtbl;
     impl->ref = 1;
     if (FAILED(hr = WindowsDuplicateString( path, &impl->path )))
     {
@@ -280,6 +331,7 @@ struct playback_item
     IMediaPlaybackItemInternal IMediaPlaybackItemInternal_iface;
     IWineMediaPath IWineMediaPath_iface;
     IMediaPlaybackSource IMediaPlaybackSource_iface;
+    IWineMediaOpened IWineMediaOpened_iface;
     LONG ref;
     IMediaSource2Internal *source;
 };
@@ -307,6 +359,12 @@ static HRESULT WINAPI playback_item_QueryInterface( IMediaPlaybackItemInternal *
     if (IsEqualGUID( iid, &IID_IWineMediaPath ))
     {
         IInspectable_AddRef( (*out = &impl->IWineMediaPath_iface) );
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_IWineMediaOpened ))
+    {
+        IInspectable_AddRef( (*out = &impl->IWineMediaOpened_iface) );
         return S_OK;
     }
 
@@ -479,17 +537,38 @@ static const struct IMediaPlaybackSourceVtbl playback_item_playback_source_vtbl 
     playback_item_playback_source_GetTrustLevel,
 };
 
-/* A TypedEventHandler<A*, B*> is a delegate: three IUnknown slots and Invoke. We only ever call
- * the pointer the app registered, never ask anyone for this interface, so it needs no IID. */
-typedef struct IWineEventHandler IWineEventHandler;
-struct IWineEventHandlerVtbl
+DEFINE_IINSPECTABLE_( playback_item_opened, IWineMediaOpened, struct playback_item, playback_item_opened_impl_from,
+                      IWineMediaOpened_iface, &impl->IMediaPlaybackItemInternal_iface )
+
+static HRESULT WINAPI playback_item_opened_NotifyOpened( IWineMediaOpened *iface )
 {
-    HRESULT (STDMETHODCALLTYPE *QueryInterface)( IWineEventHandler *, REFIID, void ** );
-    ULONG (STDMETHODCALLTYPE *AddRef)( IWineEventHandler * );
-    ULONG (STDMETHODCALLTYPE *Release)( IWineEventHandler * );
-    HRESULT (STDMETHODCALLTYPE *Invoke)( IWineEventHandler *, void *sender, void *args );
+    struct playback_item *impl = playback_item_opened_impl_from( iface );
+    IWineMediaOpened *source_opened;
+    HRESULT hr;
+
+    TRACE( "iface %p.\n", iface );
+
+    if (!impl->source) return S_OK;
+    if (FAILED(hr = IMediaSource2Internal_QueryInterface( impl->source, &IID_IWineMediaOpened,
+                                                          (void **)&source_opened )))
+        return hr;
+    hr = IWineMediaOpened_NotifyOpened( source_opened );
+    IWineMediaOpened_Release( source_opened );
+    return hr;
+}
+
+static const struct IWineMediaOpenedVtbl playback_item_opened_vtbl =
+{
+    playback_item_opened_QueryInterface,
+    playback_item_opened_AddRef,
+    playback_item_opened_Release,
+    /* IInspectable methods */
+    playback_item_opened_GetIids,
+    playback_item_opened_GetRuntimeClassName,
+    playback_item_opened_GetTrustLevel,
+    /* IWineMediaOpened methods */
+    playback_item_opened_NotifyOpened,
 };
-struct IWineEventHandler { const struct IWineEventHandlerVtbl *lpVtbl; };
 
 /* ---------------------------------------------------------------- MediaBinder
  *
@@ -1500,6 +1579,7 @@ static HRESULT WINAPI playback_item_statics_Create( IMediaPlaybackItemFactoryInt
     impl->IMediaPlaybackItemInternal_iface.lpVtbl = &playback_item_vtbl;
     impl->IWineMediaPath_iface.lpVtbl = &playback_item_path_vtbl;
     impl->IMediaPlaybackSource_iface.lpVtbl = &playback_item_playback_source_vtbl;
+    impl->IWineMediaOpened_iface.lpVtbl = &playback_item_opened_vtbl;
     impl->ref = 1;
     IMediaSource2Internal_AddRef( (impl->source = source) );
 

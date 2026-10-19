@@ -211,4 +211,110 @@ namespace Wine.Internal {
         HRESULT CreateFromMediaBinder([in] Wine.Internal.IMediaBinderInternal *binder,
                                       [out, retval] Wine.Internal.IMediaSource2Internal **value);
     }
+
+    /* TimedTextSource: an external subtitle file (SRT, WebVTT, TTML) attached to a MediaSource
+     * through ExternalTimedTextSources. windows.media.core.idl has neither the class nor its
+     * interfaces; Shapr3D's tutorials build one for every video and threw 0x80040111 out of the
+     * activation, which took the whole tutorial down. Shapes and uuids from Windows.Media.winmd. */
+    [uuid(c4ed9ba6-101f-404d-a949-82f33fcd93b7)]
+    interface ITimedTextSourceInternal : IInspectable
+    {
+        HRESULT add_Resolved([in] IInspectable *handler,
+                             [out, retval] Windows.Foundation.EventRegistrationToken *token);
+        HRESULT remove_Resolved([in] Windows.Foundation.EventRegistrationToken token);
+    }
+
+    /* TimedTextSourceResolveResultEventArgs, what Resolved hands its handlers: Error is null on
+     * success, and Tracks is an IVectorView<TimedMetadataTrack> holding the parsed track. */
+    [uuid(48907c9c-dcd8-4c33-9ad3-6cdce7b1c566)]
+    interface ITimedTextSourceResolveResultEventArgsInternal : IInspectable
+    {
+        [propget] HRESULT Error([out, retval] IInspectable **value);
+        [propget] HRESULT Tracks([out, retval] IInspectable **value);
+    }
+
+    /* Private: the player tells a MediaSource or MediaPlaybackItem that it has opened the media,
+     * which is when Windows resolves the external timed text sources attached to it. No public
+     * interface carries this, because on Windows the pipeline that opens the media lives inside
+     * the source. NotifyOpened is slot 6, after IInspectable. */
+    [uuid(19ea40ff-56b2-46b0-8aee-f8d7e99a8aa9)]
+    interface IWineMediaOpened : IInspectable
+    {
+        HRESULT NotifyOpened();
+    }
+
+    [uuid(7e311853-9aba-4ac4-bb98-2fb176c3bfdd)]
+    interface ITimedTextSourceStaticsInternal : IInspectable
+    {
+        HRESULT CreateFromStream([in] IInspectable *stream,
+                                 [out, retval] Wine.Internal.ITimedTextSourceInternal **value);
+        HRESULT CreateFromUri([in] IInspectable *uri,
+                              [out, retval] Wine.Internal.ITimedTextSourceInternal **value);
+        HRESULT CreateFromStreamWithLanguage([in] IInspectable *stream, [in] HSTRING language,
+                                             [out, retval] Wine.Internal.ITimedTextSourceInternal **value);
+        HRESULT CreateFromUriWithLanguage([in] IInspectable *uri, [in] HSTRING language,
+                                          [out, retval] Wine.Internal.ITimedTextSourceInternal **value);
+    }
+
+    [uuid(b66b7602-923e-43fa-9633-587075812db5)]
+    interface ITimedTextSourceStatics2Internal : IInspectable
+    {
+        HRESULT CreateFromStreamWithIndex([in] IInspectable *stream, [in] IInspectable *index_stream,
+                                          [out, retval] Wine.Internal.ITimedTextSourceInternal **value);
+        HRESULT CreateFromUriWithIndex([in] IInspectable *uri, [in] IInspectable *index_uri,
+                                       [out, retval] Wine.Internal.ITimedTextSourceInternal **value);
+        HRESULT CreateFromStreamWithIndexAndLanguage([in] IInspectable *stream, [in] IInspectable *index_stream,
+                                                     [in] HSTRING language,
+                                                     [out, retval] Wine.Internal.ITimedTextSourceInternal **value);
+        HRESULT CreateFromUriWithIndexAndLanguage([in] IInspectable *uri, [in] IInspectable *index_uri,
+                                                  [in] HSTRING language,
+                                                  [out, retval] Wine.Internal.ITimedTextSourceInternal **value);
+    }
+
+    /* IVector<T> and IObservableVector<T> for a runtime-class T, with T as IInspectable *, which
+     * is pointer-compatible. The real IIDs are derived per T (piid.py) and answered by hand; the
+     * uuids here only name the vtable shapes and are never handed out. */
+    [uuid(45c39392-f888-419e-9b2a-9b56be987d2d)]
+    interface IWineInspectableVector : IInspectable
+    {
+        HRESULT GetAt([in] UINT32 index, [out, retval] IInspectable **value);
+        [propget] HRESULT Size([out, retval] UINT32 *value);
+        HRESULT GetView([out, retval] IInspectable **value);
+        HRESULT IndexOf([in] IInspectable *element, [out] UINT32 *index, [out, retval] boolean *found);
+        HRESULT SetAt([in] UINT32 index, [in] IInspectable *value);
+        HRESULT InsertAt([in] UINT32 index, [in] IInspectable *value);
+        HRESULT RemoveAt([in] UINT32 index);
+        HRESULT Append([in] IInspectable *value);
+        HRESULT RemoveAtEnd();
+        HRESULT Clear();
+        HRESULT GetMany([in] UINT32 start, [in] UINT32 items_size,
+                        [out, size_is(items_size), length_is(*value)] IInspectable **items,
+                        [out, retval] UINT32 *value);
+        HRESULT ReplaceAll([in] UINT32 count, [in, size_is(count)] IInspectable **items);
+    }
+
+    [uuid(31d32a7a-4e70-4143-b1b7-444b96af7edb)]
+    interface IWineInspectableObservable : IInspectable
+    {
+        HRESULT add_VectorChanged([in] IInspectable *handler,
+                                  [out, retval] Windows.Foundation.EventRegistrationToken *token);
+        HRESULT remove_VectorChanged([in] Windows.Foundation.EventRegistrationToken token);
+    }
+
+    [uuid(4cf5255f-93c9-47ad-b35f-0f722e82e5dc)]
+    interface IWineInspectableIterator : IInspectable
+    {
+        [propget] HRESULT Current([out, retval] IInspectable **value);
+        [propget] HRESULT HasCurrent([out, retval] boolean *value);
+        HRESULT MoveNext([out, retval] boolean *value);
+        HRESULT GetMany([in] UINT32 items_size,
+                        [out, size_is(items_size), length_is(*value)] IInspectable **items,
+                        [out, retval] UINT32 *value);
+    }
+
+    [uuid(2b8f4cf7-1025-49b0-8ea9-bf375e7f212e)]
+    interface IWineInspectableIterable : IInspectable
+    {
+        HRESULT First([out, retval] Wine.Internal.IWineInspectableIterator **value);
+    }
 }

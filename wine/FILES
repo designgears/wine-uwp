@@ -201,6 +201,7 @@ dlls/windows.media.playback.mediaplayer/Makefile.in
 dlls/windows.media.playback.mediaplayer/playback_engine.c
 dlls/windows.media.playback.mediaplayer/private.h
 dlls/windows.media/private.h
+dlls/windows.media/timedtext.c
 dlls/windows.media/tracks.c
 dlls/windows.networking/async.c
 dlls/windows.networking/async_private.idl
