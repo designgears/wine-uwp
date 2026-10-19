@@ -81,14 +81,27 @@
 
 #endif
 
-/* Audio playback, in playback_engine.c. */
+/* Playback, in playback_engine.c. Notifications come from the engine's threads, unlocked. */
 struct playback;
-HRESULT playback_create( struct playback **out );
+enum playback_event
+{
+    PLAYBACK_EVENT_STATE,       /* started or stopped playing */
+    PLAYBACK_EVENT_POSITION,    /* the clock moved (a few times a second while playing) */
+    PLAYBACK_EVENT_SEEKED,
+    PLAYBACK_EVENT_ENDED,
+};
+typedef void (*playback_notify_cb)( void *ctx, enum playback_event event );
+HRESULT playback_create( playback_notify_cb notify, void *ctx, struct playback **out );
 void playback_destroy( struct playback *pb );
 HRESULT playback_set_path( struct playback *pb, const WCHAR *path );
 HRESULT playback_probe( struct playback *pb );
 HRESULT playback_play( struct playback *pb );
 HRESULT playback_pause( struct playback *pb );
+HRESULT playback_seek( struct playback *pb, LONGLONG position );
+void playback_set_volume( struct playback *pb, double volume, BOOL muted );
 BOOL playback_is_playing( struct playback *pb );
 LONGLONG playback_position( struct playback *pb );
 LONGLONG playback_duration( struct playback *pb );
+void playback_video_size( struct playback *pb, UINT32 *width, UINT32 *height );
+void playback_set_surface_size( struct playback *pb, UINT32 width, UINT32 height );
+HANDLE playback_video_surface( struct playback *pb );

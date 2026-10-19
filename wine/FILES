@@ -189,6 +189,7 @@ dlls/windows.graphics/Makefile.in
 dlls/windows.graphics/private.h
 dlls/windows.graphics/weakref.c
 dlls/windows.graphics/weakref.h
+dlls/windows.media.mediacontrol/main.c
 dlls/windows.media/classes.idl
 dlls/windows.media/codecquery.c
 dlls/windows.media/main.c
@@ -201,6 +202,7 @@ dlls/windows.media.playback.mediaplayer/Makefile.in
 dlls/windows.media.playback.mediaplayer/playback_engine.c
 dlls/windows.media.playback.mediaplayer/private.h
 dlls/windows.media/private.h
+dlls/windows.media/timedtext.c
 dlls/windows.media/tracks.c
 dlls/windows.networking/async.c
 dlls/windows.networking/async_private.idl

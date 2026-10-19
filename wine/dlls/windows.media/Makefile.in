@@ -9,5 +9,6 @@ SOURCES = \
 	mediasource.c \
 	mediasource_private.idl \
 	playback.c \
+	timedtext.c \
 	tracks.c \
 	transcoder.c
