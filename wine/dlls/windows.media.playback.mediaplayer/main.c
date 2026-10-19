@@ -456,16 +456,16 @@ static HRESULT WINAPI media_player_get_Position( IMediaPlayer *iface, TimeSpan *
     struct media_player *impl = impl_from_IMediaPlayer( iface );
     TRACE( "iface %p, value %p\n", iface, value );
     if (!value) return E_POINTER;
-    *value = impl->position;
+    value->Duration = impl->playback ? playback_position( impl->playback ) : 0;
     return S_OK;
 }
 
 static HRESULT WINAPI media_player_put_Position( IMediaPlayer *iface, TimeSpan value )
 {
     struct media_player *impl = impl_from_IMediaPlayer( iface );
-    TRACE( "iface %p\n", iface );
-    impl->position = value;
-    return S_OK;
+    TRACE( "iface %p, value %I64d\n", iface, value.Duration );
+    if (!impl->playback) return S_OK;
+    return playback_seek( impl->playback, value.Duration );
 }
 
 static HRESULT WINAPI media_player_get_BufferingProgress( IMediaPlayer *iface, DOUBLE *value )
@@ -489,9 +489,10 @@ static HRESULT WINAPI media_player_get_CurrentState( IMediaPlayer *iface, MediaP
 
 static HRESULT WINAPI media_player_get_CanSeek( IMediaPlayer *iface, boolean *value )
 {
+    struct media_player *impl = impl_from_IMediaPlayer( iface );
     TRACE( "iface %p, value %p\n", iface, value );
     if (!value) return E_POINTER;
-    *value = FALSE;
+    *value = impl->playback && playback_duration( impl->playback );
     return S_OK;
 }
 
@@ -544,6 +545,7 @@ static HRESULT WINAPI media_player_put_IsMuted( IMediaPlayer *iface, boolean val
     TRACE( "iface %p, value %d\n", iface, value );
     if (impl->muted == !!value) return S_OK;
     impl->muted = !!value;
+    if (impl->playback) playback_set_volume( impl->playback, impl->volume, impl->muted );
     event_list_invoke( &impl->muted_changed, &impl->IMediaPlayer_iface, NULL );
     return S_OK;
 }
@@ -580,6 +582,7 @@ static HRESULT WINAPI media_player_put_Volume( IMediaPlayer *iface, DOUBLE value
     TRACE( "iface %p, value %f\n", iface, value );
     if (impl->volume == value) return S_OK;
     impl->volume = value;
+    if (impl->playback) playback_set_volume( impl->playback, impl->volume, impl->muted );
     event_list_invoke( &impl->volume_changed, &impl->IMediaPlayer_iface, NULL );
     return S_OK;
 }
@@ -732,6 +735,37 @@ static HRESULT WINAPI media_player_remove_BufferingEnded( IMediaPlayer *iface, E
 }
 
 static HRESULT media_player_resolve_source( struct media_player *impl );
+
+/* The engine's notifications, on its threads, turned into the player's and the session's events. */
+static void media_player_notify( void *ctx, enum playback_event event )
+{
+    struct media_player *impl = ctx;
+    IMediaPlaybackSession *session = impl->session;
+
+    switch (event)
+    {
+    case PLAYBACK_EVENT_STATE:
+        event_list_invoke( &impl->session_state_changed, session, NULL );
+        event_list_invoke( &impl->current_state_changed, &impl->IMediaPlayer_iface, NULL );
+        break;
+    case PLAYBACK_EVENT_POSITION:
+        event_list_invoke( &impl->session_position_changed, session, NULL );
+        break;
+    case PLAYBACK_EVENT_SEEKED:
+        event_list_invoke( &impl->session_seek_completed, session, NULL );
+        event_list_invoke( &impl->seek_completed, &impl->IMediaPlayer_iface, NULL );
+        break;
+    case PLAYBACK_EVENT_ENDED:
+        if (impl->looping)
+        {
+            playback_seek( impl->playback, 0 );
+            playback_play( impl->playback );
+            break;
+        }
+        event_list_invoke( &impl->media_ended, &impl->IMediaPlayer_iface, NULL );
+        break;
+    }
+}
 
 static HRESULT WINAPI media_player_Play( IMediaPlayer *iface )
 {
@@ -1205,19 +1239,19 @@ static HRESULT WINAPI playback_session_get_NaturalDuration( IMediaPlaybackSessio
 
 static HRESULT WINAPI playback_session_get_Position( IMediaPlaybackSession *iface, TimeSpan *value )
 {
-    struct playback_session *impl = impl_from_IMediaPlaybackSession( iface );
+    struct media_player *player = session_player( iface );
     TRACE( "iface %p, value %p\n", iface, value );
     if (!value) return E_POINTER;
-    *value = impl->position;
+    value->Duration = player->playback ? playback_position( player->playback ) : 0;
     return S_OK;
 }
 
 static HRESULT WINAPI playback_session_put_Position( IMediaPlaybackSession *iface, TimeSpan value )
 {
-    struct playback_session *impl = impl_from_IMediaPlaybackSession( iface );
+    struct media_player *player = session_player( iface );
     TRACE( "iface %p, value %I64d\n", iface, value.Duration );
-    impl->position = value;
-    return S_OK;
+    if (!player->playback) return S_OK;
+    return playback_seek( player->playback, value.Duration );
 }
 
 static HRESULT WINAPI playback_session_get_PlaybackState( IMediaPlaybackSession *iface, MediaPlaybackState *value )
@@ -1235,10 +1269,7 @@ static HRESULT WINAPI playback_session_get_PlaybackState( IMediaPlaybackSession 
 
 static HRESULT WINAPI playback_session_get_CanSeek( IMediaPlaybackSession *iface, boolean *value )
 {
-    TRACE( "iface %p, value %p\n", iface, value );
-    if (!value) return E_POINTER;
-    *value = FALSE;
-    return S_OK;
+    return media_player_get_CanSeek( &session_player( iface )->IMediaPlayer_iface, value );
 }
 
 static HRESULT WINAPI playback_session_get_CanPause( IMediaPlaybackSession *iface, boolean *value )
@@ -2669,7 +2700,7 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
     }
 
     impl->IMediaPlayer_iface.lpVtbl = &media_player_vtbl;
-    if (FAILED(playback_create( &impl->playback )))
+    if (FAILED(playback_create( media_player_notify, impl, &impl->playback )))
         WARN( "no playback engine; the player will not produce audio.\n" );
     impl->IMediaPlayer2_iface.lpVtbl = &media_player2_vtbl;
     impl->IMediaPlayer3_iface.lpVtbl = &media_player3_vtbl;
