@@ -110,14 +110,85 @@ void playback_destroy( struct playback *pb )
     free( pb );
 }
 
+LONG WINAPI GetCurrentPackagePath( UINT32 *length, WCHAR *path );
+
+static int hex_digit( WCHAR c )
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static BOOL is_dot_segment( const WCHAR *seg, const WCHAR *end )
+{
+    return seg[0] == '.' && (end - seg == 1 || (end - seg == 2 && seg[1] == '.'));
+}
+
+/* ms-appx:///<path> (or ms-appx://<package name>/<path>) names a file in the package's install
+ * directory. Media Foundation has no handler for the scheme - the reader failed every packaged
+ * video with MF_E_UNSUPPORTED_SCHEME - so turn it into the file's path. Percent escapes are
+ * decoded (ASCII only), and "." / ".." segments are refused so a URI cannot leave the package.
+ * Returns NULL for anything that is not an ms-appx URI or does not resolve. */
+static WCHAR *ms_appx_to_path( const WCHAR *uri )
+{
+    const WCHAR *p;
+    WCHAR *out, *seg;
+    UINT32 len = 0;
+    SIZE_T n;
+
+    if (wcsnicmp( uri, L"ms-appx://", 10 )) return NULL;
+    if (!(p = wcschr( uri + 10, '/' ))) return NULL;   /* skip the (usually empty) host */
+    while (*p == '/') p++;
+
+    if (GetCurrentPackagePath( &len, NULL ) != ERROR_INSUFFICIENT_BUFFER) return NULL;
+    if (!(out = malloc( (len + wcslen( p ) + 2) * sizeof(WCHAR) ))) return NULL;
+    if (GetCurrentPackagePath( &len, out )) goto fail;
+
+    n = wcslen( out );
+    if (n && out[n - 1] != '\\') out[n++] = '\\';
+    seg = out + n;
+    for (; *p && *p != '?' && *p != '#'; p++)
+    {
+        WCHAR c = *p;
+        int hi, lo;
+
+        if (c == '%')
+        {
+            if ((hi = hex_digit( p[1] )) < 0 || (lo = hex_digit( p[2] )) < 0) goto fail;
+            if (!(c = hi * 16 + lo) || c >= 0x80) goto fail;
+            p += 2;
+        }
+        if (c == '/') c = '\\';
+        if (c == '\\')
+        {
+            if (is_dot_segment( seg, out + n )) goto fail;
+            out[n++] = c;
+            seg = out + n;
+            continue;
+        }
+        out[n++] = c;
+    }
+    if (is_dot_segment( seg, out + n )) goto fail;
+    out[n] = 0;
+    TRACE( "%s is %s.\n", debugstr_w(uri), debugstr_w(out) );
+    return out;
+
+fail:
+    WARN( "cannot resolve %s.\n", debugstr_w(uri) );
+    free( out );
+    return NULL;
+}
+
+
 /* A source can arrive as a plain path, a file:// URI or a ms-appx URI; the reader wants a path or
- * a URL it understands, and file:// is the one form both agree on. */
+ * a URL it understands. ms-appx is resolved to the packaged file here; the others pass through. */
 HRESULT playback_set_path( struct playback *pb, const WCHAR *path )
 {
     WCHAR *copy;
 
     if (!path) return E_INVALIDARG;
-    if (!(copy = wcsdup( path ))) return E_OUTOFMEMORY;
+    if (!(copy = ms_appx_to_path( path )) && !(copy = wcsdup( path ))) return E_OUTOFMEMORY;
 
     EnterCriticalSection( &pb->cs );
     playback_stop_locked( pb );
