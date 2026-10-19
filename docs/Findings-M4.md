@@ -12835,3 +12835,8 @@ its SpriteVisual to `IVisual4` `{9476bf11}` (IsPixelSnappingEnabled), which visu
 page shows its collection cards with artwork (`docs/screenshots/msstore-apps-cards.png`). `visual_qi` now logs every
 refused IID as a FIXME (`visual: no interface`), so the next missing one is a grep away. Still open: the hero banner
 area is empty on Home and Apps, and Home's "Best selling games" tiles stay blank grey.
+
+Library opens too (`docs/screenshots/msstore-library.png`): Updates & downloads with Get updates, and the Store itself
+listed (its "Modified 12/31/1600" is a zero FILETIME from our package data). Get updates goes through AppInstallManager,
+whose stand-in (`shims/appinstallmanager`) still answers empty lists, so the in-app self-update needs a real
+implementation there, backed by the FE3 download and `install-app.py` path the Xbox app's Gaming Services shim uses.
