@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     a2a6a9ce3533222b0073e14105a9bfdd9a345c6c
-                 d2d1: Widen rectangles and rounded rectangles; dcomp: ICompositorRestricted hover pointer source, color stop QueryInterface.
+  wine HEAD:     aa721f44d9e21d21c6434c1b8318613276e9dafe
+                 d2d1: Support 8bpp alpha WIC render targets.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-19T10:56:48Z
+  captured:      2026-10-19T11:13:35Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

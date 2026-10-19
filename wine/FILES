@@ -323,3 +323,4 @@ dlls/windows.networking/hstringvector.c
 dlls/ntdll/unix/process.c
 dlls/wineuwp/clientadapter.c
 dlls/d2d1/geometry.c
+dlls/d2d1/wic_render_target.c
