@@ -728,6 +728,7 @@ extern IActivationFactory *composition_object_activation_factory;
 extern IActivationFactory *composition_island_activation_factory;
 extern IActivationFactory *effect_source_parameter_activation_factory;
 extern IActivationFactory *scene_lighting_effect_activation_factory;
+extern IActivationFactory *easing_function_activation_factory;
 extern IActivationFactory *composition_path_activation_factory;
 extern IActivationFactory *interactions_activation_factory;
 
@@ -774,6 +775,11 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **fac
     if (name && !wcscmp(name, L"Windows.UI.Composition.CompositionEffectSourceParameter"))
     {
         IActivationFactory_AddRef( (*factory = effect_source_parameter_activation_factory) );
+        return S_OK;
+    }
+    if (name && !wcscmp(name, L"Windows.UI.Composition.CompositionEasingFunction"))
+    {
+        IActivationFactory_AddRef( (*factory = easing_function_activation_factory) );
         return S_OK;
     }
     if (name && !wcscmp(name, L"Windows.UI.Composition.CompositionIsland"))

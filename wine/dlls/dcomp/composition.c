@@ -2467,6 +2467,99 @@ static HRESULT create_object4_view( IUnknown *owner, void **out )
     return S_OK;
 }
 
+/* ICompositionObject2 {ef874ea1} view for objects other than our dcomp visuals: 6 get_Comment, 7 put_Comment,
+ * 8 get_ImplicitAnimations, 9 put_ImplicitAnimations, 10 StartAnimationGroup, 11 StopAnimationGroup. Every
+ * CompositionObject has it; the Microsoft Store 22608 casts a color brush to it. The comment and the implicit
+ * animations are kept on the view; implicit animations and groups are not run. */
+static const GUID IID_ICompositionObject2_view = { 0xef874ea1, 0x5cff, 0x4b68, { 0x9e, 0x30, 0xa1, 0x51, 0x9d, 0x08, 0xba, 0x03 } };
+struct object2_view
+{
+    const void **vtbl;
+    LONG ref;
+    IUnknown *owner;
+    HSTRING comment;
+    IUnknown *implicit;
+};
+static HRESULT WINAPI object2_view_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct object2_view *view = iface;
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view ))
+    {
+        InterlockedIncrement( &view->ref );
+        *out = iface;
+        return S_OK;
+    }
+    return IUnknown_QueryInterface( view->owner, iid, out );
+}
+static ULONG WINAPI object2_view_AddRef( void *iface )
+{
+    return InterlockedIncrement( &((struct object2_view *)iface)->ref );
+}
+static ULONG WINAPI object2_view_Release( void *iface )
+{
+    struct object2_view *view = iface;
+    ULONG ref = InterlockedDecrement( &view->ref );
+    if (!ref)
+    {
+        WindowsDeleteString( view->comment );
+        if (view->implicit) IUnknown_Release( view->implicit );
+        IUnknown_Release( view->owner );
+        free( view );
+    }
+    return ref;
+}
+static HRESULT WINAPI object2_view_get_Comment( void *iface, HSTRING *value )
+{
+    if (!value) return E_POINTER;
+    return WindowsDuplicateString( ((struct object2_view *)iface)->comment, value );
+}
+static HRESULT WINAPI object2_view_put_Comment( void *iface, HSTRING value )
+{
+    struct object2_view *view = iface;
+    WindowsDeleteString( view->comment );
+    return WindowsDuplicateString( value, &view->comment );
+}
+static HRESULT WINAPI object2_view_get_ImplicitAnimations( void *iface, IUnknown **value )
+{
+    struct object2_view *view = iface;
+    if (!value) return E_POINTER;
+    if ((*value = view->implicit)) IUnknown_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI object2_view_put_ImplicitAnimations( void *iface, IUnknown *value )
+{
+    struct object2_view *view = iface;
+    TRACE( "%p implicit animations %p: not run.\n", view->owner, value );
+    if (value) IUnknown_AddRef( value );
+    if (view->implicit) IUnknown_Release( view->implicit );
+    view->implicit = value;
+    return S_OK;
+}
+static HRESULT WINAPI object2_view_AnimationGroup( void *iface, IUnknown *value )
+{
+    TRACE( "%p group %p: not run.\n", ((struct object2_view *)iface)->owner, value );
+    return S_OK;
+}
+static const void *object2_view_vtbl[] =
+{
+    object2_view_QueryInterface, object2_view_AddRef, object2_view_Release,
+    object4_view_GetIids, object4_view_GetRuntimeClassName, object4_view_GetTrustLevel,
+    object2_view_get_Comment, object2_view_put_Comment, object2_view_get_ImplicitAnimations,
+    object2_view_put_ImplicitAnimations, object2_view_AnimationGroup, object2_view_AnimationGroup,
+};
+static HRESULT create_object2_view( IUnknown *owner, void **out )
+{
+    struct object2_view *view;
+
+    *out = NULL;
+    if (!(view = calloc( 1, sizeof(*view) ))) return E_OUTOFMEMORY;
+    view->vtbl = object2_view_vtbl;
+    view->ref = 1;
+    IUnknown_AddRef( (view->owner = owner) );
+    *out = view;
+    return S_OK;
+}
+
 static const GUID IID_IMap_animations_local =
     {0x4ba9aa1d,0x57ac,0x54de,{0xa8,0x07,0xb5,0x2e,0x68,0x9b,0xfc,0x04}};
 static HRESULT comp_map_for_owner( IUnknown *owner, void **out );
@@ -2570,7 +2663,7 @@ static ULONG WINAPI expr_anim2_Release( void *iface )
 static HRESULT WINAPI expr_anim2_GetIids( void *iface, ULONG *count, IID **iids ) { *count = 0; *iids = NULL; return S_OK; }
 static HRESULT WINAPI expr_anim2_GetRuntimeClassName( void *iface, HSTRING *name )
 {
-    return WindowsCreateString( L"Windows.UI.Composition.ExpressionAnimation", 42, name );
+    return IInspectable_GetRuntimeClassName( (IInspectable *)((struct expr_anim2 *)iface)->owner, name );
 }
 static HRESULT WINAPI expr_anim2_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
 static HRESULT WINAPI expr_anim2_SetBooleanParameter( void *iface, HSTRING key, boolean value ) { return S_OK; }
@@ -2797,7 +2890,10 @@ static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void 
     /* An ExpressionAnimation's Target: the catch-all answered ICompositionAnimation2 with this table, whose slot 7
      * then wrote a recording object into get_Target's HSTRING; React Native's animation driver released it as a
      * string and aborted (Xbox app, right after its splash) */
-    if (IsEqualGUID( iid, &IID_ICompositionAnimation2_early ) && object->vtbl == (const void **)expression_animation_vtbl)
+    /* The same for every recording animation (the spring animations): the Microsoft Store 22608 read a garbage
+     * HSTRING from get_Target and .NET copied 2 KiB from NULL */
+    if (IsEqualGUID( iid, &IID_ICompositionAnimation2_early ) && (object->vtbl == (const void **)expression_animation_vtbl ||
+        (object->kind && strlen( object->kind ) > 9 && !strcmp( object->kind + strlen( object->kind ) - 9, "Animation" ))))
         return expr_anim2_create( (IUnknown *)&object->vtbl, out );
     /* dcomp's surface-copy interface has a contract (CopySurface must return a surface): surfaces answer it, anything
      * else must refuse rather than hand XAML a vtable whose slot 3 returns nothing */
@@ -2807,6 +2903,9 @@ static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void 
         return create_closable_view( (IUnknown *)&object->vtbl, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local ))
         return create_weak_view( (IUnknown *)&object->vtbl, weak_source_vtbl, out );
+    /* not on expression animations: XAML's own code may expect their table there */
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view ) && object->vtbl != (const void **)expression_animation_vtbl)
+        return create_object2_view( (IUnknown *)&object->vtbl, out );
     InterlockedIncrement( &object->ref );
     *out = &object->vtbl;
     return S_OK;
@@ -7093,6 +7192,9 @@ static HRESULT WINAPI dcvc_iterable_GetTrustLevel( void *iface, TrustLevel *leve
     return inspectable_trust( level );
 }
 
+/* IIterator<Visual>: .NET asks for it before iterating a VisualCollection (the Microsoft Store 22608) */
+static const GUID IID_IIterator_Visual_local =
+    { 0xeca15496, 0xdcaa, 0x5095, { 0xa8, 0x98, 0xf8, 0x60, 0x2a, 0x40, 0xe1, 0x0a } };
 struct dcv_iterator
 {
     const void **vtbl;
@@ -7105,7 +7207,7 @@ static HRESULT WINAPI dcv_iterator_QueryInterface( void *iface, REFIID iid, void
     struct dcv_iterator *iterator = CONTAINING_RECORD( iface, struct dcv_iterator, vtbl );
     if (!out) return E_POINTER;
     if (!IsEqualGUID( iid, &IID_IUnknown ) && !IsEqualGUID( iid, &IID_IInspectable ) &&
-        !IsEqualGUID( iid, &IID_IAgileObject ))
+        !IsEqualGUID( iid, &IID_IAgileObject ) && !IsEqualGUID( iid, &IID_IIterator_Visual_local ))
     {
         *out = NULL;
         return E_NOINTERFACE;
@@ -7157,12 +7259,39 @@ static HRESULT WINAPI dcv_iterator_MoveNext( void *iface, boolean *value )
     if (value) *value = iterator->index < iterator->collection->owner->child_count;
     return S_OK;
 }
+static HRESULT WINAPI dcv_iterator_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI dcv_iterator_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.Foundation.Collections.IIterator`1<Windows.UI.Composition.Visual>";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI dcv_iterator_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI dcv_iterator_GetMany( void *iface, UINT32 capacity, void **items, UINT32 *actual )
+{
+    struct dcv_iterator *iterator = CONTAINING_RECORD( iface, struct dcv_iterator, vtbl );
+    UINT32 count = 0;
+    boolean more;
+
+    if (!actual) return E_POINTER;
+    while (count < capacity && SUCCEEDED( dcv_iterator_get_Current( iface, &items[count] ) ))
+    {
+        count++;
+        dcv_iterator_MoveNext( iface, &more );
+    }
+    *actual = count;
+    return S_OK;
+}
 static const void *dcv_iterator_vtbl[] =
 {
     dcv_iterator_QueryInterface, dcv_iterator_AddRef, dcv_iterator_Release,
-    dcv_iterator_QueryInterface /*GetIids-shaped slot, QI is fine*/, dcv_iterator_QueryInterface,
-    dcv_iterator_QueryInterface,
-    dcv_iterator_get_Current, dcv_iterator_get_HasCurrent, dcv_iterator_MoveNext,
+    dcv_iterator_GetIids, dcv_iterator_GetRuntimeClassName, dcv_iterator_GetTrustLevel,
+    dcv_iterator_get_Current, dcv_iterator_get_HasCurrent, dcv_iterator_MoveNext, dcv_iterator_GetMany,
 };
 static HRESULT WINAPI dcvc_iterable_First( void *iface, void **out )
 {
@@ -10641,9 +10770,9 @@ static HRESULT WINAPI iterator_QueryInterface( void *iface, REFIID iid, void **o
     struct visual_iterator *impl = CONTAINING_RECORD( iface, struct visual_iterator, vtbl );
     if (!out) return E_POINTER;
     if (!IsEqualGUID( iid, &IID_IUnknown ) && !IsEqualGUID( iid, &IID_IInspectable ) &&
-        !IsEqualGUID( iid, &IID_IAgileObject ))
+        !IsEqualGUID( iid, &IID_IAgileObject ) && !IsEqualGUID( iid, &IID_IIterator_Visual_local ))
     {
-        TRACE( "visual iterator: no interface %s.\n", debugstr_guid(iid) );
+        FIXME( "visual iterator: no interface %s.\n", debugstr_guid(iid) );
         *out = NULL;
         return E_NOINTERFACE;
     }
@@ -10711,7 +10840,8 @@ static HRESULT WINAPI iterator_GetMany( void *iface, unsigned int capacity, IVis
     while (count < capacity && impl->index < impl->collection->count)
     {
         items[count] = (IVisual *)impl->collection->children[impl->index++];
-        IVisual_AddRef( items[count++] );
+        IVisual_AddRef( items[count] );
+        count++;
     }
     *actual = count;
     return S_OK;
@@ -13086,9 +13216,11 @@ static HRESULT WINAPI color_brush_QueryInterface( ICompositionColorBrush *iface,
         *out = &impl->ICompositionObject_iface;
     else if (IsEqualGUID( iid, &IID_ICompositionObjectPartner_local ))
         *out = &impl->partner_vtbl;
+    else if (IsEqualGUID( iid, &IID_ICompositionObject2_view ))
+        return create_object2_view( (IUnknown *)&impl->ICompositionColorBrush_iface, out );
     else
     {
-        TRACE( "color brush %p: no interface %s.\n", impl, debugstr_guid( iid ) );
+        FIXME( "color brush %p: no interface %s.\n", impl, debugstr_guid( iid ) );
         *out = NULL;
         return E_NOINTERFACE;
     }
@@ -13744,6 +13876,7 @@ static HRESULT WINAPI kf_animation_QueryInterface( void *iface, REFIID iid, void
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct kf_animation *impl = CONTAINING_RECORD( iface, struct kf_animation, vtbl );
 
@@ -14055,6 +14188,7 @@ static HRESULT WINAPI clip_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct comp_clip *impl = CONTAINING_RECORD( iface, struct comp_clip, vtbl );
 
@@ -14350,6 +14484,7 @@ static HRESULT WINAPI comp_batch_QueryInterface( void *iface, REFIID iid, void *
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct comp_batch *batch = CONTAINING_RECORD( iface, struct comp_batch, vtbl );
 
@@ -14710,6 +14845,7 @@ static HRESULT WINAPI anim_controller_QueryInterface( void *iface, REFIID iid, v
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct anim_controller *ctrl = CONTAINING_RECORD( iface, struct anim_controller, vtbl );
 
@@ -14956,6 +15092,7 @@ static HRESULT WINAPI matrix_transform_QueryInterface( void *iface, REFIID iid, 
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct matrix_transform *impl = CONTAINING_RECORD( iface, struct matrix_transform, vtbl );
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
@@ -14993,6 +15130,7 @@ static HRESULT WINAPI manip_transform_QueryInterface( void *iface, REFIID iid, v
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct manip_transform *impl = CONTAINING_RECORD( iface, struct manip_transform, vtbl );
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
@@ -15026,6 +15164,7 @@ static HRESULT WINAPI expr_animation_QueryInterface( void *iface, REFIID iid, vo
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     struct expr_animation *impl = CONTAINING_RECORD( iface, struct expr_animation, vtbl );
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
     if (is_animation_group_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
@@ -16023,6 +16162,7 @@ static HRESULT WINAPI comp_shape_QueryInterface( void *iface, REFIID iid, void *
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     struct comp_shape *shape = CONTAINING_RECORD( iface, struct comp_shape, vtbl );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     TRACE( "%s %p, iid %s.\n", shape->kind, shape, debugstr_guid( iid ) );
@@ -16305,7 +16445,10 @@ static HRESULT WINAPI shape_children_GetMany( void *iface, UINT32 start, UINT32 
     unsigned int i;
     *actual = 0;
     for (i = start; i < shape->child_count && *actual < count; i++)
-        IInspectable_AddRef( (items[(*actual)++] = shape->children[i]) );
+    {
+        IInspectable_AddRef( (items[*actual] = shape->children[i]) );
+        (*actual)++;
+    }
     return S_OK;
 }
 static HRESULT WINAPI shape_children_ReplaceAll( void *iface, UINT32 count, IInspectable **items )
@@ -16329,6 +16472,7 @@ static HRESULT WINAPI path_geometry_QueryInterface( void *iface, REFIID iid, voi
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct path_geometry *geometry = CONTAINING_RECORD( iface, struct path_geometry, vtbl );
     TRACE( "%p, iid %s.\n", geometry, debugstr_guid( iid ) );
@@ -16711,6 +16855,7 @@ static HRESULT WINAPI cubic_bezier_QueryInterface( void *iface, REFIID iid, void
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct cubic_bezier_easing *impl = CONTAINING_RECORD( iface, struct cubic_bezier_easing, vtbl );
 
@@ -17060,6 +17205,7 @@ static HRESULT WINAPI effect_brush_QueryInterface( void *iface, REFIID iid, void
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     struct effect_brush *brush = CONTAINING_RECORD( iface, struct effect_brush, vtbl );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
 
@@ -17197,6 +17343,7 @@ static HRESULT WINAPI effect_factory_QueryInterface( void *iface, REFIID iid, vo
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     struct effect_factory *factory = CONTAINING_RECORD( iface, struct effect_factory, vtbl );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
 
@@ -18823,6 +18970,7 @@ static HRESULT WINAPI nine_grid_QueryInterface( void *iface, REFIID iid, void **
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     struct nine_grid_brush *brush = nine_grid_from( iface );
 
     static const GUID IID_ICompositionSurfaceBrush_local =
@@ -19062,6 +19210,7 @@ static HRESULT WINAPI mask_brush_QueryInterface( void *iface, REFIID iid, void *
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     struct mask_brush *brush = mask_brush_from( iface );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
 
@@ -19481,7 +19630,13 @@ static HRESULT WINAPI stop_collection_RemoveAtEnd( void *iface )
 static HRESULT WINAPI stop_collection_Clear( void *iface )
 {
     struct stop_collection *impl = stop_collection_from( iface );
-    while (impl->count) IUnknown_Release( impl->stops[--impl->count] );
+    /* not IUnknown_Release( impl->stops[--impl->count] ): the macro names its argument twice, so that released
+     * one stop through the next one's table and then read stops[-1] (XAML's AddWUCStops, Microsoft Store 22608) */
+    while (impl->count)
+    {
+        impl->count--;
+        IUnknown_Release( impl->stops[impl->count] );
+    }
     stop_collection_changed();
     return S_OK;
 }
@@ -20450,6 +20605,7 @@ static HRESULT WINAPI animation_group_QueryInterface( void *iface, REFIID iid, v
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject2_view )) return create_object2_view( iface, out );
     struct animation_group *group = animation_group_from( iface );
 
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
@@ -20643,7 +20799,11 @@ static HRESULT WINAPI animation_group_iterator_GetMany( void *iface, UINT32 size
 
     if (!count) return E_POINTER;
     while (n < size && iter->index < iter->count)
-        IUnknown_AddRef( (items[n++] = iter->items[iter->index++]) );
+    {
+        items[n] = iter->items[iter->index++];
+        IUnknown_AddRef( items[n] );
+        n++;
+    }
     *count = n;
     return S_OK;
 }
@@ -20780,6 +20940,133 @@ static HRESULT WINAPI compositor2_CreateStepEasingFunctionWithStepCount( void *i
     if (!result) return E_POINTER;
     return create_easing( "StepEasingFunction", 0, result );   /* runs linear */
 }
+
+/* Windows.UI.Composition.CompositionEasingFunction statics {17a766b6} (Windows 11): the same easings the compositor
+ * makes, created for an owner compositor. The Microsoft Store 22608 makes its list animations' easings here, and
+ * without the class its ResponsiveItemsRepeaterList cannot be created (an empty Home page). */
+static const GUID IID_ICompositionEasingFunctionStatics_local =
+    { 0x17a766b6, 0x2936, 0x53ea, { 0xb5, 0xaf, 0xc6, 0x42, 0xf4, 0xa6, 0x10, 0x83 } };
+static IActivationFactory easing_factory;
+static const void *const *easing_statics;
+static HRESULT WINAPI easing_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
+    {
+        *out = &easing_factory;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_ICompositionEasingFunctionStatics_local ))
+    {
+        *out = (void *)&easing_statics;
+        return S_OK;
+    }
+    FIXME( "CompositionEasingFunction factory: no interface %s.\n", debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI easing_factory_AddRef( IActivationFactory *iface ) { return 2; }
+static ULONG WINAPI easing_factory_Release( IActivationFactory *iface ) { return 1; }
+static HRESULT WINAPI easing_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI easing_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
+{
+    static const WCHAR nameW[] = L"Windows.UI.Composition.CompositionEasingFunction";
+    return WindowsCreateString( nameW, ARRAY_SIZE(nameW) - 1, name );
+}
+static HRESULT WINAPI easing_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI easing_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+{
+    return E_NOTIMPL;   /* abstract: Windows has no constructor either */
+}
+static const IActivationFactoryVtbl easing_factory_vtbl =
+{
+    easing_factory_QueryInterface, easing_factory_AddRef, easing_factory_Release, easing_factory_GetIids,
+    easing_factory_GetRuntimeClassName, easing_factory_GetTrustLevel, easing_factory_ActivateInstance,
+};
+static IActivationFactory easing_factory = { &easing_factory_vtbl };
+IActivationFactory *easing_function_activation_factory = &easing_factory;
+
+static HRESULT WINAPI easing_statics_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return easing_factory_QueryInterface( &easing_factory, iid, out );
+}
+static ULONG WINAPI easing_statics_AddRef( void *iface ) { return 2; }
+static ULONG WINAPI easing_statics_Release( void *iface ) { return 1; }
+static HRESULT WINAPI easing_statics_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return inspectable_get_iids( count, iids );
+}
+static HRESULT WINAPI easing_statics_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return easing_factory_GetRuntimeClassName( &easing_factory, name );
+}
+static HRESULT WINAPI easing_statics_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return inspectable_trust( level );
+}
+static HRESULT WINAPI easing_statics_CreateCubicBezier( void *iface, ICompositor *owner, Vector2 point1, Vector2 point2,
+        void **result )
+{
+    return compositor_CreateCubicBezierEasingFunction( owner, point1, point2, (ICubicBezierEasingFunction **)result );
+}
+static HRESULT WINAPI easing_statics_CreateLinear( void *iface, ICompositor *owner, void **result )
+{
+    return compositor_CreateLinearEasingFunction( owner, (ILinearEasingFunction **)result );
+}
+static HRESULT WINAPI easing_statics_CreateStep( void *iface, ICompositor *owner, void **result )
+{
+    return compositor2_CreateStepEasingFunction( NULL, result );
+}
+static HRESULT WINAPI easing_statics_CreateStepWithCount( void *iface, ICompositor *owner, INT32 count, void **result )
+{
+    return compositor2_CreateStepEasingFunctionWithStepCount( NULL, count, result );
+}
+static HRESULT WINAPI easing_statics_CreateBack( void *iface, ICompositor *owner, int mode, float amplitude, void **result )
+{
+    return dcprivate_CreateBackEasingFunction( NULL, mode, amplitude, result );
+}
+static HRESULT WINAPI easing_statics_CreateBounce( void *iface, ICompositor *owner, int mode, INT32 bounces, float bounciness,
+        void **result )
+{
+    return dcprivate_CreateBounceEasingFunction( NULL, mode, bounces, bounciness, result );
+}
+static HRESULT WINAPI easing_statics_CreateCircle( void *iface, ICompositor *owner, int mode, void **result )
+{
+    return dcprivate_CreateCircleEasingFunction( NULL, mode, result );
+}
+static HRESULT WINAPI easing_statics_CreateElastic( void *iface, ICompositor *owner, int mode, INT32 oscillations,
+        float springiness, void **result )
+{
+    return dcprivate_CreateElasticEasingFunction( NULL, mode, oscillations, springiness, result );
+}
+static HRESULT WINAPI easing_statics_CreateExponential( void *iface, ICompositor *owner, int mode, float exponent, void **result )
+{
+    return dcprivate_CreateExponentialEasingFunction( NULL, mode, exponent, result );
+}
+static HRESULT WINAPI easing_statics_CreatePower( void *iface, ICompositor *owner, int mode, float power, void **result )
+{
+    return dcprivate_CreatePowerEasingFunction( NULL, mode, power, result );
+}
+static HRESULT WINAPI easing_statics_CreateSine( void *iface, ICompositor *owner, int mode, void **result )
+{
+    return dcprivate_CreateSineEasingFunction( NULL, mode, result );
+}
+static const void *easing_statics_vtbl[] =
+{
+    easing_statics_QueryInterface, easing_statics_AddRef, easing_statics_Release, easing_statics_GetIids,
+    easing_statics_GetRuntimeClassName, easing_statics_GetTrustLevel,
+    easing_statics_CreateCubicBezier, easing_statics_CreateLinear, easing_statics_CreateStep,
+    easing_statics_CreateStepWithCount, easing_statics_CreateBack, easing_statics_CreateBounce,
+    easing_statics_CreateCircle, easing_statics_CreateElastic, easing_statics_CreateExponential,
+    easing_statics_CreatePower, easing_statics_CreateSine,
+};
+static const void *const *easing_statics = easing_statics_vtbl;
 
 static struct compositor *impl_from_compositor3( void *iface )
 {
@@ -21757,6 +22044,9 @@ static const GUID IID_IInteractionTrackerStatics_ = { 0xbba5d7b7, 0x6590, 0x4498
 static const GUID IID_IVisualInteractionSource_ = { 0xca0e8a86, 0xd8d6, 0x4111, { 0xb0, 0x88, 0x70, 0x34, 0x7b, 0xd2, 0xb0, 0xed } };
 static const GUID IID_ICompositionInteractionSource_ = { 0x043b2431, 0x06e3, 0x495a, { 0xba, 0x54, 0x40, 0x9f, 0x00, 0x17, 0xfa, 0xc0 } };
 static const GUID IID_IVisualInteractionSource2_ = { 0xaa914893, 0xa73c, 0x414d, { 0x80, 0xd0, 0x24, 0x9b, 0xad, 0x2f, 0xbd, 0x93 } };
+static const GUID IID_IVisualInteractionSource3_ = { 0xd941ef2a, 0x0d5c, 0x4057, { 0x92, 0xd7, 0xc9, 0x71, 0x15, 0x33, 0x20, 0x4f } };
+struct interactions_object;
+static HRESULT create_vis3_view( struct interactions_object *owner, void **out );
 static const GUID IID_IInteractionTrackerInertiaModifier_ = { 0xa0e2c920, 0x26b4, 0x4da2, { 0x8b, 0x61, 0x5e, 0x68, 0x39, 0x79, 0xbb, 0xe2 } };
 static const GUID IID_IInteractionTrackerInertiaRestingValue_ = { 0x86f7ec09, 0x5096, 0x4170, { 0x9c, 0xc8, 0xdf, 0x2f, 0xe1, 0x01, 0xbb, 0x93 } };
 static const GUID IID_IInteractionTrackerInertiaRestingValueStatics_ = { 0x18ed4699, 0x0745, 0x4096, { 0xbc, 0xab, 0x3a, 0x4e, 0x99, 0x56, 0x9b, 0xcf } };
@@ -21821,6 +22111,8 @@ static HRESULT WINAPI interactions_QueryInterface( void *iface, REFIID iid, void
         *out = &object->vtbl;
         return S_OK;
     }
+    if (object->vtbl2 && IsEqualGUID( iid, &IID_IVisualInteractionSource3_ ))
+        return create_vis3_view( object, out );
     if (object->vtbl2 && IsEqualGUID( iid, &IID_IVisualInteractionSource2_ ))
     {
         InterlockedIncrement( &object->ref );
@@ -22261,6 +22553,96 @@ static const void *vis2_vtbl[] =
     vis2_configure, vis2_configure, vis2_configure, vis2_configure, vis2_configure,
 };
 
+/* InteractionSourceConfiguration {a78347e5}: three redirection modes, kept and answered */
+static const GUID IID_IInteractionSourceConfiguration_ = { 0xa78347e5, 0xa9d1, 0x4d02, { 0x98, 0x5e, 0xb9, 0x30, 0xcd, 0x0b, 0x9d, 0xa4 } };
+static HRESULT WINAPI config_get_mode( void *iface, unsigned int i, int *value )
+{
+    if (!value) return E_POINTER;
+    *value = interactions_from( iface )->modes[i];
+    return S_OK;
+}
+static HRESULT WINAPI config_get_PositionX( void *iface, int *value ) { return config_get_mode( iface, 0, value ); }
+static HRESULT WINAPI config_put_PositionX( void *iface, int value ) { interactions_from( iface )->modes[0] = value; return S_OK; }
+static HRESULT WINAPI config_get_PositionY( void *iface, int *value ) { return config_get_mode( iface, 1, value ); }
+static HRESULT WINAPI config_put_PositionY( void *iface, int value ) { interactions_from( iface )->modes[1] = value; return S_OK; }
+static HRESULT WINAPI config_get_Scale( void *iface, int *value ) { return config_get_mode( iface, 2, value ); }
+static HRESULT WINAPI config_put_Scale( void *iface, int value ) { interactions_from( iface )->modes[2] = value; return S_OK; }
+static const void *config_vtbl[] =
+{
+    interactions_QueryInterface, interactions_AddRef, interactions_Release,
+    interactions_GetIids, interactions_GetRuntimeClassName, interactions_GetTrustLevel,
+    config_get_PositionX, config_put_PositionX, config_get_PositionY, config_put_PositionY,
+    config_get_Scale, config_put_Scale,
+};
+
+/* IVisualInteractionSource3 {d941ef2a}: 6 get_PointerWheelConfig. A view on the source; the configuration is
+ * made once and kept in the source's items[0], which a VisualInteractionSource does not otherwise use. */
+struct vis3_view
+{
+    const void **vtbl;
+    LONG ref;
+    struct interactions_object *owner;
+};
+static HRESULT WINAPI vis3_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct vis3_view *view = iface;
+    return interactions_QueryInterface( &view->owner->vtbl, iid, out );
+}
+static ULONG WINAPI vis3_AddRef( void *iface )
+{
+    return InterlockedIncrement( &((struct vis3_view *)iface)->ref );
+}
+static ULONG WINAPI vis3_Release( void *iface )
+{
+    struct vis3_view *view = iface;
+    ULONG ref = InterlockedDecrement( &view->ref );
+    if (!ref)
+    {
+        interactions_Release( &view->owner->vtbl );
+        free( view );
+    }
+    return ref;
+}
+static HRESULT WINAPI vis3_GetIids( void *iface, ULONG *count, IID **iids ) { *count = 0; *iids = NULL; return S_OK; }
+static HRESULT WINAPI vis3_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return interactions_GetRuntimeClassName( &((struct vis3_view *)iface)->owner->vtbl, name );
+}
+static HRESULT WINAPI vis3_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
+static HRESULT WINAPI vis3_get_PointerWheelConfig( void *iface, IUnknown **value )
+{
+    struct interactions_object *source = ((struct vis3_view *)iface)->owner, *config;
+
+    if (!value) return E_POINTER;
+    if (!source->items[0])
+    {
+        if (!(config = interactions_create( "InteractionSourceConfiguration",
+                                            L"Windows.UI.Composition.Interactions.InteractionSourceConfiguration",
+                                            &IID_IInteractionSourceConfiguration_, config_vtbl, FALSE )))
+            return E_OUTOFMEMORY;
+        source->items[0] = (IUnknown *)&config->vtbl;
+        if (!source->count) source->count = 1;   /* so the source's Release lets it go */
+    }
+    IUnknown_AddRef( (*value = source->items[0]) );
+    return S_OK;
+}
+static const void *vis3_vtbl[] =
+{
+    vis3_QueryInterface, vis3_AddRef, vis3_Release, vis3_GetIids, vis3_GetRuntimeClassName, vis3_GetTrustLevel,
+    vis3_get_PointerWheelConfig,
+};
+static HRESULT create_vis3_view( struct interactions_object *owner, void **out )
+{
+    struct vis3_view *view;
+    if (!(view = calloc( 1, sizeof(*view) ))) { *out = NULL; return E_OUTOFMEMORY; }
+    view->vtbl = vis3_vtbl;
+    view->ref = 1;
+    view->owner = owner;
+    interactions_AddRef( &owner->vtbl );
+    *out = view;
+    return S_OK;
+}
+
 static HRESULT create_visual_interaction_source( IUnknown *visual, void **out )
 {
     struct interactions_object *object;
@@ -22365,10 +22747,27 @@ static const void *resting_statics_vtbl[] =
 static const void *const *resting_statics = resting_statics_vtbl;
 static const void *const *tracker_statics = tracker_statics_vtbl;
 static const void *const *vis_statics = vis_statics_vtbl;
+/* IVisualInteractionSourceStatics2 {a979c032}: CreateFromIVisualElement(element). The source is only kept (and
+ * handed back by get_Source), so the element stands in for its visual. The Microsoft Store 22608's
+ * ResponsiveItemsRepeaterList cannot be created when this fails. */
+static const GUID IID_IVisualInteractionSourceStatics2_ = { 0xa979c032, 0x5764, 0x55e0, { 0xbc, 0x1f, 0x07, 0x78, 0x78, 0x6d, 0xcf, 0xde } };
+static HRESULT WINAPI vis_statics2_CreateFromIVisualElement( void *iface, IUnknown *element, void **out )
+{
+    TRACE( "element %p.\n", element );
+    return create_visual_interaction_source( element, out );
+}
+static const void *vis_statics2_vtbl[] =
+{
+    interactions_statics_QueryInterface, interactions_statics_AddRef, interactions_statics_Release,
+    interactions_statics_GetIids, interactions_statics_GetRuntimeClassName, interactions_statics_GetTrustLevel,
+    vis_statics2_CreateFromIVisualElement,
+};
+static const void *const *vis_statics2 = vis_statics2_vtbl;
 static HRESULT WINAPI interactions_statics_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IInteractionTrackerStatics_ )) { *out = &tracker_statics; return S_OK; }
     if (IsEqualGUID( iid, &IID_IVisualInteractionSourceStatics_ )) { *out = &vis_statics; return S_OK; }
+    if (IsEqualGUID( iid, &IID_IVisualInteractionSourceStatics2_ )) { *out = &vis_statics2; return S_OK; }
     if (IsEqualGUID( iid, &IID_IInteractionTrackerInertiaRestingValueStatics_ )) { *out = &resting_statics; return S_OK; }
     if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ))
     {
@@ -22398,8 +22797,13 @@ static HRESULT WINAPI generic_factory_QueryInterface( IActivationFactory *iface,
     {
         if (IsEqualGUID( iid, &IID_IInteractionTrackerStatics_ )) { *out = &tracker_statics; return S_OK; }
         if (IsEqualGUID( iid, &IID_IVisualInteractionSourceStatics_ )) { *out = &vis_statics; return S_OK; }
-    if (IsEqualGUID( iid, &IID_IInteractionTrackerInertiaRestingValueStatics_ )) { *out = &resting_statics; return S_OK; }
-        if (!getenv( "WINE_DCOMP_INTERACTIONS_RECORD" )) return create_failing_object( "InteractionsStatics", out );
+        if (IsEqualGUID( iid, &IID_IVisualInteractionSourceStatics2_ )) { *out = &vis_statics2; return S_OK; }
+        if (IsEqualGUID( iid, &IID_IInteractionTrackerInertiaRestingValueStatics_ )) { *out = &resting_statics; return S_OK; }
+        if (!getenv( "WINE_DCOMP_INTERACTIONS_RECORD" ))
+        {
+            FIXME( "Interactions statics %s: creators fail.\n", debugstr_guid( iid ) );
+            return create_failing_object( "InteractionsStatics", out );
+        }
     }
     return create_comp_object( factory->kind, out );
 }

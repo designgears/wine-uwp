@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     749a77301608c1e42362eac212d904dd97c996b6
-                 dcomp, iphlpapi: Microsoft Store 22608 start-up.
+  wine HEAD:     85079fc0c5f08a905da84782ab0f41aed10f36e3
+                 dcomp: more of what the Microsoft Store 22608 needs.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-19T20:39:30Z
+  captured:      2026-10-19T22:00:04Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

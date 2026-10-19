@@ -12880,7 +12880,31 @@ A parameterised IID nobody recognises is worth brute-forcing over IVector/IItera
 **Get dcomp's base from a `BP armed` line before symbolising a fault address**: assuming the previous run's base sent
 me to two wrong functions.
 
-Now: the 22608 Home page shows its nav rail (Themes, What's New, Downloads, Library), search box and skeleton cards,
-then dies in `stop_collection_Clear` called from XAML's `CGradientStopCollection::AddWUCStops` (a dangling color
-stop in a brush's ColorStops), and under `warn+heap` timing in a generic slot writing a recording object through a
-non-pointer. Both are catch-all misuse still to be traced. Start-up takes ~2 minutes before the Home skeleton.
+Then, in later rounds the same day:
+5. **`stop_collection_Clear` was our bug, not an over-release**: `IUnknown_Release( impl->stops[--impl->count] )`.
+   Wine's COM macros name their argument twice, so each pass decremented twice, released `stops[1]` through
+   `stops[2]`'s table and then read `stops[-1]`. Three `GetMany` loops had the same shape (`items[n++]` inside
+   `..._AddRef`) and skipped every other element. **Never put a side effect inside a COM macro's argument**;
+   `grep -nE "_(Release|AddRef)\(.*(\+\+|--)"` finds them. I spent two probe runs on lifetimes first: logging
+   every stop's free showed only one free in the whole run, from inside Clear, which is what gave it away.
+6. `IIterator<Visual>` (`{eca15496}`) on both visual iterators (one also had its QI in the GetIids,
+   GetRuntimeClassName and GetTrustLevel slots); `CompositionEasingFunction` statics (`{17a766b6}`, Windows 11's
+   static easing creators); `IVisualInteractionSourceStatics2::CreateFromIVisualElement` and
+   `IVisualInteractionSource3::get_PointerWheelConfig` (the Interactions factory deliberately returns failing
+   creators for statics it does not know: log their IID, it was the `E_NOTIMPL` behind
+   `ResponsiveItemsRepeaterList`); an `ICompositionObject2` view for every object but dcomp visuals (a color brush
+   was cast to it); and the Target-keeping `ICompositionAnimation2` view for every recording animation, not just
+   expressions (a spring animation's slot 7 wrote a garbage HSTRING that .NET copied 2 KiB from NULL).
+
+How these were found: `WinStore.App.dll+0x3188990` is the runtime's throw helper and `+0xc46a10` its
+ThrowExceptionForHR (HRESULT in `ecx`); breakpoints there with `@stk` group every managed failure by HRESULT and
+call site. The call before a failing HRESULT goes through the CFG dispatcher with the target in `rax`; a breakpoint
+just before and after the call pairs target and result. The native object behind a .NET RCW is in `rax` right
+after `call *0x38(vtbl)` in the QI stubs (`+0x29ad459`, `+0x29acd92`); its first qword is our vtable. **dcomp's
+base moves with its size: read it from `/proc/<pid>/maps` of the same build**, never reuse an older run's.
+
+Now (`docs/screenshots/msstore-22608-home-navrail.png`): 22608 starts with no managed exceptions left, shows its nav
+rail and search box, and its UI thread then spins at ~90% CPU in `CXcpDispatcher::OnWindowMessage` walking a long
+list of pending `0x403` messages. The Home area stays empty and clicks are not handled. `WINE_UWP_PROFILE` puts
+BringIntoView, ItemsRepeater and SetTimer churn from `dcomp!apply_clip_object` in the same thread. Next: what keeps
+posting.
