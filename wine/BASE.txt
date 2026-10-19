@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     aa721f44d9e21d21c6434c1b8318613276e9dafe
-                 d2d1: Support 8bpp alpha WIC render targets.
+  wine HEAD:     424269a51e10947940ecc1c5167e2020473b1a68
+                 dcomp: Answer IClosable with a real Close for every catch-all object.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-19T11:13:35Z
+  captured:      2026-10-19T11:19:15Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

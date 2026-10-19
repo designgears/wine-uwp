@@ -2624,6 +2624,75 @@ static HRESULT expr_anim2_create( IUnknown *owner, void **out )
     return S_OK;
 }
 
+/* Windows.Foundation.IClosable for any object answered by the catch-all below. Its slot 6 is Close(), and handing
+ * out the primary table made Close() run whatever typed method sits there: the Microsoft Store disposing a surface
+ * brush ran get_BitmapInterpolationMode, which wrote through Close's missing argument and fail-fasted the app. Close
+ * releases nothing: the painter walks our objects by raw pointer, so they live until their last reference goes. */
+struct closable_view
+{
+    const void **vtbl;
+    LONG ref;
+    IUnknown *owner;
+};
+static HRESULT WINAPI closable_view_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct closable_view *view = iface;
+    return IUnknown_QueryInterface( view->owner, iid, out );
+}
+static ULONG WINAPI closable_view_AddRef( void *iface )
+{
+    struct closable_view *view = iface;
+    return InterlockedIncrement( &view->ref );
+}
+static ULONG WINAPI closable_view_Release( void *iface )
+{
+    struct closable_view *view = iface;
+    ULONG ref = InterlockedDecrement( &view->ref );
+    if (!ref)
+    {
+        IUnknown_Release( view->owner );
+        free( view );
+    }
+    return ref;
+}
+static HRESULT WINAPI closable_view_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    struct closable_view *view = iface;
+    return IInspectable_GetIids( (IInspectable *)view->owner, count, iids );
+}
+static HRESULT WINAPI closable_view_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    struct closable_view *view = iface;
+    return IInspectable_GetRuntimeClassName( (IInspectable *)view->owner, name );
+}
+static HRESULT WINAPI closable_view_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    struct closable_view *view = iface;
+    return IInspectable_GetTrustLevel( (IInspectable *)view->owner, level );
+}
+static HRESULT WINAPI closable_view_Close( void *iface )
+{
+    struct closable_view *view = iface;
+    TRACE( "%p, owner %p.\n", view, view->owner );
+    return S_OK;
+}
+static const void *closable_view_vtbl[] =
+{
+    closable_view_QueryInterface, closable_view_AddRef, closable_view_Release, closable_view_GetIids,
+    closable_view_GetRuntimeClassName, closable_view_GetTrustLevel, closable_view_Close,
+};
+static HRESULT create_closable_view( IUnknown *owner, void **out )
+{
+    struct closable_view *view;
+
+    if (!(view = calloc( 1, sizeof(*view) ))) { *out = NULL; return E_OUTOFMEMORY; }
+    view->vtbl = closable_view_vtbl;
+    view->ref = 1;
+    IUnknown_AddRef( (view->owner = owner) );
+    *out = &view->vtbl;
+    return S_OK;
+}
+
 static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void **out )
 {
     struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
@@ -2653,6 +2722,8 @@ static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void 
      * else must refuse rather than hand XAML a vtable whose slot 3 returns nothing */
     if (IsEqualGUID( iid, &IID_IDCompositionSurfaceCopy_local ))
         return surface_copy_query( iface, __builtin_return_address( 0 ), out );
+    if (IsEqualGUID( iid, &IID_IClosable ))
+        return create_closable_view( (IUnknown *)&object->vtbl, out );
     InterlockedIncrement( &object->ref );
     *out = &object->vtbl;
     return S_OK;
@@ -13538,6 +13609,7 @@ static const void *kfa3_vtbl[] =
 
 static HRESULT WINAPI kf_animation_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct kf_animation *impl = CONTAINING_RECORD( iface, struct kf_animation, vtbl );
 
@@ -13847,6 +13919,7 @@ static struct comp_clip *clip_from_any( void *iface )
 }
 static HRESULT WINAPI clip_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct comp_clip *impl = CONTAINING_RECORD( iface, struct comp_clip, vtbl );
 
@@ -14140,6 +14213,7 @@ static ULONG WINAPI comp_batch_Release( void *iface )
 }
 static HRESULT WINAPI comp_batch_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct comp_batch *batch = CONTAINING_RECORD( iface, struct comp_batch, vtbl );
 
@@ -14498,6 +14572,7 @@ static struct anim_controller *anim_controller_from_any( void *object )
 }
 static HRESULT WINAPI anim_controller_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct anim_controller *ctrl = CONTAINING_RECORD( iface, struct anim_controller, vtbl );
 
@@ -14742,6 +14817,7 @@ static HRESULT WINAPI matrix_transform_SetMatrix( void *iface, const D2D_MATRIX_
 }
 static HRESULT WINAPI matrix_transform_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct matrix_transform *impl = CONTAINING_RECORD( iface, struct matrix_transform, vtbl );
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
@@ -14777,6 +14853,7 @@ static struct matrix_transform *matrix_transform_from( IUnknown *object )
 
 static HRESULT WINAPI manip_transform_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct manip_transform *impl = CONTAINING_RECORD( iface, struct manip_transform, vtbl );
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
@@ -14808,6 +14885,7 @@ static struct expr_animation *expr_from_anim_view( void *iface )
 }
 static HRESULT WINAPI expr_animation_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     struct expr_animation *impl = CONTAINING_RECORD( iface, struct expr_animation, vtbl );
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
     if (is_animation_group_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
@@ -15803,6 +15881,7 @@ static struct path_geometry *geometry_from_view( void *iface ) { return CONTAINI
 
 static HRESULT WINAPI comp_shape_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     struct comp_shape *shape = CONTAINING_RECORD( iface, struct comp_shape, vtbl );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     TRACE( "%s %p, iid %s.\n", shape->kind, shape, debugstr_guid( iid ) );
@@ -16106,6 +16185,7 @@ static const void *shape_children_vtbl[] =
 /* path geometry: ICompositionPathGeometry main table (6 get_Path, 7 put_Path), ICompositionGeometry view (trims) */
 static HRESULT WINAPI path_geometry_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct path_geometry *geometry = CONTAINING_RECORD( iface, struct path_geometry, vtbl );
     TRACE( "%p, iid %s.\n", geometry, debugstr_guid( iid ) );
@@ -16486,6 +16566,7 @@ static LONG cubic_bezier_vtbl_ready;
 
 static HRESULT WINAPI cubic_bezier_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct cubic_bezier_easing *impl = CONTAINING_RECORD( iface, struct cubic_bezier_easing, vtbl );
 
@@ -16833,6 +16914,7 @@ static LONG effect_vtbls_ready;
 
 static HRESULT WINAPI effect_brush_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     struct effect_brush *brush = CONTAINING_RECORD( iface, struct effect_brush, vtbl );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
 
@@ -16968,6 +17050,7 @@ static const void *effect_brush_iface_vtbl[] =
 
 static HRESULT WINAPI effect_factory_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     struct effect_factory *factory = CONTAINING_RECORD( iface, struct effect_factory, vtbl );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
 
@@ -18592,6 +18675,7 @@ static struct nine_grid_brush *nine_grid_from( void *iface )
 }
 static HRESULT WINAPI nine_grid_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     struct nine_grid_brush *brush = nine_grid_from( iface );
 
     static const GUID IID_ICompositionSurfaceBrush_local =
@@ -18829,6 +18913,7 @@ static struct mask_brush *mask_brush_from( void *iface )
 
 static HRESULT WINAPI mask_brush_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     struct mask_brush *brush = mask_brush_from( iface );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
 
@@ -20215,6 +20300,7 @@ static struct animation_group *animation_group_from( void *iface )
 
 static HRESULT WINAPI animation_group_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
     struct animation_group *group = animation_group_from( iface );
 
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }

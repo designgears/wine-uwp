@@ -12818,3 +12818,14 @@ Library and Help; content not yet loaded). Now it stops on its start-up code: th
 thread (`CoreApplication.MainView` dispatcher), but the hosted CoreWindow and its XAML live on the second view our
 activation creates, so XAML calls fail with `RPC_E_WRONG_THREAD`. Also open: an InvalidCast in `HoverXamlLight` and an
 `E_NOTIMPL` in the Toolkit's `AttachedShadowElementContext`. All of this is built only in `uwp-bin/wine-build-wow64`.
+
+### Microsoft Store: navigating pages (2026-10-19)
+
+Clicking Apps fail-fasted (0x1007 out of mrt100) with `dcomp.dll` as the faulting frame: first
+`surface_brush_get_BitmapInterpolationMode`, then, once that was covered, `path_geometry_get_Path`. The managed side
+disposes composition objects through `IClosable::Close` (slot 6), and every catch-all `QueryInterface` handed out the
+primary table, so Close ran whatever getter sits in slot 6 and wrote through its missing argument. dcomp now answers
+`IClosable` with a shared tear-off (`create_closable_view`) from `comp_object_QueryInterface` and from the fifteen
+typed objects with their own catch-all; Close releases nothing (the painter holds raw pointers). Navigation works
+(`docs/screenshots/msstore-apps-skeleton.png`), but pages stay on their loading skeletons: the content lists are the
+next problem, the same one as the empty Home tiles. Also visible: the nav rail icons are drawn oversized and offset.
