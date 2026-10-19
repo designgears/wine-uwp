@@ -102,3 +102,6 @@ void playback_set_volume( struct playback *pb, double volume, BOOL muted );
 BOOL playback_is_playing( struct playback *pb );
 LONGLONG playback_position( struct playback *pb );
 LONGLONG playback_duration( struct playback *pb );
+void playback_video_size( struct playback *pb, UINT32 *width, UINT32 *height );
+void playback_set_surface_size( struct playback *pb, UINT32 width, UINT32 height );
+HANDLE playback_video_surface( struct playback *pb );

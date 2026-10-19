@@ -119,6 +119,7 @@ struct media_player
     IMediaPlayerSource2 IMediaPlayerSource2_iface;
     IMediaPlayer5 IMediaPlayer5_iface;
     IClosable IClosable_iface;
+    const void **IMediaPlayer4_vtbl;
     LONG ref;
 
     ISystemMediaTransportControls *controls;
@@ -145,6 +146,7 @@ struct media_player
                       volume_changed, muted_changed, source_changed;
     struct event_list session_state_changed, session_position_changed, session_duration_changed,
                       session_video_size_changed, session_seek_completed;
+    Size surface_size;          /* IMediaPlayer4::SetSurfaceSize: what XAML renders the video at */
     /* What is open: the source and the file it named then. Opening happens once per file, not per
      * Play - but a playlist keeps one source and changes the file under it, so the file decides.
      * open_cs serialises opening, and guards source against put_Source while a worker reads it. */
@@ -179,6 +181,8 @@ static inline struct media_player *impl_from_IMediaPlayer( IMediaPlayer *iface )
  * a getter and writing NULL through its first argument corrupted the caller's handler and killed
  * the process.
  */
+static const GUID IID_IMediaPlayer4 =
+    {0x80035db0,0x7448,0x4770,{0xaf,0xcf,0x2a,0x57,0x45,0x09,0x14,0xc5}};
 static const GUID IID_IMediaPlayerPrivate =
     {0x9d47a108,0x81a6,0x43f9,{0xb4,0x0d,0x64,0x03,0x55,0x2d,0xf7,0x34}};
 
@@ -186,7 +190,10 @@ struct media_player_private
 {
     const void **vtbl;
     LONG ref;
+    IMediaPlayer *player;
 };
+
+static struct playback *media_player_playback( IMediaPlayer *player );
 
 static HRESULT WINAPI mpp_QueryInterface( void *iface, REFIID iid, void **out )
 {
@@ -211,7 +218,11 @@ static ULONG WINAPI mpp_Release( void *iface )
 {
     struct media_player_private *impl = iface;
     ULONG ref = InterlockedDecrement( &impl->ref );
-    if (!ref) free( impl );
+    if (!ref)
+    {
+        IMediaPlayer_Release( impl->player );
+        free( impl );
+    }
     return ref;
 }
 static HRESULT WINAPI mpp_GetIids( void *iface, ULONG *count, IID **iids )
@@ -247,10 +258,17 @@ static HRESULT WINAPI mpp_get_CastingRenderLocation( void *iface, INT32 *value )
     *value = 0;
     return S_OK;
 }
+/* XAML's MediaPlayerPresenter shows the video through this: a composition surface handle, which
+ * it closes when it lets go, so each call hands out a duplicate. Asked once the session reports a
+ * natural video size. */
 static HRESULT WINAPI mpp_get_VideoSwapchainHandle( void *iface, HANDLE *value )
 {
+    struct media_player_private *impl = iface;
+    struct playback *playback = media_player_playback( impl->player );
+
     if (!value) return E_POINTER;
-    *value = NULL;
+    *value = playback ? playback_video_surface( playback ) : NULL;
+    TRACE( "iface %p -> %p.\n", iface, *value );
     return S_OK;
 }
 static HRESULT WINAPI mpp_get_CurrentMediaPlaybackItem( void *iface, void **value )
@@ -297,13 +315,14 @@ static const void *media_player_private_vtbl[] =
     mpp_DisableVisibilityHandling,
 };
 
-static HRESULT create_media_player_private( void **out )
+static HRESULT create_media_player_private( IMediaPlayer *player, void **out )
 {
     struct media_player_private *impl;
 
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
     impl->vtbl = media_player_private_vtbl;
     impl->ref = 1;
+    IMediaPlayer_AddRef( (impl->player = player) );
     *out = impl;
     return S_OK;
 }
@@ -325,7 +344,14 @@ static HRESULT WINAPI media_player_QueryInterface( IMediaPlayer *iface, REFIID i
     }
 
     if (IsEqualGUID( iid, &IID_IMediaPlayerPrivate ))
-        return create_media_player_private( out );
+        return create_media_player_private( iface, out );
+
+    if (IsEqualGUID( iid, &IID_IMediaPlayer4 ))
+    {
+        *out = &impl->IMediaPlayer4_vtbl;
+        IInspectable_AddRef( *out );
+        return S_OK;
+    }
 
     if (IsEqualGUID( iid, &IID_IMediaPlayer2 ))
     {
@@ -735,6 +761,72 @@ static HRESULT WINAPI media_player_remove_BufferingEnded( IMediaPlayer *iface, E
 }
 
 static HRESULT media_player_resolve_source( struct media_player *impl );
+
+/*
+ * IMediaPlayer4, {80035db0-7448-4770-afcf-2a57450914c5}: SetSurfaceSize and GetSurface.
+ * windows.media.playback.idl has it commented out. XAML's MediaPlayerPresenter::UpdateVideoStream
+ * casts the player to it to report the size it renders the video at, and treats a failed cast as
+ * "no video": it then dropped the natural size it had read and never asked for the swap chain.
+ * The engine renders at that size, as the Windows media engine does: the compositor shows the swap
+ * chain's pixels one to one. GetSurface is for apps that compose the video themselves.
+ */
+static struct media_player *impl_from_IMediaPlayer4( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct media_player, IMediaPlayer4_vtbl );
+}
+static HRESULT WINAPI media_player4_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return IMediaPlayer_QueryInterface( &impl_from_IMediaPlayer4( iface )->IMediaPlayer_iface, iid, out );
+}
+static ULONG WINAPI media_player4_AddRef( void *iface )
+{
+    return IMediaPlayer_AddRef( &impl_from_IMediaPlayer4( iface )->IMediaPlayer_iface );
+}
+static ULONG WINAPI media_player4_Release( void *iface )
+{
+    return IMediaPlayer_Release( &impl_from_IMediaPlayer4( iface )->IMediaPlayer_iface );
+}
+static HRESULT WINAPI media_player4_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return IMediaPlayer_GetIids( &impl_from_IMediaPlayer4( iface )->IMediaPlayer_iface, count, iids );
+}
+static HRESULT WINAPI media_player4_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return IMediaPlayer_GetRuntimeClassName( &impl_from_IMediaPlayer4( iface )->IMediaPlayer_iface, name );
+}
+static HRESULT WINAPI media_player4_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return IMediaPlayer_GetTrustLevel( &impl_from_IMediaPlayer4( iface )->IMediaPlayer_iface, level );
+}
+static HRESULT WINAPI media_player4_SetSurfaceSize( void *iface, Size size )
+{
+    struct media_player *impl = impl_from_IMediaPlayer4( iface );
+
+    TRACE( "iface %p, size %.1fx%.1f.\n", iface, size.Width, size.Height );
+
+    impl->surface_size = size;
+    if (impl->playback && size.Width >= 1.0f && size.Height >= 1.0f)
+        playback_set_surface_size( impl->playback, (UINT32)(size.Width + 0.5f), (UINT32)(size.Height + 0.5f) );
+    return S_OK;
+}
+static HRESULT WINAPI media_player4_GetSurface( void *iface, void *compositor, void **surface )
+{
+    FIXME( "iface %p, compositor %p, surface %p stub!\n", iface, compositor, surface );
+    if (surface) *surface = NULL;
+    return E_NOTIMPL;
+}
+static const void *media_player4_vtbl[] =
+{
+    media_player4_QueryInterface, media_player4_AddRef, media_player4_Release,
+    media_player4_GetIids, media_player4_GetRuntimeClassName, media_player4_GetTrustLevel,
+    media_player4_SetSurfaceSize,
+    media_player4_GetSurface,
+};
+
+static struct playback *media_player_playback( IMediaPlayer *player )
+{
+    return impl_from_IMediaPlayer( player )->playback;
+}
 
 /* The engine's notifications, on its threads, turned into the player's and the session's events. */
 static void media_player_notify( void *ctx, enum playback_event event )
@@ -1320,17 +1412,25 @@ static HRESULT WINAPI playback_session_get_DownloadProgress( IMediaPlaybackSessi
 
 static HRESULT WINAPI playback_session_get_NaturalVideoHeight( IMediaPlaybackSession *iface, UINT32 *value )
 {
+    struct media_player *player = session_player( iface );
+    UINT32 width = 0;
+
     TRACE( "iface %p, value %p\n", iface, value );
     if (!value) return E_POINTER;
     *value = 0;
+    if (player->playback) playback_video_size( player->playback, &width, value );
     return S_OK;
 }
 
 static HRESULT WINAPI playback_session_get_NaturalVideoWidth( IMediaPlaybackSession *iface, UINT32 *value )
 {
+    struct media_player *player = session_player( iface );
+    UINT32 height = 0;
+
     TRACE( "iface %p, value %p\n", iface, value );
     if (!value) return E_POINTER;
     *value = 0;
+    if (player->playback) playback_video_size( player->playback, value, &height );
     return S_OK;
 }
 
@@ -1823,8 +1923,8 @@ static HRESULT media_player_resolve_source( struct media_player *impl )
     }
     if (SUCCEEDED(hr = playback_set_path( impl->playback, copy )))
     {
-        /* Learn the duration before announcing the media, so a transport that reads it as it
-         * enables itself sees the real value. */
+        /* Learn the duration and the picture size before announcing the media, so a transport
+         * that reads them as it enables itself, and XAML's presenter, see the real values. */
         playback_probe( impl->playback );
         impl->opened_source = source;
         free( impl->opened_path );
@@ -1837,6 +1937,7 @@ static HRESULT media_player_resolve_source( struct media_player *impl )
     if (SUCCEEDED(hr))
     {
         event_list_invoke( &impl->session_duration_changed, impl->session, NULL );
+        event_list_invoke( &impl->session_video_size_changed, impl->session, NULL );
 
         /* Resolve the subtitle sources before announcing the media: Shapr3D's MediaOpened handler
          * blocks until every one of its TimedTextSources has raised Resolved, and it blocks this
@@ -2709,6 +2810,7 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
     impl->rate = 1.0;
     impl->IMediaPlayer5_iface.lpVtbl = &media_player5_vtbl;
     impl->IClosable_iface.lpVtbl = &media_player_closable_vtbl;
+    impl->IMediaPlayer4_vtbl = media_player4_vtbl;
     impl->ref = 1;
     /* No DebugInfo annotation, as in playback_engine.c: this PE build leaves it NULL. */
     InitializeCriticalSectionEx( &impl->open_cs, 0, 0 );
