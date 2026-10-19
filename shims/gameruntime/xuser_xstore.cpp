@@ -180,6 +180,7 @@ static HRESULT async_begin(XAsyncBlock *asyncBlock, void *context, const void *i
                            const char *identityName, XAsyncProvider *provider)
 {
     if (!asyncBlock || !provider) return E_INVALIDARG;
+    if (identityName && !strncmp(identityName, "XStore", 6)) gdk_log("GDK store: %s\n", identityName);
     auto *s = new (std::nothrow) AsyncState();
     if (!s) return E_OUTOFMEMORY;
     s->provider = provider;
@@ -1371,6 +1372,19 @@ struct XStoreService final : IXStoreImpl4
         if (!out) return E_POINTER;
         *out = (XStoreContextHandle)(user ? user : (XUserHandle)(uintptr_t)1);
         gdk_log("GDK store: CreateContext user=%p -> %p\n", user, *out);
+        void *frames[12];
+        USHORT n = RtlCaptureStackBackTrace(0, 12, frames, nullptr);
+        for (USHORT i = 0; i < n; i++)
+        {
+            HMODULE mod = nullptr;
+            char name[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)frames[i], &mod))
+                GetModuleFileNameA(mod, name, sizeof(name));
+            const char *base = strrchr(name, '\\');
+            gdk_log("GDK store:   frame %u %s+%#llx\n", i, base ? base + 1 : name,
+                    (unsigned long long)((char *)frames[i] - (char *)mod));
+        }
         return S_OK;
     }
     void STDMETHODCALLTYPE XStoreCloseContextHandle(XStoreContextHandle) override {}
@@ -1521,13 +1535,13 @@ struct XStoreService final : IXStoreImpl4
         if (out) out->quantity = 0;
         return async_get_status(async, TRUE);
     }
-    HRESULT STDMETHODCALLTYPE XStoreGetUserCollectionsIdAsync(const XStoreContextHandle, const char *, const char *, XAsyncBlock *) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE XStoreGetUserCollectionsIdAsync(const XStoreContextHandle, const char *, const char *, XAsyncBlock *) override { gdk_log("GDK store: XStoreGetUserCollectionsIdAsync -> E_NOTIMPL\n"); return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE XStoreGetUserCollectionsIdResultSize(XAsyncBlock *, SIZE_T *) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE XStoreGetUserCollectionsIdResult(XAsyncBlock *, SIZE_T, char *) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE XStoreGetUserPurchaseIdAsync(const XStoreContextHandle, const char *, const char *, XAsyncBlock *) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE XStoreGetUserPurchaseIdAsync(const XStoreContextHandle, const char *, const char *, XAsyncBlock *) override { gdk_log("GDK store: XStoreGetUserPurchaseIdAsync -> E_NOTIMPL\n"); return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE XStoreGetUserPurchaseIdResultSize(XAsyncBlock *, SIZE_T *) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE XStoreGetUserPurchaseIdResult(XAsyncBlock *, SIZE_T, char *) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE XStoreQueryLicenseTokenAsync(const XStoreContextHandle, const char **, SIZE_T, const char *, XAsyncBlock *) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE XStoreQueryLicenseTokenAsync(const XStoreContextHandle, const char **, SIZE_T, const char *, XAsyncBlock *) override { gdk_log("GDK store: XStoreQueryLicenseTokenAsync -> E_NOTIMPL\n"); return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE XStoreQueryLicenseTokenResultSize(XAsyncBlock *, SIZE_T *) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE XStoreQueryLicenseTokenResult(XAsyncBlock *, SIZE_T, char *) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE __PADDING__() override { return E_NOTIMPL; }

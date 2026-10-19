@@ -1058,6 +1058,7 @@ static HRESULT xbl_title_token(const std::string &msa_token)
  * otherwise races a long title-no window after default-SISU 401 → user/authenticate → title/authenticate 403). */
 static void fetch_account_email(void);
 static void fetch_account_puid(void);
+static void publish_signed_in_account(const std::string &xuid);
 static std::string stored_msa_account(void);
 
 static HRESULT xbl_sign_in_via_title_sisu(const std::string &title_app, UINT32 title_id,
@@ -1204,7 +1205,27 @@ static HRESULT xbl_sign_in(void)
     });
     fetch_account_email();
     fetch_account_puid();
+    publish_signed_in_account(xui["xid"].str());
     return S_OK;
+}
+
+/* What Windows' Xbox sign-in and the Microsoft Store leave in HKCU for games to read. Halo Infinite compares
+ * XboxLive\Xuid with its user and XboxLive\AccountId with Store\PrimaryWebAccountId, and shows "The Microsoft
+ * Store user is not the same as the logged in Xbox Live user" when any is missing or different. Our Store account
+ * is the Xbox sign-in's Microsoft account, so both ids are its WebAccount.Id (the PUID). */
+static void publish_signed_in_account(const std::string &xuid)
+{
+    EnterCriticalSection(&account.cs);
+    std::string id = !account.puid.empty() ? account.puid : account.msa_user_id;
+    LeaveCriticalSection(&account.cs);
+    auto set = [](const char *key, const char *name, const std::string &value) {
+        if (value.empty()) return;
+        RegSetKeyValueA(HKEY_CURRENT_USER, key, name, REG_SZ, value.c_str(), (DWORD)value.size() + 1);
+    };
+    set("SOFTWARE\\Microsoft\\XboxLive", "Xuid", xuid);
+    set("SOFTWARE\\Microsoft\\XboxLive", "AccountId", id);
+    set("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Store", "PrimaryWebAccountId", id);
+    trace("published the signed-in account for games (xuid %s)", xuid.c_str());
 }
 
 static HRESULT sign_in_silently(void)
