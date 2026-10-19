@@ -423,7 +423,17 @@ struct StorageDeviceDetails : IStorageDeviceDetailsAbi
     LONG ref = 1;
     bool data_device;
     ULARGE_INTEGER total = {}, free_ = {};
-    StorageDeviceDetails(bool data = false) : data_device(data) { GetDiskFreeSpaceExW(data ? data_game_folder().c_str() : L"C:\\", &free_, &total, nullptr); }
+    StorageDeviceDetails(bool data = false) : data_device(data)
+    {
+        /* a fresh data directory has no stage/ until the first install: measure the nearest folder that exists */
+        std::wstring path = data ? data_game_folder() : L"C:\\";
+        while (!GetDiskFreeSpaceExW(path.c_str(), &free_, &total, nullptr))
+        {
+            size_t slash = path.find_last_of(L'\\');
+            if (slash == std::wstring::npos || slash < 3) break;
+            path.resize(slash);
+        }
+    }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
     {
         if (!out) return E_POINTER;

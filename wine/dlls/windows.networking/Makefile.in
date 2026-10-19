@@ -5,6 +5,7 @@ SOURCES = \
 	async.c \
 	async_private.idl \
 	classes.idl \
+	hstringvector.c \
 	main.c \
 	messagewebsocket.c \
 	streamsocket.c

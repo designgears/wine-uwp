@@ -44,6 +44,8 @@
 extern IActivationFactory *stream_socket_factory;
 extern IActivationFactory *message_websocket_factory;
 
+extern HRESULT hstring_vector_create( IVector_HSTRING **out );
+
 extern HRESULT async_action_param_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback, IAsyncAction **out );
 extern HRESULT async_operation_boolean_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
                                               IAsyncOperation_boolean **out );

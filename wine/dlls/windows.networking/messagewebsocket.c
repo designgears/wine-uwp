@@ -65,6 +65,7 @@ struct message_websocket
 
     struct ws_header headers[MAX_WS_HEADERS];
     UINT header_count;
+    IVector_HSTRING *protocols;  /* SupportedProtocols, offered in the upgrade request */
 
     SocketMessageType message_type;
     UINT32 max_message_size;
@@ -1032,6 +1033,7 @@ static HRESULT http_upgrade( struct message_websocket *impl, const WCHAR *host, 
     char key_raw[16], key_b64[32], req[8192], resp[4096];
     char host_a[256], path_a[2048];
     SIZE_T req_len, resp_len = 0;
+    UINT32 count;
     UINT i;
     HRESULT hr;
     const char *status;
@@ -1074,6 +1076,21 @@ static HRESULT http_upgrade( struct message_websocket *impl, const WCHAR *host, 
                              value_a, sizeof(value_a), NULL, NULL );
         req_len += snprintf( req + req_len, sizeof(req) - req_len, "%s: %s\r\n", name_a, value_a );
     }
+    if (SUCCEEDED(IVector_HSTRING_get_Size( impl->protocols, &count )) && count)
+    {
+        req_len += snprintf( req + req_len, sizeof(req) - req_len, "Sec-WebSocket-Protocol: " );
+        for (i = 0; i < count; i++)
+        {
+            char proto_a[256];
+            HSTRING proto;
+            if (FAILED(IVector_HSTRING_GetAt( impl->protocols, i, &proto ))) break;
+            WideCharToMultiByte( CP_UTF8, 0, WindowsGetStringRawBuffer( proto, NULL ), -1,
+                                 proto_a, sizeof(proto_a), NULL, NULL );
+            WindowsDeleteString( proto );
+            req_len += snprintf( req + req_len, sizeof(req) - req_len, "%s%s", i ? ", " : "", proto_a );
+        }
+        req_len += snprintf( req + req_len, sizeof(req) - req_len, "\r\n" );
+    }
     req_len += snprintf( req + req_len, sizeof(req) - req_len, "\r\n" );
     if (req_len >= sizeof(req)) return E_INVALIDARG;
 
@@ -1100,6 +1117,18 @@ static HRESULT http_upgrade( struct message_websocket *impl, const WCHAR *host, 
         return HRESULT_FROM_WIN32( ERROR_PROTOCOL_UNREACHABLE );
     }
     TRACE( "WS upgrade 101 ok.\n" );
+    if ((status = strstr( resp, "\r\nSec-WebSocket-Protocol:" )) || (status = strstr( resp, "\r\nsec-websocket-protocol:" )))
+    {
+        WCHAR proto[256];
+        char *end;
+        status += 25;
+        while (*status == ' ') status++;
+        if ((end = strstr( status, "\r\n" ))) *end = 0;
+        MultiByteToWideChar( CP_UTF8, 0, status, -1, proto, ARRAY_SIZE(proto) );
+        WindowsDeleteString( impl->protocol );
+        WindowsCreateString( proto, wcslen( proto ), &impl->protocol );
+        if (end) *end = '\r';
+    }
     return S_OK;
 }
 
@@ -1333,8 +1362,9 @@ static HRESULT WINAPI ws_control_put_ProxyCredential( IWebSocketControl *iface, 
 { FIXME( "ProxyCredential stub.\n" ); return S_OK; }
 static HRESULT WINAPI ws_control_get_SupportedProtocols( IWebSocketControl *iface, IVector_HSTRING **value )
 {
-    FIXME( "SupportedProtocols stub returning NULL.\n" );
-    *value = NULL;
+    struct message_websocket *impl = CONTAINING_RECORD( iface, struct message_websocket, IWebSocketControl_iface );
+    /* callers append to it (React Native's WebSocket module does, with no check for NULL) */
+    IVector_HSTRING_AddRef( (*value = impl->protocols) );
     return S_OK;
 }
 static const IWebSocketControlVtbl ws_control_vtbl =
@@ -1565,6 +1595,7 @@ static ULONG WINAPI mws_Release( IMessageWebSocket *iface )
         }
         WindowsDeleteString( impl->close_reason );
         WindowsDeleteString( impl->protocol );
+        IVector_HSTRING_Release( impl->protocols );
         DeleteCriticalSection( &impl->cs );
         DeleteCriticalSection( &impl->write_cs );
         free( impl );
@@ -1671,10 +1702,12 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
 {
     struct message_websocket *impl;
     WSADATA data;
+    HRESULT hr;
     TRACE( "ActivateInstance MessageWebSocket.\n" );
     if (!instance) return E_POINTER;
     WSAStartup( MAKEWORD(2, 2), &data );
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    if (FAILED(hr = hstring_vector_create( &impl->protocols ))) { free( impl ); return hr; }
     impl->IMessageWebSocket_iface.lpVtbl = &mws_vtbl;
     impl->IWebSocket_iface.lpVtbl = &websocket_vtbl;
     impl->IClosable_iface.lpVtbl = &ws_closable_vtbl;

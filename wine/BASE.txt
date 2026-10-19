@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     2951a4ae1c1e52cf1df90c88f9628f9abb13452e
-                 ws2_32: Trace send destinations and the first bytes sent.
+  wine HEAD:     6a58702f9ceed5eb34aa809e0742f3e5850b067d
+                 windows.networking: Implement MessageWebSocketControl.SupportedProtocols.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-19T03:44:31Z
+  captured:      2026-10-19T05:38:46Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

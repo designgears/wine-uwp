@@ -2439,6 +2439,18 @@ extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthSetTitleContext(const ch
 struct IXboxAuthManagerFactoryAbi : IInspectable { virtual HRESULT STDMETHODCALLTYPE CreateInstance(IInspectable *, IXboxAuthManagerAbi **) = 0; };
 struct IXboxAuthManagerStaticsAbi : IInspectable { virtual HRESULT STDMETHODCALLTYPE AddUserWithTransferTokenAsync(HSTRING, IAsyncOpAbi **) = 0; };
 
+/* A GDK title ships MicrosoftGame.Config at its package root; packaged apps such as the Xbox app do not. */
+static bool is_gdk_title_process(void)
+{
+    WCHAR root[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"WINE_UWP_PACKAGE_PATH", root, MAX_PATH);
+    if (!n || n >= MAX_PATH - 32) return false;
+    std::wstring path(root);
+    if (path.back() != L'\\') path += L'\\';
+    path += L"MicrosoftGame.Config";
+    return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
 struct ManagerFactory : IXboxAuthManagerFactoryAbi, IXboxAuthManagerStaticsAbi, IActivationFactoryAbi
 {
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
@@ -2476,8 +2488,10 @@ struct ManagerFactory : IXboxAuthManagerFactoryAbi, IXboxAuthManagerStaticsAbi, 
             a->Release();
         }
         trace("XboxAuthManager(msa app %s, title %#x)", app.c_str(), title);
-        /* Persist title identity for GDK GetToken in this process when the manager is for a game. */
-        if (!app.empty() && title && app != MSA_CLIENT_ID)
+        /* Persist title identity for GDK GetToken in this process when the manager is for a game. The Xbox app
+         * creates one for its own client (000000004424DA1F) too; that is not a GDK title, and pinning its Win32
+         * device made the app's SISU 401 and left it signed out. */
+        if (!app.empty() && title && app != MSA_CLIENT_ID && is_gdk_title_process())
             XboxAuthSetTitleContext(app.c_str(), title);
         *out = new Manager();
         return S_OK;
