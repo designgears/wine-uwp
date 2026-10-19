@@ -260,9 +260,13 @@ static bool base_iid(REFIID iid)
     return IsEqualGUID(iid, IID_IUnknown) || IsEqualGUID(iid, IID_IInspectable) || IsEqualGUID(iid, IID_IAgileObject_);
 }
 
-/* The one storage device: the prefix's C: drive. The id is ours (Gaming Services uses volume GUIDs); it only has
- * to be stable and the same in every call. */
+/* Stable stand-in volume IDs for the prefix and the host game-data drive. */
 static const GUID DEVICE_ID = {0x7e1d3a52,0x5c1b,0x4f3e,{0x9a,0x52,0x77,0x69,0x6e,0x65,0x75,0x77}};
+/* Installed payloads live in the host data directory, addressed through Wine's Z: drive. */
+static const GUID DATA_DEVICE_ID = {0x7e1d3a53,0x5c1b,0x4f3e,{0x9a,0x52,0x77,0x69,0x6e,0x65,0x75,0x77}};
+static std::wstring games_data_unix(void);
+static std::wstring unix_to_windows(const std::wstring &);
+static std::wstring data_game_folder(void) { return unix_to_windows(games_data_unix()) + L"\\stage"; }
 
 /* IVectorView<Guid> {9520e64b} with IIterable<Guid> {f4ca3045}; the iterator is IIterator<Guid> {d3d64048} */
 static const GUID IID_IVectorView_Guid = {0x9520e64b,0x15b2,0x52a6,{0x98,0xed,0x31,0x91,0xfa,0x6c,0xf6,0x8a}};
@@ -417,8 +421,9 @@ struct IStorageDeviceDetailsAbi : IInspectable
 struct StorageDeviceDetails : IStorageDeviceDetailsAbi
 {
     LONG ref = 1;
+    bool data_device;
     ULARGE_INTEGER total = {}, free_ = {};
-    StorageDeviceDetails() { GetDiskFreeSpaceExW(L"C:\\", &free_, &total, nullptr); }
+    StorageDeviceDetails(bool data = false) : data_device(data) { GetDiskFreeSpaceExW(data ? data_game_folder().c_str() : L"C:\\", &free_, &total, nullptr); }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
     {
         if (!out) return E_POINTER;
@@ -432,9 +437,9 @@ struct StorageDeviceDetails : IStorageDeviceDetailsAbi
     HRESULT STDMETHODCALLTYPE get_TotalSize(UINT64 *v) override { if (!v) return E_POINTER; *v = total.QuadPart; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_FreeSpace(UINT64 *v) override { if (!v) return E_POINTER; *v = free_.QuadPart; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_Status(INT32 *v) override { if (!v) return E_POINTER; *v = 1; /* Ready */ return S_OK; }
-    HRESULT STDMETHODCALLTYPE get_DriveLetter(HSTRING *v) override { tracef("StorageDeviceDetails.DriveLetter"); return hstr(L"C:", v); }
-    HRESULT STDMETHODCALLTYPE get_GameFolder(HSTRING *v) override { tracef("StorageDeviceDetails.GameFolder"); return hstr(game_folder(), v); }
-    HRESULT STDMETHODCALLTYPE get_DisplayName(HSTRING *v) override { tracef("StorageDeviceDetails.DisplayName"); return hstr(L"Local Disk", v); }
+    HRESULT STDMETHODCALLTYPE get_DriveLetter(HSTRING *v) override { tracef("StorageDeviceDetails.DriveLetter -> %s", data_device ? "Z:" : "C:"); return hstr(data_device ? L"Z:" : L"C:", v); }
+    HRESULT STDMETHODCALLTYPE get_GameFolder(HSTRING *v) override { return hstr(data_device ? data_game_folder() : game_folder(), v); }
+    HRESULT STDMETHODCALLTYPE get_DisplayName(HSTRING *v) override { return hstr(data_device ? L"Game data" : L"Local Disk", v); }
     HRESULT STDMETHODCALLTYPE get_BusType(INT32 *v) override { if (!v) return E_POINTER; *v = 0; /* Unknown */ return S_OK; }
     HRESULT STDMETHODCALLTYPE get_BusDetails(INT32 *v) override { if (!v) return E_POINTER; *v = 0; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_AssociationType(INT32 *v) override { if (!v) return E_POINTER; *v = 0; return S_OK; }
@@ -446,13 +451,18 @@ static HRESULT WINAPI st_QueryDeviceDetails(Factory *, const GUID *id, IInspecta
 {
     if (!out) return E_POINTER;
     *out = nullptr;
-    /* GameCatalogGrtsHelpers::GetInstallDriveInfo asks with the id it keeps as the package's "deviceId", which
-     * here is the package instance id (nothing we hand out carries another GUID for it). There is one device,
-     * and every package is on it: answer with it rather than fail the catalog item's state update. */
+    /* Older queue records use the package instance as their device ID. Those payloads are in the
+     * host data directory too; report the same drive that QueryInstallPath and enumeration expose. */
     if (id && !IsEqualGUID(*id, DEVICE_ID) && is_package_instance(id))
     {
-        tracef("Storage.QueryDeviceDetails(a package instance) -> C:");
-        *out = new StorageDeviceDetails();
+        tracef("Storage.QueryDeviceDetails(a package instance) -> Z:");
+        *out = new StorageDeviceDetails(true);
+        return S_OK;
+    }
+    if (id && IsEqualGUID(*id, DATA_DEVICE_ID))
+    {
+        tracef("Storage.QueryDeviceDetails -> Z:");
+        *out = new StorageDeviceDetails(true);
         return S_OK;
     }
     if (!id || !IsEqualGUID(*id, DEVICE_ID))
@@ -472,7 +482,8 @@ static HRESULT WINAPI st_EnumerateDevices(Factory *, IInspectable **out)
     if (!out) return E_POINTER;
     GuidView *v = new GuidView();
     v->items.push_back(DEVICE_ID);
-    tracef("Storage.EnumerateDevices -> 1 device");
+    v->items.push_back(DATA_DEVICE_ID);
+    tracef("Storage.EnumerateDevices -> C:, Z:");
     *out = static_cast<IGuidViewAbi *>(v);
     return S_OK;
 }
@@ -493,18 +504,22 @@ static HRESULT WINAPI gf_QueryForDevice(Factory *, const GUID *id, HSTRING *out)
 {
     if (!out) return E_POINTER;
     *out = nullptr;
-    if (!id || !IsEqualGUID(*id, DEVICE_ID)) return E_INVALIDARG;
-    tracef("GameFolder.QueryForDevice -> %ls", game_folder().c_str());
-    return hstr(game_folder(), out);
+    if (!id || (!IsEqualGUID(*id, DEVICE_ID) && !IsEqualGUID(*id, DATA_DEVICE_ID))) return E_INVALIDARG;
+    return hstr(IsEqualGUID(*id, DATA_DEVICE_ID) ? data_game_folder() : game_folder(), out);
 }
 static HRESULT WINAPI gf_SetForDevice(Factory *, const GUID *id, HSTRING path)
 {
     UINT32 len = 0;
     const wchar_t *p = WindowsGetStringRawBuffer(path, &len);
-    if (!id || !IsEqualGUID(*id, DEVICE_ID) || !len) return E_INVALIDARG;
+    if (!id || !len) return E_INVALIDARG;
+    if (IsEqualGUID(*id, DATA_DEVICE_ID))
+    {
+        /* WINE_UWP_GAMES_DATA owns this location. Do not accept a move we cannot perform. */
+        return !_wcsicmp(p, data_game_folder().c_str()) ? S_OK : HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    }
+    if (!IsEqualGUID(*id, DEVICE_ID)) return E_INVALIDARG;
     tracef("GameFolder.SetForDevice(%ls)", p);
-    RegSetKeyValueW(HKEY_CURRENT_USER, SETTINGS_KEY, L"GameFolder", REG_SZ, p, (len + 1) * sizeof(wchar_t));
-    return S_OK;
+    return HRESULT_FROM_WIN32(RegSetKeyValueW(HKEY_CURRENT_USER, SETTINGS_KEY, L"GameFolder", REG_SZ, p, (len + 1) * sizeof(wchar_t)));
 }
 
 /* CustomizationGlobalProps {c2f4f8e3}: the update settings, a property bag read and written as a whole */
@@ -600,6 +615,95 @@ static HRESULT WINAPI cu_SetGlobalProps(Factory *, IInspectable *props)
     p.save();
     tracef("Customization.SetGlobalProps (automatic updates %lu, during gameplay %lu)", p.automatic, p.during);
     return S_OK;
+}
+
+/* Manage reads the per-game settings independently of the global update policy. */
+static const GUID IID_ICustomizationGameProps = {0xfee91193,0x2e09,0x5fb9,{0x8f,0x59,0x03,0x5d,0x0c,0x45,0xf3,0xe1}};
+struct ICustomizationGamePropsAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_UpdatePriority(INT32 *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_UpdatePriority(INT32) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_CommandLineArgs(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_CommandLineArgs(HSTRING) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_ResolutionCap(INT32 *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_ResolutionCap(INT32) = 0;
+};
+struct GameProps : ICustomizationGamePropsAbi
+{
+    LONG ref = 1;
+    INT32 priority = 0, cap = 0; /* Standard priority, Default resolution cap */
+    std::wstring args;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (!out) return E_POINTER;
+        if (base_iid(iid) || IsEqualGUID(iid, IID_ICustomizationGameProps)) *out = static_cast<ICustomizationGamePropsAbi *>(this);
+        else { *out = nullptr; return E_NOINTERFACE; }
+        AddRef();
+        return S_OK;
+    }
+    IINSPECTABLE_BOILERPLATE(L"Microsoft.GamePlatform.Services.CustomizationGameProps")
+    HRESULT STDMETHODCALLTYPE get_UpdatePriority(INT32 *v) override { if (!v) return E_POINTER; *v = priority; return S_OK; }
+    HRESULT STDMETHODCALLTYPE put_UpdatePriority(INT32 v) override { if (v < 0 || v > 2) return E_INVALIDARG; priority = v; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_CommandLineArgs(HSTRING *v) override { return hstr(args, v); }
+    HRESULT STDMETHODCALLTYPE put_CommandLineArgs(HSTRING v) override { UINT32 n; const wchar_t *p = WindowsGetStringRawBuffer(v, &n); args.assign(p, n); return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_ResolutionCap(INT32 *v) override { if (!v) return E_POINTER; *v = cap; return S_OK; }
+    HRESULT STDMETHODCALLTYPE put_ResolutionCap(INT32 v) override { if (v < 0 || v > 2) return E_INVALIDARG; cap = v; return S_OK; }
+};
+static HRESULT game_props_key(HSTRING family, std::wstring &key)
+{
+    UINT32 n;
+    const wchar_t *p = WindowsGetStringRawBuffer(family, &n);
+    if (!n || std::find(p, p + n, L'\\') != p + n || std::find(p, p + n, L'\0') != p + n) return E_INVALIDARG;
+    key = std::wstring(SETTINGS_KEY) + L"\\Games\\" + std::wstring(p, n);
+    return S_OK;
+}
+static HRESULT WINAPI cu_QueryGameProps(Factory *, HSTRING family, IInspectable **out)
+{
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    std::wstring key;
+    HRESULT hr = game_props_key(family, key);
+    if (FAILED(hr)) return hr;
+    GameProps *p = new GameProps;
+    DWORD size = sizeof(p->priority);
+    RegGetValueW(HKEY_CURRENT_USER, key.c_str(), L"UpdatePriority", RRF_RT_REG_DWORD, nullptr, &p->priority, &size);
+    size = sizeof(p->cap);
+    RegGetValueW(HKEY_CURRENT_USER, key.c_str(), L"ResolutionCap", RRF_RT_REG_DWORD, nullptr, &p->cap, &size);
+    if (p->priority < 0 || p->priority > 2) p->priority = 0;
+    if (p->cap < 0 || p->cap > 2) p->cap = 0;
+    size = 0;
+    if (!RegGetValueW(HKEY_CURRENT_USER, key.c_str(), L"CommandLineArgs", RRF_RT_REG_SZ, nullptr, nullptr, &size) && size)
+    {
+        std::vector<wchar_t> buf(size / sizeof(wchar_t) + 1, 0);
+        if (!RegGetValueW(HKEY_CURRENT_USER, key.c_str(), L"CommandLineArgs", RRF_RT_REG_SZ, nullptr, buf.data(), &size)) p->args = buf.data();
+    }
+    tracef("Customization.QueryGameProps(%ls) -> priority %d", WindowsGetStringRawBuffer(family, nullptr), p->priority);
+    *out = static_cast<ICustomizationGamePropsAbi *>(p);
+    return S_OK;
+}
+static HRESULT WINAPI cu_SetGameProps(Factory *, HSTRING family, IInspectable *props)
+{
+    std::wstring key;
+    HRESULT hr = game_props_key(family, key);
+    if (FAILED(hr)) return hr;
+    ICustomizationGamePropsAbi *in = nullptr;
+    if (!props || FAILED(props->QueryInterface(IID_ICustomizationGameProps, (void **)&in))) return E_INVALIDARG;
+    INT32 priority = 0, cap = 0;
+    HSTRING args = nullptr;
+    hr = in->get_UpdatePriority(&priority);
+    if (SUCCEEDED(hr)) hr = in->get_ResolutionCap(&cap);
+    if (SUCCEEDED(hr)) hr = in->get_CommandLineArgs(&args);
+    in->Release();
+    if (FAILED(hr)) { WindowsDeleteString(args); return hr; }
+    if (priority < 0 || priority > 2 || cap < 0 || cap > 2) { WindowsDeleteString(args); return E_INVALIDARG; }
+    LSTATUS status = RegSetKeyValueW(HKEY_CURRENT_USER, key.c_str(), L"UpdatePriority", REG_DWORD, &priority, sizeof(priority));
+    if (!status) status = RegSetKeyValueW(HKEY_CURRENT_USER, key.c_str(), L"ResolutionCap", REG_DWORD, &cap, sizeof(cap));
+    UINT32 n;
+    const wchar_t *p = WindowsGetStringRawBuffer(args, &n);
+    if (!status) status = RegSetKeyValueW(HKEY_CURRENT_USER, key.c_str(), L"CommandLineArgs", REG_SZ, p, (n + 1) * sizeof(wchar_t));
+    WindowsDeleteString(args);
+    tracef("Customization.SetGameProps(%ls) -> priority %d", WindowsGetStringRawBuffer(family, nullptr), priority);
+    return HRESULT_FROM_WIN32(status);
 }
 
 /* SupportedFeatures: none of the optional Gaming Services features (streaming, remote install, ...) */
@@ -1019,13 +1123,144 @@ static HRESULT WINAPI ca_GetRawContentAccessDataAsync(Factory *, IInspectable **
 #include "install.inc"
 #include "gdkpackage.inc"
 
+/* Update-availability queries must succeed even when no update is available. Feature changes use
+ * an explicit PackageRequest; a temporary PackagePreview must not advertise a package update. */
+static const GUID IID_IPackageUpdate_ = {0x6afcfc17,0xa4a4,0x5293,{0xae,0x0d,0x32,0x38,0x0d,0x47,0x8e,0x60}};
+static const GUID IID_AsyncOp_PackageUpdate_ = {0x297569b9,0x7e29,0x5534,{0xa9,0x93,0xf2,0x57,0x0b,0x81,0x32,0xbe}};
+static const GUID IID_IVectorView_PackageUpdate_ = {0x63d04add,0xa47c,0x5978,{0x93,0x3a,0x58,0xc2,0x52,0x4d,0x9f,0x30}};
+static const GUID IID_IIterable_PackageUpdate_ = {0x3b76b432,0xcc28,0x59d5,{0x8b,0xdf,0x06,0xc1,0x6f,0x2d,0x9e,0xb4}};
+static const GUID IID_IIterator_PackageUpdate_ = {0x1e40d83e,0x7caa,0x5f07,{0xa6,0x66,0x66,0xc6,0x01,0xda,0x2f,0xa1}};
+static const GUID IID_AsyncOp_PackageUpdateView_ = {0x939df71b,0xd0cc,0x5681,{0x8a,0x21,0xdc,0x19,0x1c,0x3b,0xe5,0xcd}};
+struct IPackageUpdateAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_Status(INT32 *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_InstanceId(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_AvailableDate(INT64 *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE QuerySize(IInspectable **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE StartUpdateAsync(INT32, HSTRING, IInspectable **) = 0;
+};
+
+struct PackageUpdateObj : IPackageUpdateAbi
+{
+    LONG ref = 1;
+    std::wstring store_id, instance;
+    UINT64 size = 0;
+    INT32 status = 2; /* NoUpdateAvailable */
+    PackageUpdateObj(const InstalledGame &game) : store_id(game.store_id), instance(game.instance) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (!out) return E_POINTER;
+        if (base_iid(iid) || IsEqualGUID(iid, IID_IPackageUpdate_)) *out = static_cast<IPackageUpdateAbi *>(this);
+        else if (IsEqualGUID(iid, IID_IWeakReferenceSource_)) return weak_source(this, out);
+        else { *out = nullptr; return E_NOINTERFACE; }
+        AddRef();
+        return S_OK;
+    }
+    IINSPECTABLE_BOILERPLATE(L"Microsoft.GamePlatform.Services.PackageUpdate")
+    HRESULT STDMETHODCALLTYPE get_Status(INT32 *v) override
+    {
+        if (!v) return E_POINTER;
+        *v = status;
+        tracef("PackageUpdate.Status(%ls) -> %d", store_id.c_str(), *v);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_InstanceId(HSTRING *v) override
+    {
+        tracef("PackageUpdate.InstanceId(%ls) -> %ls", store_id.c_str(), instance.c_str());
+        return hstr(instance, v);
+    }
+    HRESULT STDMETHODCALLTYPE get_AvailableDate(INT64 *v) override
+    {
+        if (!v) return E_POINTER;
+        *v = 0;
+        tracef("PackageUpdate.AvailableDate(%ls) -> 0", store_id.c_str());
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE QuerySize(IInspectable **v) override
+    {
+        if (!v) return E_POINTER;
+        *v = static_cast<IPackageRequestSizeAbi *>(new PackageRequestSize(size, true));
+        tracef("PackageUpdate.QuerySize(%ls) -> %llu", store_id.c_str(), (unsigned long long)size);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE StartUpdateAsync(INT32, HSTRING, IInspectable **out) override
+    {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+};
+
+static PackageUpdateObj *package_update_for(const std::wstring &source)
+{
+    InstalledGame game;
+    if (!find_installed(source, game)) return nullptr;
+    tracef("PackageUpdate.QueryUpdate(%ls) -> no update", game.store_id.c_str());
+    return new PackageUpdateObj(game);
+}
+
+static HRESULT WINAPI pu_QueryUpdate(Factory *, HSTRING source, INT32 source_type, boolean include_related, IInspectable **out)
+{
+    if (!out) return E_POINTER;
+    std::wstring key = WindowsGetStringRawBuffer(source, nullptr);
+    tracef("PackageUpdate.QueryUpdate source=%ls type=%d related=%d", key.c_str(), source_type, include_related);
+    PackageUpdateObj *update = package_update_for(key);
+    if (!update) { *out = nullptr; return HRESULT_FROM_WIN32(ERROR_NOT_FOUND); }
+    *out = static_cast<IPackageUpdateAbi *>(update);
+    return S_OK;
+}
+static HRESULT WINAPI pu_QueryUpdateAsync(Factory *, HSTRING source, INT32 source_type, boolean include_related, IInspectable **out)
+{
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    std::wstring key = WindowsGetStringRawBuffer(source, nullptr);
+    tracef("PackageUpdate.QueryUpdateAsync source=%ls type=%d related=%d", key.c_str(), source_type, include_related);
+    PackageUpdateObj *update = package_update_for(key);
+    if (!update) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    AsyncOp *op = new AsyncOp(IID_AsyncOp_PackageUpdate_);
+    op->finish(S_OK, static_cast<IPackageUpdateAbi *>(update));
+    *out = static_cast<IAsyncOpAbi *>(op);
+    return S_OK;
+}
+static HRESULT pu_query_updates_async(INT32 filter, IInspectable **out)
+{
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    ObjView *updates = new ObjView(IID_IVectorView_PackageUpdate_, IID_IIterable_PackageUpdate_, IID_IIterator_PackageUpdate_,
+                                    L"Windows.Foundation.Collections.IVectorView`1<Microsoft.GamePlatform.Services.PackageUpdate>");
+    AsyncOp *op = new AsyncOp(IID_AsyncOp_PackageUpdateView_);
+    op->finish(S_OK, static_cast<IEmptyViewAbi *>(updates));
+    *out = static_cast<IAsyncOpAbi *>(op);
+    tracef("PackageUpdate.QueryUpdatesAsync(filter %d) -> 0", filter);
+    return S_OK;
+}
+static HRESULT WINAPI pu_QueryUpdatesAsync(Factory *, IInspectable **out)
+{ return pu_query_updates_async(0, out); }
+static HRESULT WINAPI pu_QueryUpdatesAsyncFiltered(Factory *, INT32 filter, IInspectable **out)
+{ return pu_query_updates_async(filter, out); }
+
 /* Storage.EnumerateContent: the games installed through the queue (stage directories with a marker) */
-static HRESULT WINAPI st_EnumerateContent(Factory *, const GUID *, IInspectable **out)
+static HRESULT WINAPI st_EnumerateContent(Factory *, const GUID *device, IInspectable **out)
+{
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!device || (!IsEqualGUID(*device, DEVICE_ID) && !IsEqualGUID(*device, DATA_DEVICE_ID))) return E_INVALIDARG;
+    HStringView *v = new HStringView;
+    if (IsEqualGUID(*device, DATA_DEVICE_ID))
+        for (auto &g : installed_games()) v->items.push_back(g.instance);
+    tracef("Storage.EnumerateContent -> %zu", v->items.size());
+    *out = static_cast<IHStringViewAbi *>(v);
+    return S_OK;
+}
+
+/* No products are blocked for migration on this local Gaming Services stand-in. Returning the empty
+ * list lets the Xbox product page continue; the generic no-service HRESULT turns its content panel
+ * into "Content failed to load." */
+static HRESULT WINAPI store_EnumerateMigrationBlockedProducts(Factory *, IInspectable **out)
 {
     if (!out) return E_POINTER;
     HStringView *v = new HStringView;
-    for (auto &g : installed_games()) v->items.push_back(g.instance);
-    tracef("Storage.EnumerateContent -> %zu", v->items.size());
+    tracef("Store.EnumerateMigrationBlockedProducts -> 0");
     *out = static_cast<IHStringViewAbi *>(v);
     return S_OK;
 }
@@ -1033,6 +1268,10 @@ static HRESULT WINAPI st_EnumerateContent(Factory *, const GUID *, IInspectable 
 struct special { const wchar_t *cls; int slot; const void *fn; };
 static const special specials[] =
 {
+    { L"Microsoft.GamePlatform.Services.PackageUpdate", 6, (void *)pu_QueryUpdate },
+    { L"Microsoft.GamePlatform.Services.PackageUpdate", 7, (void *)pu_QueryUpdateAsync },
+    { L"Microsoft.GamePlatform.Services.PackageUpdate", 10, (void *)pu_QueryUpdatesAsync },
+    { L"Microsoft.GamePlatform.Services.PackageUpdate", 11, (void *)pu_QueryUpdatesAsyncFiltered },
     { L"Microsoft.GamePlatform.Services.PlatformStatus", 6, (void *)ps_get_ApiStatus },
     { L"Microsoft.GamePlatform.Services.Storage", 6, (void *)st_QueryDeviceDetails },
     { L"Microsoft.GamePlatform.Services.Storage", 7, (void *)st_EnumerateDevices },
@@ -1043,26 +1282,29 @@ static const special specials[] =
     { L"Microsoft.GamePlatform.Services.GameFolder", 7, (void *)gf_SetForDevice },
     { L"Microsoft.GamePlatform.Services.Customization", 6, (void *)cu_QueryGlobalProps },
     { L"Microsoft.GamePlatform.Services.Customization", 7, (void *)cu_SetGlobalProps },
+    { L"Microsoft.GamePlatform.Services.Customization", 8, (void *)cu_QueryGameProps },
+    { L"Microsoft.GamePlatform.Services.Customization", 9, (void *)cu_SetGameProps },
     { L"Microsoft.GamePlatform.Services.SupportedFeatures", 6, (void *)sf_QueryFeatures },
     { L"Microsoft.GamePlatform.Services.SupportedFeatures", 7, (void *)sf_QueryFeatures },
     { L"Microsoft.GamePlatform.Services.ProcessMonitor", 6, (void *)pm_QueryGamingServicesUsage },
     { L"Microsoft.GamePlatform.Services.ProcessMonitor", 7, (void *)pm_EnumerateRunningGames },
     { L"Microsoft.GamePlatform.Services.Package", 6, (void *)pk_Create },
     { L"Microsoft.GamePlatform.Services.Store", 8, (void *)store_QueryProductDetails },
+    { L"Microsoft.GamePlatform.Services.Store", 7, (void *)store_EnumerateMigrationBlockedProducts },
     { L"Microsoft.GamePlatform.Services.ContentAccess", 6, (void *)ca_GetRawContentAccessDataAsync },
     { L"Microsoft.GamePlatform.Services.Store", 9, (void *)store_QueryProductType },
     { L"Microsoft.GamePlatform.Services.PackageRequest", 6, (void *)rq_CreateForSource },
     { L"Microsoft.GamePlatform.Services.PackageRequest", 7, (void *)rq_CreateForSourceDevice },
     { L"Microsoft.GamePlatform.Services.PackageRequest", 8, (void *)rq_CreateForStoreId },
     { L"Microsoft.GamePlatform.Services.PackageQueue", 6, (void *)pq_SubmitRequestAsync },
-    { L"Microsoft.GamePlatform.Services.PackageQueue", 8, (void *)pq_ok_instance },
-    { L"Microsoft.GamePlatform.Services.PackageQueue", 9, (void *)pq_ok_instance },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 8, (void *)pq_PauseInstance },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 9, (void *)pq_ResumeInstance },
     { L"Microsoft.GamePlatform.Services.PackageQueue", 10, (void *)pq_CancelInstance },
-    { L"Microsoft.GamePlatform.Services.PackageQueue", 11, (void *)pq_ok_id },
-    { L"Microsoft.GamePlatform.Services.PackageQueue", 12, (void *)pq_ok_id },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 11, (void *)pq_PauseId },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 12, (void *)pq_ResumeId },
     { L"Microsoft.GamePlatform.Services.PackageQueue", 13, (void *)pq_CancelId },
-    { L"Microsoft.GamePlatform.Services.PackageQueue", 14, (void *)pq_ok },
-    { L"Microsoft.GamePlatform.Services.PackageQueue", 15, (void *)pq_ok },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 14, (void *)pq_PauseAll },
+    { L"Microsoft.GamePlatform.Services.PackageQueue", 15, (void *)pq_ResumeAll },
     { L"Microsoft.GamePlatform.Services.PackageQueue", 16, (void *)pq_CancelAll },
     { L"Microsoft.GamePlatform.Services.PackageQueue", 17, (void *)pq_Enumerate },
     { L"Microsoft.GamePlatform.Services.PackageQueue", 18, (void *)pq_EnumerateId },

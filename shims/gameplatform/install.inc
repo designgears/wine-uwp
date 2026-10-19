@@ -47,7 +47,18 @@ struct Install
     bool cancel = false;
     bool features_chosen = false;       /* the app called ConfigureFeatures; otherwise the default recipe */
     std::vector<std::string> features;
+    bool paused = false;
+    std::wstring pause_file;            /* Windows path of the installer's pause marker, while it runs */
+    bool uwp = true;
 };
+
+static std::wstring stage_name_for_family(const std::wstring &family)
+{
+    std::wstring name = family.substr(0, family.find(L'_'));
+    name = name.substr(name.rfind(L'.') + 1);
+    for (auto &c : name) c = towlower(c);
+    return name;
+}
 
 static SRWLOCK installs_lock = SRWLOCK_INIT;
 static std::vector<Install *> installs;     /* the queue: in progress, and finished ones until they are removed */
@@ -117,7 +128,13 @@ template <class T> static HRESULT weak_source(T *self, void **out)
 
 /* ---- the installed games: stage directories with a .wine-uwp-xbox marker ---- */
 
-struct InstalledGame { std::wstring instance, store_id, family, full_name, stage_dir /* Windows path */, title, aumid; UINT64 size = 0; };
+struct InstalledGame
+{
+    std::wstring instance, store_id, family, full_name, stage_dir /* Windows path */, title, aumid;
+    std::vector<std::string> features;
+    UINT64 size = 0;
+    bool uwp = true, features_known = false;
+};
 
 static bool read_marker(const std::wstring &dir, InstalledGame &g)
 {
@@ -140,6 +157,20 @@ static bool read_marker(const std::wstring &dir, InstalledGame &g)
         else if (!strcmp(line, "title")) g.title = v;
         else if (!strcmp(line, "aumid")) g.aumid = v;
         else if (!strcmp(line, "size")) g.size = _wcstoui64(v.c_str(), nullptr, 10);
+        else if (!strcmp(line, "uwp")) g.uwp = v != L"false" && v != L"0";
+        else if (!strcmp(line, "features"))
+        {
+            g.features_known = true;
+            std::string list = utf8(v);
+            size_t start = 0;
+            while (start < list.size())
+            {
+                size_t end = list.find(';', start);
+                g.features.push_back(list.substr(start, end == std::string::npos ? std::string::npos : end - start));
+                if (end == std::string::npos) break;
+                start = end + 1;
+            }
+        }
     }
     g.stage_dir = dir;
     g.instance = instance_for(g.family);
@@ -324,7 +355,7 @@ struct InstallationInfo : IInstallationInfoAbi
     HRESULT STDMETHODCALLTYPE get_LaunchRegionsStreaming(boolean *v) override { if (!v) return E_POINTER; *v = FALSE; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_EnhancedStreaming(boolean *v) override { if (!v) return E_POINTER; *v = FALSE; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_Error(HRESULT *v) override { if (!v) return E_POINTER; *v = in.error; return S_OK; }
-    HRESULT STDMETHODCALLTYPE get_DataRate(UINT32 *v) override { if (!v) return E_POINTER; *v = 0; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_DataRate(UINT32 *v) override { if (!v) return E_POINTER; *v = in.state == ST_STREAMING ? in.rate : 0; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_StorageSpaceRequired(UINT64 *v) override { if (!v) return E_POINTER; *v = in.total; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_PersistentLocalStorageSize(UINT64 *v) override { if (!v) return E_POINTER; *v = 0; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_PersistentLocalStorageCrdId(UINT32 *v) override { if (!v) return E_POINTER; *v = 0; return S_OK; }
@@ -783,9 +814,32 @@ static HRESULT msixvc_url(const GUID &content_id, std::string &url)
     return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
 }
 
+static bool signal_host_installer(DWORD pid, bool force)
+{
+    if (!pid) return false;
+    /* A Unix executable launched by Wine has a Windows launcher handle. Terminating that handle
+     * leaves Python alive, so signal the actual PID reported by our installer instead. */
+    std::wstring cmd = L"\"Z:\\bin\\kill\" " + std::wstring(force ? L"-KILL " : L"-TERM ") + std::to_wstring(pid);
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    {
+        tracef("install: cannot signal host installer %lu (%lu)", pid, GetLastError());
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    tracef("install: sent %s to host installer %lu", force ? "SIGKILL" : "SIGTERM", pid);
+    return true;
+}
+
 static HRESULT run_installer(Install *in, const std::string &url, const std::wstring &stage_name, std::wstring &log_out,
                              const std::string &keys = std::string(), const std::wstring &extra_args = std::wstring())
 {
+    AcquireSRWLockShared(&installs_lock);
+    bool canceled_before_download = in->cancel;
+    ReleaseSRWLockShared(&installs_lock);
+    if (canceled_before_download) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
     std::wstring data = games_data_unix(), script = env_w(L"WINE_UWP_INSTALLER"), tree = env_w(L"WINE_UWP_WINDOWS_TREE");
     if (data.empty() || script.empty() || tree.empty())
     {
@@ -794,12 +848,24 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
     }
     CreateDirectoryW((unix_to_windows(data)).c_str(), nullptr);
     std::wstring log_unix = data + L"/install-" + stage_name + L".log";
+    /* pausing: the installer waits between chunks while this file exists */
+    std::wstring pause_unix = log_unix + L".paused";
+    AcquireSRWLockExclusive(&installs_lock);
+    in->pause_file = unix_to_windows(pause_unix);
+    if (in->paused)
+    {
+        /* Pause can arrive while ST_WAITING, before run_installer has assigned the marker path. */
+        HANDLE f = CreateFileW(in->pause_file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    }
+    else DeleteFileW(in->pause_file.c_str());
+    ReleaseSRWLockExclusive(&installs_lock);
     log_out = unix_to_windows(log_unix);
     DeleteFileW(log_out.c_str());
     /* the host's Python runs wine-uwp's installer; Wine starts a Unix program given by its path */
     /* the exit status goes to the log too: a Unix child's process handle is not something to rely on */
     std::wstring cmd = L"\"Z:\\bin\\sh\" -c \"python3 '" + script + L"' '" + wide(url) + L"' '" + data + L"' --windows '" + tree +
-                       L"' --stage '" + stage_name + L"'" + extra_args + L" > '" + log_unix + L"' 2>&1; echo EXIT $? >> '" + log_unix + L"'\"";
+                       L"' --stage '" + stage_name + L"' --pause-file '" + pause_unix + L"'" + extra_args + L" > '" + log_unix + L"' 2>&1; echo EXIT $? >> '" + log_unix + L"'\"";
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi;
     /* an encrypted package's content keys go to the installer in a file in $XDG_RUNTIME_DIR (in memory, the user's
@@ -835,7 +901,12 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
     CloseHandle(pi.hThread);
     tracef("install: installer started for %ls", stage_name.c_str());
     std::string seen;
+    size_t parsed = 0;
+    DWORD host_pid = 0;
+    ULONGLONG cancel_t0 = 0;
+    bool cancel_signaled = false, cancel_forced = false;
     ULONGLONG rate_t0 = 0;
+    ULONGLONG report_t0 = 0;
     UINT64 rate_b0 = 0;
     bool installed = false, exited = false;
     int exit_code = -1, grace = 0;
@@ -852,30 +923,39 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
             CloseHandle(f);
             if (all.size() > seen.size())
             {
-                std::string fresh = all.substr(seen.size());
                 seen = all;
-                for (size_t p = 0; p < fresh.size();)
+                while (parsed < seen.size())
                 {
-                    size_t e = fresh.find('\n', p);
-                    if (e == std::string::npos) e = fresh.size();
-                    std::string line = fresh.substr(p, e - p);
-                    p = e + 1;
-                    unsigned pct, total;
-                    if (sscanf(line.c_str(), "PROGRESS %u %u", &pct, &total) == 2 && total)
+                    size_t e = seen.find('\n', parsed);
+                    if (e == std::string::npos) break;
+                    std::string line = seen.substr(parsed, e - parsed);
+                    parsed = e + 1;
+                    UINT64 completed, total;
+                    if (!line.compare(0, 4, "PID ")) host_pid = strtoul(line.c_str() + 4, nullptr, 10);
+                    else if (sscanf(line.c_str(), "PROGRESS %llu %llu", &completed, &total) == 2 && total)
                     {
                         ULONGLONG now = GetTickCount64();
                         AcquireSRWLockExclusive(&installs_lock);
-                        in->done = in->total * pct / total;
-                        /* the rate over the last 2 s or more */
+                        UINT64 fraction_done = (UINT64)((long double)in->total * std::min(completed, total) / total);
+                        in->done = std::min(in->total, fraction_done);
+                        if (in->cancel) { ReleaseSRWLockExclusive(&installs_lock); continue; }
+                        if (in->paused) { rate_t0 = 0; ReleaseSRWLockExclusive(&installs_lock); continue; }
+                        /* Byte-precise progress avoids permille quantization on very large packages. */
                         if (!rate_t0) { rate_t0 = now; rate_b0 = in->done; }
                         else if (now - rate_t0 >= 2000)
                         {
-                            in->rate = (UINT32)std::min((in->done - rate_b0) * 1000 / (now - rate_t0), (UINT64)0xffffffff);
+                            UINT64 delta = in->done >= rate_b0 ? in->done - rate_b0 : 0;
+                            in->rate = (UINT32)std::min(delta * 1000 / (now - rate_t0), (UINT64)0xffffffff);
                             rate_t0 = now; rate_b0 = in->done;
                         }
                         in->state = ST_STREAMING;
                         ReleaseSRWLockExclusive(&installs_lock);
-                        report(in);
+                        /* Keep XAML event traffic bounded while still refreshing speed smoothly. */
+                        if (!report_t0 || now - report_t0 >= 500 || completed >= total)
+                        {
+                            report_t0 = now;
+                            report(in);
+                        }
                     }
                     else if (!line.compare(0, 10, "INSTALLED ")) installed = true;
                     else if (!line.compare(0, 5, "EXIT ")) { exit_code = atoi(line.c_str() + 5); exited = true; }
@@ -883,6 +963,11 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
                 }
             }
         }
+        AcquireSRWLockShared(&installs_lock);
+        bool paused = in->paused;
+        bool canceled = in->cancel;
+        ReleaseSRWLockShared(&installs_lock);
+        if (paused) rate_t0 = 0; /* do not average a pause interval into the next speed sample */
         if (exited) break;
         /* a Unix child's handle may not be waitable at all (WAIT_FAILED at once): without this the loop re-read the
          * log as fast as it could, 45% of a core here and as much again in the wineserver, and the whole app dragged */
@@ -890,10 +975,21 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
         if (wait == WAIT_OBJECT_0)
         {
             /* the shell is gone; its last words may still be on their way to the log */
-            if (++grace > 10) break;
+            if (++grace > 10 && !canceled) break;
             Sleep(500);
         }
-        if (in->cancel) { TerminateProcess(pi.hProcess, 1); break; }
+        if (canceled)
+        {
+            if (!cancel_signaled && host_pid && signal_host_installer(host_pid, false))
+            {
+                cancel_signaled = true;
+                cancel_t0 = GetTickCount64();
+            }
+            if (cancel_signaled && !cancel_forced && GetTickCount64() - cancel_t0 >= 5000)
+                cancel_forced = signal_host_installer(host_pid, true);
+            /* Keep reading until the shell's EXIT record confirms Python has stopped and released
+             * its staging lock. The launcher handle alone does not establish that. */
+        }
     }
     CloseHandle(pi.hProcess);
     if (!key_file.empty()) DeleteFileW(key_file.c_str());   /* normally the installer has, as it read them */
@@ -944,17 +1040,21 @@ static DWORD WINAPI install_thread(void *param)
     std::wstring stage_name, log;
 
     AcquireSRWLockExclusive(&installs_lock);
-    in->total = d.size;
-    in->state = ST_STREAMING;
+    /* SubmitRequestAsync already set the selected GDK feature size. The catalog's d.size is the
+     * full package and must not replace it when the worker starts. */
+    if (d.uwp) in->total = d.size;
+    /* Pause can be requested as soon as SubmitRequestAsync publishes the queued item, before
+     * this worker gets scheduled. Do not overwrite that state while resolving the delivery URL. */
+    bool canceled_before_start = in->cancel;
+    if (!canceled_before_start) in->state = in->paused ? ST_PAUSED : ST_STREAMING;
     ReleaseSRWLockExclusive(&installs_lock);
+    if (canceled_before_start) { hr = HRESULT_FROM_WIN32(ERROR_CANCELLED); goto done; }
     report(in);
     if (!d.uwp)
     {
         /* a GDK title: its .msixvc from the Xbox CDN, decrypted with the licence's content key */
         std::string keys;
-        stage_name = d.family.substr(0, d.family.find(L'_'));
-        stage_name = stage_name.substr(stage_name.rfind(L'.') + 1);
-        for (auto &c : stage_name) c = towlower(c);
+        stage_name = stage_name_for_family(d.family);
         if (FAILED(hr = msixvc_url(d.content_id, url))) goto done;
         if (FAILED(hr = encrypted_package_keys(d.content_id, keys))) goto done;
         hr = run_installer(in, url, stage_name, log, keys, gdk_installer_args(in->store_id, in->features_chosen ? &in->features : nullptr));
@@ -968,9 +1068,7 @@ static DWORD WINAPI install_thread(void *param)
     tracef("install %ls: package %s", in->store_id.c_str(), pkg.moniker.c_str());
     if ((url = fe3_file_url(pkg)).empty()) { hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND); goto done; }
     tracef("install %ls: download address found", in->store_id.c_str());
-    stage_name = d.family.substr(0, d.family.find(L'_'));
-    stage_name = stage_name.substr(stage_name.rfind(L'.') + 1);
-    for (auto &c : stage_name) c = towlower(c);
+    stage_name = stage_name_for_family(d.family);
     if (d.encrypted)
     {
         std::string keys;
@@ -985,7 +1083,13 @@ installed:
         std::wstring dir = unix_to_windows(games_data_unix()) + L"\\stage\\" + stage_name, full, aumid, title;
         read_identity(dir, full, aumid, title);
         std::string marker = "store_id=" + utf8(in->store_id) + "\nfamily=" + utf8(d.family) + "\nfull_name=" + utf8(full) + "\naumid=" +
-                             utf8(aumid) + "\ntitle=" + utf8(title) + "\nsize=" + std::to_string(d.size) + "\n";
+                             utf8(aumid) + "\ntitle=" + utf8(title) + "\nsize=" + std::to_string(d.size) + "\nuwp=" + (d.uwp ? "true" : "false") + "\n";
+        if (in->features_chosen)
+        {
+            marker += "features=";
+            for (size_t i = 0; i < in->features.size(); i++) marker += (i ? ";" : "") + in->features[i];
+            marker += "\n";
+        }
         HANDLE f = CreateFileW((dir + L"\\.wine-uwp-xbox").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
         DWORD written;
         if (f != INVALID_HANDLE_VALUE) { WriteFile(f, marker.data(), (DWORD)marker.size(), &written, nullptr); CloseHandle(f); }
@@ -995,16 +1099,17 @@ installed:
     }
 done:
     AcquireSRWLockExclusive(&installs_lock);
-    in->state = SUCCEEDED(hr) ? ST_COMPLETED : ST_FAILED;
-    in->error = hr;
-    if (SUCCEEDED(hr)) in->done = in->total;
+    bool canceled = in->cancel;
+    in->state = canceled ? ST_CANCELED : (SUCCEEDED(hr) ? ST_COMPLETED : ST_FAILED);
+    in->error = canceled ? HRESULT_FROM_WIN32(ERROR_CANCELLED) : hr;
+    if (SUCCEEDED(hr) && !canceled) in->done = in->total;
     ReleaseSRWLockExclusive(&installs_lock);
-    tracef("install %ls -> %s (%#lx)", in->store_id.c_str(), SUCCEEDED(hr) ? "completed" : "failed", (unsigned long)hr);
+    tracef("install %ls -> %s (%#lx)", in->store_id.c_str(), canceled ? "canceled" : (SUCCEEDED(hr) ? "completed" : "failed"), (unsigned long)in->error);
     report(in);
-    if (SUCCEEDED(hr))
+    if (SUCCEEDED(hr) || canceled)
     {
-        /* finished items leave the queue */
-        Sleep(1000);
+        /* Completed and canceled items leave the queue after their terminal state is observable. */
+        if (!canceled) Sleep(1000);
         report(in, true, true);
         AcquireSRWLockExclusive(&installs_lock);
         for (size_t i = 0; i < installs.size(); i++) if (installs[i] == in) { installs.erase(installs.begin() + i); break; }
@@ -1046,7 +1151,8 @@ struct PackageRequestSize : IPackageRequestSizeAbi
 {
     LONG ref = 1;
     UINT64 size;
-    PackageRequestSize(UINT64 s) : size(s) {}
+    bool upgrade;
+    PackageRequestSize(UINT64 s, bool u = false) : size(s), upgrade(u) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
     {
         if (!out) return E_POINTER;
@@ -1056,7 +1162,7 @@ struct PackageRequestSize : IPackageRequestSizeAbi
         return E_NOINTERFACE;
     }
     IINSPECTABLE_BOILERPLATE(L"Microsoft.GamePlatform.Services.PackageRequestSize")
-    HRESULT STDMETHODCALLTYPE get_IsUpgrade(boolean *v) override { if (!v) return E_POINTER; *v = FALSE; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_IsUpgrade(boolean *v) override { if (!v) return E_POINTER; *v = upgrade; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_TotalSize(UINT64 *v) override { if (!v) return E_POINTER; *v = size; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_DownloadSize(UINT64 *v) override { if (!v) return E_POINTER; *v = size; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_FreeSpaceRequired(UINT64 *v) override { if (!v) return E_POINTER; *v = size; return S_OK; }
@@ -1236,6 +1342,8 @@ static HRESULT WINAPI pq_SubmitRequestAsync(Factory *, IInspectable *request, IN
     req->Release();
     ProductDetails d = query_product(in->store_id);
     in->family = d.family;
+    in->uwp = d.uwp;
+    in->stage = stage_name_for_family(d.family);
     in->instance = instance_for(d.family.empty() ? in->store_id : d.family);
     in->total = d.size;
     if (!d.uwp) in->total = gdk_request_size(in->store_id, in->features_chosen ? &in->features : nullptr, d.size);
@@ -1314,34 +1422,93 @@ static HRESULT WINAPI pq_QueryInstallationSummary(Factory *, GUID id, IInspectab
 static HRESULT cancel_install(Install *in)
 {
     if (!in) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    if (in->state == ST_COMPLETED || in->state == ST_FAILED || in->state == ST_CANCELED)
+        return HRESULT_FROM_WIN32(ERROR_INVALID_STATE);
+    tracef("install %ls: cancel requested", in->store_id.c_str());
     in->cancel = true;
+    in->paused = false;
+    in->rate = 0;
+    in->state = ST_CANCELED;
+    in->error = HRESULT_FROM_WIN32(ERROR_CANCELLED);
     return S_OK;
 }
 static HRESULT WINAPI pq_CancelInstance(Factory *, HSTRING instance, boolean nondestructive, boolean *out)
 {
     std::wstring key = WindowsGetStringRawBuffer(instance, nullptr);
-    AcquireSRWLockShared(&installs_lock);
+    AcquireSRWLockExclusive(&installs_lock);
     HRESULT hr = cancel_install(find_install(&key, nullptr));
-    ReleaseSRWLockShared(&installs_lock);
+    Install *in = find_install(&key, nullptr);
+    ReleaseSRWLockExclusive(&installs_lock);
+    if (SUCCEEDED(hr) && in) report(in);
     if (out) *out = SUCCEEDED(hr);
     return S_OK;
 }
 static HRESULT WINAPI pq_CancelId(Factory *, GUID id, boolean nondestructive, boolean *out)
 {
-    AcquireSRWLockShared(&installs_lock);
+    AcquireSRWLockExclusive(&installs_lock);
     HRESULT hr = cancel_install(find_install(nullptr, &id));
-    ReleaseSRWLockShared(&installs_lock);
+    Install *in = find_install(nullptr, &id);
+    ReleaseSRWLockExclusive(&installs_lock);
+    if (SUCCEEDED(hr) && in) report(in);
     if (out) *out = SUCCEEDED(hr);
     return S_OK;
 }
-static HRESULT WINAPI pq_ok_instance(Factory *, HSTRING) { return S_OK; }
-static HRESULT WINAPI pq_ok_id(Factory *, GUID) { return S_OK; }
-static HRESULT WINAPI pq_ok(Factory *) { return S_OK; }
+/* Pause and Resume: the installer stops between chunks while its pause marker exists */
+static void set_paused(Install *in, bool pause)
+{
+    std::wstring marker;
+    bool changed;
+    INT32 old_state;
+    AcquireSRWLockExclusive(&installs_lock);
+    old_state = in->state;
+    changed = in->paused != pause && (in->state == ST_STREAMING || in->state == ST_PAUSED || in->state == ST_WAITING);
+    if (changed)
+    {
+        in->paused = pause;
+        in->rate = 0;
+        in->state = pause ? ST_PAUSED : (in->pause_file.empty() ? ST_WAITING : ST_STREAMING);
+    }
+    marker = in->pause_file;
+    ReleaseSRWLockExclusive(&installs_lock);
+    if (!changed) return;
+    if (!marker.empty())
+    {
+        if (pause)
+        {
+            HANDLE f = CreateFileW(marker.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+            if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        }
+        else DeleteFileW(marker.c_str());
+    }
+    tracef("install %ls: %s (state %d -> %d)", in->store_id.c_str(), pause ? "paused" : "resumed", old_state, pause ? ST_PAUSED : (marker.empty() ? ST_WAITING : ST_STREAMING));
+    report(in);
+}
+static void set_paused_where(const std::wstring *instance, const GUID *id, bool pause)
+{
+    std::vector<Install *> hits;
+    AcquireSRWLockShared(&installs_lock);
+    for (Install *in : installs)
+        if ((!instance && !id) || (instance && (!_wcsicmp(in->instance.c_str(), instance->c_str()) || !_wcsicmp(in->store_id.c_str(), instance->c_str()))) ||
+            (id && IsEqualGUID(in->id, *id)))
+            hits.push_back(in);
+    ReleaseSRWLockShared(&installs_lock);
+    for (Install *in : hits) set_paused(in, pause);
+}
+static HRESULT WINAPI pq_PauseInstance(Factory *, HSTRING instance)
+{ std::wstring s = WindowsGetStringRawBuffer(instance, nullptr); tracef("PackageQueue.PauseInstance(%ls)", s.c_str()); set_paused_where(&s, nullptr, true); return S_OK; }
+static HRESULT WINAPI pq_ResumeInstance(Factory *, HSTRING instance)
+{ std::wstring s = WindowsGetStringRawBuffer(instance, nullptr); tracef("PackageQueue.ResumeInstance(%ls)", s.c_str()); set_paused_where(&s, nullptr, false); return S_OK; }
+static HRESULT WINAPI pq_PauseId(Factory *, GUID id) { tracef("PackageQueue.PauseId"); set_paused_where(nullptr, &id, true); return S_OK; }
+static HRESULT WINAPI pq_ResumeId(Factory *, GUID id) { tracef("PackageQueue.ResumeId"); set_paused_where(nullptr, &id, false); return S_OK; }
+static HRESULT WINAPI pq_PauseAll(Factory *) { tracef("PackageQueue.PauseAll"); set_paused_where(nullptr, nullptr, true); return S_OK; }
+static HRESULT WINAPI pq_ResumeAll(Factory *) { tracef("PackageQueue.ResumeAll"); set_paused_where(nullptr, nullptr, false); return S_OK; }
 static HRESULT WINAPI pq_CancelAll(Factory *, boolean, boolean *out)
 {
-    AcquireSRWLockShared(&installs_lock);
-    for (Install *in : installs) in->cancel = true;
-    ReleaseSRWLockShared(&installs_lock);
+    std::vector<Install *> canceled;
+    AcquireSRWLockExclusive(&installs_lock);
+    for (Install *in : installs) if (SUCCEEDED(cancel_install(in))) canceled.push_back(in);
+    ReleaseSRWLockExclusive(&installs_lock);
+    for (Install *in : canceled) report(in);
     if (out) *out = TRUE;
     return S_OK;
 }
@@ -1403,13 +1570,15 @@ struct QueueView : IQueueViewAbi
     }
     IINSPECTABLE_BOILERPLATE(L"Microsoft.GamePlatform.Services.PackageQueueView")
     Install *find() { return by_id ? find_install(nullptr, &id) : find_install(&instance, nullptr); }
-    HRESULT STDMETHODCALLTYPE Pause() override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE Resume() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE Pause() override { tracef("PackageQueueView.Pause(%ls)", instance.c_str()); if (by_id) set_paused_where(nullptr, &id, true); else set_paused_where(&instance, nullptr, true); return S_OK; }
+    HRESULT STDMETHODCALLTYPE Resume() override { tracef("PackageQueueView.Resume(%ls)", instance.c_str()); if (by_id) set_paused_where(nullptr, &id, false); else set_paused_where(&instance, nullptr, false); return S_OK; }
     HRESULT STDMETHODCALLTYPE Cancel(boolean, boolean *out) override
     {
-        AcquireSRWLockShared(&installs_lock);
+        AcquireSRWLockExclusive(&installs_lock);
         HRESULT hr = cancel_install(find());
-        ReleaseSRWLockShared(&installs_lock);
+        Install *in = find();
+        ReleaseSRWLockExclusive(&installs_lock);
+        if (SUCCEEDED(hr) && in) report(in);
         if (out) *out = SUCCEEDED(hr);
         return S_OK;
     }
@@ -1420,6 +1589,7 @@ struct QueueView : IQueueViewAbi
         AcquireSRWLockShared(&installs_lock);
         if (Install *in = find()) v->items.push_back(in->instance);
         ReleaseSRWLockShared(&installs_lock);
+        tracef("PackageQueueView.Enumerate(%ls) -> %zu", instance.c_str(), v->items.size());
         *out = static_cast<IHStringViewAbi *>(v);
         return S_OK;
     }
@@ -1482,6 +1652,11 @@ static bool queued_game(Factory *f, InstalledGame &g)
         if (!_wcsicmp(in->instance.c_str(), key.c_str()) || !_wcsicmp(in->store_id.c_str(), key.c_str()))
         {
             g.instance = in->instance; g.family = in->family; g.store_id = in->store_id; g.full_name = in->family;
+            /* Pending payloads are unpacked beside the final directory. QueryDetails needs a real
+             * stage path so its logo properties point into the visible .new tree during download. */
+            if (!in->stage.empty() && in->stage.find(L'\\') == std::wstring::npos)
+                g.stage_dir = unix_to_windows(games_data_unix()) + L"\\stage\\" + in->stage + L".new";
+            g.uwp = in->uwp;
             g.size = in->total;
             found = true;
             break;
@@ -1658,11 +1833,25 @@ static INT64 file_time_of(const std::wstring &path)
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return 0;
     return ((INT64)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
 }
+static std::wstring package_logo_path(const InstalledGame &g)
+{
+    /* Keep the actual codec in the extension. Candy Crush's package logo is JPEG; the legacy
+     * .png copy is retained for wine-uwp's desktop launcher, but XAML's image loader uses the
+     * extension to choose its decoder. */
+    const WCHAR *extensions[] = { L".jpg", L".jpeg", L".png" };
+    for (const auto *extension : extensions)
+    {
+        std::wstring path = g.stage_dir + L"\\.wine-uwp-icon" + extension;
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return path;
+    }
+    return g.stage_dir + L"\\.wine-uwp-icon.png";
+}
 struct PackageDetails : IPackageDetailsAbi
 {
     LONG ref = 1;
     InstalledGame g;
-    PackageDetails(const InstalledGame &x) : g(x) {}
+    bool pending;
+    PackageDetails(const InstalledGame &x, bool p = false) : g(x), pending(p) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
     {
         if (!out) return E_POINTER;
@@ -1675,14 +1864,30 @@ struct PackageDetails : IPackageDetailsAbi
     HRESULT STDMETHODCALLTYPE get_InstanceId(HSTRING *v) override { return hstr(g.instance, v); }
     HRESULT STDMETHODCALLTYPE get_PackageFullName(HSTRING *v) override { return hstr(g.full_name, v); }
     HRESULT STDMETHODCALLTYPE get_DefaultDisplayName(HSTRING *v) override { return hstr(g.title, v); }
-    HRESULT STDMETHODCALLTYPE get_Square44x44LogoPath(HSTRING *v) override { return hstr(g.stage_dir + L"\\.wine-uwp-icon.png", v); }
-    HRESULT STDMETHODCALLTYPE get_Square150x150LogoPath(HSTRING *v) override { return hstr(g.stage_dir + L"\\.wine-uwp-icon.png", v); }
+    HRESULT STDMETHODCALLTYPE get_Square44x44LogoPath(HSTRING *v) override
+    {
+        std::wstring path = package_logo_path(g);
+        tracef("PackageDetails(%ls).Square44x44LogoPath -> %ls", g.title.c_str(), path.c_str());
+        return hstr(path, v);
+    }
+    HRESULT STDMETHODCALLTYPE get_Square150x150LogoPath(HSTRING *v) override
+    {
+        std::wstring path = package_logo_path(g);
+        tracef("PackageDetails(%ls).Square150x150LogoPath -> %ls", g.title.c_str(), path.c_str());
+        return hstr(path, v);
+    }
     HRESULT STDMETHODCALLTYPE get_SplashScreenPath(HSTRING *v) override { return hstr(L"", v); }
     HRESULT STDMETHODCALLTYPE get_TitleId(UINT32 *v) override { if (!v) return E_POINTER; *v = 0; return S_OK; }
-    HRESULT STDMETHODCALLTYPE get_Registered(boolean *v) override { if (!v) return E_POINTER; *v = TRUE; return S_OK; }
-    HRESULT STDMETHODCALLTYPE get_Registerable(boolean *v) override { if (!v) return E_POINTER; *v = FALSE; /* already registered: TRUE shows the "found on your PC, add it" Install button */ return S_OK; }
-    HRESULT STDMETHODCALLTYPE get_NotFullyStreamed(boolean *v) override { if (!v) return E_POINTER; *v = FALSE; return S_OK; }
-    HRESULT STDMETHODCALLTYPE get_IsUwp(boolean *v) override { if (!v) return E_POINTER; *v = TRUE; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_Registered(boolean *v) override { if (!v) return E_POINTER; *v = !pending; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_Registerable(boolean *v) override { if (!v) return E_POINTER; *v = FALSE; /* installed packages are already registered; pending ones do not have all their files yet */ return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_NotFullyStreamed(boolean *v) override { if (!v) return E_POINTER; *v = pending; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_IsUwp(boolean *v) override
+    {
+        if (!v) return E_POINTER;
+        *v = g.uwp;
+        tracef("PackageDetails(%ls).IsUwp -> %d", g.title.c_str(), (int)g.uwp);
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE get_UsesFeatures(boolean *v) override { if (!v) return E_POINTER; *v = FALSE; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_IsMoving(boolean *v) override { if (!v) return E_POINTER; *v = FALSE; return S_OK; }
     HRESULT STDMETHODCALLTYPE get_InstallDate(INT64 *v) override { if (!v) return E_POINTER; *v = file_time_of(g.stage_dir + L"\\.wine-uwp-xbox"); return S_OK; }
@@ -1731,9 +1936,13 @@ struct PackageHeader : IPackageHeaderAbi
 static HRESULT WINAPI pi_QueryDetails(Factory *f, IInspectable **out)
 {
     InstalledGame g;
-    if (!package_game(f, g)) return generic_slot(f, 13, out, nullptr, __builtin_return_address(0));
+    /* Paused installs take the client's package-metadata path that Streaming bypasses. The queued
+     * package exists before it is registered; returning GP_E_NO_SERVICE here drops its queue row. */
+    bool pending = !package_game(f, g);
+    if (pending && !queued_game(f, g)) return generic_slot(f, 13, out, nullptr, __builtin_return_address(0));
     if (!out) return E_POINTER;
-    *out = static_cast<IPackageDetailsAbi *>(new PackageDetails(g));
+    tracef("Package(%ls).QueryDetails -> %s", f->source, pending ? "pending" : "installed");
+    *out = static_cast<IPackageDetailsAbi *>(new PackageDetails(g, pending));
     return S_OK;
 }
 static HRESULT WINAPI pi_QueryHeader(Factory *f, IInspectable **out)

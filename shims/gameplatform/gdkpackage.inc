@@ -1042,6 +1042,7 @@ struct PackagePreviewObj : IPackagePreviewAbi
         tmp.ConfigureFeatures(iterable);
         features = tmp.features;
         configured = true;
+        tracef("PackagePreview(%ls).ConfigureFeatures: %zu features", store_id.c_str(), features.size());
         return S_OK;
     }
 };
