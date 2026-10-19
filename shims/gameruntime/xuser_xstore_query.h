@@ -1,0 +1,31 @@
+#pragma once
+/* Factories for QueryApiImpl — keep package_abi.h free of XUser/XStore types. */
+#include <Windows.h>
+#include <Unknwn.h>
+
+HRESULT query_xuser(REFIID iid, void **out);
+HRESULT query_xstore(REFIID iid, void **out);
+HRESULT query_xthreading(REFIID iid, void **out);
+HRESULT query_xgame(REFIID iid, void **out);
+HRESULT query_xsystem(REFIID iid, void **out);
+HRESULT query_xfeature(REFIID iid, void **out);
+HRESULT query_xnetworking(REFIID iid, void **out);
+
+/* Bind TitleId/MSAAppId and kick background title-identity warm (SISU/XSTS). */
+void wineuwp_warm_xboxauth_title_context(void);
+
+inline constexpr GUID CLSID_XGameRuntimeFeatureImpl_ =
+    {0x8836fe87, 0xedb9, 0x4fe3, {0x8d, 0xad, 0x05, 0xf0, 0xd2, 0xcd, 0x5b, 0x40}};
+inline constexpr GUID CLSID_XNetworkingImpl_ =
+    {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
+
+inline constexpr GUID CLSID_XUserImpl_ =
+    {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
+inline constexpr GUID CLSID_XStoreImpl_ =
+    {0x0dd112ac, 0x7c24, 0x448c, {0xb9, 0x2b, 0x39, 0x60, 0xfb, 0x5b, 0xd3, 0x0c}};
+inline constexpr GUID CLSID_XThreadingImpl_ =
+    {0x073b7dcb, 0x1fcf, 0x4030, {0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28}};
+inline constexpr GUID CLSID_XGameImpl_ =
+    {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+inline constexpr GUID CLSID_XSystemImpl_ =
+    {0xe349bd1a, 0xfc20, 0x4e40, {0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f}};

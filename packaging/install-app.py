@@ -30,6 +30,8 @@ is "INSTALLED <stage name>". Only the standard library is used.
 """
 
 import argparse
+import contextlib
+import fcntl
 import json
 import hashlib
 import io
@@ -37,10 +39,13 @@ import os
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 import zlib
@@ -98,16 +103,37 @@ class HttpFile(io.RawIOBase):
         return urllib.request.urlopen(req, timeout=60)
 
     def _fetch(self, start, end):
-        for attempt in range(5):
+        expected = end - start
+        data = bytearray()
+        attempts = 0
+        while len(data) < expected:
+            wait_while_paused()
             try:
-                with self._open(rng=(start, end - 1)) as r:
-                    data = r.read()
-                if len(data) == end - start:
-                    return data
+                # Keep network reads bounded so Pause can close the current range request and
+                # resume at the next byte. Leaving a response open while paused can time out at
+                # the CDN; issuing a new Range request after resume avoids losing the partial data.
+                with self._open(rng=(start + len(data), end - 1)) as r:
+                    while len(data) < expected:
+                        if pause_requested():
+                            break
+                        chunk = r.read(min(256 << 10, expected - len(data)))
+                        if not chunk:
+                            break
+                        data.extend(chunk)
             except OSError as e:
-                if attempt == 4:
+                attempts += 1
+                if attempts == 5:
                     raise SystemExit(f"download failed: {e}")
-        raise SystemExit("download failed: short reads from the server")
+                data.clear()
+                continue
+            if len(data) == expected:
+                return bytes(data)
+            if pause_requested():
+                continue
+            attempts += 1
+            if attempts == 5:
+                raise SystemExit("download failed: short reads from the server")
+            data.clear()
 
     def readable(self):
         return True
@@ -550,6 +576,7 @@ class MsixvcPackage:
         self.user = self.tree + sum(levels)
         xvc_at = self.user + pages(user)
         info = self._read(xvc_at * XVD_PAGE, pages(xvc) * XVD_PAGE)
+        self.content_id = uuid.UUID(bytes_le=bytes(info[:16]))
         self.key_ids = [info[16 + 16 * i:32 + 16 * i] for i in range(192)]
         version, count = struct.unpack_from("<II", info, 0xD10)
         if version < 1:
@@ -812,6 +839,60 @@ def pick_logo(names, logo):
     return best[1] if best else None
 
 
+def stage_package_logo(pkg, member, dest):
+    """Publish the selected game logo as soon as staging starts, before the full payload extracts."""
+    if not member:
+        return None
+    icon_ext = os.path.splitext(urllib.parse.unquote(member))[1].lower()
+    if icon_ext not in (".png", ".jpg", ".jpeg"):
+        icon_ext = ".png"
+    icon_path = os.path.join(dest, ".wine-uwp-icon" + icon_ext)
+    try:
+        with pkg.open(member) as src, open(icon_path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    except (KeyError, FileNotFoundError):
+        return None
+    # Keep the legacy desktop launcher path. GamePlatform advertises the correctly suffixed copy.
+    if icon_ext != ".png":
+        shutil.copy2(icon_path, os.path.join(dest, ".wine-uwp-icon.png"))
+    return icon_path
+
+
+def wait_while_paused():
+    """The Xbox app's Pause: the Gaming Services stand-in leaves --pause-file while it is paused."""
+    if pause_requested():
+        marker = sys.argv[sys.argv.index("--pause-file") + 1]
+        say("STAGE Paused")
+        while os.path.exists(marker):
+            time.sleep(0.5)
+        say("STAGE Resumed")
+
+
+def pause_requested():
+    if "--pause-file" not in sys.argv:
+        return False
+    return os.path.exists(sys.argv[sys.argv.index("--pause-file") + 1])
+
+
+def seed_from_installed(final, dest, full):
+    """Start the new copy from the installed one when it is the same package, so installing another
+    feature (High-Resolution Textures, say) fetches only the chunks that are missing. Reflinks only: a
+    plain copy of a 100 GB game would cost more than the download it saves."""
+    try:
+        with open(os.path.join(final, ".wine-uwp-chunks.json"), encoding="utf-8") as f:
+            if json.load(f).get("package") != full:
+                return
+    except (OSError, ValueError):
+        return
+    r = subprocess.run(["cp", "-a", "--reflink=always", final + "/.", dest + "/"], capture_output=True, text=True)
+    if r.returncode:
+        say(f"warning: could not reuse the installed files ({r.stderr.strip()[:200]}); fetching everything")
+        remove_staging_entry(dest)
+        os.makedirs(dest)
+        return
+    say("reusing the installed files of the same package")
+
+
 def extract(pkg, dest):
     members = [m for m in pkg.infolist() if not m.is_dir()]
     total = sum(m.file_size for m in members) or 1
@@ -822,17 +903,26 @@ def extract(pkg, dest):
         if rel.startswith("/") or ".." in rel.split("/"):
             raise SystemExit(f"refusing unsafe path in package: {m.filename}")
         out = os.path.join(dest, rel)
+        # already there from seed_from_installed (same package): nothing to fetch
+        if os.path.isfile(out) and not os.path.islink(out) and os.path.getsize(out) == m.file_size:
+            done += m.file_size
+            say(f"PROGRESS {done} {total}")
+            continue
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with pkg.open(m) as src, open(out, "wb") as dst:
             # progress in a large file too, so a download that is mostly one file does not look stalled
             while True:
+                wait_while_paused()
                 chunk = src.read(8 << 20)
                 if not chunk:
                     break
                 dst.write(chunk)
                 done += len(chunk)
-                say(f"PROGRESS {done * 1000 // total} 1000")
-        say(f"PROGRESS {done * 1000 // total} 1000")
+                # Preserve byte precision. The queue uses this both for its progress bar and for
+                # the rolling transfer rate; rounded permille values made small increments look
+                # stationary and kept the displayed speed at zero on large games.
+                say(f"PROGRESS {done} {total}")
+        say(f"PROGRESS {done} {total}")
 
 
 def find_framework(dirs, name, min_version, publisher, older=False):
@@ -895,6 +985,120 @@ def info_only(args):
     return 0
 
 
+def remove_staging_entry(path):
+    """Remove our scratch entry without following a symlink to another directory."""
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+@contextlib.contextmanager
+def staging_directory(final):
+    """Own one package's staging area until publication or failure cleanup finishes."""
+    locks = os.path.join(os.path.dirname(final), ".install-locks")
+    os.makedirs(locks, exist_ok=True)
+    # Keep lock files: unlinking one while a worker holds it lets another lock a different inode.
+    with open(os.path.join(locks, os.path.basename(final) + ".lock"), "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit(f"installation already in progress: {os.path.basename(final)}")
+        backup = final + ".old"
+        if os.path.lexists(backup) and not os.path.lexists(final):
+            os.rename(backup, final)
+        dest = final + ".new"
+        remove_staging_entry(dest)
+        os.makedirs(dest)
+        try:
+            yield dest
+        finally:
+            # A failed worker must never delete another package's active download or backup.
+            remove_staging_entry(dest)
+
+
+def publish_stage(dest, final):
+    """Publish the new copy, restoring the installed version if the final rename fails."""
+    backup = final + ".old"
+    remove_staging_entry(backup)
+    if os.path.lexists(final):
+        os.rename(final, backup)
+    try:
+        os.rename(dest, final)
+    except BaseException:
+        if os.path.lexists(backup) and not os.path.lexists(final):
+            os.rename(backup, final)
+        raise
+    remove_staging_entry(backup)
+
+
+def write_gdk_chunk_metadata(pkg, dest, package_full_name):
+    """Record which GDK chunks were installed so xgameruntime can answer availability queries."""
+    if not isinstance(pkg, MsixvcPackage):
+        return
+    installed = {m.region for m in pkg.members}
+    features = []
+    regions = []
+    layouts = [n for n in pkg.namelist() if n.lower().startswith("layout_") and n.lower().endswith(".xml")]
+    layout_root = None
+    if layouts:
+        try:
+            layout_root = ET.fromstring(pkg.read(layouts[0]))
+        except (ET.ParseError, KeyError, OSError):
+            layout_root = None
+    if layout_root is not None:
+        feats = layout_root.find("Features")
+        if feats is not None:
+            for feat in feats:
+                tags = [t for t in (feat.get("Tags") or "").split(";") if t]
+                features.append({
+                    "id": feat.get("Id") or "",
+                    "name": feat.get("DisplayName") or "",
+                    "hidden": feat.get("Hidden") == "true",
+                    "tags": tags,
+                })
+        for chunk in layout_root.findall("Chunk"):
+            try:
+                rid = int(chunk.get("Id"))
+            except (TypeError, ValueError):
+                continue
+            tags = [t for t in (chunk.get("Tags") or "").split(";") if t]
+            languages = [t for t in (chunk.get("Languages") or "").split(";") if t]
+            regions.append({
+                "id": rid,
+                "ready": rid in installed,
+                "tags": tags,
+                "languages": languages,
+            })
+    if not regions:
+        # Fall back to the XVC region table when the package has no layout XML.
+        for rid in sorted(pkg.regions):
+            if rid >= 0x40000000 and rid != 0x40000003:
+                continue
+            regions.append({
+                "id": rid,
+                "ready": rid in installed,
+                "tags": list(pkg.region_tags.get(rid, [])),
+                "languages": list(pkg.region_langs.get(rid, [])),
+            })
+    meta = {
+        "version": 1,
+        "package": package_full_name,
+        # what XPackageGetCurrentProcessPackageIdentifier answers: at most 32 characters, so not the full name
+        "identifier": pkg.content_id.hex.upper(),
+        "features": features,
+        "regions": regions,
+    }
+    with open(os.path.join(dest, ".wine-uwp-chunks.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+        f.write("\n")
+    ready = sum(1 for r in regions if r["ready"])
+    say(f"GDK chunks: {ready}/{len(regions)} ready")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("package")
@@ -906,6 +1110,7 @@ def main():
                     help="PACKAGE is an .appinstaller (file or URL): print the version it offers, install nothing")
     ap.add_argument("--stage", help="stage directory name (default: the package name's last part, lowercased)")
     ap.add_argument("--keys-once", help="like --keys, and the file is deleted once read")
+    ap.add_argument("--pause-file", help="while this file exists, wait between chunks (the Xbox app's Pause)")
     ap.add_argument("--tags", help="a GDK package's install feature tags to install (a;b), from the install dialog")
     ap.add_argument("--languages", help="the user's languages (en-US;en): a GDK package's other language regions are left out")
     ap.add_argument("--keys", help="an encrypted package's content keys: a file of \"keyid key\" hex lines, or - for "
@@ -919,6 +1124,12 @@ def main():
     if not args.datadir or not args.windows:
         ap.error("installing needs DATADIR and --windows")
 
+    print(f"PID {os.getpid()}", flush=True)
+    with contextlib.ExitStack() as resources:
+        return install_package(args, resources)
+
+
+def install_package(args, resources):
     apps_dir = os.path.join(args.windows, "Program Files", "WindowsApps")
     sys32 = os.path.join(args.windows, "Windows", "System32")
     with tempfile.TemporaryDirectory(prefix="wine-uwp-install-", dir=args.datadir) as tmp:
@@ -957,14 +1168,16 @@ def main():
         icon_member = pick_logo(pkg.namelist(), info["logo"])
         # built beside the installed copy and swapped in at the end, so a failed update leaves the old app working
         final = os.path.join(args.datadir, "stage", stage)
-        dest = final + ".new"
+        if not stage or stage in (".", "..") or os.path.basename(stage) != stage or "\\" in stage:
+            raise SystemExit(f"invalid stage directory name: {stage}")
         say(f"STAGE Unpacking {info['title'] or info['name']} {info['version']}")
-        if os.path.exists(dest):
-            shutil.rmtree(dest)
-        os.makedirs(dest)
+        dest = resources.enter_context(staging_directory(final))
+        seed_from_installed(final, dest, full)
+        icon_path = stage_package_logo(pkg, icon_member, dest)
+        if icon_member and not icon_path:
+            say(f"warning: manifest logo {icon_member} was not included; installing without a launcher icon")
         extract(pkg, dest)
-        if icon_member:
-            shutil.copy2(os.path.join(dest, urllib.parse.unquote(icon_member)), os.path.join(dest, ".wine-uwp-icon.png"))
+        write_gdk_chunk_metadata(pkg, dest, full)
         pkg.close()
 
     say("STAGE Installing frameworks")
@@ -1036,31 +1249,13 @@ def main():
     if appinstaller:
         with open(os.path.join(dest, ".wine-uwp-appinstaller"), "w") as f:
             f.write(appinstaller + "\n")
-    if os.path.exists(final):
-        os.rename(final, final + ".old")
-    os.rename(dest, final)
-    shutil.rmtree(final + ".old", ignore_errors=True)
+    publish_stage(dest, final)
     say(f"STAGE Installed {title} {info['version']}")
     say(f"INSTALLED {stage}")
 
-
-def cleanup_partial(datadir):
-    """A failed or cancelled install leaves no half-unpacked copy behind (the app is gigabytes)."""
-    stage = os.path.join(datadir, "stage")
-    for d in os.listdir(stage) if os.path.isdir(stage) else ():
-        if d.endswith((".new", ".old")):
-            shutil.rmtree(os.path.join(stage, d), ignore_errors=True)
 
 
 if __name__ == "__main__":
     import signal
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-    try:
-        rc = main()
-    except BaseException as e:
-        failed = not (isinstance(e, SystemExit) and e.code in (0, None))
-        a = [x for x in sys.argv[1:] if not x.startswith("-")]
-        if failed and "--info" not in sys.argv and len(a) >= 2:
-            cleanup_partial(a[1])
-        raise
-    sys.exit(rc)
+    sys.exit(main())

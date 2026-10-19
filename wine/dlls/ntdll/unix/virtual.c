@@ -109,6 +109,8 @@ struct reserved_area
 };
 
 static struct list reserved_areas = LIST_INIT(reserved_areas);
+/* bottom-up allocations are placed below this when there is room (2^43, see map_view) */
+static void * const bottom_up_preferred_limit = (void *)0x80000000000;
 
 struct builtin_module
 {
@@ -2302,6 +2304,24 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
+
+        /* Windows hands out bottom-up allocations from the lowest free address. The preloader also
+         * reserves an area just below the user space limit, so try the low part of the address
+         * space first: some titles (Halo Infinite) pack heap pointers into 43 bits and corrupt
+         * anything placed above that. */
+        if (!top_down && end > bottom_up_preferred_limit && start < bottom_up_preferred_limit)
+        {
+            if ((ptr = map_reserved_area( start, bottom_up_preferred_limit, host_size, 0, unix_prot, align_mask )))
+            {
+                TRACE( "got low mem in reserved area %p-%p\n", ptr, (char *)ptr + size );
+                goto done;
+            }
+            if ((ptr = map_free_area( start, bottom_up_preferred_limit, host_size, 0, unix_prot, align_mask )))
+            {
+                TRACE( "got low mem with map_free_area %p-%p\n", ptr, (char *)ptr + size );
+                goto done;
+            }
+        }
 
         if ((ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
         {

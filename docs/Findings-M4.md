@@ -11248,7 +11248,69 @@ purchase SDK, Store Purchase App, WebView2 - none runs here) or an opacity anima
 Real installation would need Gaming Services itself (`PackageQueue.SubmitRequestAsync`, MSIXVC, kernel drivers), which
 cannot run here; the queue's statics are traced (0x87E00196) so a click that gets that far will show in the log.
 
-Also measured: `PackageUpdate.QueryUpdatesAsync` (CheckForAllUpdates) is still 0x87E00196 - harmless.
+`PackageUpdate.QueryUpdatesAsync` (CheckForAllUpdates) is still 0x87E00196. That query is unrelated to the add-ons action.
+`PackageUpdate.QueryUpdateAsync` is a separate call in `GameCatalogGrtsPackage::StartUpdateAsync`; it must answer before
+the Xbox app submits an install-queue request. The live desktop log showed this call returning 0x87E00196 for every
+attempt, and no `PackageQueue.SubmitRequestAsync` after the add-ons dialog. The temporary `PackagePreview.ConfigureFeatures`
+selection also had no path into the queue. This explains why checking Campaign and clicking Apply changes appeared to do
+nothing.
+
+### Xbox Manage add-ons: PackageUpdate must submit the selected features (10-16)
+
+Implemented a `PackageUpdate` object for Store IDs and installed instance IDs. `PackagePreview.ConfigureFeatures` now
+records the selected feature IDs by Store ID; the update query compares them with the feature IDs saved in the installed
+stage marker (legacy installs use the package's default feature set). `StartUpdateAsync` submits a `PackageRequest` with
+that exact selection through the existing queue path. Successful feature installs persist their selected IDs in the
+marker, and update size reports `IsUpgrade`.
+
+The shim builds successfully. An isolated Xbox run reached Manage > Add-ons, and clicking the Campaign checkbox
+produced `PackagePreview(9PP5G1F0C2B6).ConfigureFeatures` with `CampaignS1`. The app queries `PackageUpdate` by Halo's
+instance GUID before the preview changes; the GUID resolves to the installed marker and the object returns
+`NoUpdateAvailable`. After Campaign is selected, clicking the visible Apply changes button produces no new
+`PackageUpdate.Status`, `StartUpdateAsync`, `QueryUpdateAsync`, or queue-submission trace. No payload was downloaded.
+`PackageUpdate.Status` and `StartUpdateAsync` now both read the current preview selection to handle a cached update
+object, but the UI did not call either after the checkbox changed. The remaining failure is before the queue bridge:
+either the Apply command is not firing/reaching this API under Wine, or a separate app-side command path must be found.
+Do not test against the desktop prefix or its `xbox-games` directory.
+
+Follow-up virtual repro (10-16): advertising `OptionalUpdateAvailable` for every package with visible add-ons makes
+the Halo detail page incorrectly show **Update** before any add-on is selected. It does not make Manage > Add-ons
+submit a request: with Campaign selected, Apply leaves the modal open and there is no subsequent `PackageUpdate`,
+`PackageQueue`, or `StartUpdateAsync` trace. The speculative status change was removed. The Campaign checkbox does
+call `PackagePreview.ConfigureFeatures(CampaignS1)` and updates the displayed size, so the preview side is responsive;
+the missing behavior remains specifically after Apply.
+
+Follow-up virtual repro on the rebuilt shim (10-16): on Xvfb `:98`, clicking Campaign changes the checkbox and size
+from 67.77 GB to 74.31 GB; clicking the center of the visibly enabled green Apply changes button leaves the dialog
+open. The log adds no GamePlatform call after the click. Root-window coordinates must account for the Xvfb window's
+`(4,30)` offset; earlier clicks that used client-image coordinates as root coordinates were outside the target and
+are not valid click tests. A startup breakpoint at `windows.ui.xaml.dll`'s `ButtonBase::OnPointerPressed`,
+`ButtonBase::OnPointerReleased`, and `ButtonBase::OnClick` did not report a hit for ordinary navigation, checkbox,
+or close-button interactions either, so that probe is not a reliable way to locate this app's routed click handler.
+The Apply command remains unresolved; next trace the control's actual event route or keyboard invocation before
+changing GamePlatform status behavior again.
+
+Routed-event follow-up (10-16): with `RaiseRoutedEvent` (`windows.ui.xaml.dll+0x111338`) and
+`ContentRootInput::ProcessPointerInput` (`+0xb3ea0`) breakpoints enabled, the root-window click at `(644,714)` is
+inside the Apply button in the root capture. It produces pointer processing and the XAML event sequence
+`PointerMoved`, `PointerPressed`, `PointerReleased`, `Tapped`, `PointerCaptureLost`; the modal remains open and
+there is still no `PackageUpdate`, `PackageQueue`, or `StartUpdateAsync` call. Enter after the click also leaves the
+modal open. This confirms input reaches the XAML tree but not yet that the Apply button's own Click/command handler
+ran: the routed event breakpoint does not identify its source element. A standalone `Microsoft.UI.Xaml.dll` is
+loaded as well as `windows.ui.xaml.dll`, so the prior ButtonBase breakpoints on the latter may not cover the WinUI
+control implementation. Continue tracing the actual WinUI button event source/command binding before changing the
+GamePlatform implementation.
+
+Follow-up on the enabled Apply button (10-16): Tab navigation visibly focuses it, but Enter and Space still leave
+the dialog open. A fresh run with `PackageUpdate` getter tracing shows the app reads `Status` and `AvailableDate`
+when it opens Manage, and the pointer click on enabled Apply produces no further update calls; `InstanceId`,
+`QuerySize`, and `StartUpdateAsync` are also not called by that click. After selecting Campaign, the checkbox
+configuration is accepted and the button becomes enabled, so the failure is in XAML/app command activation before
+the GamePlatform update object. A live pointer breakpoint reports a `CTextBlock` target on press and `CCanvas` on
+release/tap; the XAML routed-event source alone is not enough to prove that the ButtonBase command was invoked.
+The pointer click at the button's label and at its left blank area both leave it unchanged. Need inspect the actual
+WinUI control/event hookup or Wine's button activation path. Do not treat a refreshed `PackageUpdate.Status` query
+behind the modal as a successful Apply.
 
 ### Start-up hang: combase activation took the loader lock under XAML's g_csStatic
 
@@ -11667,6 +11729,63 @@ Result: `docs/screenshots/xbox-halo-choose-what-to-install.png` - base game requ
 99.26 GB" instead of the whole 134 GB package. Along the way XAML needed `IDWriteTextLayout::HitTestTextRange` (it was a
 stub) to draw the dialog's text at all.
 
+### Xbox install: a missing optional logo must not discard a completed download (10-16)
+
+`uwp-bin/xbox-games/install-254428597cfe2.log` reached `PROGRESS 1000 1000`, then `install-app.py` raised
+`FileNotFoundError` copying the manifest's `Logo_44.png` from the staged package. That exception kept the otherwise
+fully unpacked selected payload from being promoted into its final stage directory, and the Xbox page reported
+"Content failed to load." The small logo is launcher decoration, not part of package activation. Installation now
+warns and proceeds without `.wine-uwp-icon.png` when the manifest path is absent (as can happen for a feature-streamed
+GDK package). The first Halo install reached 100% but failed here; the final stage was not materialized. This was a
+real installer bug, but it did not explain the separate "Content failed to load" banner on Halo's product page.
+
+### Halo product page: migration-blocked-products query must return an empty list (10-16)
+
+After the installer fix, the product page still showed "Content failed to load." Inspection of the live app log
+(`UWP_LOG=/tmp/wine-uwp-xbox-desktop-restart.log`) showed `Store.EnumerateMigrationBlockedProducts` called from
+`XboxPcApp.exe+0x6815b1`, answered by the generic `0x87E00196` no-service failure. The same request recurred on the
+Halo page. The Gaming Services stand-in has no migration-blocked products, so this method now returns a real empty
+`IVectorView<String>` instead of propagating a service failure. After rebuilding and reloading the app, the Halo page
+loaded with its Install, cloud play and ownership actions; the banner was gone. The new log records both
+`Store.QueryProductDetails(9PP5G1F0C2B6)` and `Store.EnumerateMigrationBlockedProducts -> 0`. This identifies the
+missing result as the page-load failure. The previous paused install queue was interrupted by the requested reload.
+
+### Xbox install queue: Pause must cover range reads and the waiting-to-worker handoff (10-16)
+
+The user's report that Pause did not stop a download exposed two gaps in the marker design. Python checked the marker
+between extracted-file reads, but `HttpFile._fetch` read each CDN range without checking it; this delayed pausing
+while a range was in flight. Also, `PackageQueue.Pause` accepts `ST_WAITING`, but at that point `Install.pause_file`
+is empty, so `set_paused` could mark the item paused without creating a marker. When `run_installer` later assigned
+the path it only removed stale markers, leaving the worker unpaused. The range reader now checks between 256 KiB
+reads, closes a partial request when paused, and resumes from the next byte with a new Range request. The
+waiting-to-worker handoff now materializes a marker if the item was already paused, and queue state reports
+`ST_PAUSED` immediately. Existing installer processes have already imported the old Python code; this fix applies
+to installs started after the updated app/shim is loaded. Not verified in a new install yet.
+
+The same live inspection found two host-side `python3 packaging/install-app.py` workers for Halo writing the same
+`.new` stage and log. They survived an earlier `wineserver -k` reload because they are host children of Wine's shell,
+not Wine server processes. Restarting the app during an install can therefore leave an orphan installer and start a
+second one against the same paths. Check for the host worker before any later restart; installer lifecycle cleanup is
+still open. After the requested reload, the live log showed `STAGE Paused` at 10% and the marker existed, but the
+restarted app's Install queue page said it was empty while two Python workers remained asleep on that marker. Thus a
+worker can be physically paused yet no longer be controllable from the app after its in-memory queue is lost.
+
+### Xbox install progress and UI smoothness follow-up (10-16)
+
+The live Halo page still showed its content-load banner. The two old host installer processes were asleep on the
+pause marker, while the restarted Xbox app no longer had a queue item for them. The progress log showed permille
+values (`PROGRESS 10 1000`): for a large selected game, each displayed step represented a large amount of work,
+making both progress and the rate estimate appear stalled. The installer now reports exact extracted bytes and
+total bytes; the shim scales that ratio to the package size, computes rate from byte-precise deltas, resets the
+sampling window across pauses, and caps `InstallationChanged` notifications at two per second. The queue shim
+build succeeds, but the live app has not loaded this DLL and these changes have not been exercised on a fresh
+download.
+
+The live screen also confirms My Library, Cloud Gaming and Store still have empty nav-icon slots. These are distinct
+from missing draw calls: the 10-15 investigation found the app creates no icon element for those three entries.
+Home, Game Pass, search, chevrons and queue icons had already been restored by fixing D3D11's
+`GetCreationFlags`. This session did not modify the Xbox app package or verify those remaining nav icons.
+
 ### Blocky scaled composition surfaces (10-16)
 
 The user's Xbox crops show stair-stepped edges on both line icons and text. In `wine/dlls/dcomp/composition.c`,
@@ -11714,6 +11833,119 @@ the shared Wine build and reload on the desktop. Promoted the tested DComp build
 confirmed the active Xbox process maps `/home/bobby/src/wine-build/dlls/dcomp/x86_64-windows/dcomp.dll`. The current
 desktop capture is `/tmp/xbox-linear-desktop.png` (Xbox Home); the isolated Halo detail capture remains available for
 the exact page with the scaled art.
+
+### Xbox selected install size is overwritten when the worker starts (10-16)
+
+The Halo install dialog showed 49.28 GB for the selected base components, but the queue card showed 125.3 GB. The
+selection itself reached both the queue request and host installer: `PackageRequest.ConfigureFeatures()` was empty
+after the user deselected optional features, the installer received `--tags 'game;launch' --languages 'EN-US'`, and
+its `PROGRESS` denominator was 52,907,835,538 bytes (49.28 GiB). The mismatch came from `install_thread()` resetting
+`in->total` to the full catalog `d.size` after `SubmitRequestAsync()` had set the selected size. This inflated the
+queue display and made host progress fractions/rates wrong. `install_thread()` now preserves the selected GDK total
+while continuing to replace it with `d.size` for ordinary Store packages. Rebuilt `wineuwp_gameplatform.dll` and
+reproduced the flow on a copied prefix with an isolated `WINE_UWP_GAMES_DATA`: unchecking Campaign changed the preview
+to 49.28 GB, the installer's tags were `game;launch`, and the queue showed `0 B of 49.3 GB` (capture:
+`/tmp/xbox-selected-size-queue-panel.png`). The test worker was paused and stopped in its isolated data directory.
+The desktop's existing paused install and old loaded shim were left untouched; the rebuilt shim is picked up by the
+next app launch through `install-overrides.sh`.
+
+### Xbox recent-game logo has an extension mismatch (10-16)
+
+The staged Candy Crush logo is JPEG data copied to `.wine-uwp-icon.png`. The Xbox `PackageDetails` shim now also
+provides a correctly suffixed path for the JPEG, as a defensive metadata fix. The installer writes a correctly suffixed
+`.wine-uwp-icon.jpg`/`.jpeg`/`.png` helper, while preserving the legacy `.png` desktop-launcher file. The shim prefers
+the correctly suffixed file when returning package logo paths. Existing staged installs need the suffixed copy added
+once; Candy Crush's current helper was identified as JPEG by its file signature. Instrumented both logo getters,
+reloaded the desktop app, and captured Home: neither getter was called, and the art remained absent. A copied-prefix
+run with `WINE_UWP_STATEREPOSITORY_TRACE=1` also recorded no StateRepository calls. The missing recent-game art is
+therefore not explained by these two local metadata paths; investigate the Xbox screen's own data source. The three
+empty navigation icon slots are separate: the earlier
+visual-tree trace showed Xbox creates no icon elements for them, so this needs app-side UI data/logic rather than an
+image decoder change.
+
+### Preserve an immediate pause while the install worker starts (10-16)
+
+`PackageQueue.SubmitRequestAsync()` publishes an item before `install_thread()` is scheduled. `set_paused()` accepts
+that initial `ST_WAITING` state and reports `ST_PAUSED`, but the worker then unconditionally assigned `ST_STREAMING` as
+its first action. A pause in that window stopped the host installer (the pause marker was still honored) while the
+public queue state incorrectly said it was streaming. The worker now preserves `ST_PAUSED` through delivery URL
+resolution. `run_installer()` creates the marker before launching the host installer, so it stays paused until Resume
+removes the marker.
+
+Cancellation had a synchronization defect too: `cancel` was written while holding a shared SRW lock and read without a
+lock. Cancel requests now take the exclusive lock; the installer loop reads the flag under a shared lock, and the shim
+logs an explicit `cancel requested` line. That trace distinguishes an app Cancel call from a paused item being filtered
+by the UI. The desktop capture `/tmp/xbox-pause-current.png` shows the Install queue page empty; it was captured after
+the earlier download session, so it confirms the visible symptom but is not a reproduction of this change. The shim
+builds successfully. The currently open desktop app has not been restarted and is still using the previous DLL.
+
+The pause failure was reproduced on copied prefixes: the shim logged `PackageQueue.PauseInstance(...)` and the host
+installer logged `STAGE Paused`, with no cancellation request. The actual WinMD enum confirms `Paused = 1`,
+`Streaming = 2`, and `Waiting = 6`. The Xbox page still empties the Install queue after Pause. The shim tried
+`QueueChanged` after `InstallationChanged`, synchronous `ItemAdded` both before and after the state notification,
+delayed `ItemAdded` after the API call, delayed state notification without queue events, and reporting `Waiting`
+while the worker remained paused; none kept the item visible. The delayed callback experiment rules out simple
+re-entrant event delivery. Captures from the isolated run: `/tmp/pause12-paused.png` (delayed state report) and
+`/tmp/pause14-paused.png` (Waiting state plus delayed ItemAdded) both show the empty queue; the installer log confirms
+`STAGE Paused`. The public API call is synchronous `void Pause(string packageInstance)`, which the app invokes
+directly from the row's pause button. The working hypothesis at this stage was that the client filtered `Paused` and needed an active row re-published.
+**That inference was disproved by the queued-package metadata diagnosis below.**
+
+Follow-up UI experiments on Xvfb `:98` used fresh copied prefixes and isolated game-data directories, not the desktop
+prefix. Reporting `Paused` makes the Xbox client remove the row. A delayed remove/re-add with a fresh identity restores
+the row and its pause button; rotating the identity again after the next click clears the client's stuck `Pausing`
+label. The installer then logged `STAGE Resumed`, and the row showed 247.5 MB at 183.2 Mbps (`/tmp/pause28-resume12.png`).
+A second pause froze it at 396.5 MB (`/tmp/pause28-repause.png`), but the pause itself hit a race in
+`HttpFile._fetch`: if the pause marker appears just as a range finishes, the pause check ran before the full-buffer
+check, looped with `len(data) == expected`, and fell out of the function returning `None`. Reordering those checks
+returns the completed range first. A new isolated UI run after this change completed three pause/resume cycles with
+no installer error. On the third pause the installer progress remained exactly 1,463,608,041 bytes across a four
+second wait and logged `STAGE Paused` (`/tmp/pause29-thirdpause.png`). The next click logged `STAGE Resumed`; progress
+then advanced to 1,920,441,087 bytes at 193 Mbps (`/tmp/pause29-thirdresume.png`). While paused the app keeps the row
+under Active as “Downloading” at 0 bps, because reporting `Paused` removes it; clicking the same row control resumes
+the worker. Thus the download is controllable and preserves its byte offset, though the paused status text/icon is
+still not a faithful paused affordance.
+
+### Xbox Premium badge: antialias SVG geometry through stepped downsampling (10-16)
+
+The Xbox bundle contains `BadgePremium.svg` (152x32), but the badge in the virtual screen was exactly two colors:
+our Direct2D SVG renderer tessellates paths to triangles and its D3D path does not antialias triangle edges. A direct
+`probe-svg.exe` run reproduced the same 2-color output. Supersampling alone followed by a single large linear
+minification still skipped most coverage samples (5 colors). Rendering the SVG target at 8x for small targets, then
+downsampling through 4x and 2x intermediate targets with linear filtering, produces 59 colors in the same 75x20
+badge crop and visibly smooths the letter edges (`/tmp/xbox-premium-filtered.png`, `/tmp/premium-filtered-zoom.png`).
+Large SVG targets use 2x and scratch storage is capped at 8 million pixels; non-bitmap targets retain the direct path.
+`TESTDISPLAY=:97 WINEPREFIX=uwp-bin/prefix-pause-test25 WINE_BUILD=uwp-bin/wine-build-premium ./regress.sh calc mp`
+passed: Calculator AE 0, Media Player 2834 colours.
+
+### Xbox paused-row investigation: queued package details are missing (10-16)
+
+The earlier claim that Xbox deliberately filters `Paused` was premature. On the isolated `pause-ui30` run, the shim
+reported the real state 1 and the host logged `STAGE Paused`, but a breakpoint after the native client's operation
+state assignment (`XboxPcApp.exe+6b4181`, `[rdi+538]`) did not fire for the transition. It had fired for Streaming
+(mapped to native operation state 4). `GameCatalogGrtsPackage::Command_ProcessStateChanged` calls the package-state
+helper at `+6b34a0` before `UpdateInstallOperationData`; its non-Streaming branch queries package details. The shim
+returned `GP_E_NO_SERVICE` from `PackageInstance.QueryDetails` for an item that exists in the install queue but is not
+installed yet. The row then disappeared (`/tmp/pause-ui30-paused2.png`). Test the missing queued-package metadata
+contract before any more identity rotation or state substitution experiments. The new test build removes both of
+those workarounds and represents queued package details as unregistered and not fully streamed.
+
+The `pause-ui31` run confirms the cause. `Package.QueryDetails` now also answers for a queued package, returning
+`Registered = false`, `Registerable = false` and `NotFullyStreamed = true`. The native operation-state breakpoint
+then reaches state 8 (Paused), and the Xbox Install queue displays **Download paused**, retains the item and replaces
+the row's Pause button with Resume; Resume all is enabled too. Clicking that row control calls
+`PackageQueue.ResumeInstance`, and the native state returns to 4 (Downloading). The delayed remove/re-add, GUID
+rotation, Streaming substitution and Pause-as-toggle workaround have all been removed. Pause is idempotent again,
+and installation/package identities stay unchanged through each cycle.
+
+Three complete UI pause/resume cycles passed. In the second, progress remained exactly 259,539,890 bytes across a
+three-second paused wait, then reached 318,260,146 after Resume. In the third, it remained at 507,958,352 while paused
+and reached 566,678,608 after Resume; the UI showed 76.7 Mbps. The final test item is paused at 884,794,089 bytes on
+Xvfb `:98`, prefix `uwp-bin/prefix-pause-ui30`, data `uwp-bin/xbox-pause-ui31`. Captures:
+`docs/screenshots/xbox-install-paused-resume.png` and `docs/screenshots/xbox-install-resumed.png`. The final shim build
+passes after removing temporary state-getter tracing. The desktop process is still using its earlier loaded shim.
+Seven obsolete isolated test installers were also terminated by their exact test data directories; they had survived
+Wine shutdown and held roughly 3.7 GB of swap. The desktop's game-data workers were left running.
 
 ### Game Pass bypasses the Premium SVG drawing path (10-16)
 
@@ -11764,3 +11996,714 @@ The tested `d2d1.dll` and `dcomp.dll` were promoted atomically to the standard W
 DLLs retained under ignored `uwp-bin/vector-shared-backup`. Other relevant build DLLs (ntdll, combase,
 wineuwp, dwrite, dxgi, d3d11, wined3d) compare identical between the tested and standard builds.
 The running desktop session was not controlled or restarted; new launches pick up the rendering fix.
+
+User-requested desktop reload: the first start exited with a ReactNative/CoreMessaging abort after
+showing a transient window. One retry reached Xbox Home and stayed open, with Premium and Game Pass
+filtered as on the virtual desktop (`/tmp/xbox-badge-desktop.png`). The desktop app now loads the
+rebuilt Gaming Services shim and the standard rendering DLLs; the prior current-state note about
+its older loaded shim no longer applies.
+
+### Install error 0x80004005: a stale staging file and global failure cleanup (10-16)
+
+The desktop Halo failure occurs before payload progress: `install-254428597cfe2.log` ends with
+`NotADirectoryError` in `shutil.rmtree(dest)`. `stage/254428597cfe2.new` is a regular 40,960-byte
+PE DLL (same size/time as the installed mrt100.dll), not a staging directory. The old failure handler
+also walks every package's `.new` and `.old` entries and removes them. Another worker can therefore
+lose its staging directory while copying a helper DLL; `shutil.copy2(src, dest)` then recreates the
+now-missing directory path as a regular file. This mechanism is consistent with the leftover DLL;
+the historical worker race itself was not traced.
+
+`python3 packaging/test-install-staging.py` reproduces the exact stale-file exception with a tiny
+synthetic MSIX, and exposes cross-package deletion, missing duplicate-worker locking, symlink
+handling and interrupted-publication recovery (4 failures, 1 error before the fix). The installer
+now owns a package lock through staging, publication and failure cleanup; removes only its own
+scratch entry, handling files/directories/symlinks; restores interrupted backups and rolls back a
+failed publication. The eight focused checks now pass. Desktop left open; its Restart install action
+starts the updated host Python script without an app relaunch. The virtual Halo install passed the former
+failure point, reached the queue at 31%, paused visibly, and resumed with progress advancing. It was paused
+again at 15.8 GB of 49.3 GB to avoid downloading the full game. Captures: `docs/screenshots/xbox-install-staging-paused.png`
+and `/tmp/install-staging-resumed.png`.
+
+The focused suite was extended to exercise a failed final rename with rollback and the `--info`
+CLI path; all eight checks pass. No Wine or host rendering module was changed for this install fix.
+
+### Halo install-queue artwork (10-16)
+
+On isolated Xvfb `:97`, the Halo queue row's 100px image is blank while the bottom-left active
+download tile shows Halo artwork. The valid 44px manifest logo is already present in the live
+`.new` staging directory. Gaming Services receives `Package.QueryDetails -> pending`, but the app
+does not call `Square44x44LogoPath`, `Square150x150LogoPath` or `IsUwp` in the captured run. This
+rules out a missing/corrupt staged icon and these `PackageDetails` getters as the immediate cause;
+the queue row is sourcing its image elsewhere or failing before those getters. The earlier changes
+to publish a logo during streaming and expose its staged path are therefore not a complete fix.
+The `IsUwp` experiment also had no effect. Queue screenshot `/tmp/xbox-icons-current.png`, trace
+`/tmp/xbox-icons-isuwp-test.log`; the test install was paused at 516.5 MB to avoid a full download.
+Next trace the Xbox queue row's actual image source before changing icon metadata again.
+
+The user's later `:98` run reproduced the row in the paused state: Halo shows 843.9 MB / 49.3 GB,
+the 100px square remains blank, and the bottom-left download tile still has artwork. Its log again
+shows `Package.QueryDetails -> pending` but no `PackageDetails` property calls. Capture:
+`docs/screenshots/xbox-install-queue-blank-art.png`; log `/tmp/xbox-pause-ui31.log`. This confirms
+the getter/path negative on the *active queue row*, resolving the earlier concern that the empty
+queue after a test restart invalidated that observation. The row is a GDK/XVC package (`not UWP`);
+which Xbox service supplies its larger artwork remains to be traced.
+
+The `:96` product-page trace narrows the split: the Halo product page paints its store artwork,
+while its empty queue has no install row to inspect. Xbox's binary has a distinct
+`GameCatalogThirdPartyItem::OnItemImagesChanged` path and a React Native `FileImageElement` loader;
+the queue does not call the package-logo getters. The `ImageCache` module initializes, and a
+2,325-byte image response is written to its temporary cache file during product-page navigation,
+so a blanket network/image-cache failure is not supported. The app later aborts in React Native,
+before the cache file can be checked after rename. This points to an image-data/source handoff for
+the library/queue entries, rather than general image decoding, but does not yet identify which
+GameCatalog or GDK method leaves the image field empty. Captured PDP screenshot:
+`/tmp/xbox-icon-trace-now.png`; file trace: `/tmp/xbox-active-row-filetrace.log`.
+
+A second isolated launch with `WINEDEBUG=+file` confirms no access to `.wine-uwp-icon.png` (or any
+Halo manifest logo) and no PackageDetails logo getter call while the app initializes. This run does
+not reproduce the active row: the UI reports an empty queue after restarting, even though the
+installer's host process remains paused at 1.36 GB. Do not infer image-loader failure from that
+empty-queue run. It also logs two `BitmapScaler_Initialize unsupported mode 1` warnings; Wine's
+scaler falls back to nearest-neighbour for unsupported pixel formats, which can explain blocky
+scaling but not the blank card. Log `/tmp/xbox-icon-filetrace.log`, empty-queue capture
+`/tmp/xbox-icon-filetrace-queue.png`.
+
+The subsequent desktop log `/tmp/xbox-install-fix-desktop.log` independently repeats this: Halo is
+classified as XVC, then the queued package gets `QueryDetails -> pending`, with no logo property
+calls. It also logs the same two WIC interpolation fallbacks. The command's exit 143 did not mean
+the desktop Xbox process had exited; PID 2745282 was still present when checked. No desktop input
+or restart was performed.
+
+A fresh isolated install reproduces the blank queue tile at 3.4 GB / 49.3 GB; the row was paused
+after capture to avoid finishing the download. `WINEDEBUG=+tracelogging` shows React Native dispatching
+`ImageCache.prefetchItems` during the session, but the app's ImageCache database stays at zero rows
+and the cache folder contains no image files. `Package.QueryDetails -> pending` is logged; the
+PackageDetails logo getters still are not called, and there is no `FileImageElement::LoadImageSource`
+failure. The screenshot confirms the queue row itself is blank while its bottom-left download tile
+has Halo art: `docs/screenshots/xbox-install-queue-image-source-trace.png`; log:
+`/tmp/xbox-art-queue-trace.log`. The current evidence narrows the failure to the data passed to the
+queue's image binding or its GameCatalog provider; it is not a general rasterization or download
+failure. A breakpoint at the `ImageCache.prefetchItems` native method (`XboxPcApp.exe+0x6f9ea0`)
+confirms the dispatch reaches its handler and then an async helper; the handler's input shape is not
+decoded yet. Next capture the JS arguments passed to `ImageCache.prefetchItems` and trace the queue item
+image field before changing Wine rendering code again.
+
+The same isolated prefix's `AsyncCache.db` contains complete `product_summary` records for both
+Halo product IDs used by the install flow (`9PP5G1F0C2B6` and campaign `9PD22XJDR74N`), each with
+multiple valid store artwork URIs. The queued multiplayer item is `9PP5G1F0C2B6`. In the log,
+`ImageCache.prefetchItems` is dispatched immediately after `startItemInstall` for that same item,
+but `ImageCache.db` still has no rows. This rules out absent store artwork metadata and narrows the
+remaining break to the prefetch arguments, image selection, or native prefetch result. The unrelated
+`sidebar_mru_data.cached_title_records` is `{}` in this prefix, so it does not explain the active
+install row. Continue by decoding the prefetch call's actual JS arguments/result.
+
+A fresh copy of the same prefix shows the broader library failure: My Games reports 602 titles, but
+the visible Halo, Solitaire, Candy Crush and other tiles all use the generic missing-image glyph;
+the My Library and Store sidebar icons are also absent. Opening My Games causes a WinHTTP request to
+`images-eds-ssl.xboxlive.com/image?...&format=png&w=424&h=424`. TLS validation succeeds and the
+request returns HTTP 200, `Content-Type: image/png`, 134,781 bytes. The tiles remain placeholders
+after the response. The local `ImageCache.db` has its schema but zero image rows and no companion
+files. A WIC probe of that exact downloaded PNG decodes and scales it at both interpolation modes
+tested (mode 1 and Fant) with `S_OK`; the unsupported-mode fallback is not a decode failure. This
+rules out a general network failure and a basic PNG/WIC decode failure, but the current trace does
+not yet prove whether this particular request came from `ImageCache.prefetchItems` or another image
+loader. The image still fails after HTTP delivery and decode, before the visible card is populated.
+Capture: `docs/screenshots/xbox-my-games-placeholder-images.png`; log:
+`/tmp/xbox-imagecache-debug.log`. Next identify the loader's image-cache write/result and bind it to
+the affected card.
+
+A follow-up on the My Games image failure (10-16) narrows the exception. `WINEDEBUG=+file,+tracelogging`
+shows Xbox activating `Windows.UI.Xaml.Media.Imaging.BitmapImage`, then reporting repeated
+`GameDetailsImageLoadError/50079` exceptions from `FileImageElement::LoadImageSource`. The app's own
+binary contains the corresponding diagnostic, `FileImageElement::LoadImageSource - SetSourceAsync
+failed`; the caught HRESULT is `0x80004005` (`E_FAIL`). Immediately afterward it reads the packaged
+`ImageLoadErrorFallback.png`, matching the placeholder in the capture. In this run, file tracing did
+not show a read of any downloaded/cache image file before those failures, and `ImageCache.db` still
+has zero records. Thus the earlier claim that the pixels failed *after* a successful app-side decode
+was too strong: only the independent WIC probe decoded the separately fetched PNG. Network fetch,
+app cache-file publication/lookup, stream construction, and `BitmapImage.SetSourceAsync` remain
+separate handoffs to distinguish. The concrete next target is the stream passed to SetSourceAsync,
+including whether the app opened an image file at all and what HRESULT SetSourceAsync returned.
+Capture: `/tmp/xbox-current.png` (My games, 602 entries, placeholder art), log:
+`/tmp/xbox-imagecache-filetrace.log`; the accompanying network log is
+`/tmp/xbox-imagecache-network-trace.log`.
+
+### Corrections and stream probe (10-16)
+
+The earlier statement that the breakpoint at `XboxPcApp.exe+0x6f9ea0` hit
+`ImageCache.prefetchItems` was a bad function label. Its return site is inside a generated
+`StorageItemThumbnail` async-operation function; do not treat those hits as proof that the JS
+prefetch arguments were captured. The `prefetchItems` string's actual React Native registration is
+separate, and the ImageCache module contains an async `PrefetchItem` helper in the
+`XboxPcApp.exe+0x7aeac0` region. A breakpoint there in a later launch did not fire, so that run did
+not establish the call path either.
+
+The earlier “no cache files” summary also described only the post-run directory. The
+`+file,+tracelogging` run records multiple `ImageCache\\<number>.tmp` writes followed by renames to
+`ImageCache\\<number>`; a subsequent filesystem inspection after the app run found only the DB.
+Thus downloads do reach disk and get renamed, but the database still reports zero rows, and the trace
+contains no open/read of those final image paths before the UI falls back. This shifts the next check
+to the cache-index/result and the stream the UI gives BitmapImage, rather than claiming files were
+never written.
+
+Added `probes/probe-bitmapimage.cpp` to exercise the same storage stream setup against the exact
+424x424 PNG fetched from Xbox. `StorageFile.GetFileFromPathAsync`, `IStorageFile::OpenAsync`, and
+`IRandomAccessStream::get_Size` all return `S_OK`; the stream is 134,781 bytes. The probe cannot
+activate `BitmapImage` outside a packaged XAML UI process: `RoActivateInstance` returns
+`0x8001010e` (`RPC_E_WRONG_THREAD`) under both STA and MTA initialization, before
+`SetSourceAsync` can be called. So it validates the generic StorageFile stream, but does not yet
+reproduce the app's `SetSourceAsync` E_FAIL. The next meaningful probe must run on Xbox's actual UI
+thread or instrument its stream at the call boundary.
+
+### Async BitmapImage callback boundary (10-16)
+
+**Async BitmapImage calls do reach XAML on the My Games route.** In an isolated copy of the Xbox
+prefix, `BitmapSourceGenerated::SetSourceAsync` (`Windows.UI.Xaml.dll+0x4e3a20`) and
+`BitmapSource::SetSourceAsyncImpl` (`+0x4e3b7c`) both fired for the library tiles, followed by
+`BitmapSource::OnStreamReadCompleted` (`+0x6f050`). A breakpoint after `CImageSource::SetSource`
+(`+0x6f1f4`) observed `EAX=0` for sampled callbacks, and the callback returned `EAX=0` at
+`+0x6f280`. This proves the async read/callback path runs and its final native return is success for
+those samples, but the rendered tiles still show placeholders. It does not prove the image payload
+was nonempty or valid: inspect the stream size in `SetSourceShared` (`+0x6fa48`) and the buffer length
+immediately before `CImageSource::SetSource` (`+0x6f1ef`) next. The standalone screenshot for this
+run is `/tmp/xbox-async-result-library.png` (My Games, 602 titles, visible placeholder icons).
+
+The next boundary trace resolves the size question: `BitmapSource::SetSourceShared` successfully obtains
+an image size (`GetSize` returns `S_OK` with `0xAA1F0` bytes), and XAML requests that many bytes via
+`ReadAsync`. Immediately before `CImageSource::SetSource`, the byte count is still `0xAA1F0`, with
+`EAX=0` afterward. The SetSourceAsync caller stack resolves through `XboxPcApp`'s generated
+`BitmapImage.SetSourceAsync` wrapper into `FileImageElement` (`XboxPcApp.exe+0xcf14c..0xcf8ad`).
+Thus this is not just the fallback's unrelated XAML activity, but successful API/read/SetSource
+status still does not establish that the bytes are a valid image or that the visual updates. Next
+inspect the buffer prefix at `+0x6f1ef@r8` and correlate it with the source file/cache entry; the
+current app copy has the ImageCache DB but no durable image files after startup.
+
+A bounded 32-byte dump at `BitmapSource::OnStreamReadCompleted`'s
+`CImageSource::SetSource` call shows the transferred buffer begins with the PNG signature and an
+IHDR declaring 1080x1080; it is not an empty stream or an obvious HTML/error response. This is only a
+header check, not a full decode. The XAML PDB also exposes the deferred decoder path
+(`ImageDecoderFactory::CreateDecoder` at `+0x18344c`, `WicSingleImageDecoder::DecodeFrame` at
+`+0x17d100`, `ImageCacheDecodeHandlerTask::Execute` at `+0x185760`, and
+`CImageSource::FireImageFailed` at `+0xf3860`). Next instrument decode and failure callbacks: the
+failure may occur after the successful stream read and source assignment.
+
+### Deferred decode boundary (10-16)
+
+The first observed `CImageSource::FireImageFailed` call is not at SetSourceAsync: it is deferred from
+`CImageSource::OnImageViewUpdated` through `DecodeStream` / `ImageProvider`, with `R8=0x80004005`
+(`E_FAIL`). In the same run, `ImageDecoderFactory::CreateDecoder` and
+`WicSingleImageDecoder::DecodeFrame` were entered repeatedly. The failure stack is XAML's own image
+provider path, so the current leading hypothesis is a WIC/XAML decode failure after the PNG stream is
+read, rather than cache lookup or app-side stream construction. This still does not identify which
+WIC operation fails. Next capture `WicSingleImageDecoder::DecodeFrame`'s HRESULT at its shared
+return (`+0x17d41f`) and `EncodedImageData::CreateWicBitmapDecoder`'s return (`+0x17d1af`), then
+instrument the failing WIC call. The visible My Games screenshot remains placeholder art.
+
+Correction to the first deferred-decode interpretation: `WicSingleImageDecoder::DecodeFrame`'s
+common return breakpoint observed `S_OK` for the sampled frames, while the call to
+`ImagingUtility::CreateDefaultColorTransform` returned `0x88982F81` (`WINCODEC_ERR_UNSUPPORTEDOPERATION`).
+XAML branches on that negative result and continues through its fallback color path, so this HRESULT
+is not yet the reported image failure. A separate `FireImageFailed(E_FAIL)` was observed in the same
+run, but it has not been correlated to those frames. Next compare the app's `GameDetailsImageLoadError`
+trace with the corresponding decode request and returned response; do not label color transform as
+root cause.
+
+The app's trace logging is now confirmed in the same isolated My Games reproduction: it catches
+`0x80004005` from `co_await BitmapImage.SetSourceAsync` inside `FileImageElement::LoadImageSource`.
+At the native `SetSourceAsync` return site, the immediate HRESULT is `S_OK`; the error is delivered
+later by the async action. Sampled `WicSingleImageDecoder::DecodeFrame` calls return `S_OK`; the
+`CreateDefaultColorTransform` HRESULT remains the handled `WINCODEC_ERR_UNSUPPORTEDOPERATION` noted
+above. Therefore the actual `CoreSetError`/`GetResults` edge of the async action is the next boundary,
+not the synchronous SetSourceAsync call or color-transform helper.
+
+Async-action callsite tracing confirms Xbox's generated `IAsyncAction::GetResults` wrapper is invoked
+from its coroutine (`XboxPcApp.exe+0x53290`) after `SetSourceAsync`. Its XAML implementation jumps to
+`CheckValidStateForResultsCall` (`Windows.UI.Xaml.dll+0x5963e4`), which reads the action's stored
+completion state/error code. The `CoreSetError` breakpoint did not fire in this reproduction, so the
+error may be written through another completion path; capture the HRESULT returned by this state
+check and the stored action error field at that point to identify the setter.
+
+Pointer correlation corrects the prior interpretation of this results-state trace. The actions
+returned by `BitmapSource.SetSourceAsyncImpl` at `Windows.UI.Xaml.dll+0x4e3a8c` have output pointers
+`0x7f4d0d4143f0`, `0x7f4d0d4145a0`, and `0x7f4d0d414900`; those exact pointers later appear as
+`GetResults` receivers in the Xbox coroutine at `XboxPcApp.exe+0x53290`. Each reaches
+`CheckValidStateForResultsCall` in Completed state (`1`) and returns `S_OK`. However, those calls
+occur after the corresponding `GameDetailsImageLoadError/50079` events in the same log. Thus they
+are successful bundled fallback-image loads, not the original artwork requests. The earlier
+original-art attempt fails before these observed actions; its source/stream setup and exact failing
+operation remain unknown. Do not use the sampled PNG buffer, WIC results, or async completion as
+evidence that the original tile image decoded. Log: `/tmp/xbox-xaml-correlate2.log`; screenshot:
+`/tmp/xbox-decode-result-library.png` (My Games, 602 entries, placeholder artwork).
+
+
+### Diagnostic session cleanup (10-16)
+
+The image investigation had accumulated many long-lived Xbox instances, each in a reflinked test
+prefix on its own Xvfb display. Several had `WINEDEBUG=+tracelogging` and breakpoint logging enabled.
+Stopped the image-investigation sessions on displays `:103` through `:118` using their own
+`WINEPREFIX` wineservers; left the user's `:0` process and unrelated prefixes alone. Their logs
+were about 22–96 MB each and resided in `/tmp` (tmpfs); the copied prefixes are about 5.3 GB
+apparent size each, so their COW writes are the disk-I/O risk. Avoid leaving diagnostic instances
+running. Future reproduction should use one isolated prefix/display, a bounded capture window, and
+minimal logging.
+
+### Xbox install cancellation follow-up (10-16)
+
+The queue shim set `Install::cancel` and terminated the installer child, but the worker finalized every
+unsuccessful install as `ST_FAILED`; only successful installs emitted `ItemRemoved` and left the queue.
+That made cancel look like a failed install and left the item visible. Cancellation also closed the
+installer handle immediately after `TerminateProcess`, without waiting for the child to stop writing.
+The shim now publishes `ST_CANCELED` with `ERROR_CANCELLED`, waits up to 10 seconds for the child,
+and removes canceled items after publishing their terminal state. It also avoids overwriting a
+canceled state with streaming progress and handles cancellation before download startup. `./build.sh`
+passes. This is a source/build verification only; an isolated UI cancel/requeue check has not yet been
+run, so the behavior is not yet confirmed in the Xbox app.
+
+### Apply follow-up: inspect the React Native command, not ButtonBase (10-16)
+
+The bounded `trace+tracelogging` repro reaches `RCTEventEmitter.receiveTouches` for Apply, but emits no
+GameCatalog update/installation call. Native ButtonBase breakpoints also miss working navigation and
+checkbox interactions, so their absence cannot establish that Apply lost its click. The UI is React Native
+(Hermes bytecode v96 in `Bundle/index.bundle`). A test mapping `EnableMouseInPointerForWindow` to the
+process-wide mouse-in-pointer switch did not change the symptom; it was reverted in source and the
+isolated user32 build. Do not repeat that experiment as a proposed fix.
+
+Opening Manage logs `GetItemCustomizationSettings` rejecting because `Customization.QueryGameProps`
+(slot 8) returns `0x87E00196`. General displays the corresponding priority-settings error. Whether
+Apply depends on that failed result is still to be determined from its packaged JavaScript handler.
+Log `/tmp/xbox-apply-app-handler.log`, bounded click slice `/tmp/xbox-apply-click-only.log`, screenshot
+`/tmp/xbox-apply-trace-after.png`: Add-ons, Campaign selected, green Apply still visible after clicking.
+The trace instance was stopped after capture. Use `WINE_UWP_GAMES_DATA=$PWD/uwp-bin/xbox-addons-ui-test`
+explicitly: run.sh otherwise defaults even an isolated prefix to the user's `xbox-games` directory.
+The existing isolated directory has a small installed Halo marker suitable for exercising the UI.
+
+Correction from packaged-handler disassembly: the absence of a GameCatalog call after Apply does not
+by itself point to a lost React Native click or to the earlier `QueryGameProps` failure. The handler
+does run in Hermes bytecode v96, and it has an earlier installed-drive state guard. Functions
+#57659/#57660 initialize and fetch the installed-drive LCE; #57666 calls
+`getInstalledDriveInfoAsync` and converts its result/error into LCE state. The completion callback
+#57661 first invokes the LCE's `isContent` predicate and returns immediately unless it is true. Only
+after that does it inspect `features.selectionUpdates.isModified` and dispatch
+`gameCatalogActions.startItemInstall.start`; DLC updates are checked separately. The green button's
+enabled state is based on customization being loaded and either features or DLCs being modified,
+not on the installed-drive LCE, so an enabled Apply can still enter the callback and return at this
+guard. Function #53080 confirms the modified-state predicate; renderer #53082 wires the enabled
+result to the button's `disabled` property.
+
+In the same investigation, `getInstalledDriveInfoAsync` reaches `Package.QueryInstallPath` for the
+installed package path under `Z:\home\bobby\Projects\wine-uwp\uwp-bin\xbox-addons-ui-test\stage\254428597cfe2`,
+then `Storage.EnumerateDevices` reports only `C:` and the lookup queries C: drive details. This makes
+an unresolved installed-drive LCE a concrete explanation to test: if the returned result cannot
+match the package's Z: install path to an enumerated device, the LCE may never become Content and
+Apply will take the early return. This is a prediction, not yet a confirmed result or fix. Expose
+the Z: data device in the isolated fixture and check the LCE plus whether the GameCatalog install
+action follows. This corrects the earlier implication that the no-op must occur before the
+GamePlatform/UI activation path; the JavaScript callback can run and return before issuing any native
+install/update call.
+
+### Apply submits after the installed drive resolves (10-16)
+
+The first fixed virtual run confirms the drive mismatch is load-bearing. `Package.QueryInstallPath` returns
+an actual `Z:\...\xbox-addons-ui-test\stage\...` path, but `Storage.EnumerateDevices` advertised only C:.
+Consequently the JS installed-drive lookup could not produce Content and Apply's callback returned before
+its Redux install action. The storage shim now also advertises the host data device on Z:, with the actual
+stage folder, stable device ID and disk-space information. Legacy package-instance device queries resolve
+to that same device. Content enumeration is filtered by device, so packages are not returned on both drives.
+The host data location is controlled by WINE_UWP_GAMES_DATA; its folder setter rejects unsupported moves.
+
+Selecting Campaign and clicking Apply now closes Manage, calls GameCatalogModule.StartItemInstall,
+creates a PackageRequest with ConfigureFeatures(CampaignS1), and submits it to PackageQueue. It is an
+install-request path, not the previously suspected PackageUpdate.StartUpdateAsync path. The UI shows
+Downloading with the selected 74.3 GB total. The test was paused at 0 B, showing Download paused and a Resume
+control (`docs/screenshots/xbox-campaign-apply-queued-paused.png`), then canceled through its menu: the child
+exits with ERROR_CANCELLED, the item is removed and the queue is empty
+(`docs/screenshots/xbox-campaign-change-canceled.png`). No Campaign payload-completion claim is made.
+
+Manage's separate General-tab failure was also fixed: Customization.QueryGameProps/SetGameProps implement
+the exact metadata ABI, default to Standard priority and Default resolution cap, and persist per-package
+settings in the prefix registry. They previously returned GP_E_NO_SERVICE, leaving the priority UI in error.
+The missing installed-drive Content guard, rather than this independent customization query, explains Apply.
+
+### Cancel must stop the Unix installer, not its Wine launcher (10-16)
+
+The first cancel screenshot proved only that the queue row disappeared. Inspection found the corresponding
+host Python process still paused: TerminateProcess had killed its Wine launcher, not Python. That test child
+was explicitly stopped. The installer now emits its own `PID <decimal>` record, flushed before installation
+work, while keeping --info JSON and --latest output unchanged. The queue worker parses complete PID/EXIT
+records, signals that exact Unix PID with `/bin/kill -TERM`, escalates after five seconds if necessary, and
+waits for the outer shell's EXIT record. The grace period begins when TERM is sent, so a delayed PID report
+does not skip cleanup by immediately sending KILL.
+
+Repeat virtual UI run on the rebuilt shim: Apply closed Manage and queued CampaignS1, Pause retained the row
+with Resume, Cancel removed it, the host log ended `EXIT 143`, and `ps` confirmed the reported Python PID
+1527611 no longer existed. The final queue capture is `docs/screenshots/xbox-campaign-change-canceled.png`.
+The localhost integration test in packaging/test-install-staging.py blocks an actual installer in an HTTP
+Range request, checks that its flushed PID matches Popen.pid, terminates it, and verifies exit 143 plus cleanup
+of temporary and staging paths. All 10 host-installer tests pass.
+
+The final UI run also verified General's priority setting: selecting "As soon as possible" saved priority 2,
+and reopening Manage queried priority 2 and displayed the same value (`docs/screenshots/xbox-game-priority-persisted.png`).
+One intervening startup/navigation attempt aborted in the pre-existing ReactNative animation path
+(ReactNative+0xc6d8, HRESULT E_INVALIDARG); the following run reached Manage and passed. This was not an Apply
+failure and is still an independent rendering/startup flake, not evidence of complete Xbox stability.
+
+Removed the abandoned preview-to-PackageUpdate side table after confirming the real Apply path. A preview
+is temporary UI state; retaining its selection globally could advertise an OptionalUpdateAvailable after
+the user merely selected a checkbox and closed/canceled the dialog. Update-availability queries still return
+a valid NoUpdateAvailable object (this stand-in does not discover package-version updates); feature changes
+reach the queue only through the explicit PackageRequest sent by Apply.
+
+Hermes investigation toolkit: `uwp-bin/ext/hermes-dec` (P1sec upstream) parses this bundle's bytecode v96.
+Keep HBCReader's source file open while calling parse_hbc_bytecode. First list matching function IDs and
+names; disassemble only relevant small functions. Dumping the localization enum module printed thousands
+of unrelated strings and obscured the handler. The verified Apply hook IDs are recorded above.
+
+Regression run before the requested desktop reopen: Calculator AE 0; Media Player Home visibly renders
+(2,826 colors). Solitaire logs FEState in 3/3 runs with no critical errors, but the suite's immediate screenshots
+are still splash artwork, so that alone is not a visual front-end verification. Feedback Hub fails on the
+already documented unimplemented msvcp140_app GetNextAsyncId export (same failure recorded in older controls).
+Calculator keyboard screenshots visibly show the expected results, but each comparison reports AE 67.6392;
+that pixel difference has not yet been localized. Do not describe the entire regression suite as passing.
+The user then requested reopening on :0 and being asked about further regression testing. The latest shim
+was rebuilt; further regression work is pending that response.
+The user declined further regression testing. Reopened the desktop prefix on :0 with the rebuilt shim,
+UWP_TIMEOUT=86400 and log /tmp/xbox-apply-fixed-desktop.log. No test interactions were performed on :0.
+
+### 2026-10-16: Proton EasyAntiCheat runtime installation
+
+Steam's sole library did not contain app 1826330 (Proton EasyAntiCheat Runtime). Official SteamCMD
+bootstrapped successfully but anonymous app_update failed with `No subscription`. Installed Lutris's
+published eac_runtime-20240114.tar.xz instead (27,232 bytes; SHA256
+8c711a3dd0906fdedd2fdcdedc7b33e09eff5aa22fe2b2dffcc046f02e194957), from
+https://github.com/lutris/buildbot/releases/download/2022.06.23/eac_runtime-20240114.tar.xz.
+It carries v2/lib64/easyanticheat{,_x64}.{dll,so} and v2/lib32/easyanticheat_x86.{dll,so}.
+Third-party binaries remain under ignored uwp-bin/ext/ProtonEasyAntiCheatRuntime. Both prefix-test
+and the existing prefix-pause-ui30 have a Program Files (x86)/Proton EasyAntiCheat Runtime symlink.
+No prefix/build copies and no Wine restarts were made.
+
+Proton's ntdll set_dll_path appends PROTON_EAC_RUNTIME/v2/lib{32,64}; our Wine does not implement
+that variable. Merely exporting it would leave these libraries undiscoverable. env.sh now discovers
+the prefix link/shared runtime and exports both PROTON_EAC_RUNTIME and the equivalent WINEDLLPATH
+entries. The existing ntdll builtin loader accepts that layout and associates PE bridges with their
+adjacent Unix .so libraries. Do not copy only PE DLLs to system32 or force EAC native overrides.
+install-overrides.sh attaches an already installed runtime before its cached-stamp return. Downloads
+are explicit through packaging/install-eac-runtime.sh --download, pinned by SHA256; this also accepts
+an existing Steam runtime or PROTON_EAC_RUNTIME override. No network operation occurs on normal launch.
+
+Host ldd resolves libpthread/libdl/libc for both runtime architectures. The 64-bit ntdll.so dependency
+resolves against our Wine build. This build has no 32-bit ntdll, so the 32-bit bridge is installed but
+not usable by a 32-bit process yet. Halo's bundled EasyAntiCheat_EOS_Setup.exe is PE32; an explicit
+install of its Settings.json productid into prefix-test failed with missing syswow64/ntdll.dll
+(c0000135). No Windows EAC service installation succeeded. Do not mix the system Wine 11.19's
+32-bit builtins into our custom 11.17 build to work around this.
+
+The existing Halo EAC bootstrapper log independently shows a linux64 module download (HTTP 200)
+followed by Wine mapping failure 206 before this installation. This task has not retested the game,
+service, or EAC module loading: the user requested installation and previously declined regressions.
+Already-running Xbox retains its old environment; runtime settings take effect on the next run.sh launch.
+Installation is not evidence of protected-game compatibility.
+
+### 2026-10-17: Building WoW64 for the Xbox prefix
+
+The shared build config.status confirms --enable-archs=x86_64, and i686-w64-mingw32-gcc is already
+installed. At the user's request, configured a fresh (not copied) uwp-bin/wine-build-wow64 from
+our existing Wine source with --enable-archs=i386,x86_64 --enable-wineuwp=x86_64 --disable-tests
+--without-oss --without-pcap --without-opencl. The custom wineuwp UWP host uses x64 CONTEXT
+registers without architecture guards and is only needed for our x64 UWP apps; restrict it to
+x86_64 rather than attempting to build it for i386. config.status confirms dlls/wineuwp is in
+i386_DISABLED_SUBDIRS. Standard i386 Windows modules and x64 WoW64 remain enabled.
+Building at nice 10 / ionice best-effort priority 7 with make -j2 to limit SSD/CPU pressure.
+Build log: /tmp/wine-wow64-build.log. The user's desktop app is left running until the new build
+is ready; no extra prefix copy or broad regression run was requested.
+
+The first full build stopped at msvcp140's i386 misc.o: the existing mutex ABI padding and static
+assertions hard-coded the x64 layout (owner offset 72, size 80). A targeted make of that object
+reproduced the same failure. Microsoft's STL __msvc_threads_core.hpp defines critical-section
+storage as 64 bytes for _WIN64 and 36 otherwise, giving x86 owner offset 40 and total size 48.
+Changed padding and assertions to those pointer-dependent values; both i386 and x86_64 misc.o
+then compiled successfully. The x64 layout is unchanged. Synced dlls/msvcp90/misc.c into wine/;
+the full low-priority build resumed. This is a compile/ABI assertion check, not an application
+regression test. Upstream ABI reference: https://github.com/microsoft/STL/blob/main/stl/inc/__msvc_threads_core.hpp.
+
+Next i386 compile blocker: dcomp composition.c's NX fault logger directly reads/writes x64 CONTEXT
+registers and assumes the x64 calling convention. Targeted composition.o compilation reproduced
+the error. Guard the handler, its registration, and its state with __x86_64__; leave the exported
+internal install function as a no-op on other architectures. Do not try to adapt its x64 soft-return
+recovery to x86 stdcall by renaming registers: argument cleanup and register-based parameters differ.
+The targeted i386 and x86_64 composition objects both compiled after that guard.
+
+The third blocker was the same class in ntdll/rtl.c: the UWP hardware-breakpoint/single-step helper
+assumes x64 CONTEXT fields and parameter registers. Targeted i386 rtl.o reproduced it. Guarded
+that diagnostic implementation with __x86_64__, with a no-op arm_uwp_breaks on other architectures;
+both rtl.o architectures then compiled. The x64 implementation is unchanged. Synced and committed
+both architecture guards in the external Wine checkout and repo copy, then resumed the full build.
+Fourth compile blocker: user32/message.c's UWP watchpoint handler also uses x64 registers and an
+8-byte hardware watchpoint. Reproduced with the i386 message.o target, guarded the diagnostic
+helpers on __x86_64__, and confirmed both message.o architectures compile. Normal CoreMessaging
+dispatch remains present on both architectures; its optional diagnostic hook is a no-op on x86.
+Synced and committed that guard in both source trees.
+
+The next blocker was linking i386 rpcrt4: the ObjectStublessClient3..32 exports were declared
+stdcall with no arguments, asking for _ObjectStublessClientN@0, but thunks.c's assembly defines
+bare _ObjectStublessClientN symbols and performs its own dynamic argument cleanup. nm confirmed
+the symbols; targeted rpcrt4.dll linking reproduced the failure. Changed these norelay export
+declarations to cdecl so they resolve the actual assembly symbols; no generated relay wrapper
+changes the thunk calling convention. Both i386 and x86_64 rpcrt4.dll then linked successfully.
+Synced and committed the spec change in both source trees. The pre-existing uncommitted
+ndr_stubless.c tracing is unrelated and was left untouched.
+The user explicitly authorized make -j6 during the build; switched from two to six jobs while
+retaining nice 10 and ionice best-effort priority 7. Existing objects were retained.
+The i386 StreamSocket compile then rejected five internal callbacks: connect/read/write/flush/upgrade
+were marked WINAPI (stdcall on x86) while async_private.h's async_operation_callback is cdecl.
+Targeted streamsocket.o reproduced all five mismatches. Removed WINAPI from those internal
+callbacks, retaining WINAPI on the actual COM methods. Both object architectures then compiled;
+synced and committed the fix in both trees and resumed at -j6. This fixes real x86 stack cleanup,
+not just compiler strictness; x64 has one calling convention and was unaffected.
+The full make -j6 completed successfully. Closed only prefix-test's old wineserver, then ran
+the new build's wineboot -u on :98 (exit 0); syswow64/ntdll.dll now matches the built i386 module
+(4,032,306 bytes). Reapplying the native DLL/shim overrides before the requested :0 launch.
+sync-wine --check reports zero differing/missing files and the same pre-existing unlisted
+ndr_stubless.c tracing file. No application regression suite was run.
+Reapplied overrides successfully. Retried Halo's bundled 32-bit EOS Setup with its Settings.json
+productid: exit 0. A live reg query confirms HKLM\System\CurrentControlSet\Services\EasyAntiCheat_EOS
+with ImagePath C:\Program Files (x86)\EasyAntiCheat_EOS\EasyAntiCheat_EOS.exe, Type 0x10, demand start;
+the executable is present. This supersedes the earlier missing-32-bit-ntdll installation failure.
+Service registration is not a protected-game launch/compatibility check.
+
+Reopened Xbox on :0 using WINE_BUILD=uwp-bin/wine-build-wow64, prefix-test, existing xbox-games data,
+UWP_TIMEOUT=86400, log /tmp/xbox-wow64-desktop.log. The captured window is Halo Infinite's product
+page, signed in as DesignGears; no desktop clicks or game/regression tests were performed.
+Screenshot: docs/screenshots/xbox-wow64-desktop.png. App launch tool session: 27107.
+
+### 2026-10-17: Halo EAC 206 mapping failure, native syscalls
+
+Reproduced the user's "Failed to load the anti-cheat module" on :98 with the existing
+prefix-pause-ui30 and WoW64 build, using the installed Halo stage. Download of linux64 succeeds
+(HTTP 200, 9,618,741 bytes); mapping fails immediately and bootstrapper returns 206. The same
+failure occurs launching HaloInfinite.exe directly with no package identity/WinUI/Xbox launcher.
+The repeatable helper is ignored uwp-bin/halo-eac-repro.sh; it polls the real EAC log, captures the
+error window, and exits 206. Its --keep equivalent is HALO_REPRO_KEEP=1, which waits on the failed
+launcher for inspection. All kills are scoped to prefix-pause-ui30; no new prefixes or build copies.
+
+The bootstrapper's Wine helper at 0x700100000000 is a Linux syscall ABI thunk. Before dlopen it
+calls memfd_create (syscall 0x13f), then writes the downloaded native module and calls dlopen on
+/proc/self/fd/<fd>. A trace+seh run shows SIGSYS at 0x700100000011 with rax 0x13f, which our current
+syscall-user-dispatch handler mistakes for a Windows syscall. The dlopen/libc cache remains zero
+because memfd creation failed first; those zero caches alone do not prove libc lookup failed.
+No EAC runtime DLL load occurs before this failure. The legacy Proton runtime and Windows EOS
+service installation do not fix this separate native EOS bootstrapper path.
+
+Valve's Wine already handles this under WINE_HACK_NATIVE_SYSCALLS=1: its SIGSYS handler adjusts
+the kernel allow range to cover native code above 0x700100000000, retaining Windows dispatch for
+the lower Windows range. Porting that opt-in (off by default), including retry only when prctl
+succeeds. Compiling only ntdll in the existing, unused wine-build-vector-control to avoid modifying
+the WoW64 build used by the desktop app. Source: ValveSoftware/wine bleeding-edge
+dlls/ntdll/unix/signal_x86_64.c and loader.c. This preserves actual native anti-cheat initialization;
+no game or EAC binary patch, signature change, or disable switch is involved.
+
+Confirmed with the isolated vector-control build: native syscalls disabled reproduces 206;
+enabled produces launcher status 301, "Easy Anti-Cheat successfully loaded in-game", in two
+runs. The native SIGSYS trace explicitly allows memfd_create and the real game process starts.
+The next visible failure is Halo's graphics check: "Hardware Tiled Resources Tier 2" missing.
+Screenshots: halo-eac-mapping-error.png and halo-eac-loaded-graphics-error.png under docs/screenshots.
+No fake feature reporting was added. An exploratory override pointing WINEPATH at installed
+Proton DXVK/VKD3D directories could not resolve d3d11.dll through the EAC game launch; no runtime
+DLLs were copied/replaced for this experiment. Actual graphics support remains unresolved.
+
+The first desktop retry through wineuwp-launch still gave 206 despite launch.env setting the
+native-syscalls variable: Windows CreateProcess's environment is separate from the host Unix
+environ preserved by Wine's posix_spawn. Reading getenv alone is insufficient for a per-game flag.
+At signal_init_process the Windows PEB/process parameters are already initialized, so read that
+environment block there (case-insensitive name), with the Unix environ as fallback. This also lets
+a child explicitly override a host flag. Verified the actual wineuwp-launch.exe path with the host
+WINE_HACK_NATIVE_SYSCALLS unset: EAC now reports 301. run.sh enables it for direct staged EOS
+launches; install-app.py writes it into launch.env when EasyAntiCheat/Settings.json is present.
+The existing Halo stage's ignored launch.env was updated too. The Wine feature remains off unless
+explicitly enabled; it is not added to the global launch defaults.
+
+On the user's request to open on :0, updated the desktop WoW64 ntdll and reopened Xbox. Halo was
+launched there with the native flag supplied on the host as well: EAC reports 301, followed by the
+same Hardware Tiled Resources Tier 2 dialog. Captured and inspected
+docs/screenshots/halo-desktop-graphics-error.png. No desktop clicks were performed.
+The completed per-game environment fix was then built into WoW64: compiled only the Unix objects,
+linked ntdll to a temporary output, and atomically renamed it into place, preserving existing live
+processes' mapped inode. Subsequent game processes can read launch.env's Windows environment flag
+without needing the Xbox parent restarted again. Desktop logs: /tmp/xbox-eac-native-desktop.log,
+/tmp/halo-eac-fixed-desktop2.log. This validates native EAC module initialization, not online play.
+
+The user received the old WoW64 desktop session's termination notification (PID 1806114, exit 137)
+with an additional unmatched-backtick/EOF error from run.sh. The current run.sh passes bash -n;
+the newer Xbox PID 1820785 is still running. The EOF is consistent with the five-line insertion
+made in-place into run.sh while that old shell was blocked in Wine: resuming at its old file
+offset can begin inside the screenshot command comment. Avoid in-place changes to active shell
+scripts; use atomic replacement or wait for their active invocations to finish.
+
+### Halo graphics runtime and packed allocator pointers (2026-10-17)
+
+Installed Proton Experimental's existing native DXVK d3d11/dxgi and VKD3D-Proton
+D3D12/D3D12Core into only prefix-pause-ui30/system32, backing up originals in
+uwp-bin/halo-graphics-original. AppDefaults/HaloInfinite.exe/DllOverrides selects
+native,builtin; Xbox defaults remain untouched. WINEPATH alone did not propagate
+working DLL resolution through EAC. Native graphics recognizes RTX 5090 and creates
+a Vulkan swapchain on Xvfb :98, passing the missing tiled-resources check.
+
+Three runs then crashed at HaloInfinite.exe+68c821. The minidump shows its freelist
+unpacks a pointer via >>21 and mask 0x7fffffffff8, but its heap structure lives at
+0x7fXXXXXXXXXX: the upper pointer bits are lost. Wine map_view exhausts preloader
+reservations then uses anonymous Unix mmap for unconstrained allocations, giving
+high Linux addresses. Proton's current allocator instead searches free address
+space in the requested direction. Experiment in existing vector-control build:
+prefer map_free_area for unconstrained allocations too, retaining mmap fallback.
+The first run survives the former crash and reaches a black in-game loading screen
+with the animated Halo spinner; this is not yet evidence of a menu or gameplay.
+Old crash_report/minidump.dmp persists after successful progress; always check its
+timestamp against the current run before attributing it to a new failure.
+
+The low-allocation run reaches animated loading artwork and progress, then fails
+later at STATUS_WINE_STUB (0x80000100): concrt140's concurrent queue iterator
+constructor is unimplemented. This is a different failure from the packed pointer
+AV. Existing Microsoft.VCLibs.140.00.UWPDesktop already contains native concrt140;
+next experiment links it alongside Halo and enables a Halo-only native override.
+A tiny ignored VirtualAlloc probe reserves 128 x 64MiB (MEM_RESERVE/PAGE_NOACCESS,
+no committed payload or disk image): original WoW64 build returns 128 high mappings,
+changed vector-control returns zero high mappings, last allocation 0x200030000.
+The probe reuses prefix-pause-test25; no new prefix/build copy was created.
+
+Native concrt140 gets the next run through startup videos, then Halo raises its
+own fatal error (0xe343000a). The dump's exception parameter points directly to:
+"File read request offset is beyond module EOF. Incomplete module install? Module:
+0x9B644EBB0C5BF1BE~File, ModuleSizeOnDisk: 0 bytes ... FileOffset: 1625493504,
+ReadSize: 1890334". There are no zero-byte installed files. Stage size is 75GiB;
+modules are under deploy/pc, not game/. This needs file-open/size investigation,
+not another change to the packed-pointer fix.
+
+Prepared game-local native DLL symlinks at stage root and game/, with per-game
+WINEDLLOVERRIDES appended atomically to launch.env. Restored the four test-prefix
+system32 graphics originals and removed experimental AppDefaults overrides; next
+run verifies the sibling DLL resolution. The :0 prefix remains unchanged. File
+trace filters to a 20,000-line ring in memory before writing a bounded log, avoiding
+another large +file trace on the user's SSD.
+
+wineuwp-launch's launch.env parser only handles literal export/name=value and
+surrounding quotes; ${WINEDLLOVERRIDES} is not expanded. Corrected Halo's final
+per-game override to include the complete literal UWP defaults plus DirectX and
+concrt140 native,builtin. run.sh sourcing a file successfully does not validate
+the native wrapper's interpretation of variable references.
+
+Confirmed sibling graphics DLLs resolve through the actual wrapper/EAC launch with
+prefix system32 restored, AppDefaults deleted, and a literal per-game override.
+The same content fatal repeats. Hash 0x9B644EBB0C5BF1BE is stored at byte8 of
+`deploy/pc/globals/common-rtx-new.module`; its real size is 2,859,864,064 bytes.
+A CreateFile2/GetFileSizeEx/FileStandardInfo probe with matching overlapped and
+unbuffered flags returns that exact size successfully, ruling out generic Wine
+large-file sizing. No zero-byte stage files exist. The attempted High-to-Low texture test was invalid: a later dump audit showed
+it had reintroduced the earlier concrt140 stub failure after AppDefaults removal.
+It did not reach the content fatal and cannot rule out the quality preference. Luna's inventory confirms HD1 was intentionally deselected
+in the earlier install flow (`--tags game;launch`), and the game has explicit
+handling/log strings for missing optional high-res module files.
+
+Temporary isolated kernelbase GetFileSizeEx trace confirms the game itself receives
+2,859,864,064 for the base common module through both call sites +649b74 and
++24c9b2a. Thus this is not merely a successful standalone probe: actual game API
+results are correct. The zero comes later, in its internal sizes array indexed by
+the read's variant. Temporary kernelbase source instrumentation is restored after
+each isolated build so it cannot enter the production WoW64 build accidentally.
+Luna inspected the external clean-room xgameruntime project; its chunk-availability
+API always says Ready, so it would not provide accurate optional-content state and
+was not installed. Microsoft's XPackageFindChunkAvailability contract describes
+minimum actual availability across selectors, not unconditional success.
+
+Correction after auditing the newest dump rather than its timestamp alone: the
+AppDefaults-free runs reintroduced STATUS_WINE_STUB in builtin concrt140. Native
+DirectX sibling libraries loaded, but launch.env's per-game WINEDLLOVERRIDES is
+not sufficient: Wine Unix loadorder.c reads the host getenv, not the child's
+Windows environment written by wineuwp-launch. Restored the Halo-only concrt140
+AppDefaults override and repeated the content diagnostic. The low-texture test
+must be repeated with this override; prior claims that it disproved HD selection
+were premature. The earlier native-concrt run genuinely reached the module EOF
+fatal, and actual game GetFileSizeEx calls still confirmed correct base sizes.
+
+## Halo GDK chunk availability (xgameruntime) — 2026-10-17
+
+Halo’s content fatal (`ModuleSizeOnDisk: 0` for the HD variant of `common-rtx-new.module`)
+comes from reading optional HD1 data that was never installed (`--tags game;launch`).
+Microsoft’s XPackageFindChunkAvailability must report those chunks as Installable so the
+game can skip them; the clean-room xgameruntime always saying Ready would not help.
+
+Added `shims/gameruntime` (output `xgameruntime.dll`):
+- Answers `InitializeApiImpl` / `QueryApiImpl` for CLSID_XPackageImpl through IXPackageImpl4
+  (coclass default; FindChunkAvailability remains vtable slot 12 / 0x60).
+- Reads `WINE_UWP_PACKAGE_PATH\.wine-uwp-chunks.json` written by `install-app.py` for Msixvc
+  packages (features + per-chunk ready/tags/languages from layout XML).
+- Feature matching: bare tag specs belong to that feature; `launch#hd1` compounds count as
+  optional add-ons (HD1), not base Launch. Language-tagged chunks are ignored for Feature/Tag
+  selectors unless they match the user locale.
+
+`probe-gdkchunks.exe` on the Halo stage: Feature Launch Ready, Feature HD1 Installable,
+chunk 1200 Installable, chunk 1000 Ready. DLL installed into `prefix` and
+`uwp-bin/prefix-test` system32 plus the stage `game/` directory. Desktop Xbox on :0 still
+needs a relaunch to load the new DLL into a Halo process.
+
+### Halo Infinite: sign-in, WinHTTP read-after-close heap corruption, HD1 campaign halt (2026-10-18)
+
+Launch recipe that works: prefix `uwp-bin/prefix-pause-ui30` (the one with EAC and the native DXVK/VKD3D graphics),
+`WINE_BUILD=uwp-bin/wine-build-wow64` (its ntdll has the native-syscall interop; `~/src/wine-build`'s 10-15 ntdll
+does not, and EAC then fails "Wine module mapping" with 206/210), `WINE_HACK_NATIVE_SYSCALLS=1`, `UWP_STAGE=254428597cfe2`.
+EAC then logs `Launcher finished with: 301`. `run.sh` defaults `UWP_STAGE` to calculator; without it `wine HaloInfinite.exe`
+ends in "ShellExecuteEx failed: File not found".
+
+- **Account mismatch / "different account" in game**: every XSTS token was "title no" because `xboxauth.bin` in this
+  prefix had no refresh token for Halo's own MSA client `000000004C25467F` (`0x80047801`, "device-code that client once").
+  Copied the store from `prefix-test` (same DPAPI keys); `probe-xboxauth.exe halotitle` then passes (title-bound XSTS,
+  presence 200). A new prefix needs `probe-xboxauth.exe halodevice` once (human device-code step).
+- **The BG NET WORKER freelist crashes (`+0x5C8DFD`, `+0x68cbb2/cc0b/cc89`, hash chain `+0x67ed66`) were one bug**:
+  WinHTTP kept reading into the caller's buffer after `WinHttpCloseHandle` on the request (trace: ReadData, close 1 ms
+  later, then 3 READ_COMPLETEs writing ~690 KB). Windows cancels a closed request's I/O and Halo frees the buffer on close.
+  Fix in `dlls/winhttp`: request `handle_closing` sets `closing`, cancels the queue and `netconn_cancel_io`; `read_data`
+  stops with `ERROR_WINHTTP_OPERATION_CANCELLED`. Login and multiplayer then work. It appeared only once sign-in worked,
+  because more HTTP traffic starts at "Authenticating with services".
+- `shims/gameruntime/hd_softskip.cpp` (an earlier session's runtime patcher: NOPs the game's `halt`, its module-EOF
+  check and an HD branch, rewrote freelist walks) **hid the real fault and turned clean halts into corruption**. Now opt-in
+  only (`WINE_UWP_HD_SOFTSKIP=1`), off by default.
+- ntdll `map_view`: bottom-up allocations landed in the preloader's reserved area at `0x7fffff...`; they now try
+  `[start, 2^43)` first (Windows gives the lowest free address). Halo packs pointers into 43 bits. Not the freelist cause.
+- `shims/gameruntime` XAsync: the completion thunk read the `XAsyncBlock` after the title's callback (which may free or
+  reuse it). Fixed; not the freelist cause either.
+- WinHTTP: a queued WebSocket shutdown that is aborted now completes (OPERATION_CANCELLED), like receives and closes.
+  `send_callback` filters by notify mask, so a missing SHUTDOWN_COMPLETE in a trace may just be unsubscribed.
+- **Campaign halt** "File read request offset is beyond module EOF ... ModuleSizeOnDisk: 0" (campaign child, build
+  18197): it opens `deploy\pc\...\*.module_hd1` (High-Resolution Textures, feature HD1) which were never installed. HD1 is
+  in the layout's default recipe (`IncludedFeatures="Launch;Game;HD1"`, no StoreId) but the install's tags left it out.
+  ~~The game makes no XPackage availability calls, so how Windows tells it HD1 is absent is unknown; route: install
+  HD1.~~ **Wrong, and the HD1 install was reverted** (55 files deleted, regions reset to not ready). The real cause is
+  below ("Halo campaign: the package identifier"). `install-app.py` still seeds `.new` from the installed copy with
+  reflinks for the same package and skips files already present at the right size; that part is a valid improvement.
+- Tooling: the `wineuwp` `WINE_UWP_BP` breakpoints do nothing in GDK games (wineuwp is not loaded there). Crash reports
+  now land in `crash_report/crash_game_<time>/`; watch `crash_info.txt`, the top-level `minidump.dmp` is not always rewritten.
+
+### Halo campaign: the package identifier, not HD1 (2026-10-18)
+
+**In game** (`docs/screenshots/halo-campaign-in-game.png`): Campaign -> Slot 1 New Game -> the map loads
+(`halo-campaign-loading-map.png`) -> the opening cutscene -> first-person play with HUD, with HD1 **not** installed.
+
+Cause: `XPackageGetCurrentProcessPackageIdentifier` answered the package *full name* (62 characters). The campaign's
+platform object (`GdkSupport_Release.dll` wrappers, delay-loaded) asks with a 33-byte buffer
+(`XPACKAGE_IDENTIFIER_MAX_LENGTH`), got `ERROR_INSUFFICIENT_BUFFER`, left its identifier empty, and from then on its
+availability wrapper returns Unavailable without ever calling `XPackageFindChunkAvailability` - which is why no
+availability call appeared in any log. With no feature information it reads modules' HD data, the `_hd1` open fails
+("Failed to open high res module file", size 0) and the next HD read halts. Now the identifier is the MSIXVC content id
+as 32 hex digits (Halo `513710F5AB8E4D7C9ED5D0BA94DCFB33`, the same GUID as `layout_<id>.xml` and the catalog's
+`ContentId`); `install-app.py` records it as `"identifier"` from the XVC info (first 16 bytes, checked against Bad
+Magpie's layout name) and the shim falls back to the layout file name for older installs. The game then enumerates the
+features and asks FindChunkAvailability for each feature and chunk; HD1 answers Installable (2) and it loads past.
+
+How it was found, for next time:
+- The **parent** game decides HD with a global `platform == 0` (0 loose, 1 Steam, 2 packaged, from
+  `GetCurrentPackageFullName`); `probe-peek` showed platform 2, HD off - correct. The campaign build has no such flag.
+- The campaign exe is packed: `.text` is encrypted on disk and most pages stay `PAGE_NOACCESS` until first touch.
+  `WINE_UWP_DUMP_IMAGE=Z:\tmp\img.bin` (shims/gameruntime `hd_softskip.cpp`) writes the decrypted image, touching each
+  no-access page so the packer's handler decrypts it; `objdump -D -b binary -m i386:x86-64 --adjust-vma=0x140000000`
+  then reads it. Imports from `GdkSupport_Release.dll` are MSVC delay loads: parse the delay-import directory (data
+  directory 13) to name the IAT slots, then find `call [rip]` to them.
+- The parent exe had been byte-patched on disk by the earlier soft-skip work (21 bytes: HD bit, EOF jae, halt call).
+  Restored from `.bak-hdbit` (`pecheck.py`: Authenticode pristine); the patched copy is `.patched-softskip`.
