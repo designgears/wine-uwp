@@ -189,6 +189,7 @@ dlls/windows.graphics/Makefile.in
 dlls/windows.graphics/private.h
 dlls/windows.graphics/weakref.c
 dlls/windows.graphics/weakref.h
+dlls/windows.media.mediacontrol/main.c
 dlls/windows.media/classes.idl
 dlls/windows.media/codecquery.c
 dlls/windows.media/main.c
