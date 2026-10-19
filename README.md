@@ -26,9 +26,14 @@ closed-source Store apps install and run, with no source and no symbols for any 
 | Calculator | Fully working; the pixel-exact regression baseline |
 | Feedback Hub | Works, interactive |
 | Camera | Starts, then shows its own error page |
+| Halo Infinite (GDK, via the Xbox app) | Installs from the Xbox app; campaign and online multiplayer play, with EasyAntiCheat |
 
 <p align="center">
   <img src="docs/screenshots/solitaire-unpatched-menu-game.png" alt="Solitaire: menu and a game of Klondike" width="820">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/halo-multiplayer-in-match.png" alt="Halo Infinite: an online multiplayer match" width="820">
 </p>
 
 ## How it works
