@@ -11655,6 +11655,8 @@ static HRESULT visual_qi( struct visual *impl, REFIID iid, void **out )
     /* Visual is an IAnimationObject on Windows; the Microsoft Store's AnimatedFrame casts its visual to it */
     else if (IsEqualGUID( iid, &IID_IAnimationObject_local ))
         return create_anim_object_view( (IUnknown *)&impl->ICompositionObject_iface, out );
+    else if (IsEqualGUID( iid, &IID_ICompositionObject2_view ))
+        return create_object2_view( (IUnknown *)&impl->ICompositionObject_iface, out );
     else if (IsEqualGUID( iid, &IID_IClosable ))
         *out = &impl->closable_vtbl;
     else if (IsEqualGUID( iid, &IID_IInteropVisual_private ) ||
@@ -13218,6 +13220,10 @@ static HRESULT WINAPI color_brush_QueryInterface( ICompositionColorBrush *iface,
         *out = &impl->partner_vtbl;
     else if (IsEqualGUID( iid, &IID_ICompositionObject2_view ))
         return create_object2_view( (IUnknown *)&impl->ICompositionColorBrush_iface, out );
+    else if (IsEqualGUID( iid, &IID_IClosable ))
+        return create_closable_view( (IUnknown *)&impl->ICompositionColorBrush_iface, out );
+    else if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local ))
+        return create_weak_view( (IUnknown *)&impl->ICompositionColorBrush_iface, weak_source_vtbl, out );
     else
     {
         FIXME( "color brush %p: no interface %s.\n", impl, debugstr_guid( iid ) );
@@ -22053,6 +22059,7 @@ static const GUID IID_IInteractionTrackerInertiaRestingValueStatics_ = { 0x18ed4
 static const GUID IID_IVisualInteractionSourceStatics_ = { 0x369965e1, 0x8645, 0x4f75, { 0xba, 0x00, 0x64, 0x79, 0xcd, 0x10, 0xc8, 0xe6 } };
 static const GUID IID_ICompositionInteractionSourceCollection_ = { 0x1b468e4b, 0xa5bf, 0x47d8, { 0xa5, 0x47, 0x38, 0x94, 0x15, 0x5a, 0x15, 0x8c } };
 static const GUID IID_IInteractionTrackerValuesChangedArgs_ = { 0xcf1578ef, 0xd3df, 0x4501, { 0xb9, 0xe6, 0xf0, 0x2f, 0xb2, 0x2f, 0x73, 0xd0 } };
+static const GUID IID_IInteractionTrackerCustomAnimationStateEnteredArgs_ = { 0x8d1c8cf1, 0xd7b0, 0x434c, { 0xa5, 0xd2, 0x2d, 0x76, 0x11, 0x86, 0x48, 0x34 } };
 static const GUID IID_IInteractionTrackerIdleStateEnteredArgs_ = { 0x50012faa, 0x1510, 0x4142, { 0xa1, 0xa5, 0x01, 0x9b, 0x09, 0xf8, 0x85, 0x7b } };
 
 struct interactions_object
@@ -22074,6 +22081,9 @@ struct interactions_object
     BOOL rails_x, rails_y, in_callback;
     const WCHAR *class_name;
     const GUID *main_iid;
+    Vector3 notified_position;  /* tracker: what the owner last saw in ValuesChanged */
+    float notified_scale;
+    BOOL notified;
 };
 
 static struct interactions_object *interactions_from( void *iface )
@@ -22301,38 +22311,112 @@ static void tracker_sync_properties( struct interactions_object *tracker )
     }
 }
 
-/* Tell the owner a request landed: ValuesChanged, then IdleStateEntered. IInteractionTrackerOwner
- * slots: 6 CustomAnimationStateEntered, 7 IdleStateEntered, 8 InertiaStateEntered,
- * 9 InteractingStateEntered, 10 RequestIgnored, 11 ValuesChanged. */
-static void tracker_notify( struct interactions_object *tracker, INT32 request )
+/* Tell the owner a request landed. IInteractionTrackerOwner slots: 6 CustomAnimationStateEntered,
+ * 7 IdleStateEntered, 8 InertiaStateEntered, 9 InteractingStateEntered, 10 RequestIgnored, 11 ValuesChanged.
+ * As on Windows, ValuesChanged is raised only when position or scale changed, and only an animated request
+ * leaves Idle (CustomAnimation, then Idle again); an immediate TryUpdatePosition keeps the state. Raising both for
+ * every request kept the Microsoft Store 22608's carousel requesting ~40 times a second, and its UI thread never
+ * got to anything else. */
+#define TRACKER_IMMEDIATE 0
+#define TRACKER_ANIMATED  1
+#define TRACKER_SETTLED   2   /* velocity requests: Inertia is not modelled, the owner sees Idle again */
+static void tracker_raise( struct interactions_object *tracker, unsigned int slot, const char *kind, const WCHAR *class_name,
+                           const GUID *iid, const void **vtbl, INT32 request )
 {
     typedef HRESULT (WINAPI *callback_t)( void *iface, void *tracker, void *args );
+    const void **owner_vtbl = *(const void ***)tracker->owner;
     struct interactions_object *args;
-    const void **owner_vtbl;
+
+    if (!(args = interactions_create( kind, class_name, iid, vtbl, FALSE ))) return;
+    args->position = tracker->position;
+    args->scale = tracker->scale;
+    args->request_id = request;
+    ((callback_t)owner_vtbl[slot])( tracker->owner, &tracker->vtbl, &args->vtbl );
+    interactions_Release( &args->vtbl );
+}
+static void tracker_notify( struct interactions_object *tracker, INT32 request, int how );
+
+/* An animated request leaves Idle for CustomAnimation at once and comes back when the animation would have ended.
+ * Raising Idle straight away made the Microsoft Store 22608's hero carousel, which moves to the next page from its
+ * IdleStateEntered, request ~40 times a second, and its UI thread did nothing else. The timer runs on the requesting
+ * (UI) thread, as the owner's callbacks must. */
+struct tracker_idle { struct interactions_object *tracker; INT32 request; ULONGLONG due; };
+static __thread struct tracker_idle *tracker_idles;
+static __thread unsigned int tracker_idle_count;
+static __thread UINT_PTR tracker_idle_timer;
+static void CALLBACK tracker_idle_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD time )
+{
+    ULONGLONG now = GetTickCount64();
+    unsigned int i = 0;
+
+    while (i < tracker_idle_count)
+    {
+        struct tracker_idle idle = tracker_idles[i];
+        if (idle.due > now) { i++; continue; }
+        tracker_idles[i] = tracker_idles[--tracker_idle_count];
+        tracker_notify( idle.tracker, idle.request, TRACKER_SETTLED );
+        interactions_Release( &idle.tracker->vtbl );
+    }
+    if (!tracker_idle_count && tracker_idle_timer)
+    {
+        KillTimer( NULL, tracker_idle_timer );
+        tracker_idle_timer = 0;
+    }
+}
+static void tracker_notify_animated( struct interactions_object *tracker, INT32 request, LONGLONG ms )
+{
+    struct tracker_idle *idles;
+    unsigned int i;
+
+    tracker_notify( tracker, request, TRACKER_ANIMATED );
+    if (ms < 16) ms = 16;
+    /* a new request replaces the one in flight, which never reaches Idle */
+    for (i = 0; i < tracker_idle_count; i++) if (tracker_idles[i].tracker == tracker) break;
+    if (i == tracker_idle_count)
+    {
+        if (!(idles = realloc( tracker_idles, (tracker_idle_count + 1) * sizeof(*idles) )))
+        {
+            tracker_notify( tracker, request, TRACKER_SETTLED );
+            return;
+        }
+        tracker_idles = idles;
+        tracker_idle_count++;
+        interactions_AddRef( &tracker->vtbl );
+        tracker_idles[i].tracker = tracker;
+    }
+    tracker_idles[i].request = request;
+    tracker_idles[i].due = GetTickCount64() + ms;
+    TRACE_(dcompanim)( "tracker %p: request %d settles in %lld ms.\n", tracker, request, ms );
+    if (!tracker_idle_timer) tracker_idle_timer = SetTimer( NULL, 0, 16, tracker_idle_proc );
+}
+
+static void tracker_notify( struct interactions_object *tracker, INT32 request, int how )
+{
+    BOOL changed;
 
     tracker_sync_properties( tracker );
     scene_dirty();
     if (!tracker->owner || tracker->in_callback) return;
-    owner_vtbl = *(const void ***)tracker->owner;
+    changed = !tracker->notified || memcmp( &tracker->notified_position, &tracker->position, sizeof(Vector3) ) ||
+              tracker->notified_scale != tracker->scale;
     tracker->in_callback = TRUE;
-    if ((args = interactions_create( "InteractionTrackerValuesChangedArgs",
-                                     L"Windows.UI.Composition.Interactions.InteractionTrackerValuesChangedArgs",
-                                     &IID_IInteractionTrackerValuesChangedArgs_, values_changed_args_vtbl, FALSE )))
+    if (how == TRACKER_ANIMATED)
+        tracker_raise( tracker, 6, "InteractionTrackerCustomAnimationStateEnteredArgs",
+                       L"Windows.UI.Composition.Interactions.InteractionTrackerCustomAnimationStateEnteredArgs",
+                       &IID_IInteractionTrackerCustomAnimationStateEnteredArgs_, idle_args_vtbl, request );
+    if (changed)
     {
-        args->position = tracker->position;
-        args->scale = tracker->scale;
-        args->request_id = request;
-        ((callback_t)owner_vtbl[11])( tracker->owner, &tracker->vtbl, &args->vtbl );
-        interactions_Release( &args->vtbl );
+        tracker->notified_position = tracker->position;
+        tracker->notified_scale = tracker->scale;
+        tracker->notified = TRUE;
+        tracker_raise( tracker, 11, "InteractionTrackerValuesChangedArgs",
+                       L"Windows.UI.Composition.Interactions.InteractionTrackerValuesChangedArgs",
+                       &IID_IInteractionTrackerValuesChangedArgs_, values_changed_args_vtbl, request );
     }
-    if ((args = interactions_create( "InteractionTrackerIdleStateEnteredArgs",
-                                     L"Windows.UI.Composition.Interactions.InteractionTrackerIdleStateEnteredArgs",
-                                     &IID_IInteractionTrackerIdleStateEnteredArgs_, idle_args_vtbl, FALSE )))
-    {
-        args->request_id = request;
-        ((callback_t)owner_vtbl[7])( tracker->owner, &tracker->vtbl, &args->vtbl );
-        interactions_Release( &args->vtbl );
-    }
+    if (how == TRACKER_SETTLED)
+        tracker_raise( tracker, 7, "InteractionTrackerIdleStateEnteredArgs",
+                       L"Windows.UI.Composition.Interactions.InteractionTrackerIdleStateEnteredArgs",
+                       &IID_IInteractionTrackerIdleStateEnteredArgs_, idle_args_vtbl, request );
     tracker->in_callback = FALSE;
 }
 
@@ -22411,7 +22495,7 @@ static HRESULT WINAPI tracker_TryUpdatePosition( void *iface, Vector3 value, INT
     TRACE( "%p position %g,%g,%g -> request %ld.\n", tracker, value.X, value.Y, value.Z, id );
     if (request) *request = id;
     tracker_set_position( tracker, value );
-    tracker_notify( tracker, id );
+    tracker_notify( tracker, id, TRACKER_IMMEDIATE );
     return S_OK;
 }
 static HRESULT WINAPI tracker_TryUpdatePositionBy( void *iface, Vector3 amount, INT32 *request )
@@ -22424,9 +22508,36 @@ static HRESULT WINAPI tracker_TryUpdatePositionWithAnimation( void *iface, void 
 {
     struct interactions_object *tracker = interactions_from( iface );
     INT32 id = InterlockedIncrement( &tracker->request_id );
-    FIXME( "%p animation %p: applied as idle.\n", tracker, animation );
+    struct kf_animation *kf = kf_animation_from( animation );
+    struct kf_key key;
+    IUnknown *identity = NULL;
+
+    /* the parameter is a CompositionAnimation, which for a key-frame animation is one of its other tables */
+    if (!kf && animation && SUCCEEDED( IUnknown_QueryInterface( (IUnknown *)animation, &IID_IUnknown, (void **)&identity ) ))
+    {
+        kf = kf_animation_from( identity );
+        IUnknown_Release( identity );
+    }
+
+    /* the animation is not run, but it lands where its last key says: a carousel that animates to its next page
+     * and never sees the tracker get there asks again, ~15 times a second (the Microsoft Store 22608's hero) */
+    if (kf && kf->value_kind == KF_VECTOR3 && kf->key_count && kf_sample( kf, 1.0f, &key ) &&
+        !kf->keys[min( kf->key_count, KF_KEYS ) - 1].expr)
+    {
+        TRACE( "%p animation %p: lands at %g,%g,%g.\n", tracker, animation, key.u.vector3.X, key.u.vector3.Y, key.u.vector3.Z );
+        tracker_set_position( tracker, key.u.vector3 );
+    }
+    else
+    {
+        HSTRING name = NULL;
+        if (animation) IInspectable_GetRuntimeClassName( (IInspectable *)animation, &name );
+        FIXME( "%p animation %p (%s, kf %p kind %d keys %u last expr %d): not landed, applied as idle.\n", tracker, animation,
+               debugstr_hstring( name ), kf, kf ? kf->value_kind : -1, kf ? kf->key_count : 0,
+               kf && kf->key_count ? kf->keys[min( kf->key_count, KF_KEYS ) - 1].expr : -1 );
+        WindowsDeleteString( name );
+    }
     if (request) *request = id;
-    tracker_notify( tracker, id );
+    tracker_notify_animated( tracker, id, kf ? (kf->delay_time + kf->duration) / 10000 : 0 );
     return S_OK;
 }
 static HRESULT WINAPI tracker_TryUpdatePositionWithAdditionalVelocity( void *iface, Vector3 velocity, INT32 *request )
@@ -22435,7 +22546,7 @@ static HRESULT WINAPI tracker_TryUpdatePositionWithAdditionalVelocity( void *ifa
     INT32 id = InterlockedIncrement( &tracker->request_id );
     TRACE( "%p velocity %g,%g: ignored.\n", tracker, velocity.X, velocity.Y );
     if (request) *request = id;
-    tracker_notify( tracker, id );
+    tracker_notify( tracker, id, TRACKER_SETTLED );
     return S_OK;
 }
 static HRESULT WINAPI tracker_TryUpdateScale( void *iface, float value, Vector3 center, INT32 *request )
@@ -22445,7 +22556,7 @@ static HRESULT WINAPI tracker_TryUpdateScale( void *iface, float value, Vector3 
     TRACE( "%p scale %g -> request %ld.\n", tracker, value, id );
     if (request) *request = id;
     tracker->scale = clampf( value, tracker->min_scale, tracker->max_scale );
-    tracker_notify( tracker, id );
+    tracker_notify( tracker, id, TRACKER_IMMEDIATE );
     return S_OK;
 }
 static HRESULT WINAPI tracker_TryUpdateScaleWithAnimation( void *iface, void *animation, Vector3 center, INT32 *request )
@@ -22457,7 +22568,7 @@ static HRESULT WINAPI tracker_TryUpdateScaleWithAdditionalVelocity( void *iface,
     struct interactions_object *tracker = interactions_from( iface );
     INT32 id = InterlockedIncrement( &tracker->request_id );
     if (request) *request = id;
-    tracker_notify( tracker, id );
+    tracker_notify( tracker, id, TRACKER_SETTLED );
     return S_OK;
 }
 static const void *tracker_vtbl[] =

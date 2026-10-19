@@ -12905,6 +12905,20 @@ base moves with its size: read it from `/proc/<pid>/maps` of the same build**, n
 
 Now (`docs/screenshots/msstore-22608-home-navrail.png`): 22608 starts with no managed exceptions left, shows its nav
 rail and search box, and its UI thread then spins at ~90% CPU in `CXcpDispatcher::OnWindowMessage` walking a long
-list of pending `0x403` messages. The Home area stays empty and clicks are not handled. `WINE_UWP_PROFILE` puts
-BringIntoView, ItemsRepeater and SetTimer churn from `dcomp!apply_clip_object` in the same thread. Next: what keeps
-posting.
+list of pending `0x403` messages. The Home area stays empty and clicks are not handled.
+
+**The spin was our InteractionTracker.** The hero carousel (PipsPager under it) moves to the next page from the
+tracker's IdleStateEntered. Ours raised ValuesChanged and IdleStateEntered synchronously on every request, so the
+carousel requested ~40 times a second (breakpoints on `tracker_TryUpdatePosition*` counted 5000+ in 150 s, called
+from a scoped batch's Completed handler). Now, as on Windows, ValuesChanged is raised only when a value changes, an
+immediate request keeps the state, and an animated one enters CustomAnimation and settles to Idle after the
+animation's delay + duration on a UI-thread timer. The batch was not the gate: the Store creates it *after* the
+request. Result: one request in 200 s, the UI thread idle (~6% CPU), and the nav rail responds
+(`docs/screenshots/msstore-22608-library-selected.png`).
+
+Now: no managed exceptions except a P/Invoke `Win32Exception` ("Call failed", +0x9fdb9). Pages stay empty: the Home
+rows exist (1207 px wide, stacked) but are painted at X = -1.87e26 (`trace+dcompops`: `hidden ... at -1.87276e+26`).
+No `SetOffset` warns, so it comes through an expression or transform; candidates bound on those visuals include
+`visual.Offset.X + _repeaterVisual.Translation.X`, `this.Target.Position + visual.Translation.X` and `-clip.Left`.
+Next: `./dcomptree.py` on one row to find which ancestor carries the absurd X. **`/tmp` is wiped by a reboot**: the
+test scripts (`store-run.sh`, `store-crash.sh`) and Xvfb `:97` have to be recreated.
