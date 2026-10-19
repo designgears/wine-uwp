@@ -136,6 +136,18 @@ target_link_libraries(storecontext PRIVATE runtimeobject.lib)
 # api-ms-win-appmodel-advertisingid-l1-1-0: twinapi.appcore imports three functions from this
 # apiset and Wine implements none, so the loader's unresolved-import stub raises
 # EXCEPTION_WINE_STUB (0x80000100) mid-startup. Built with the apiset's exact file name.
+# dmprocessxmlfiltered.dll: the Microsoft Store's MDM policy query; no enrolment here, so every Get is "not found".
+add_library(dmprocessxml SHARED shims/dmprocessxml/dmprocessxml.cpp)
+set_target_properties(dmprocessxml PROPERTIES PREFIX "" OUTPUT_NAME "dmprocessxmlfiltered")
+target_link_libraries(dmprocessxml PRIVATE oleaut32.lib)
+# Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager for the Microsoft Store.
+add_library(appinstallmanager SHARED shims/appinstallmanager/appinstallmanager.cpp)
+set_target_properties(appinstallmanager PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_appinstallmanager")
+target_link_libraries(appinstallmanager PRIVATE runtimeobject.lib)
+# Windows.System.Profile.WindowsIntegrityPolicy: not in S mode (Windows' asks a lockdown-policy service over RPC).
+add_library(integritypolicy SHARED shims/integritypolicy/integritypolicy.cpp)
+set_target_properties(integritypolicy PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_integritypolicy")
+target_link_libraries(integritypolicy PRIVATE runtimeobject.lib)
 add_library(advertisingid SHARED shims/advertisingid/advertisingid.cpp)
 set_target_properties(advertisingid PROPERTIES PREFIX "" SUFFIX ""
                       OUTPUT_NAME "api-ms-win-appmodel-advertisingid-l1-1-0.dll")

@@ -4019,6 +4019,8 @@ static HRESULT create_navigation_client( IUnknown **out )
 
 /* Put the stand-in client on the window's WindowServer, the way CImmersiveWindowFactoryProxy
  * puts the real one there. */
+HRESULT attach_window_client_adapter( IUnknown *window, HWND hwnd );
+
 static HRESULT attach_navigation_client( void *window )
 {
     struct navigation_host_vtbl
@@ -4565,6 +4567,7 @@ static HRESULT WINAPI wf_CreateCoreWindow( struct window_factory *wf, HSTRING ti
     static PrivateCreateCoreWindow_t pcreate;
     const WCHAR *str;
     UINT32 len = 0;
+    HWND core_window = NULL;
     HRESULT hr;
 
     ERR( "CreateCoreWindow %s on thread %lu\n", debugstr_hstring( title ), GetCurrentThreadId() );
@@ -4587,11 +4590,8 @@ static HRESULT WINAPI wf_CreateCoreWindow( struct window_factory *wf, HSTRING ti
         return hr;
     }
     TRACE( "PrivateCreateCoreWindow -> %p hr %#lx\n", *window, hr );
-    {
-        HWND core_window = NULL;
-        EnumWindows( show_core_window, (LPARAM)&core_window );
-        connect_dcomp_target( core_window );
-    }
+    EnumWindows( show_core_window, (LPARAM)&core_window );
+    connect_dcomp_target( core_window );
     if (!GetEnvironmentVariableW( L"WINE_UWP_NO_TEXT_INPUT_PRODUCER", NULL, 0 )) attach_text_input_producer( (IUnknown *)*window );
     push_title_bar_metrics_later();
     if (FAILED( hr = attach_navigation_client( *window ) ))
@@ -4601,6 +4601,9 @@ static HRESULT WINAPI wf_CreateCoreWindow( struct window_factory *wf, HSTRING ti
         *window = NULL;
         return hr;
     }
+    /* the shell's window client adapter (see clientadapter.c); WINE_UWP_NO_WINDOW_CLIENT_ADAPTER leaves it out */
+    if (!GetEnvironmentVariableW( L"WINE_UWP_NO_WINDOW_CLIENT_ADAPTER", NULL, 0 ))
+        attach_window_client_adapter( (IUnknown *)*window, core_window );
     broadcast_configure_core_window( *window );
     broadcast_load_app_xaml();
     pump_view_thread_later( 5000 );
@@ -5276,6 +5279,86 @@ static DWORD WINAPI code_bp_thread( void *arg )
     return 0;
 }
 
+/* WINE_UWP_WATCH=module+rva: a hardware write watchpoint on the 8 bytes at that address, on every thread (new
+ * ones are picked up every 20 ms). Each write is logged with the new value and the writer's caller chain, which
+ * finds who clears a static the app itself writes only once. Uses DR0; the target's own debug registers lose. */
+static ULONG_PTR watch_addr;
+static LONG watch_hits;
+
+static LONG CALLBACK watch_handler( EXCEPTION_POINTERS *info )
+{
+    CONTEXT *ctx = info->ContextRecord;
+    struct code_bp stk = { "", 0 };
+
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(ctx->Dr6 & 1)) return EXCEPTION_CONTINUE_SEARCH;
+    ctx->Dr6 &= ~0xfULL;
+    if (InterlockedIncrement( &watch_hits ) <= code_bp_max)
+    {
+        char at[128];
+        code_bp_describe( ctx->Rip, at, sizeof(at) );
+        ERR( "WATCH %p written by tid %04lx at %s, now %Ix\n", (void *)watch_addr, GetCurrentThreadId(), at,
+             *(ULONG_PTR *)watch_addr );
+        strcpy( stk.dump_reg, "stk" );
+        stk.dump_count = 12;
+        code_bp_dump( &stk, ctx );
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static DWORD WINAPI watch_thread( void *arg )
+{
+    char *spec = arg, *plus = strrchr( spec, '+' );
+    DWORD armed[1024], narmed = 0, self = GetCurrentThreadId();
+    unsigned int tries;
+    HMODULE mod = NULL;
+
+    if (!plus) return 0;
+    *plus = 0;
+    for (tries = 0; tries < 2400 && !(mod = GetModuleHandleA( spec )); tries++) Sleep( 50 );
+    if (!mod) return 0;
+    watch_addr = (ULONG_PTR)mod + strtoull( plus + 1, NULL, 16 );
+    AddVectoredExceptionHandler( 1, watch_handler );
+    ERR( "WATCH armed on %s+%s at %p, now %Ix\n", spec, plus + 1, (void *)watch_addr, *(ULONG_PTR *)watch_addr );
+    for (;;)
+    {
+        HANDLE snap = CreateToolhelp32Snapshot( TH32CS_SNAPTHREAD, 0 );
+        THREADENTRY32 te = { sizeof(te) };
+        if (snap == INVALID_HANDLE_VALUE) break;
+        for (BOOL ok = Thread32First( snap, &te ); ok; ok = Thread32Next( snap, &te ))
+        {
+            HANDLE thread;
+            CONTEXT ctx;
+            DWORD i;
+
+            if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == self) continue;
+            for (i = 0; i < narmed && armed[i] != te.th32ThreadID; i++) ;
+            if (i < narmed || narmed == ARRAY_SIZE(armed)) continue;
+            if (!(thread = OpenThread( THREAD_ALL_ACCESS, FALSE, te.th32ThreadID ))) continue;
+            SuspendThread( thread );
+            memset( &ctx, 0, sizeof(ctx) );
+            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            GetThreadContext( thread, &ctx );
+            ctx.Dr0 = watch_addr;
+            ctx.Dr7 = (ctx.Dr7 & ~0xf0003ULL) | 1 | (1ULL << 16) | (3ULL << 18);   /* L0, write, 8 bytes */
+            if (SetThreadContext( thread, &ctx )) armed[narmed++] = te.th32ThreadID;
+            ResumeThread( thread );
+            CloseHandle( thread );
+        }
+        CloseHandle( snap );
+        Sleep( 20 );
+    }
+    return 0;
+}
+
+static void maybe_start_watch(void)
+{
+    static char spec[128];
+    HANDLE thread;
+
+    if (!GetEnvironmentVariableA( "WINE_UWP_WATCH", spec, sizeof(spec) )) return;
+    if ((thread = CreateThread( NULL, 0, watch_thread, spec, 0, NULL ))) CloseHandle( thread );
+}
+
 /* WINE_UWP_TEST_CRASH=<seconds>: fault on a thread of our own, which the app's runtime has never seen,
  * after that long. It stands in for a crash on a graphics worker when testing an app's crash reporter. */
 static DWORD WINAPI test_crash_thread( void *arg )
@@ -5346,6 +5429,7 @@ HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID iid, void **out)
     {
         maybe_start_stack_dumper();
         maybe_start_code_bps();
+        maybe_start_watch();
         maybe_start_test_crash();
     }
     TRACE("%s, %s, %p\n", debugstr_guid(clsid), debugstr_guid(iid), out);

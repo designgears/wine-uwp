@@ -1248,6 +1248,25 @@ BOOL WINAPI FileIconInit(BOOL bFullInit)
 }
 
 /*************************************************************************
+ * SHTestTokenMembership	[SHELL32.245]
+ *
+ * Whether the token (NULL: the caller's) is a member of the BUILTIN alias with relative id rid, e.g.
+ * DOMAIN_ALIAS_RID_ADMINS. Windows.UI.Immersive.dll imports it by ordinal.
+ */
+BOOL WINAPI SHTestTokenMembership(HANDLE token, ULONG rid)
+{
+    SID_IDENTIFIER_AUTHORITY nt = {SECURITY_NT_AUTHORITY};
+    BOOL member = FALSE;
+    PSID sid;
+
+    TRACE("%p %lu\n", token, rid);
+    if (!AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, rid, 0, 0, 0, 0, 0, 0, &sid)) return FALSE;
+    if (!CheckTokenMembership(token, sid, &member)) member = FALSE;
+    FreeSid(sid);
+    return member;
+}
+
+/*************************************************************************
  * IsUserAnAdmin    [SHELL32.680] NT 4.0
  *
  * Checks whether the current user is a member of the Administrators group.

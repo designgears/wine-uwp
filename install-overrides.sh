@@ -509,6 +509,15 @@ if [ -f "$XA_SHIM" ]; then
   echo "installed: Xbox sign-in (XboxAuthManager, WebAuthenticationCoreManager, StoreConfiguration) stand-in"
 fi
 
+# dmprocessxmlfiltered.dll: the Microsoft Store imports DMProcessConfigXMLFiltered to read MDM policies. Windows'
+# copy needs the whole device-management enrolment stack. See shims/dmprocessxml.
+DMX=${SHIM_DIR}/dmprocessxmlfiltered.dll
+if [ -f "$DMX" ]; then
+  DMX_DST=$SYS32/dmprocessxmlfiltered.dll
+  if ! cmp -s "$DMX" "$DMX_DST"; then cp -f --reflink=auto "$DMX" "$DMX_DST"; fi
+  echo "installed: dmprocessxmlfiltered (MDM policy query) stand-in"
+fi
+
 # api-ms-win-appmodel-advertisingid-l1-1-0.dll. No registry entry: this is a plain DLL resolved by
 # name at load time, so it only has to exist in system32 for twinapi.appcore's imports to bind to
 # it instead of Wine's raising stub.
@@ -547,6 +556,21 @@ fi
 # ({c2f03a33-...}, not registered under Wine) and, when that fails, never completes the
 # IAsyncOperation the caller is waiting on. Solitaire blocks there forever and its render loop
 # never starts. See shims/taskbarmanager.
+# Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager (see shims/appinstallmanager): Windows'
+# InstallService.dll is a client of an InstallService broker that does not exist here; the Microsoft Store
+# fail-fasts at start-up without the class. Registered in the SHIM_CLASSES pass below.
+AIM_SHIM=${SHIM_DIR}/wineuwp_appinstallmanager.dll
+if [ -f "$AIM_SHIM" ]; then
+  cmp -s "$AIM_SHIM" "$SYS32/wineuwp_appinstallmanager.dll" || cp -f --reflink=auto "$AIM_SHIM" "$SYS32/wineuwp_appinstallmanager.dll"
+  echo "installed: AppInstallManager (Microsoft Store installs) stand-in"
+fi
+# Windows.System.Profile.WindowsIntegrityPolicy (see shims/integritypolicy): Windows' implementation raises
+# EPT_S_NOT_REGISTERED from wldp's RPC to the lockdown-policy service, which kills the Microsoft Store.
+WIP_SHIM=${SHIM_DIR}/wineuwp_integritypolicy.dll
+if [ -f "$WIP_SHIM" ]; then
+  cmp -s "$WIP_SHIM" "$SYS32/wineuwp_integritypolicy.dll" || cp -f --reflink=auto "$WIP_SHIM" "$SYS32/wineuwp_integritypolicy.dll"
+  echo "installed: WindowsIntegrityPolicy (not in S mode) stand-in"
+fi
 TB_SHIM=${SHIM_DIR}/wineuwp_taskbarmanager.dll
 if [ -f "$TB_SHIM" ]; then
   TB_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_taskbarmanager.dll
@@ -638,6 +662,8 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_userpicker.dll" ]       && SHIM_CLASSES="$SHIM_CLASSES Windows.System.UserPicker:wineuwp_userpicker.dll"
 [ -f "$SYS32/wineuwp_memorymanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.System.MemoryManager:wineuwp_memorymanager.dll"
 [ -f "$SYS32/wineuwp_deviceinformation.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Devices.Enumeration.DeviceInformation:wineuwp_deviceinformation.dll"
+[ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager:wineuwp_appinstallmanager.dll"
+[ -f "$SYS32/wineuwp_integritypolicy.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.System.Profile.WindowsIntegrityPolicy:wineuwp_integritypolicy.dll"
 [ -f "$SYS32/wineuwp_taskbarmanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Shell.TaskbarManager:wineuwp_taskbarmanager.dll"
 [ -f "$SYS32/wineuwp_storecontext.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Services.Store.StoreContext:wineuwp_storecontext.dll"
 [ -f "$SYS32/wineuwp_xboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager:wineuwp_xboxauth.dll"

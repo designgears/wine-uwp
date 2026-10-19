@@ -130,6 +130,56 @@ static const struct IPropertySetVtbl settings_vtbl =
 
 DEFINE_IINSPECTABLE( settings_map, IMap_HSTRING_IInspectable, struct settings, IPropertySet_iface )
 
+/* A copy of the current values. Windows' ApplicationDataContainerSettings is a view of the settings store, and
+ * enumerating it walks what was there when the enumeration began: the Microsoft Store removes stale cached
+ * accounts while enumerating LocalSettings.Values, which a live PropertySet answers with E_CHANGED_STATE. */
+static HRESULT settings_snapshot( struct settings *impl, IPropertySet **out )
+{
+    static const WCHAR class[] = L"Windows.Foundation.Collections.PropertySet";
+    IIterator_IKeyValuePair_HSTRING_IInspectable *iter;
+    IMap_HSTRING_IInspectable *map;
+    IInspectable *inspectable;
+    HSTRING_HEADER header;
+    HSTRING name;
+    boolean more;
+    HRESULT hr;
+
+    *out = NULL;
+    if (FAILED(hr = WindowsCreateStringReference( class, ARRAY_SIZE(class) - 1, &header, &name )) ||
+        FAILED(hr = RoActivateInstance( name, &inspectable ))) return hr;
+    hr = IInspectable_QueryInterface( inspectable, &IID_IPropertySet, (void **)out );
+    IInspectable_Release( inspectable );
+    if (FAILED(hr)) return hr;
+    if (FAILED(hr = IPropertySet_QueryInterface( *out, &IID_IMap_HSTRING_IInspectable, (void **)&map ))) goto failed;
+    if (SUCCEEDED(hr = IIterable_IKeyValuePair_HSTRING_IInspectable_First( impl->inner_iterable, &iter )))
+    {
+        for (hr = IIterator_IKeyValuePair_HSTRING_IInspectable_get_HasCurrent( iter, &more );
+             SUCCEEDED(hr) && more; hr = IIterator_IKeyValuePair_HSTRING_IInspectable_MoveNext( iter, &more ))
+        {
+            IKeyValuePair_HSTRING_IInspectable *pair;
+            IInspectable *value = NULL;
+            HSTRING key = NULL;
+            boolean replaced;
+
+            if (FAILED(hr = IIterator_IKeyValuePair_HSTRING_IInspectable_get_Current( iter, &pair ))) break;
+            if (SUCCEEDED(hr = IKeyValuePair_HSTRING_IInspectable_get_Key( pair, &key )) &&
+                SUCCEEDED(hr = IKeyValuePair_HSTRING_IInspectable_get_Value( pair, &value )))
+                hr = IMap_HSTRING_IInspectable_Insert( map, key, value, &replaced );
+            if (value) IInspectable_Release( value );
+            WindowsDeleteString( key );
+            IKeyValuePair_HSTRING_IInspectable_Release( pair );
+            if (FAILED(hr)) break;
+        }
+        IIterator_IKeyValuePair_HSTRING_IInspectable_Release( iter );
+    }
+    IMap_HSTRING_IInspectable_Release( map );
+    if (SUCCEEDED(hr)) return S_OK;
+failed:
+    IPropertySet_Release( *out );
+    *out = NULL;
+    return hr;
+}
+
 static HRESULT WINAPI settings_map_Lookup( IMap_HSTRING_IInspectable *iface, HSTRING key, IInspectable **value )
 {
     struct settings *impl = impl_from_IMap_HSTRING_IInspectable( iface );
@@ -166,7 +216,19 @@ static HRESULT WINAPI settings_map_HasKey( IMap_HSTRING_IInspectable *iface, HST
 static HRESULT WINAPI settings_map_GetView( IMap_HSTRING_IInspectable *iface, IMapView_HSTRING_IInspectable **view )
 {
     struct settings *impl = impl_from_IMap_HSTRING_IInspectable( iface );
-    return IMap_HSTRING_IInspectable_GetView( impl->inner_map, view );
+    IMap_HSTRING_IInspectable *map;
+    IPropertySet *copy;
+    HRESULT hr;
+
+    if (!view) return E_POINTER;
+    if (FAILED(hr = settings_snapshot( impl, &copy ))) return hr;
+    if (SUCCEEDED(hr = IPropertySet_QueryInterface( copy, &IID_IMap_HSTRING_IInspectable, (void **)&map )))
+    {
+        hr = IMap_HSTRING_IInspectable_GetView( map, view );
+        IMap_HSTRING_IInspectable_Release( map );
+    }
+    IPropertySet_Release( copy );
+    return hr;
 }
 
 static HRESULT WINAPI settings_map_Insert( IMap_HSTRING_IInspectable *iface, HSTRING key,
@@ -254,7 +316,20 @@ static HRESULT WINAPI settings_iterable_First( IIterable_IKeyValuePair_HSTRING_I
         IIterator_IKeyValuePair_HSTRING_IInspectable **value )
 {
     struct settings *impl = impl_from_IIterable_IKeyValuePair_HSTRING_IInspectable( iface );
-    return IIterable_IKeyValuePair_HSTRING_IInspectable_First( impl->inner_iterable, value );
+    IIterable_IKeyValuePair_HSTRING_IInspectable *iterable;
+    IPropertySet *copy;
+    HRESULT hr;
+
+    if (!value) return E_POINTER;
+    if (FAILED(hr = settings_snapshot( impl, &copy ))) return hr;
+    if (SUCCEEDED(hr = IPropertySet_QueryInterface( copy, &IID_IIterable_IKeyValuePair_HSTRING_IInspectable,
+                                                    (void **)&iterable )))
+    {
+        hr = IIterable_IKeyValuePair_HSTRING_IInspectable_First( iterable, value );
+        IIterable_IKeyValuePair_HSTRING_IInspectable_Release( iterable );
+    }
+    IPropertySet_Release( copy );
+    return hr;
 }
 
 static const struct IIterable_IKeyValuePair_HSTRING_IInspectableVtbl settings_iterable_vtbl =

@@ -652,3 +652,18 @@ HRESULT file_stream_open( const WCHAR *path, FileAccessMode mode, BOOL sequentia
     *out = &impl->IRandomAccessStreamWithContentType_iface;
     return S_OK;
 }
+
+/* shcore's CreateRandomAccessStreamOnFile: the same file stream StorageFile.OpenAsync hands out. MrmCoreR opens
+ * resource files through it. */
+HRESULT WINAPI __wine_create_random_access_stream_on_file( const WCHAR *path, FileAccessMode mode, REFIID riid, void **out )
+{
+    IRandomAccessStreamWithContentType *stream;
+    HRESULT hr;
+
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (FAILED(hr = file_stream_open( path, mode, FALSE, &stream ))) return hr;
+    hr = IRandomAccessStreamWithContentType_QueryInterface( stream, riid, out );
+    IRandomAccessStreamWithContentType_Release( stream );
+    return hr;
+}

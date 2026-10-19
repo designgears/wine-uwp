@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     54ab329529ca445514b3e252d9b13adccf069f05
-                 ntdll: Give a child's host environment the Wine variables of its environment block.
+  wine HEAD:     8a4c0e913ba66e4fd3a9fd9dfb74d4b9e44f8442
+                 dcomp: Refuse IReferenceTracker everywhere, IVisual2 on visuals, ICompositionObject view on gradient brushes, safe NX handler.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-19T06:19:37Z
+  captured:      2026-10-19T10:06:01Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

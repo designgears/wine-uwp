@@ -324,3 +324,4 @@
 @ stub _PredictReasonableImpact
 @ stdcall -private __wine_storage_file_create(wstr ptr)
 @ stdcall -private __wine_storage_folder_create(wstr ptr)
+@ stdcall -private __wine_create_random_access_stream_on_file(wstr long ptr ptr)

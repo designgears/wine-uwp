@@ -312,6 +312,7 @@
 @ stdcall FindExecutableA(str str ptr)
 @ stdcall FindExecutableW(wstr wstr ptr)
 @ stub FixupOptionalComponents
+245 stdcall SHTestTokenMembership(ptr long)
 @ stdcall FreeIconList(long)
 @ stdcall GetCurrentProcessExplicitAppUserModelID(ptr) shcore.GetCurrentProcessExplicitAppUserModelID
 @ stdcall InitNetworkAddressControl()

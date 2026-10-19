@@ -2287,7 +2287,35 @@ static void WINAPI nx_soft_ret( void )
 {
 }
 
+/* Whether [addr, addr + size) is committed, readable memory. The handler below must not fault itself: vectored
+ * handlers run before any __TRY, so a fault while dumping re-entered it once per frame until the stack ran out,
+ * which hung the Microsoft Store's UI thread on an ordinary bad read in managed code (rcx 0x3f80000000000000). */
+static BOOL nx_readable( const void *addr, SIZE_T size )
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    ULONG_PTR p = (ULONG_PTR)addr;
+
+    if (p < 0x10000 || (p >> 47) || !VirtualQuery( addr, &mbi, sizeof(mbi) )) return FALSE;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return FALSE;
+    return p + size <= (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+}
+
+static LONG nx_veh_thread;
+static LONG CALLBACK comp_object_nx_veh_body( EXCEPTION_POINTERS *info );
+
 static LONG CALLBACK comp_object_nx_veh( EXCEPTION_POINTERS *info )
+{
+    LONG result;
+
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    /* one thread at a time, and never re-entered by a fault of its own */
+    if (InterlockedCompareExchange( &nx_veh_thread, GetCurrentThreadId(), 0 )) return EXCEPTION_CONTINUE_SEARCH;
+    result = comp_object_nx_veh_body( info );
+    InterlockedExchange( &nx_veh_thread, 0 );
+    return result;
+}
+
+static LONG CALLBACK comp_object_nx_veh_body( EXCEPTION_POINTERS *info )
 {
     EXCEPTION_RECORD *rec = info->ExceptionRecord;
     CONTEXT *ctx = info->ContextRecord;
@@ -2318,8 +2346,8 @@ static LONG CALLBACK comp_object_nx_veh( EXCEPTION_POINTERS *info )
     __ENDTRY
     __TRY
     {
-        unsigned char *ip = ((void **)ctx->Rsp)[0];
-        if ((ULONG_PTR)ip > 0x10000)
+        unsigned char *ip = nx_readable( (void *)ctx->Rsp, sizeof(void *) ) ? ((void **)ctx->Rsp)[0] : NULL;
+        if ((ULONG_PTR)ip > 0x10000 && nx_readable( ip - 16, 16 ))
         {
             FIXME( "  call-site bytes:" );
             for (i = 0; i < 16; i++) FIXME( " %02x", ip[-16 + i] );
@@ -2331,7 +2359,7 @@ static LONG CALLBACK comp_object_nx_veh( EXCEPTION_POINTERS *info )
         FIXME( "  (failed to dump call-site)\n" );
     }
     __ENDTRY
-    if (words)
+    if (words && nx_readable( words, 3 * sizeof(void *) ))
     {
         __TRY
         {
@@ -6702,6 +6730,7 @@ struct dcv_visual_collection
 
 static HRESULT WINAPI dcvc_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct dcv_visual_collection *collection = CONTAINING_RECORD( iface, struct dcv_visual_collection, vtbl );
 
     if (!out) return E_POINTER;
@@ -9921,6 +9950,8 @@ struct visual
     const void **interop_vtbl; /* private InteropVisual, GetVisualCollection at slot 45 */
     const void **closable_vtbl; /* Windows.Foundation.IClosable, see visual_closable_vtbl */
     const void **sprite2_vtbl;  /* ISpriteVisual2 (Shadow), see visual_sprite2_vtbl */
+    const void **visual2_vtbl;  /* IVisual2 (RelativeOffset/SizeAdjustment), see visual_visual2_vtbl */
+    IUnknown *parent_for_transform; /* IVisual2.ParentForTransform: kept, not applied yet */
     IUnknown *shadow;           /* the CompositionShadow set through ISpriteVisual2, kept but not drawn */
     Vector2 relative_offset, relative_size; /* InteropVisual SetRelativeOffset/Width/Height, fractions of the parent */
     BOOL has_relative_size;
@@ -11001,6 +11032,85 @@ static const void *visual_sprite2_vtbl[] =
     sprite2_get_Shadow, sprite2_put_Shadow,
 };
 
+/* IVisual2 {3052b611}: 6/7 ParentForTransform, 8/9 RelativeOffsetAdjustment, 10/11 RelativeSizeAdjustment. The
+ * adjustments are fractions of the parent's size, the same thing InteropVisual's SetRelativeOffset/Width/Height set,
+ * which the painter already applies; the Z of the offset has nothing to apply to. The Windows Community Toolkit's
+ * attached shadows size their SpriteVisual this way (Microsoft Store), and casting to IVisual2 failed. */
+static const GUID IID_IVisual2_local = { 0x3052b611, 0x56c3, 0x4c3e, { 0x8b, 0xf3, 0xf6, 0xe1, 0xad, 0x47, 0x3f, 0x06 } };
+static struct visual *impl_from_visual2( void *iface ) { return CONTAINING_RECORD( iface, struct visual, visual2_vtbl ); }
+static HRESULT WINAPI visual2_QueryInterface( void *iface, REFIID iid, void **out ) { return visual_qi( impl_from_visual2( iface ), iid, out ); }
+static ULONG WINAPI visual2_AddRef( void *iface ) { return ISpriteVisual_AddRef( &impl_from_visual2( iface )->ISpriteVisual_iface ); }
+static ULONG WINAPI visual2_Release( void *iface ) { return ISpriteVisual_Release( &impl_from_visual2( iface )->ISpriteVisual_iface ); }
+static HRESULT WINAPI visual2_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return ISpriteVisual_GetIids( &impl_from_visual2( iface )->ISpriteVisual_iface, count, iids );
+}
+static HRESULT WINAPI visual2_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return ISpriteVisual_GetRuntimeClassName( &impl_from_visual2( iface )->ISpriteVisual_iface, name );
+}
+static HRESULT WINAPI visual2_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return ISpriteVisual_GetTrustLevel( &impl_from_visual2( iface )->ISpriteVisual_iface, level );
+}
+static HRESULT WINAPI visual2_get_ParentForTransform( void *iface, IUnknown **value )
+{
+    struct visual *impl = impl_from_visual2( iface );
+    if (!value) return E_POINTER;
+    if ((*value = impl->parent_for_transform)) IUnknown_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI visual2_put_ParentForTransform( void *iface, IUnknown *value )
+{
+    struct visual *impl = impl_from_visual2( iface );
+    TRACE( "visual %p, parent %p.\n", impl, value );
+    if (value) IUnknown_AddRef( value );
+    if (impl->parent_for_transform) IUnknown_Release( impl->parent_for_transform );
+    impl->parent_for_transform = value;
+    return S_OK;
+}
+static HRESULT WINAPI visual2_get_RelativeOffsetAdjustment( void *iface, Vector3 *value )
+{
+    struct visual *impl = impl_from_visual2( iface );
+    if (!value) return E_POINTER;
+    value->X = impl->relative_offset.X;
+    value->Y = impl->relative_offset.Y;
+    value->Z = 0;
+    return S_OK;
+}
+static HRESULT WINAPI visual2_put_RelativeOffsetAdjustment( void *iface, Vector3 value )
+{
+    struct visual *impl = impl_from_visual2( iface );
+    TRACE( "visual %p, %f,%f.\n", impl, value.X, value.Y );
+    impl->relative_offset.X = value.X;
+    impl->relative_offset.Y = value.Y;
+    scene_changed();
+    return S_OK;
+}
+static HRESULT WINAPI visual2_get_RelativeSizeAdjustment( void *iface, Vector2 *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_visual2( iface )->relative_size;
+    return S_OK;
+}
+static HRESULT WINAPI visual2_put_RelativeSizeAdjustment( void *iface, Vector2 value )
+{
+    struct visual *impl = impl_from_visual2( iface );
+    TRACE( "visual %p, %f,%f.\n", impl, value.X, value.Y );
+    impl->relative_size = value;
+    impl->has_relative_size = value.X != 0 || value.Y != 0;
+    scene_changed();
+    return S_OK;
+}
+static const void *visual_visual2_vtbl[] =
+{
+    visual2_QueryInterface, visual2_AddRef, visual2_Release,
+    visual2_GetIids, visual2_GetRuntimeClassName, visual2_GetTrustLevel,
+    visual2_get_ParentForTransform, visual2_put_ParentForTransform,
+    visual2_get_RelativeOffsetAdjustment, visual2_put_RelativeOffsetAdjustment,
+    visual2_get_RelativeSizeAdjustment, visual2_put_RelativeSizeAdjustment,
+};
+
 /* ILayerVisual2 {98f9aeeb}: 6 get_Shadow, 7 put_Shadow - the same slots as ISpriteVisual2, so a layer answers it
  * with sprite2_vtbl. XAML's HWCompTreeNodeWinRT::MakeLayerVisual (its drop shadows) queries a new layer visual for
  * it and uses the result unchecked: refused, Shapr3D crashed as soon as its viewport appeared. A byte patch in
@@ -11086,6 +11196,8 @@ static HRESULT visual_qi( struct visual *impl, REFIID iid, void **out )
         *out = &impl->shape_vtbl;
     else if (IsEqualGUID( iid, &IID_IVisual ))
         *out = &impl->IVisual_iface;
+    else if (IsEqualGUID( iid, &IID_IVisual2_local ))
+        *out = &impl->visual2_vtbl;
     else if (IsEqualGUID( iid, &IID_ICompositionObject ))
         *out = &impl->ICompositionObject_iface;
     else if (IsEqualGUID( iid, &IID_IClosable ))
@@ -11132,6 +11244,7 @@ static ULONG visual_release( struct visual *impl )
         impl->collection.count = 0;
         free( impl->collection.children );
         if (impl->brush) ICompositionBrush_Release( impl->brush );
+        if (impl->parent_for_transform) IUnknown_Release( impl->parent_for_transform );
         if (impl->shadow) IUnknown_Release( impl->shadow );
         if (impl->effect) IUnknown_Release( impl->effect );
         if (impl->clip) ICompositionClip_Release( impl->clip );
@@ -11854,6 +11967,7 @@ static HRESULT create_visual( ICompositor *compositor, enum visual_kind kind, vo
     impl->interop_vtbl = visual_interop_vtbl;
     impl->closable_vtbl = visual_closable_vtbl;
     impl->sprite2_vtbl = visual_sprite2_vtbl;
+    impl->visual2_vtbl = visual_visual2_vtbl;
     impl->collection.IVisualCollection_iface.lpVtbl = &collection_vtbl;
     impl->collection.iterable_vtbl = iterable_vtbl;
     impl->collection.owner = impl;
@@ -13297,6 +13411,7 @@ static const void *kfa3_vtbl[] =
 
 static HRESULT WINAPI kf_animation_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct kf_animation *impl = CONTAINING_RECORD( iface, struct kf_animation, vtbl );
 
     TRACE( "%s %p, iid %s.\n", impl->kind, impl, debugstr_guid( iid ) );
@@ -13605,6 +13720,7 @@ static struct comp_clip *clip_from_any( void *iface )
 }
 static HRESULT WINAPI clip_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct comp_clip *impl = CONTAINING_RECORD( iface, struct comp_clip, vtbl );
 
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
@@ -13897,6 +14013,7 @@ static ULONG WINAPI comp_batch_Release( void *iface )
 }
 static HRESULT WINAPI comp_batch_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct comp_batch *batch = CONTAINING_RECORD( iface, struct comp_batch, vtbl );
 
     TRACE( "%s %p, iid %s.\n", batch->kind, batch, debugstr_guid( iid ) );
@@ -14254,6 +14371,7 @@ static struct anim_controller *anim_controller_from_any( void *object )
 }
 static HRESULT WINAPI anim_controller_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct anim_controller *ctrl = CONTAINING_RECORD( iface, struct anim_controller, vtbl );
 
     TRACE( "%p, iid %s.\n", ctrl, debugstr_guid( iid ) );
@@ -14497,6 +14615,7 @@ static HRESULT WINAPI matrix_transform_SetMatrix( void *iface, const D2D_MATRIX_
 }
 static HRESULT WINAPI matrix_transform_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct matrix_transform *impl = CONTAINING_RECORD( iface, struct matrix_transform, vtbl );
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
     InterlockedIncrement( &impl->ref );
@@ -14531,6 +14650,7 @@ static struct matrix_transform *matrix_transform_from( IUnknown *object )
 
 static HRESULT WINAPI manip_transform_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct manip_transform *impl = CONTAINING_RECORD( iface, struct manip_transform, vtbl );
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
     if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
@@ -14564,6 +14684,9 @@ static HRESULT WINAPI expr_animation_QueryInterface( void *iface, REFIID iid, vo
     struct expr_animation *impl = CONTAINING_RECORD( iface, struct expr_animation, vtbl );
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
     if (is_animation_group_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+    /* IReferenceTracker (.NET asks every object): the clone below would put its tracker calls into
+     * CreateAnimatorPartner, slot 3; the Microsoft Store fail-fasted on it building its NavigationView */
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     /* ICompositionObject stays the generic table, as for every recording object: XAML's expression
      * conversion walks Properties and private partner interfaces from there, which only the
      * recording table survives. */
@@ -15856,6 +15979,7 @@ static const void *shape_children_vtbl[] =
 /* path geometry: ICompositionPathGeometry main table (6 get_Path, 7 put_Path), ICompositionGeometry view (trims) */
 static HRESULT WINAPI path_geometry_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct path_geometry *geometry = CONTAINING_RECORD( iface, struct path_geometry, vtbl );
     TRACE( "%p, iid %s.\n", geometry, debugstr_guid( iid ) );
     if (IsEqualGUID( iid, &IID_ICompositionObject ))
@@ -16235,6 +16359,7 @@ static LONG cubic_bezier_vtbl_ready;
 
 static HRESULT WINAPI cubic_bezier_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct cubic_bezier_easing *impl = CONTAINING_RECORD( iface, struct cubic_bezier_easing, vtbl );
 
     TRACE( "cubic bezier %p, iid %s.\n", impl, debugstr_guid( iid ) );
@@ -19062,6 +19187,13 @@ static HRESULT WINAPI gradient_brush_QueryInterface( void *iface, REFIID iid, vo
         *out = &impl->grad2_vtbl;
         return S_OK;
     }
+    /* ICompositionObject's slot 6 is get_Compositor; the catch-all's primary vtable has get_EndPoint (or
+     * get_EllipseCenter) there, so .NET wrapped the Vector2 (0,1) as the compositor and faulted calling it (the
+     * Microsoft Store's shadows ask a gradient brush for its Compositor). */
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&impl->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
+        return create_object4_view( (IUnknown *)&impl->vtbl, out );
     /* WinUI closes the brushes it drops; the catch-all below would hand it the primary vtable, whose slot 6
      * is a getter (get_EllipseCenter on a radial brush) that writes through Close's missing argument. */
     if (IsEqualGUID( iid, &IID_IClosable ))
@@ -21827,6 +21959,7 @@ static HRESULT WINAPI interactions_statics_QueryInterface( void *iface, REFIID i
 
 static HRESULT WINAPI generic_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
 {
+    if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct generic_factory *factory = CONTAINING_RECORD( iface, struct generic_factory, IActivationFactory_iface );
     TRACE( "%s factory, iid %s.\n", factory->kind, debugstr_guid( iid ) );
     if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||

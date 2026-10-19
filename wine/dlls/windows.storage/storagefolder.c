@@ -380,25 +380,39 @@ static HRESULT WINAPI storage_folder_GetItemAsync( IStorageFolder *iface, HSTRIN
     return hr;
 }
 
+/* IStorageFolder's GetFilesAsync(), GetFoldersAsync() and GetItemsAsync() are the default queries of
+ * IStorageFolderQueryOperations on the same folder (the Microsoft Store lists its account cache with the first). */
+static HRESULT WINAPI folder_query_GetFilesAsyncOverloadDefaultStartAndCount( IStorageFolderQueryOperations *iface,
+        CommonFileQuery query, IAsyncOperation_IVectorView_StorageFile **operation );
+static HRESULT WINAPI folder_query_GetFoldersAsyncOverloadDefaultStartAndCount( IStorageFolderQueryOperations *iface,
+        CommonFolderQuery query, IAsyncOperation_IVectorView_StorageFolder **operation );
+static HRESULT WINAPI folder_query_GetItemsAsync( IStorageFolderQueryOperations *iface, UINT32 start_index,
+        UINT32 max_items_to_retrieve, IAsyncOperation_IVectorView_IStorageItem **operation );
+
 static HRESULT WINAPI storage_folder_GetFilesAsyncOverloadDefaultOptionsStartAndCount( IStorageFolder *iface,
                                                                                        IAsyncOperation_IVectorView_StorageFile **operation )
 {
-    FIXME( "iface %p, operation %p stub!\n", iface, operation );
-    return E_NOTIMPL;
+    struct storage_folder *impl = impl_from_IStorageFolder( iface );
+    TRACE( "iface %p, operation %p.\n", iface, operation );
+    return folder_query_GetFilesAsyncOverloadDefaultStartAndCount( &impl->IStorageFolderQueryOperations_iface,
+                                                                   CommonFileQuery_DefaultQuery, operation );
 }
 
 static HRESULT WINAPI storage_folder_GetFoldersAsyncOverloadDefaultOptionsStartAndCount( IStorageFolder *iface,
                                                                                          IAsyncOperation_IVectorView_StorageFolder **operation )
 {
-    FIXME( "iface %p, operation %p stub!\n", iface, operation );
-    return E_NOTIMPL;
+    struct storage_folder *impl = impl_from_IStorageFolder( iface );
+    TRACE( "iface %p, operation %p.\n", iface, operation );
+    return folder_query_GetFoldersAsyncOverloadDefaultStartAndCount( &impl->IStorageFolderQueryOperations_iface,
+                                                                     CommonFolderQuery_DefaultQuery, operation );
 }
 
 static HRESULT WINAPI storage_folder_GetItemsAsyncOverloadDefaultStartAndCount( IStorageFolder *iface,
                                                                                 IAsyncOperation_IVectorView_IStorageItem **operation )
 {
-    FIXME( "iface %p, operation %p stub!\n", iface, operation );
-    return E_NOTIMPL;
+    struct storage_folder *impl = impl_from_IStorageFolder( iface );
+    TRACE( "iface %p, operation %p.\n", iface, operation );
+    return folder_query_GetItemsAsync( &impl->IStorageFolderQueryOperations_iface, 0, ~0u, operation );
 }
 
 static const struct IStorageFolderVtbl storage_folder_vtbl =

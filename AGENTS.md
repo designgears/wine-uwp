@@ -317,6 +317,8 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | What is the app itself logging? (ETW TraceLogging, wil errors) | `WINEDEBUG=trace+tracelogging` (a long string continues on `  +160 ...` lines, up to 8 KiB): ntdll enables every ETW provider at verbose level and decodes each TraceLogging event (provider, event name, fields). The Xbox app's own `LogMsgError` lines named every blocker after the splash, with source file and HRESULT, where originate traces had only addresses. Very chatty (React Native's Systrace: 60k lines a run); grep the provider you want |
 | Does an app's own WinRT interface cross processes? | `WINEDEBUG=trace+winmdps`: the metadata-based marshaler (`dlls/rpcrt4/ndr_winmd.c`, CLSID `{00000355}`) logs every proxy/stub it builds from `.winmd` with method and format-string sizes, and a FIXME for any method it cannot marshal |
 | Replace a package's own WinRT class with a stand-in | register it under `ActivatableClassId\<class>` with `OverridesPackage`=1 (DWORD): combase then prefers it to the package manifest, which otherwise wins. Make an absent platform package "installed" with `HKLM\Software\Wine\WineUWP\StandInPackages\<family>` (appxdeploymentclient `standin.c`) |
+| Does a Windows DLL that imports by ordinal reach the right function of ours? | `uwp-bin/venv/bin/python ordinal-compare.py uwp-bin/win11/Windows/System32 <build dir>`: every by-ordinal import from a Windows DLL into a DLL we build, with the name Windows exports at that ordinal and ours. A name mismatch is a silent wrong call: uxtheme 121 was our `GetThemeAnimationProperty`, which wrote into the Microsoft Store's service container. `MISSING` means a raising stub |
+| Who writes this word of memory? | `WINE_UWP_WATCH=module+rva`: a hardware write watchpoint (DR0) on those 8 bytes on every thread, new ones picked up every 20 ms; each write logs the new value and the writer's caller chain. It found the uxtheme ordinal bug in one run, after the app's only writer of the slot had been ruled out |
 | Which methods of an interface does the app actually call? | give every slot a traced thunk returning `E_NOTIMPL` and read the log - see `shims/storecontext`, which proved the app wanted only `GetDefault` out of 26 methods |
 
 ### Unique-HRESULT tagging
@@ -545,6 +547,10 @@ ms, and Shapr3D starts a preview only on a move that arrives while it is idle. M
 drone's extrude look like 150 ms per preview; continuous 8 ms moves give ~78 ms. Measure interaction
 rates with continuous input (`/tmp/smoothdrag.sh` in the session: a move every ~8 ms), and use the
 `dcompinput`/`ptrdisp` trace channels to see input arrive.
+
+**`trace+tracelogging` changes what .NET apps do.** Our ntdll enables every ETW provider for it, so .NET's own EventSources switch on: the Microsoft Store's dependency-injection EventSource then reflected over a delegate .NET Native had not kept, and start-up died with `MissingRuntimeArtifactException`. A crash that appears only under that channel is the channel's.
+
+**.NET Native's first-chance exceptions are visible.** A breakpoint on `mrt100_app.dll`'s `RhpThrowEx` (`WINE_UWP_BP=mrt100_app.dll+45be0@stk:10` for the Store's runtime) logs every managed throw with its caller chain; group them by the exception object (`rcx`) and the first throw of each object is its origin. The app's own string literals (frozen `String` objects in `.rdata`, referenced by `leaq`) name its functions: `/tmp/nstr.py` in the 10-19 session lists them per function.
 
 **Do not leave `WINEDEBUG=warn+heap` on in a session the user works in.** It turns off the LFH and
 fills and checks every free: Shapr3D's modelling took 2.3x the CPU, and the user reported extrusion as

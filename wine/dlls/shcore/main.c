@@ -2664,6 +2664,29 @@ HRESULT WINAPI RegisterScaleChangeNotifications(DISPLAY_DEVICE_TYPE display_devi
 }
 
 /*************************************************************************
+ * CreateRandomAccessStreamOnFile        [SHCORE.@]
+ *
+ * An IRandomAccessStream over a file; access is a Windows.Storage.FileAccessMode. windows.storage owns the
+ * file stream class (StorageFile.OpenAsync hands out the same one), so this goes through its private export.
+ */
+HRESULT WINAPI CreateRandomAccessStreamOnFile(const WCHAR *path, DWORD access, REFIID riid, void **ppv)
+{
+    static HRESULT (WINAPI *open_stream)(const WCHAR *, DWORD, REFIID, void **);
+    HMODULE module;
+
+    TRACE("(%s, %lu, %s, %p)\n", debugstr_w(path), access, debugstr_guid(riid), ppv);
+    if (!ppv) return E_POINTER;
+    *ppv = NULL;
+    if (!open_stream)
+    {
+        if (!(module = LoadLibraryW(L"windows.storage.dll"))) return HRESULT_FROM_WIN32(GetLastError());
+        if (!(open_stream = (void *)GetProcAddress(module, "__wine_create_random_access_stream_on_file")))
+            return E_NOTIMPL;
+    }
+    return open_stream(path, access, riid, ppv);
+}
+
+/*************************************************************************
  * CreateRandomAccessStreamOverStream        [SHCORE.@]
  */
 HRESULT WINAPI CreateRandomAccessStreamOverStream(IStream *stream, BSOS_OPTIONS options, REFIID riid, void **ppv)

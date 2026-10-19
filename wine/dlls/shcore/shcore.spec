@@ -1,6 +1,6 @@
 1 stub -noname SHCreateReadOnlySharedMemoryStream
 @ stdcall CommandLineToArgvW(wstr ptr)
-@ stub CreateRandomAccessStreamOnFile
+@ stdcall CreateRandomAccessStreamOnFile(wstr long ptr ptr)
 @ stdcall CreateRandomAccessStreamOverStream(ptr long ptr ptr)
 @ stdcall CreateStreamOverRandomAccessStream(ptr ptr ptr)
 @ stdcall -private DllCanUnloadNow()

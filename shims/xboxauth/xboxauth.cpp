@@ -3726,6 +3726,47 @@ struct IStoreConfigurationStatics4Abi : IInspectable
     virtual HRESULT STDMETHODCALLTYPE ShouldRestrictToEnterpriseStoreOnlyForUser(IInspectable *, boolean *) = 0;
 };
 
+/* StoreHardwareManufacturerInfo: the PC's maker and model, from the BIOS key Wine fills from SMBIOS. The two OEM Store
+ * ids are empty, as on any PC without an OEM store configuration. The Microsoft Store reads this at start-up; a
+ * refusal there ended in an ArgumentNullException on its UI thread. */
+static const GUID IID_IStoreHardwareManufacturerInfo = {0xf292dc08,0xc654,0x43ac,{0xa2,0x1f,0x34,0x80,0x1c,0x9d,0x33,0x88}};
+struct IStoreHardwareManufacturerInfoAbi : IInspectable
+{
+    virtual HRESULT STDMETHODCALLTYPE get_HardwareManufacturerId(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_StoreContentModifierId(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_ModelName(HSTRING *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_ManufacturerName(HSTRING *) = 0;
+};
+static std::wstring bios_value(const wchar_t *name)
+{
+    wchar_t buf[256];
+    DWORD size = sizeof(buf);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", name, RRF_RT_REG_SZ, nullptr, buf, &size))
+        return std::wstring();
+    return buf;
+}
+struct HardwareManufacturerInfo : IStoreHardwareManufacturerInfoAbi
+{
+    LONG ref = 1;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override
+    {
+        if (!out) return E_POINTER;
+        if (is_base_iid(iid) || IsEqualGUID(iid, IID_IStoreHardwareManufacturerInfo)) { *out = this; AddRef(); return S_OK; }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    HRESULT STDMETHODCALLTYPE GetIids(ULONG *c, IID **ids) override { if (c) *c = 0; if (ids) *ids = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING *n) override
+    { return to_hstr(L"Windows.ApplicationModel.Store.Preview.StoreHardwareManufacturerInfo", n); }
+    HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel *l) override { if (!l) return E_POINTER; *l = BaseTrust; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_HardwareManufacturerId(HSTRING *v) override { return to_hstr(L"", v); }
+    HRESULT STDMETHODCALLTYPE get_StoreContentModifierId(HSTRING *v) override { return to_hstr(L"", v); }
+    HRESULT STDMETHODCALLTYPE get_ModelName(HSTRING *v) override { return to_hstr(bios_value(L"SystemProductName").c_str(), v); }
+    HRESULT STDMETHODCALLTYPE get_ManufacturerName(HSTRING *v) override { return to_hstr(bios_value(L"SystemManufacturer").c_str(), v); }
+};
+
 struct StoreConfigurationFactory : IStoreConfigurationStaticsAbi, IStoreConfigurationStatics2Abi, IStoreConfigurationStatics3Abi,
                                    IStoreConfigurationStatics4Abi, IActivationFactoryAbi
 {
@@ -3755,7 +3796,12 @@ struct StoreConfigurationFactory : IStoreConfigurationStaticsAbi, IStoreConfigur
     HRESULT STDMETHODCALLTYPE SetStoreWebAccountId(HSTRING id) override { return set_store_web_account_id(id); }
     HRESULT STDMETHODCALLTYPE IsStoreWebAccountId(HSTRING id, boolean *v) override { return is_store_web_account_id(id, v); }
     HRESULT STDMETHODCALLTYPE get_HardwareManufacturerInfo(IInspectable **v) override
-    { trace("StoreConfiguration.HardwareManufacturerInfo -> E_NOTIMPL"); if (v) *v = nullptr; return E_NOTIMPL; }
+    {
+        if (!v) return E_POINTER;
+        trace("StoreConfiguration.HardwareManufacturerInfo");
+        *v = new HardwareManufacturerInfo();
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE FilterUnsupportedSystemFeaturesAsync(IInspectable *, IAsyncOpAbi **v) override
     { trace("StoreConfiguration.FilterUnsupportedSystemFeaturesAsync -> E_NOTIMPL"); if (v) *v = nullptr; return E_NOTIMPL; }
 

@@ -12783,3 +12783,38 @@ without it). The fresh test used the release DXVK/vkd3d-proton downloads, not Pr
 
 Not yet done: the shared `~/src/wine-build` still has the old ntdll and windows.networking (built only in
 `uwp-bin/wine-build-wow64`); the regression suite has not been run on them.
+
+## Microsoft Store (2026-10-19)
+
+The ISO's provisioned Store, 22401.1400.6.0 (`install.wim`: `Program Files/WindowsApps/Microsoft.WindowsStore_*`), staged
+as `store` with `WINDOWSAPPS` pointing at the extraction; it is .NET Native on WinUI 2.8, Shapr3D's shape. The plan is
+to get this one running and let it update itself. The current one (22608) is on the Windows partition for reference.
+Run in a reflinked copy of the fresh Halo prefix (`uwp-bin/prefix-store`, Xvfb `:97`). Blockers, in order:
+
+- `dmprocessxmlfiltered.dll` (MDM policy query, `DMProcessConfigXMLFiltered`) is a static import; Windows' copy needs
+  the enrolment stack. `shims/dmprocessxml` answers every Get with SyncML 404.
+- `AppInstallManager` (InstallService.dll is a client of a broker that is not here): `shims/appinstallmanager`, traced
+  slots, empty install list, events accepted, `TryShowAs...`-style bools completed.
+- `WindowsIntegrityPolicy` (wldp RPC, `EPT_S_NOT_REGISTERED`): `shims/integritypolicy`, not in S mode.
+- **uxtheme ordinals.** A static the app's code sets once (its service container, `WinStore.App.dll+0x1463a50`) was
+  zeroed later. `WINE_UWP_WATCH` caught `uxtheme.dll` writing it: Windows.UI.Immersive.dll imports uxtheme 120/121 by
+  ordinal (`GetUserColorPreference`, `GetColorFromPreference`), ours had other functions there, and 121 was
+  `GetThemeAnimationProperty` writing `*ret_size` through a stack value. `ordinal-compare.py` found three more
+  (shell32 245, wldp 15/18/23).
+- `StoreConfiguration.HardwareManufacturerInfo`, `StorageFolder.GetFilesAsync()`, `CreateRandomAccessStreamOnFile`, and
+  a live `PropertySet` enumeration (`E_CHANGED_STATE` while removing cached accounts): implemented.
+- **Window client adapter.** `ApplicationView.TryEnterViewModeAsync(Default)` returned success with a null operation:
+  twinapi's `GetApplicationViewClientAdapter` asks `ICoreWindowAdapterInterop` (Windows.UI) for the adapter the shell
+  installs with `SetWindowClientAdapter`, and none was installed (`ERROR_NOT_FOUND`). `wineuwp/clientadapter.c` installs
+  one, laid out as CoreUIComponents' `NavigationClient*ClientAdapter` vtables (public PDB). WindowServer only reads
+  sub-adapter getters, registers five events and adds a window-pos flag, so nothing about sizes changes.
+- dcomp: catch-all `QueryInterface`s handed .NET's `IReferenceTracker` query their own tables (calls landed in
+  `CreateAnimatorPartner`, `put_Path`); a gradient brush answered `ICompositionObject` with its own table (slot 6
+  `get_EndPoint` became `get_Compositor`, and `Vector2(0,1)` became an object); visuals lacked `IVisual2`; and the NX
+  diagnostic handler re-entered itself on a fault while dumping, hanging the UI thread.
+
+State: the Store reached its main UI once (`docs/screenshots/msstore-first-ui.png`: title bar, account button,
+Library and Help; content not yet loaded). Now it stops on its start-up code: the app runs that on the main view's
+thread (`CoreApplication.MainView` dispatcher), but the hosted CoreWindow and its XAML live on the second view our
+activation creates, so XAML calls fail with `RPC_E_WRONG_THREAD`. Also open: an InvalidCast in `HoverXamlLight` and an
+`E_NOTIMPL` in the Toolkit's `AttachedShadowElementContext`. All of this is built only in `uwp-bin/wine-build-wow64`.
