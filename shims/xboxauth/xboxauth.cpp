@@ -78,6 +78,9 @@ static const GUID IID_AsyncOp_ConsentState = {0xc92086c7,0xb593,0x50c4,{0xb9,0x3
 
 static const char MSA_CLIENT_ID[] = "000000004C12AE6F";
 static const char MSA_SCOPE[] = "service::user.auth.xboxlive.com::MBI_SSL";
+/* Halo Infinite MicrosoftGame.Config MSAAppId / TitleId (0x79C6D2A0 = 2043073184). */
+static const char HALO_MSA_APP_ID[] = "000000004C25467F";
+static const UINT32 HALO_TITLE_ID = 0x79C6D2A0u;
 
 /* ------------------------------------------------------------------------------------------- */
 /* Helpers                                                                                      */
@@ -667,12 +670,33 @@ struct Account
     ULONGLONG user_expires = 0;
     std::string title_token;      /* from SISU; empty when it was refused (then XSTS carries no title claims) */
     ULONGLONG title_expires = 0;
+    std::string title_tid;        /* DisplayClaims.xti.tid of title_token (decimal string) */
     std::map<std::string, Xsts> xsts;
     /* xui claims of the http://xboxlive.com XSTS token */
     std::string uhs, xid, gtg, agg, prv, mgt, mgs, umg;
     bool signed_in = false;
 };
 static Account account;
+
+/* GDK titles pass MSAAppId+TitleId; presence/XSTS require a TitleToken whose tid matches. */
+static CRITICAL_SECTION title_ctx_cs;
+static std::string title_ctx_msa_app;
+static UINT32 title_ctx_title_id = 0;
+
+static void title_ctx_init(void)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, [](PINIT_ONCE, PVOID, PVOID *) -> BOOL {
+        InitializeCriticalSection(&title_ctx_cs);
+        return TRUE;
+    }, nullptr, nullptr);
+}
+
+static std::string refresh_store_key(const std::string &client_id)
+{
+    if (client_id.empty() || client_id == MSA_CLIENT_ID) return "refresh_token";
+    return std::string("refresh_token_") + client_id;
+}
 
 static void account_init(void)
 {
@@ -826,16 +850,17 @@ static HRESULT xbl_xsts(const std::string &user_token, const std::string &rp, Xs
 }
 
 /* XalAuthenticator::sisu_authorize, without a session id (xal-rs' xbox_live_sisu_authorization_flow after a
- * device-code login): one signed call gives user, title and device-bound XSTS tokens. AppId is the MSA client
- * the access token was issued to (xal-rs' APP_XBOX, 000000004c12ae6f, title 328178078). */
-static HRESULT xbl_sisu_authorize(const std::string &msa_token, std::string &user_token, ULONGLONG &user_expires,
-                                  Xsts &auth, Json &xui)
+ * device-code login): one signed call gives user, title and device-bound XSTS tokens. AppId must be the MSA
+ * client the access token was issued to — TitleToken.tid follows that client, not a TitleId field. */
+static HRESULT xbl_sisu_authorize_app(const std::string &msa_token, const std::string &app_id,
+                                      std::string &user_token, ULONGLONG &user_expires, Xsts &auth, Json &xui)
 {
     std::string device_token;
     HRESULT hr;
     if (FAILED(hr = xbl_device_token(device_token))) return hr;
+    std::string app = app_id.empty() ? MSA_CLIENT_ID : app_id;
     std::string url = "https://sisu.xboxlive.com/authorize", resp, body =
-        "{\"AccessToken\":\"t=" + json_escape(msa_token) + "\",\"AppId\":\"" + std::string(MSA_CLIENT_ID) +
+        "{\"AccessToken\":\"t=" + json_escape(msa_token) + "\",\"AppId\":\"" + json_escape(app) +
         "\",\"DeviceToken\":\"" + json_escape(device_token) + "\",\"Sandbox\":\"RETAIL\",\"SiteName\":"
         "\"user.auth.xboxlive.com\",\"ProofKey\":" + proof_key_json() + "}";
     /* xal-rs sends no contract version header here */
@@ -857,11 +882,146 @@ static HRESULT xbl_sisu_authorize(const std::string &msa_token, std::string &use
     if (!auth.expires) auth.expires = now_s() + 3600;
     auth.expires = auth.expires > 300 ? auth.expires - 300 : 0;
     xui = a["DisplayClaims"]["xui"].at(0);
+    std::string tid = t["DisplayClaims"]["xti"]["tid"].str();
     EnterCriticalSection(&account.cs);
     account.title_token = t["Token"].str();
     account.title_expires = parse_iso(t["NotAfter"].str());
+    if (!account.title_expires) account.title_expires = now_s() + 3600;
+    account.title_tid = tid;
     LeaveCriticalSection(&account.cs);
-    trace("SISU authorization: user, title (%s) and XSTS tokens received", t["Token"].str().empty() ? "none" : "yes");
+    trace("SISU authorization: user, title (%s tid=%s app=%s) and XSTS tokens received",
+          t["Token"].str().empty() ? "none" : "yes", tid.c_str(), app.c_str());
+    return S_OK;
+}
+
+static HRESULT xbl_sisu_authorize(const std::string &msa_token, std::string &user_token, ULONGLONG &user_expires,
+                                  Xsts &auth, Json &xui)
+{
+    return xbl_sisu_authorize_app(msa_token, MSA_CLIENT_ID, user_token, user_expires, auth, xui);
+}
+
+/* Refresh-token grant for an arbitrary MSA client. Per-client refresh lives in xboxauth.bin as
+ * refresh_token_<clientId> (the Xbox-app client keeps the bare refresh_token key). */
+static HRESULT msa_refresh_for_client(const std::string &client_id, const std::string &scope, std::string *token_out)
+{
+    std::string key = refresh_store_key(client_id);
+    std::string refresh;
+    if (key == "refresh_token")
+    {
+        EnterCriticalSection(&account.cs);
+        refresh = account.refresh_token;
+        LeaveCriticalSection(&account.cs);
+        if (refresh.empty())
+        {
+            auto kv = store_read();
+            refresh = kv["refresh_token"];
+            if (!refresh.empty())
+            {
+                EnterCriticalSection(&account.cs);
+                account.refresh_token = refresh;
+                LeaveCriticalSection(&account.cs);
+            }
+        }
+    }
+    else
+    {
+        auto kv = store_read();
+        refresh = kv[key];
+    }
+    if (refresh.empty()) return XA_E_NO_ACCOUNT;
+
+    std::string resp;
+    DWORD status = http_form("https://login.live.com/oauth20_token.srf",
+                             "grant_type=refresh_token&client_id=" + client_id + "&scope=" +
+                             urlencode(scope) + "&refresh_token=" + urlencode(refresh), resp);
+    if (!status) return XA_E_NETWORK;
+    Json j = parse_json(resp);
+    if (status != 200 || j["access_token"].str().empty())
+    {
+        log_oauth_error(("refresh " + client_id).c_str(), status, resp);
+        if (j["error"].str() == "invalid_grant" && scope == MSA_SCOPE)
+            store_update({ { key, "" } });
+        return XA_E_MSA;
+    }
+    if (!j["refresh_token"].str().empty())
+    {
+        refresh = j["refresh_token"].str();
+        store_update({ { key, refresh } });
+        if (key == "refresh_token")
+        {
+            EnterCriticalSection(&account.cs);
+            account.refresh_token = refresh;
+            LeaveCriticalSection(&account.cs);
+        }
+    }
+    if (token_out) *token_out = j["access_token"].str();
+    if (key == "refresh_token" && scope == MSA_SCOPE) take_msa_tokens(j);
+    else
+        trace("Microsoft account token for client %s received (%zu chars)", client_id.c_str(),
+              j["access_token"].str().size());
+    return S_OK;
+}
+
+/* Bind account.title_token to msa_app/title_id so XSTS carries that tid. Requires a refresh token issued
+ * to msa_app (device-code once per title client). */
+static HRESULT ensure_title_identity(const std::string &msa_app, UINT32 title_id)
+{
+    if (msa_app.empty() || !title_id) return S_OK;
+    char want[32];
+    snprintf(want, sizeof(want), "%u", title_id);
+    EnterCriticalSection(&account.cs);
+    bool have = !account.title_token.empty() && account.title_expires > now_s() + 60 && account.title_tid == want;
+    LeaveCriticalSection(&account.cs);
+    if (have) return S_OK;
+
+    EnterCriticalSection(&account.signin_cs);
+    EnterCriticalSection(&account.cs);
+    have = !account.title_token.empty() && account.title_expires > now_s() + 60 && account.title_tid == want;
+    LeaveCriticalSection(&account.cs);
+    if (have) { LeaveCriticalSection(&account.signin_cs); return S_OK; }
+
+    std::string msa;
+    HRESULT hr = msa_refresh_for_client(msa_app, MSA_SCOPE, &msa);
+    if (FAILED(hr))
+    {
+        LeaveCriticalSection(&account.signin_cs);
+        trace("title identity %s/%u: no MSA for client (%#lx) — device-code that client once",
+              msa_app.c_str(), title_id, (unsigned long)hr);
+        return hr;
+    }
+    std::string user_token;
+    ULONGLONG user_expires;
+    Xsts auth;
+    Json xui;
+    /* PC GDK titles need Win32 device tokens for SISU and the matching XSTS; Android (Xbox-app
+     * default) 401s here, and a TitleToken minted under Win32 is refused by XSTS with an Android device. */
+    if (msa_app != MSA_CLIENT_ID)
+        SetEnvironmentVariableA("WINE_UWP_XBOX_DEVICE_TYPE", "Win32");
+    hr = xbl_sisu_authorize_app(msa, msa_app, user_token, user_expires, auth, xui);
+    if (FAILED(hr) && msa_app != MSA_CLIENT_ID)
+    {
+        SetEnvironmentVariableA("WINE_UWP_XBOX_DEVICE_TYPE", "Android");
+        hr = xbl_sisu_authorize_app(msa, msa_app, user_token, user_expires, auth, xui);
+    }
+    if (FAILED(hr)) { LeaveCriticalSection(&account.signin_cs); return hr; }
+
+    EnterCriticalSection(&account.cs);
+    std::string got = account.title_tid;
+    if (got != want)
+    {
+        LeaveCriticalSection(&account.cs);
+        LeaveCriticalSection(&account.signin_cs);
+        trace("title identity: SISU tid=%s want=%s (MSA client does not bind this title)", got.c_str(), want);
+        return XA_E_XBL;
+    }
+    /* Keep user claims from title SISU; drop cached XSTS so the next mint carries the new TitleToken. */
+    account.user_token = user_token;
+    account.user_expires = user_expires;
+    account.xsts.clear();
+    if (!xui["uhs"].str().empty()) account.uhs = xui["uhs"].str();
+    LeaveCriticalSection(&account.cs);
+    LeaveCriticalSection(&account.signin_cs);
+    trace("title identity bound: app=%s tid=%s", msa_app.c_str(), want);
     return S_OK;
 }
 
@@ -894,10 +1054,36 @@ static HRESULT xbl_title_token(const std::string &msa_token)
 }
 
 /* Microsoft account token in hand (account.msa_token): get the Xbox identity. Caller holds signin_cs.
- * SISU first; if it refuses, the plain user/authenticate + XSTS path (still device-bound, but no title). */
+ * Prefer title-bound SISU when GDK SetTitleContext is set so the first XSTS is title-yes (Party/ListPartyQos
+ * otherwise races a long title-no window after default-SISU 401 → user/authenticate → title/authenticate 403). */
 static void fetch_account_email(void);
 static void fetch_account_puid(void);
 static std::string stored_msa_account(void);
+
+static HRESULT xbl_sign_in_via_title_sisu(const std::string &title_app, UINT32 title_id,
+                                          std::string &user_token, ULONGLONG &user_expires,
+                                          Xsts &x, Json &xui)
+{
+    if (title_app.empty() || !title_id || title_app == MSA_CLIENT_ID) return E_FAIL;
+    char want[32];
+    snprintf(want, sizeof(want), "%u", title_id);
+    SetEnvironmentVariableA("WINE_UWP_XBOX_DEVICE_TYPE", "Win32");
+    std::string msa_title;
+    HRESULT hr = msa_refresh_for_client(title_app, MSA_SCOPE, &msa_title);
+    if (FAILED(hr)) return hr;
+    hr = xbl_sisu_authorize_app(msa_title, title_app, user_token, user_expires, x, xui);
+    if (FAILED(hr)) return hr;
+    EnterCriticalSection(&account.cs);
+    bool tid_ok = account.title_tid == want && !account.title_token.empty();
+    LeaveCriticalSection(&account.cs);
+    if (!tid_ok)
+    {
+        trace("title SISU tid mismatch during sign-in (want %s)", want);
+        return XA_E_XBL;
+    }
+    trace("sign-in via title SISU (app=%s tid=%u) — no title-no XSTS window", title_app.c_str(), title_id);
+    return S_OK;
+}
 
 static HRESULT xbl_sign_in(void)
 {
@@ -910,17 +1096,79 @@ static HRESULT xbl_sign_in(void)
     EnterCriticalSection(&account.cs);
     msa = account.msa_token;
     LeaveCriticalSection(&account.cs);
-    if (FAILED(hr = xbl_sisu_authorize(msa, user_token, user_expires, x, xui)))
+
+    std::string title_app;
+    UINT32 title_id = 0;
+    title_ctx_init();
+    EnterCriticalSection(&title_ctx_cs);
+    title_app = title_ctx_msa_app;
+    title_id = title_ctx_title_id;
+    LeaveCriticalSection(&title_ctx_cs);
+
+    bool signed_via_title = false;
+    if (!title_app.empty() && title_id && title_app != MSA_CLIENT_ID)
+    {
+        char want[32];
+        snprintf(want, sizeof(want), "%u", title_id);
+        /* Reuse title bind from SetTitleContext early-bind thunk when it won the race. */
+        EnterCriticalSection(&account.cs);
+        bool have_title = !account.title_token.empty() && account.title_tid == want &&
+                          !account.user_token.empty() && account.user_expires > now_s() + 60;
+        if (have_title)
+        {
+            user_token = account.user_token;
+            user_expires = account.user_expires;
+        }
+        LeaveCriticalSection(&account.cs);
+        if (have_title)
+        {
+            hr = xbl_xsts(user_token, "http://xboxlive.com", x, &xui);
+            if (SUCCEEDED(hr))
+            {
+                signed_via_title = true;
+                trace("sign-in reused title-bound user token (tid=%s)", want);
+            }
+        }
+        if (!signed_via_title)
+        {
+            hr = xbl_sign_in_via_title_sisu(title_app, title_id, user_token, user_expires, x, xui);
+            if (SUCCEEDED(hr))
+                signed_via_title = true;
+            else if (hr == XA_E_NETWORK)
+                return hr;
+            else
+                trace("title SISU during sign-in failed (%#lx); trying default SISU", (unsigned long)hr);
+        }
+    }
+
+    if (!signed_via_title && FAILED(hr = xbl_sisu_authorize(msa, user_token, user_expires, x, xui)))
     {
         if (hr == XA_E_NETWORK) return hr;
         EnterCriticalSection(&account.cs);
         account.title_token.clear();
         account.title_expires = 0;
+        account.title_tid.clear();
         LeaveCriticalSection(&account.cs);
         trace("SISU refused; falling back to user/authenticate + XSTS");
         if (FAILED(hr = xbl_user_authenticate(msa, user_token, user_expires))) return hr;
-        if (xbl_title_token(msa) == XA_E_NETWORK) return XA_E_NETWORK;
-        if (FAILED(hr = xbl_xsts(user_token, "http://xboxlive.com", x, &xui))) return hr;
+        /* When a title context is set, bind title before the first XSTS mint so Party never
+         * sees a title-no token. Inline (caller already holds signin_cs; ensure_title_identity would re-enter). */
+        if (!title_app.empty() && title_id && title_app != MSA_CLIENT_ID)
+        {
+            HRESULT thr = xbl_sign_in_via_title_sisu(title_app, title_id, user_token, user_expires, x, xui);
+            if (SUCCEEDED(thr))
+                signed_via_title = true;
+            else if (thr == XA_E_NETWORK)
+                return thr;
+            else
+                trace("title SISU after user/authenticate failed (%#lx); last resort title-no XSTS",
+                      (unsigned long)thr);
+        }
+        if (!signed_via_title)
+        {
+            if (xbl_title_token(msa) == XA_E_NETWORK) return XA_E_NETWORK;
+            if (FAILED(hr = xbl_xsts(user_token, "http://xboxlive.com", x, &xui))) return hr;
+        }
     }
     if (xui["uhs"].str().empty() || xui["xid"].str().empty())
     {
@@ -943,7 +1191,17 @@ static HRESULT xbl_sign_in(void)
     account.signed_in = true;
     LeaveCriticalSection(&account.cs);
     trace("signed in to Xbox Live as \"%s\" (age group %s)", xui["gtg"].str().c_str(), xui["agg"].str().c_str());
-    store_update({ { "gamertag", xui["gtg"].str() } }); /* the WebAccount's user name, before this process signs in */
+    /* Persist XUID/claims so GDK XUser in other processes (Halo) can answer without re-SISU. */
+    store_update({
+        { "gamertag", xui["gtg"].str() },
+        { "xid", xui["xid"].str() },
+        { "uhs", xui["uhs"].str() },
+        { "agg", xui["agg"].str() },
+        { "prv", xui["prv"].str() },
+        { "mgt", xui["mgt"].str() },
+        { "mgs", xui["mgs"].str() },
+        { "umg", xui["umg"].str() },
+    });
     fetch_account_email();
     fetch_account_puid();
     return S_OK;
@@ -994,12 +1252,14 @@ static void open_browser(const std::string &url)
     trace("sign-in page %s -> %s", url.c_str(), ok ? "opened in the browser" : "no browser");
 }
 
-/* The device-code flow. Blocks until the user approves, refuses or the code expires. */
-static HRESULT sign_in_with_device_code(volatile LONG *cancelled)
+/* Device-code for an MSA client. For the Xbox-app client this also runs xbl_sign_in and replaces the
+ * primary refresh_token; for other clients (e.g. Halo MSAAppId) it only stores refresh_token_<client>. */
+static HRESULT sign_in_with_device_code_client(const char *client_id, volatile LONG *cancelled, bool full_signin)
 {
+    std::string client = client_id && *client_id ? client_id : MSA_CLIENT_ID;
     std::string resp;
     DWORD status = http_form("https://login.live.com/oauth20_connect.srf",
-                             "client_id=" + std::string(MSA_CLIENT_ID) + "&scope=" + urlencode(MSA_SCOPE) +
+                             "client_id=" + client + "&scope=" + urlencode(MSA_SCOPE) +
                              "&response_type=device_code", resp);
     if (!status) return XA_E_NETWORK;
     Json j = parse_json(resp);
@@ -1013,8 +1273,11 @@ static HRESULT sign_in_with_device_code(volatile LONG *cancelled)
     ULONGLONG deadline = now_s() + (j["expires_in"].n > 0 ? (ULONGLONG)j["expires_in"].n : 900);
     std::string verify = j["verification_uri"].str();
     if (verify.empty()) verify = "https://www.microsoft.com/link";
-    trace("device code obtained: user code %s, valid %.0f s, verification %s", user_code.c_str(), j["expires_in"].n,
-          verify.c_str());
+    printf("DEVICE_CODE client=%s user_code=%s verify=%s expires=%.0f\n",
+           client.c_str(), user_code.c_str(), verify.c_str(), j["expires_in"].n);
+    fflush(stdout);
+    trace("device code obtained: client %s, user code %s, valid %.0f s, verification %s",
+          client.c_str(), user_code.c_str(), j["expires_in"].n, verify.c_str());
     open_browser("https://www.microsoft.com/link?otc=" + user_code);
 
     while (now_s() < deadline)
@@ -1026,13 +1289,23 @@ static HRESULT sign_in_with_device_code(volatile LONG *cancelled)
         }
         status = http_form("https://login.live.com/oauth20_token.srf",
                            "grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=" +
-                           std::string(MSA_CLIENT_ID) + "&device_code=" + urlencode(device_code), resp);
+                           client + "&device_code=" + urlencode(device_code), resp);
         if (!status) continue; /* transient; keep polling */
         Json t = parse_json(resp);
         if (status == 200 && !t["access_token"].str().empty())
         {
-            take_msa_tokens(t);
-            return xbl_sign_in();
+            std::string key = refresh_store_key(client);
+            std::string refresh = t["refresh_token"].str();
+            if (!refresh.empty()) store_update({ { key, refresh } });
+            if (full_signin && key == "refresh_token")
+            {
+                take_msa_tokens(t);
+                return xbl_sign_in();
+            }
+            trace("device-code for client %s: refresh stored under %s", client.c_str(), key.c_str());
+            printf("DEVICE_CODE_OK client=%s refresh_key=%s\n", client.c_str(), key.c_str());
+            fflush(stdout);
+            return S_OK;
         }
         std::string err = t["error"].str();
         if (err == "authorization_pending") continue;
@@ -1042,6 +1315,12 @@ static HRESULT sign_in_with_device_code(volatile LONG *cancelled)
     }
     trace("device code expired before the sign-in was finished");
     return XA_E_TIMEOUT;
+}
+
+/* The device-code flow for the Xbox-app client. Blocks until the user approves, refuses or the code expires. */
+static HRESULT sign_in_with_device_code(volatile LONG *cancelled)
+{
+    return sign_in_with_device_code_client(MSA_CLIENT_ID, cancelled, true);
 }
 
 static void sign_out(void)
@@ -1056,7 +1335,12 @@ static void sign_out(void)
     account.xsts.clear();
     LeaveCriticalSection(&account.cs);
     /* the device's proof key and device token stay: they belong to the machine, not the user */
-    store_update({ { "refresh_token", "" }, { "user_id", "" }, { "gamertag", "" }, { "email", "" }, { "store_account_id", "" }, { "puid", "" } });
+    store_update({
+        { "refresh_token", "" }, { "user_id", "" }, { "gamertag", "" }, { "email", "" },
+        { "store_account_id", "" }, { "puid", "" },
+        { "xid", "" }, { "uhs", "" }, { "agg", "" }, { "prv", "" },
+        { "mgt", "" }, { "mgs", "" }, { "umg", "" },
+    });
     LeaveCriticalSection(&account.signin_cs);
     trace("signed out; the stored sign-in is deleted");
 }
@@ -1117,6 +1401,60 @@ static void load_endpoints(void)
 }
 
 /* The relying party for a URL, "" for none (the request needs no token). */
+static HRESULT get_token_for_url(const std::string &url, bool force, std::string &header, bool with_title = true);
+static bool title_endpoints_loaded;
+
+/* XAL also reads the title's own endpoint table: titles/<title id>/endpoints (no query; "?type=1" answers 414), which needs an
+ * Xbox Live token. It names the title's partner services and their relying parties; Halo's EOS
+ * anti-cheat login asks for a token for https://api.epicgames.dev, which only that table maps, and
+ * without it EOS Connect gets a null token, anti-cheat never logs in and matchmaking reports a
+ * server problem. Its entries go before the default table's, which still covers Xbox Live itself. */
+static void load_title_endpoints(void)
+{
+    EnterCriticalSection(&account.cs);
+    UINT32 tid = title_ctx_title_id;
+    bool skip = title_endpoints_loaded || !endpoints_loaded || !tid || !account.signed_in;
+    if (!skip) title_endpoints_loaded = true; /* one attempt per process; get_token_for_url comes back here */
+    LeaveCriticalSection(&account.cs);
+    if (skip) return;
+
+    char url[160];
+    snprintf(url, sizeof(url), "https://title.mgt.xboxlive.com/titles/%u/endpoints", tid);
+    std::string auth;
+    if (FAILED(get_token_for_url(url, false, auth, true)) || auth.empty())
+    {
+        trace("title %u endpoints: no token", tid);
+        return;
+    }
+    std::vector<std::string> headers = { "Accept: application/json", "x-xbl-contract-version: 1", "Authorization: " + auth };
+    SigningPolicy policy;
+    if (!find_policy(url, policy)) policy = SigningPolicy();
+    std::string sig = sign_request(policy.version, policy.max_body_bytes, "GET", split_url(url).path_and_query, auth, "");
+    if (!sig.empty()) headers.push_back("Signature: " + sig);
+    std::string resp;
+    DWORD status = http_request(L"GET", url, headers, "", resp);
+    std::vector<Endpoint> list;
+    Json j = parse_json(resp);
+    for (auto &e : j["EndPoints"].a)
+    {
+        Endpoint ep;
+        ep.protocol = e["Protocol"].str();
+        ep.host = e["Host"].str();
+        ep.path = e["Path"].str();
+        ep.rp = e["RelyingParty"].str();
+        ep.wildcard = e["HostType"].str() == "wildcard";
+        for (auto &c : ep.host) c = (char)tolower((unsigned char)c);
+        for (auto &c : ep.protocol) c = (char)tolower((unsigned char)c);
+        list.push_back(ep);
+    }
+    trace("title %u endpoints: HTTP %lu, %zu entries", tid, status, list.size());
+    for (auto &e : list) trace("  title endpoint %s://%s%s -> %s", e.protocol.c_str(), e.host.c_str(), e.path.c_str(), e.rp.c_str());
+    if (list.empty()) return;
+    EnterCriticalSection(&account.cs);
+    endpoints.insert(endpoints.begin(), list.begin(), list.end());
+    LeaveCriticalSection(&account.cs);
+}
+
 static std::string relying_party(const std::string &url)
 {
     std::string u = url, scheme, host, path = "/";
@@ -1132,6 +1470,7 @@ static std::string relying_party(const std::string &url)
     for (auto &c : scheme) c = (char)tolower((unsigned char)c);
 
     load_endpoints();
+    load_title_endpoints();
     EnterCriticalSection(&account.cs);
     const Endpoint *best = nullptr;
     int best_score = -1;
@@ -1160,6 +1499,12 @@ static std::string relying_party(const std::string &url)
         const char sfx[] = ".xboxlive.com";
         if (host.size() > strlen(sfx) && !host.compare(host.size() - strlen(sfx), strlen(sfx), sfx))
             rp = "http://xboxlive.com";
+        /* Halo Infinite title services (dummy-xsts-host probe + settings/economy/…).
+         * Not in title.mgt's default table; Partner Center RP is the Halo Waypoint audience. */
+        const char hsfx[] = ".halowaypoint.com";
+        if (rp.empty() && host.size() > strlen(hsfx) &&
+            !host.compare(host.size() - strlen(hsfx), strlen(hsfx), hsfx))
+            rp = "https://prod.xsts.halowaypoint.com/";
     }
     return rp;
 }
@@ -1191,10 +1536,22 @@ static bool find_policy(const std::string &url, SigningPolicy &out)
     bool found = best && (size_t)best->policy < policies.size();
     if (found) out = policies[best->policy];
     LeaveCriticalSection(&account.cs);
+    if (!found)
+    {
+        /* Same Halo Waypoint hosts as relying_party(): sign with the default policy so
+         * GetTokenAndSignature returns a Signature alongside the Halo-audience XSTS. */
+        const char hsfx[] = ".halowaypoint.com";
+        if (u.host.size() > strlen(hsfx) &&
+            !u.host.compare(u.host.size() - strlen(hsfx), strlen(hsfx), hsfx))
+        {
+            out = SigningPolicy();
+            found = true;
+        }
+    }
     return found && out.es256;
 }
 
-static HRESULT get_token_for_url(const std::string &url, bool force, std::string &header, bool with_title = true)
+static HRESULT get_token_for_url(const std::string &url, bool force, std::string &header, bool with_title)
 {
     header.clear();
     std::string rp = relying_party(url);
@@ -1217,11 +1574,15 @@ static HRESULT get_token_for_url(const std::string &url, bool force, std::string
 
     if (!cached)
     {
-        HRESULT hr;
+        HRESULT hr = S_OK;
         Xsts x;
-        if (force || user_expires <= now_s() + 60)
+        /* Full MSA/SISU renew only when the user token is expired (or nearly).
+         * ForceRefresh with a still-valid user token must remint XSTS only.
+         * Otherwise SISU 401 → user_authenticate replaces the title-bound
+         * user token, and XSTS(title_token + new user_token) is rejected by
+         * RTA while older cached tokens still work for presence/profile. */
+        if (user_expires <= now_s() + 60)
         {
-            /* renew the whole chain */
             EnterCriticalSection(&account.signin_cs);
             hr = msa_refresh(MSA_SCOPE, nullptr);
             if (SUCCEEDED(hr))
@@ -1245,11 +1606,21 @@ static HRESULT get_token_for_url(const std::string &url, bool force, std::string
                     EnterCriticalSection(&account.cs);
                     account.user_token = user_token;
                     account.user_expires = user_expires;
+                    if (!axui["uhs"].str().empty()) account.uhs = axui["uhs"].str();
+                    uhs = account.uhs;
                     LeaveCriticalSection(&account.cs);
                 }
             }
             LeaveCriticalSection(&account.signin_cs);
             if (FAILED(hr)) return hr;
+        }
+        else if (force)
+        {
+            EnterCriticalSection(&account.cs);
+            user_token = account.user_token;
+            uhs = account.uhs;
+            LeaveCriticalSection(&account.cs);
+            trace("ForceRefresh: remint XSTS only (user token still valid) for %s", shown.c_str());
         }
         if (FAILED(hr = xbl_xsts(user_token, rp, x, nullptr, with_title))) return hr;
         EnterCriticalSection(&account.cs);
@@ -1258,7 +1629,8 @@ static HRESULT get_token_for_url(const std::string &url, bool force, std::string
         xsts = x.token;
     }
     header = "XBL3.0 x=" + uhs + ";" + xsts;
-    trace("token for %s: relying party %s%s", shown.c_str(), rp.c_str(), cached ? " (cached)" : "");
+    trace("token for %s: relying party %s%s%s", shown.c_str(), rp.c_str(),
+          cached ? " (cached)" : "", force && !cached ? " (forced)" : "");
     return S_OK;
 }
 
@@ -2062,6 +2434,8 @@ struct Manager : IXboxAuthManagerAbi, IClosable_
     HRESULT STDMETHODCALLTYPE Close() override { return S_OK; }
 };
 
+extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthSetTitleContext(const char *msa_app_id, UINT32 title_id);
+
 struct IXboxAuthManagerFactoryAbi : IInspectable { virtual HRESULT STDMETHODCALLTYPE CreateInstance(IInspectable *, IXboxAuthManagerAbi **) = 0; };
 struct IXboxAuthManagerStaticsAbi : IInspectable { virtual HRESULT STDMETHODCALLTYPE AddUserWithTransferTokenAsync(HSTRING, IAsyncOpAbi **) = 0; };
 
@@ -2102,6 +2476,9 @@ struct ManagerFactory : IXboxAuthManagerFactoryAbi, IXboxAuthManagerStaticsAbi, 
             a->Release();
         }
         trace("XboxAuthManager(msa app %s, title %#x)", app.c_str(), title);
+        /* Persist title identity for GDK GetToken in this process when the manager is for a game. */
+        if (!app.empty() && title && app != MSA_CLIENT_ID)
+            XboxAuthSetTitleContext(app.c_str(), title);
         *out = new Manager();
         return S_OK;
     }
@@ -2405,6 +2782,9 @@ static bool pb_field(const unsigned char *p, const unsigned char *end, unsigned 
     return false;
 }
 extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthHttpGet(const char *, const char *, const char *, unsigned char **, UINT32 *, DWORD *);
+extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthGetTokenAndSignature(const char *method, const char *url, int force,
+    const void *body, UINT32 body_size, char *token, UINT32 token_cap, UINT32 *token_len,
+    char *signature, UINT32 sig_cap, UINT32 *sig_len);
 static void fetch_account_puid(void)
 {
     EnterCriticalSection(&account.cs);
@@ -3443,6 +3823,119 @@ extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthHttpGet(const char *url,
     return S_OK;
 }
 
+/* Background: bind title identity as soon as SetTitleContext runs so Party/ListPartyQos does not
+ * start under a cached title-no XSTS while the warm GetToken is still in flight. */
+static DWORD WINAPI title_ctx_bind_thunk(void *)
+{
+    std::string app;
+    UINT32 tid = 0;
+    EnterCriticalSection(&title_ctx_cs);
+    app = title_ctx_msa_app;
+    tid = title_ctx_title_id;
+    LeaveCriticalSection(&title_ctx_cs);
+    if (app.empty() || !tid || app == MSA_CLIENT_ID) return 0;
+    account_init();
+    HRESULT hr = ensure_title_identity(app, tid);
+    trace("title context early bind: app=%s tid=%u -> %#lx", app.c_str(), tid, (unsigned long)hr);
+    return 0;
+}
+
+/* GDK / xgameruntime: bind subsequent GetToken XSTS TitleTokens to this MSAAppId+TitleId.
+ * Empty msa_app_id clears the binding (Xbox-app default title). */
+extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthSetTitleContext(const char *msa_app_id, UINT32 title_id)
+{
+    title_ctx_init();
+    account_init();
+    EnterCriticalSection(&title_ctx_cs);
+    title_ctx_msa_app = msa_app_id ? msa_app_id : "";
+    title_ctx_title_id = title_id;
+    LeaveCriticalSection(&title_ctx_cs);
+    /* GDK PC titles: pin Win32 device so SISU TitleToken and later XSTS share one device identity. */
+    if (!title_ctx_msa_app.empty() && title_ctx_msa_app != MSA_CLIENT_ID)
+        SetEnvironmentVariableA("WINE_UWP_XBOX_DEVICE_TYPE", "Win32");
+    else
+        SetEnvironmentVariableA("WINE_UWP_XBOX_DEVICE_TYPE", "Android");
+    /* Drop any title-no XSTS cached before the title context existed; next mint carries TitleToken. */
+    if (!title_ctx_msa_app.empty() && title_ctx_title_id && title_ctx_msa_app != MSA_CLIENT_ID)
+    {
+        EnterCriticalSection(&account.cs);
+        account.xsts.clear();
+        LeaveCriticalSection(&account.cs);
+        QueueUserWorkItem(title_ctx_bind_thunk, nullptr, WT_EXECUTELONGFUNCTION);
+    }
+    trace("title context set: msa app %s, title %#x", title_ctx_msa_app.c_str(), title_id);
+    return S_OK;
+}
+
+/* GDK XUserGetTokenAndSignature: Authorization header + optional Signature for a URL.
+ * token/signature are written NUL-terminated; *token_len/*sig_len include the NUL. */
+extern "C" __declspec(dllexport) HRESULT WINAPI XboxAuthGetTokenAndSignature(
+    const char *method, const char *url, int force,
+    const void *body, UINT32 body_size,
+    char *token, UINT32 token_cap, UINT32 *token_len,
+    char *signature, UINT32 sig_cap, UINT32 *sig_len)
+{
+    if (!url || !token_len) return E_INVALIDARG;
+    if (token_len) *token_len = 0;
+    if (sig_len) *sig_len = 0;
+    if (token && token_cap) token[0] = 0;
+    if (signature && sig_cap) signature[0] = 0;
+
+    account_init();
+    title_ctx_init();
+    HRESULT hr;
+    if (FAILED(hr = sign_in_silently())) return hr;
+
+    std::string app;
+    UINT32 tid = 0;
+    EnterCriticalSection(&title_ctx_cs);
+    app = title_ctx_msa_app;
+    tid = title_ctx_title_id;
+    LeaveCriticalSection(&title_ctx_cs);
+    if (!app.empty() && tid)
+    {
+        hr = ensure_title_identity(app, tid);
+        if (FAILED(hr)) return hr;
+    }
+
+    std::string header;
+    if (FAILED(hr = get_token_for_url(url, force != 0, header))) return hr;
+
+    UINT32 need = (UINT32)header.size() + 1;
+    *token_len = need;
+    if (token)
+    {
+        if (token_cap < need) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+        memcpy(token, header.c_str(), need);
+    }
+
+    std::string sig;
+    SigningPolicy policy;
+    if (find_policy(url, policy))
+    {
+        std::string body_s;
+        if (body && body_size) body_s.assign((const char *)body, body_size);
+        sig = sign_request(policy.version, policy.max_body_bytes,
+                           method && *method ? method : "GET",
+                           split_url(url).path_and_query, header, body_s);
+        if (!sig.empty())
+            trace("GDK-token signed %s %s (policy %d, body %u)", method ? method : "GET",
+                  std::string(url).substr(0, std::string(url).find('?')).c_str(),
+                  policy.version, body_size);
+    }
+    if (sig_len)
+    {
+        UINT32 sneed = sig.empty() ? 0 : (UINT32)sig.size() + 1;
+        *sig_len = sneed;
+        if (sneed && signature)
+        {
+            if (sig_cap < sneed) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+            memcpy(signature, sig.c_str(), sneed);
+        }
+    }
+    return S_OK;
+}
+
 /* Does the signed-in account own Store product ARG outright? collections.mp.microsoft.com's v7.0 query with the
  * account as beneficiary: S_OK owned, S_FALSE not (subscription access is not ownership; gameplatform checks that
  * from the content access data). Controls on 10-16: owned Bad Magpie Demo and Halo Infinite listed, Resident Evil 7
@@ -3783,12 +4276,147 @@ extern "C" __declspec(dllexport) int WINAPI XboxAuthSelfTest(const char *what, c
             if (FILE *f = fopen(out, "wb")) { fwrite(resp.data(), 1, resp.size(), f); fclose(f); }
         return status == 200 ? 0 : 1;
     }
+    if (!strcmp(what, "halodevice"))
+    {
+        /* One-time MSA device-code for Halo MSAAppId; stores refresh_token_000000004C25467F. */
+        account_init();
+        HRESULT hr = sign_in_with_device_code_client(HALO_MSA_APP_ID, nullptr, false);
+        printf("halodevice -> %#lx\n", (unsigned long)hr);
+        return SUCCEEDED(hr) ? 0 : 1;
+    }
+    if (!strcmp(what, "halotitle"))
+    {
+        /* Green loop for 0x87DD002E: title-bound XSTS must make presence POST Halo id return 200. */
+        HRESULT hr = sign_in_silently();
+        if (FAILED(hr)) { printf("silent failed %#lx\n", (unsigned long)hr); return 1; }
+        XboxAuthSetTitleContext(HALO_MSA_APP_ID, HALO_TITLE_ID);
+        hr = ensure_title_identity(HALO_MSA_APP_ID, HALO_TITLE_ID);
+        printf("ensure_title_identity -> %#lx\n", (unsigned long)hr);
+        if (FAILED(hr))
+        {
+            auto kv = store_read();
+            std::string key = refresh_store_key(HALO_MSA_APP_ID);
+            printf("ensure failed: refresh_%s=%s (%#lx). If empty, run: probe-xboxauth.exe halodevice\n",
+                   key.c_str(), kv[key].empty() ? "empty" : "present", (unsigned long)hr);
+            return 1;
+        }
+        EnterCriticalSection(&account.cs);
+        printf("bound tid=%s title_token=%zu\n", account.title_tid.c_str(), account.title_token.size());
+        std::string ut = account.user_token, uhs = account.uhs, xid = account.xid;
+        LeaveCriticalSection(&account.cs);
+        Xsts x;
+        hr = xbl_xsts(ut, "http://xboxlive.com", x, nullptr, true);
+        printf("XSTS Halo-bound -> %#lx\n", (unsigned long)hr);
+        if (FAILED(hr)) return 1;
+        std::string header = "XBL3.0 x=" + uhs + ";" + x.token;
+        std::string resp, purl = "https://userpresence.xboxlive.com/users/xuid(" + xid +
+            ")/devices/current/titles/current";
+        auto try_pres = [&](const char *label, const std::string &pbody) {
+            SigningPolicy policy; find_policy(purl, policy);
+            std::string sig = sign_request(policy.version, policy.max_body_bytes, "POST",
+                                           split_url(purl).path_and_query, header, pbody);
+            std::vector<std::string> h = { "Authorization: " + header, "x-xbl-contract-version: 3",
+                                           "Content-Type: application/json", "Accept: application/json" };
+            if (!sig.empty()) h.push_back("Signature: " + sig);
+            DWORD st = http_request(L"POST", purl, h, pbody, resp);
+            printf("presence %s HTTP %lu (%.120s) body=%s\n", label, st, resp.c_str(), pbody.c_str());
+            return st;
+        };
+        char halo_id[16];
+        snprintf(halo_id, sizeof(halo_id), "%u", HALO_TITLE_ID);
+        std::string halo_body = std::string("{\"id\":\"") + halo_id + "\",\"placement\":\"full\",\"state\":\"active\"}";
+        DWORD halo = try_pres("halo-str", halo_body);
+        try_pres("xboxapp", "{\"id\":\"328178078\",\"placement\":\"full\",\"state\":\"active\"}");
+        printf("GREEN_LOOP %s (halo id %s)\n", halo == 200 ? "PASS" : "FAIL", halo_id);
+        return halo == 200 ? 0 : 1;
+    }
+    if (!strcmp(what, "titleauth"))
+    {
+        HRESULT hr = sign_in_silently();
+        if (FAILED(hr)) { printf("silent %#lx\n", (unsigned long)hr); return 1; }
+        std::string msa, device_token, resp;
+        EnterCriticalSection(&account.cs); msa = account.msa_token; LeaveCriticalSection(&account.cs);
+        if (FAILED(xbl_device_token(device_token))) return 1;
+        auto try_ta = [&](const char *label, const std::string &body) {
+            std::string url = "https://title.auth.xboxlive.com/title/authenticate";
+            DWORD st = http_request(L"POST", url, signed_headers(url, body), body, resp);
+            Json j = parse_json(resp);
+            printf("%s HTTP %lu token=%zu tid=%s XErr=%s head=%.180s\n", label, st, j["Token"].str().size(),
+                   j["DisplayClaims"]["xti"]["tid"].str().c_str(), j["XErr"].str().c_str(), resp.c_str());
+            return j["Token"].str();
+        };
+        std::string base = "{\"Properties\":{\"AuthMethod\":\"RPS\",\"DeviceToken\":\"" + json_escape(device_token) +
+            "\",\"RpsTicket\":\"t=" + json_escape(msa) + "\",\"SiteName\":\"user.auth.xboxlive.com\",\"ProofKey\":" +
+            proof_key_json() + "},\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\"}";
+        try_ta("default", base);
+        /* with TitleId in Properties */
+        std::string b2 = "{\"Properties\":{\"AuthMethod\":\"RPS\",\"DeviceToken\":\"" + json_escape(device_token) +
+            "\",\"RpsTicket\":\"t=" + json_escape(msa) + "\",\"SiteName\":\"user.auth.xboxlive.com\",\"TitleId\":\"2043073184\",\"ProofKey\":" +
+            proof_key_json() + "},\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\"}";
+        std::string tok = try_ta("titleId-prop", b2);
+        if (tok.empty()) {
+            b2 = "{\"Properties\":{\"AuthMethod\":\"RPS\",\"DeviceToken\":\"" + json_escape(device_token) +
+            "\",\"RpsTicket\":\"t=" + json_escape(msa) + "\",\"SiteName\":\"user.auth.xboxlive.com\",\"ProofKey\":" +
+            proof_key_json() + "},\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\",\"TitleId\":\"2043073184\"}";
+            tok = try_ta("titleId-top", b2);
+        }
+        /* TitleAttestation (console/Win32 style): no RPS ticket; title identity from attestation blob. */
+        auto try_attest = [&](const char *label, const char *devtype) {
+            SetEnvironmentVariableA("WINE_UWP_XBOX_DEVICE_TYPE", devtype);
+            std::string dt;
+            if (FAILED(xbl_device_token(dt, true))) { printf("%s device-%s failed\n", label, devtype); return std::string(); }
+            /* TitleAttestation is a JSON object encoded as a string value. */
+            char tiddec[16];
+            snprintf(tiddec, sizeof(tiddec), "%u", HALO_TITLE_ID);
+            std::string attest = std::string("{\"Id\":\"") + tiddec + "\",\"Version\":\"10.0.26100.0\",\"Build\":\"FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF\","
+                "\"ContentId\":\"254428597CFE2\"}";
+            std::string body = "{\"Properties\":{\"DeviceToken\":\"" + json_escape(dt) +
+                "\",\"TitleAttestation\":\"" + json_escape(attest) +
+                "\"},\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\"}";
+            return try_ta(label, body);
+        };
+        if (tok.empty()) tok = try_attest("attest-Win32", "Win32");
+        if (tok.empty()) tok = try_attest("attest-WindowsOneCore", "WindowsOneCore");
+        if (tok.empty()) tok = try_attest("attest-Android", "Android");
+        SetEnvironmentVariableA("WINE_UWP_XBOX_DEVICE_TYPE", "Android"); /* restore default */
+        if (!tok.empty()) {
+            EnterCriticalSection(&account.cs);
+            account.title_token = tok;
+            account.title_expires = now_s() + 3600;
+            account.xsts.clear();
+            LeaveCriticalSection(&account.cs);
+            Xsts x; std::string ut;
+            EnterCriticalSection(&account.cs); ut = account.user_token; LeaveCriticalSection(&account.cs);
+            hr = xbl_xsts(ut, "http://xboxlive.com", x, nullptr, true);
+            printf("XSTS %#lx\n", (unsigned long)hr);
+            if (SUCCEEDED(hr)) {
+                EnterCriticalSection(&account.cs);
+                account.xsts["http://xboxlive.com"] = x;
+                std::string header = "XBL3.0 x=" + account.uhs + ";" + x.token;
+                LeaveCriticalSection(&account.cs);
+                std::string pbody = "{\"id\":\"2043073184\",\"placement\":\"full\",\"state\":\"active\"}";
+                std::string purl = "https://userpresence.xboxlive.com/users/xuid(2533274829256434)/devices/current/titles/current";
+                SigningPolicy policy; find_policy(purl, policy);
+                std::string sig = sign_request(policy.version, policy.max_body_bytes, "POST", split_url(purl).path_and_query, header, pbody);
+                std::vector<std::string> h = {"Authorization: "+header,"x-xbl-contract-version: 3","Content-Type: application/json","Accept: application/json"};
+                if (!sig.empty()) h.push_back("Signature: "+sig);
+                DWORD st = http_request(L"POST", purl, h, pbody, resp);
+                printf("presence after titleauth HTTP %lu (%.120s)\n", st, resp.c_str());
+            }
+        }
+        return 0;
+    }
     if (!strcmp(what, "silent"))
     {
         HRESULT hr = sign_in_silently();
         trace("silent sign-in -> %#lx", (unsigned long)hr);
         if (SUCCEEDED(hr))
         {
+            EnterCriticalSection(&account.cs);
+            printf("CLAIMS gtg=%s xid=%s uhs=%s agg=%s prv=[%s] title_token=%zu title_exp=%llu\n",
+                   account.gtg.c_str(), account.xid.c_str(), account.uhs.c_str(), account.agg.c_str(),
+                   account.prv.c_str(), account.title_token.size(), (unsigned long long)account.title_expires);
+            LeaveCriticalSection(&account.cs);
             std::string h;
             hr = get_token_for_url(arg && *arg ? arg : "https://profile.xboxlive.com/users/me/profile/settings", false, h);
             trace("token -> %#lx, header %zu chars", (unsigned long)hr, h.size());

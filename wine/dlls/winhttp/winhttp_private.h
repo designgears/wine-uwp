@@ -326,6 +326,7 @@ struct socket
     enum fragment_type sending_fragment_type;
     enum fragment_type receiving_fragment_type;
     BOOL last_receive_final;
+    LONG closing; /* WinHttpCloseHandle was called: no more copies into caller buffers */
 };
 
 typedef void (*TASK_CALLBACK)( void *ctx, BOOL abort );

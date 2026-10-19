@@ -12707,3 +12707,40 @@ How it was found, for next time:
   directory 13) to name the IAT slots, then find `call [rip]` to them.
 - The parent exe had been byte-patched on disk by the earlier soft-skip work (21 bytes: HD bit, EOF jae, halt call).
   Restored from `.bak-hdbit` (`pecheck.py`: Authenticode pristine); the patched copy is `.patched-softskip`.
+
+### Halo multiplayer: lobby, XTaskQueue, XAsync, title endpoints (2026-10-18)
+
+**In a live online match** (`docs/screenshots/halo-multiplayer-in-match.png`): Multiplayer -> Quick Play
+(`halo-multiplayer-quickplay-ready.png`, PLAY enabled) -> matchmaking -> Capture the Flag on Streets with other
+players. Before this the menu said OFFLINE, "Unable to connect to the Halo Infinite Lobby Service", then "There was an
+issue with the Halo Infinite servers" with PLAY disabled. Four separate causes, in the order they were found:
+
+1. **WinHTTP, WebSocket upgrade.** The request handle the game closes right after `WinHttpWebSocketCompleteUpgrade`
+   shared its connection with the new WebSocket, and the earlier read-after-close fix (closing a request cancels its
+   I/O) closed the WebSocket's socket: its first receive failed with WSAENOTSOCK (10038). The connection now moves
+   to the WebSocket. A receive already running on a closing WebSocket no longer copies into the caller's buffer.
+2. **`shims/gameruntime` XTaskQueue was a stand-in**: SubmitCallback ran the callback inline on the submitting
+   thread, Dispatch did nothing, delays and waiters were ignored. Every queue Halo creates is Manual/Manual (it pumps
+   them from its own threads), so with WebSockets alive WinHTTP's threads ran its network callbacks in parallel with
+   BG NET WORKER and corrupted its allocator freelists (`0x1405C8DFD`, and a jump to `0x100000000`). Now real:
+   `taskqueue.inc`, two ports with Manual/ThreadPool/SerializedThreadPool/Immediate, delayed callbacks
+   (threadpool timers), waiters, monitors, terminate, composite queues; XAsync completions go to the block's
+   completion port.
+3. **XAsyncBegin treated `E_PENDING` from a provider's Begin as failure.** libHttpClient's
+   `winhttp_websocket_impl::enqueue_message` returns it (and may already have completed the call inside Begin), so
+   every WebSocket send looked failed and the game disconnected after its first AMQP frame (`WinHttpWebSocketShutdown`
+   called from Halo, 1075 bytes of AMQP header/open/begin/attach sent, nothing received yet). External providers now
+   also get the real contract: Begin only, DoWork when they XAsyncSchedule, a non-E_PENDING DoWork result completes.
+   `GDK async:` log lines name each external call (libHttpClient passes `winhttp_websocket_impl::...` identities).
+4. **No token for `https://api.epicgames.dev`.** The game's own telemetry (readable in the AMQP payloads) said
+   "Retrieving XSTS token with EOS audience" / "EOS_Connect_Credentials.Token ... cannot be null" / "Connect Login
+   Complete failed". `shims/xboxauth` read only `titles/default/endpoints`; the title's own table,
+   `https://title.mgt.xboxlive.com/titles/2043073184/endpoints` (authorised, signed, **no `?type=1`**, which answers
+   414), maps `api.epicgames.dev -> rp://eos-prod.halowaypoint.com/` and `dummy-xsts-host.svc.halowaypoint.com ->
+   https://prod.xsts.halowaypoint.com/`. Its entries now precede the default table's.
+
+Tooling that found these: temporary hex dumps of WebSocket payloads in `dlls/winhttp/socket.c` (AMQP over
+WebSocket, `AMQPWSB10`; Halo's telemetry stream carries its own log text), and `RtlCaptureStackBackTrace` in
+`WinHttpWebSocketShutdown` naming XsapiThunks (libHttpClient) and the game as the caller. Both were removed again.
+Still open: "The Microsoft Store user is not the same as the logged in Xbox Live user" at start-up (only blocks
+real-money purchases; no Store call precedes it).

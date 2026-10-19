@@ -123,6 +123,9 @@ static Identity load_identity()
     return id;
 }
 
+#include <deque>
+#include "taskqueue.inc"
+
 /* -------------------- minimal XAsync (immediate) -------------------- */
 
 static constexpr uint32_t ASYNC_SIG = 0x41535942; /* ASYB */
@@ -140,6 +143,7 @@ struct AsyncState
     SIZE_T result_size = 0;
     bool completed = false;
     HANDLE done_event = nullptr;
+    bool external = false;
     std::mutex mu;
 
     void addref() { refs.fetch_add(1, std::memory_order_relaxed); }
@@ -232,12 +236,20 @@ static DWORD WINAPI async_callback_thunk(void *param)
     return 0;
 }
 
+static void __stdcall async_completion_port_cb(void *param, BOOLEAN)
+{
+    async_callback_thunk(param);
+}
+
 static void async_complete(XAsyncBlock *asyncBlock, HRESULT result, SIZE_T requiredBufferSize)
 {
     AsyncState *s = async_state(asyncBlock);
     if (!s) return;
     bool fire = false;
     s->mu.lock();
+    if (s->external)
+        gdk_log("GDK async: complete %p %s hr %08lx size %Iu%s\n", asyncBlock, s->identity_name ? s->identity_name : "?",
+                result, requiredBufferSize, s->completed ? " (already)" : "");
     if (!s->completed)
     {
         s->status = result;
@@ -251,15 +263,108 @@ static void async_complete(XAsyncBlock *asyncBlock, HRESULT result, SIZE_T requi
      * title's handler runs (avoids PPL "unobserved exception" re-entrancy). */
     if (fire && asyncBlock->callback)
     {
+        /* On the block's completion port, which is where the title dispatches it. */
         s->addref();
         auto *cb = new (std::nothrow) AsyncCallback{ asyncBlock, s };
-        if (!cb || !QueueUserWorkItem(async_callback_thunk, cb, WT_EXECUTEDEFAULT))
+        if (!cb || FAILED(taskqueue_submit(asyncBlock->queue, XTaskQueuePort::Completion, 0, cb, async_completion_port_cb)))
         {
             delete cb;
             asyncBlock->callback(asyncBlock);
             s->release();
         }
     }
+}
+
+/* XAsyncBegin from a title or library (libHttpClient, XSAPI) follows the GDK provider contract:
+ * Begin only, and DoWork runs when the provider asks through XAsyncSchedule, as often as it asks.
+ * A DoWork result other than E_PENDING completes the call. async_begin() above runs DoWork once
+ * unasked, which our own providers are written for; an external provider that already started its
+ * work in Begin then did it twice, and libHttpClient's WebSocket send looked failed, so Halo dropped
+ * its telemetry and lobby connections right after their first frame. */
+static HRESULT async_begin_external(XAsyncBlock *asyncBlock, void *context, const void *identity,
+                                    const char *identityName, XAsyncProvider *provider)
+{
+    if (!asyncBlock || !provider) return E_INVALIDARG;
+    auto *s = new (std::nothrow) AsyncState();
+    if (!s) return E_OUTOFMEMORY;
+    s->provider = provider;
+    s->context = context;
+    s->identity = identity;
+    s->identity_name = identityName;
+    s->user = asyncBlock;
+    s->done_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    async_set_state(asyncBlock, s);
+
+    s->external = true;
+    XAsyncProviderData data{ asyncBlock, 0, nullptr, context };
+    HRESULT hr = provider(XAsyncOp::Begin, &data);
+    gdk_log("GDK async: begin %p %s queue %p -> %08lx\n", asyncBlock, identityName ? identityName : "?", asyncBlock->queue, hr);
+    /* E_PENDING from Begin means "under way" (libHttpClient's WebSocket send returns it, and may have
+     * completed the call already); only other failures abort the call. */
+    if (hr == E_PENDING) hr = S_OK;
+    if (FAILED(hr))
+    {
+        async_set_state(asyncBlock, nullptr);
+        s->release();
+        return hr;
+    }
+    return S_OK;
+}
+
+struct ScheduledWork
+{
+    AsyncState *state;
+    UINT32 delay;
+};
+
+static DWORD WINAPI async_dowork_thunk(void *param)
+{
+    auto *w = (ScheduledWork *)param;
+    AsyncState *s = w->state;
+    if (w->delay) Sleep(w->delay);
+    /* The block belongs to the title once completed, and may already carry another call. */
+    if (!s->completed && async_state(s->user) == s)
+    {
+        XAsyncProviderData data{ s->user, 0, nullptr, s->context };
+        HRESULT hr = s->provider(XAsyncOp::DoWork, &data);
+        if (hr != E_PENDING && !s->completed && async_state(s->user) == s)
+            async_complete(s->user, hr, 0);
+    }
+    s->release();
+    delete w;
+    return 0;
+}
+
+static void __stdcall async_dowork_port_cb(void *param, BOOLEAN canceled)
+{
+    auto *w = (ScheduledWork *)param;
+    w->delay = 0; /* the port already waited */
+    if (canceled)
+    {
+        AsyncState *s = w->state;
+        if (!s->completed && async_state(s->user) == s) async_complete(s->user, E_ABORT, 0);
+        s->release();
+        delete w;
+        return;
+    }
+    async_dowork_thunk(w);
+}
+
+static HRESULT async_schedule(XAsyncBlock *asyncBlock, UINT32 delayMs)
+{
+    AsyncState *s = async_state(asyncBlock);
+    if (!s) return E_INVALIDARG;
+    if (s->completed) return E_UNEXPECTED;
+    auto *w = new (std::nothrow) ScheduledWork{ s, delayMs };
+    if (!w) return E_OUTOFMEMORY;
+    s->addref();
+    HRESULT hr = taskqueue_submit(asyncBlock->queue, XTaskQueuePort::Work, delayMs, w, async_dowork_port_cb);
+    if (FAILED(hr))
+    {
+        s->release();
+        delete w;
+    }
+    return hr;
 }
 
 static HRESULT async_get_status(XAsyncBlock *asyncBlock, BOOLEAN wait)
@@ -292,6 +397,9 @@ static HRESULT async_get_result(XAsyncBlock *asyncBlock, const void *identity,
     if (FAILED(hr)) return hr;
     XAsyncProviderData data{ asyncBlock, bufferSize, buffer, s->context };
     hr = s->provider(XAsyncOp::GetResult, &data);
+    if (s->external)
+        gdk_log("GDK async: result %p %s size %Iu/%Iu -> %08lx\n", asyncBlock, s->identity_name ? s->identity_name : "?",
+                bufferSize, s->result_size, hr);
     if (SUCCEEDED(hr) && bufferUsed) *bufferUsed = s->result_size;
     return hr;
 }
@@ -1569,7 +1677,7 @@ struct IXThreadingImpl : IUnknown
     virtual HRESULT STDMETHODCALLTYPE XTaskQueueTerminate(XTaskQueueHandle, BOOLEAN, void *, void *) = 0;
     virtual HRESULT STDMETHODCALLTYPE XTaskQueueRegisterMonitor(XTaskQueueHandle, void *, void *, XTaskQueueRegistrationToken *) = 0;
     virtual void STDMETHODCALLTYPE XTaskQueueUnregisterMonitor(XTaskQueueHandle, XTaskQueueRegistrationToken) = 0;
-    virtual void STDMETHODCALLTYPE XTaskQueueGetCurrentProcessTaskQueue(XTaskQueueHandle *) = 0;
+    virtual BOOLEAN STDMETHODCALLTYPE XTaskQueueGetCurrentProcessTaskQueue(XTaskQueueHandle *) = 0;
     virtual void STDMETHODCALLTYPE XTaskQueueSetCurrentProcessTaskQueue(XTaskQueueHandle) = 0;
     virtual void STDMETHODCALLTYPE XThreadSetTimeSensitive(BOOLEAN) = 0;
     virtual BOOLEAN STDMETHODCALLTYPE XTaskQueueIsEmpty(XTaskQueueHandle, XTaskQueuePort) = 0;
@@ -1577,12 +1685,6 @@ struct IXThreadingImpl : IUnknown
     virtual BOOLEAN STDMETHODCALLTYPE XThreadIsTimeSensitive() = 0;
 };
 
-struct XTaskQueueObject
-{
-    LONG refs = 1;
-};
-
-static XTaskQueueHandle g_process_queue = nullptr;
 
 struct XThreadingService final : IXThreadingImpl
 {
@@ -1613,81 +1715,96 @@ struct XThreadingService final : IXThreadingImpl
     }
     HRESULT STDMETHODCALLTYPE XAsyncBegin(XAsyncBlock *b, void *ctx, const void *id, const char *name, XAsyncProvider *p) override
     {
-        return async_begin(b, ctx, id, name, p);
+        return async_begin_external(b, ctx, id, name, p);
     }
     HRESULT STDMETHODCALLTYPE __PADDING__() override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE XAsyncSchedule(XAsyncBlock *, UINT32) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE XAsyncSchedule(XAsyncBlock *b, UINT32 delay) override { return async_schedule(b, delay); }
     void STDMETHODCALLTYPE XAsyncComplete(XAsyncBlock *b, HRESULT r, SIZE_T n) override { async_complete(b, r, n); }
     HRESULT STDMETHODCALLTYPE XAsyncGetResult(XAsyncBlock *b, const void *id, SIZE_T n, void *buf, SIZE_T *used) override
     {
         return async_get_result(b, id, n, buf, used);
     }
-    HRESULT STDMETHODCALLTYPE XTaskQueueCreate(XTaskQueueDispatchMode, XTaskQueueDispatchMode, XTaskQueueHandle *out) override
+    HRESULT STDMETHODCALLTYPE XTaskQueueCreate(XTaskQueueDispatchMode work, XTaskQueueDispatchMode completion, XTaskQueueHandle *out) override
     {
         if (!out) return E_POINTER;
-        *out = new XTaskQueueObject();
+        *out = taskqueue_new(work, completion);
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE XTaskQueueCreateComposite(XTaskQueuePortHandle, XTaskQueuePortHandle, XTaskQueueHandle *out) override
+    HRESULT STDMETHODCALLTYPE XTaskQueueCreateComposite(XTaskQueuePortHandle work, XTaskQueuePortHandle completion, XTaskQueueHandle *out) override
     {
-        return XTaskQueueCreate(XTaskQueueDispatchMode::Immediate, XTaskQueueDispatchMode::Immediate, out);
+        return taskqueue_create_composite(work, completion, out);
     }
-    HRESULT STDMETHODCALLTYPE XTaskQueueGetPort(XTaskQueueHandle q, XTaskQueuePort, XTaskQueuePortHandle *out) override
+    HRESULT STDMETHODCALLTYPE XTaskQueueGetPort(XTaskQueueHandle q, XTaskQueuePort port, XTaskQueuePortHandle *out) override
     {
         if (!out) return E_POINTER;
-        *out = (XTaskQueuePortHandle)q;
+        TaskPort *p = taskqueue_port(q, port);
+        if (!p) return E_INVALIDARG;
+        *out = (XTaskQueuePortHandle)p;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE XTaskQueueDuplicateHandle(XTaskQueueHandle q, XTaskQueueHandle *out) override
     {
         if (!out || !q) return E_INVALIDARG;
-        InterlockedIncrement(&q->refs);
+        taskqueue_addref(q);
         *out = q;
         return S_OK;
     }
-    BOOLEAN STDMETHODCALLTYPE XTaskQueueDispatch(XTaskQueueHandle, XTaskQueuePort, UINT32) override { return FALSE; }
+    BOOLEAN STDMETHODCALLTYPE XTaskQueueDispatch(XTaskQueueHandle q, XTaskQueuePort port, UINT32 timeout) override
+    {
+        return taskqueue_dispatch(q, port, timeout);
+    }
     void STDMETHODCALLTYPE XTaskQueueCloseHandle(XTaskQueueHandle q) override
     {
-        if (q && InterlockedDecrement(&q->refs) == 0) delete q;
+        if (q && q != g_process_queue) taskqueue_release(q);
     }
-    HRESULT STDMETHODCALLTYPE XTaskQueueSubmitCallback(XTaskQueueHandle, XTaskQueuePort, void *ctx, void *cb) override
+    HRESULT STDMETHODCALLTYPE XTaskQueueSubmitCallback(XTaskQueueHandle q, XTaskQueuePort port, void *ctx, void *cb) override
     {
-        using CB = void __stdcall(void *, BOOLEAN);
-        if (cb) ((CB *)cb)(ctx, FALSE);
-        return S_OK;
+        return taskqueue_submit(q, port, 0, ctx, (TaskQueueCallback *)cb);
     }
-    HRESULT STDMETHODCALLTYPE XTaskQueueSubmitDelayedCallback(XTaskQueueHandle q, XTaskQueuePort p, UINT32, void *ctx, void *cb) override
+    HRESULT STDMETHODCALLTYPE XTaskQueueSubmitDelayedCallback(XTaskQueueHandle q, XTaskQueuePort port, UINT32 delay, void *ctx, void *cb) override
     {
-        return XTaskQueueSubmitCallback(q, p, ctx, cb);
+        return taskqueue_submit(q, port, delay, ctx, (TaskQueueCallback *)cb);
     }
-    HRESULT STDMETHODCALLTYPE XTaskQueueRegisterWaiter(XTaskQueueHandle, XTaskQueuePort, HANDLE, void *, void *, XTaskQueueRegistrationToken *token) override
+    HRESULT STDMETHODCALLTYPE XTaskQueueRegisterWaiter(XTaskQueueHandle q, XTaskQueuePort port, HANDLE h, void *ctx, void *cb, XTaskQueueRegistrationToken *token) override
     {
-        if (token) token->token = 1;
-        return S_OK;
+        return taskqueue_register_waiter(q, port, h, ctx, (TaskQueueCallback *)cb, token);
     }
-    void STDMETHODCALLTYPE XTaskQueueUnregisterWaiter(XTaskQueueHandle, XTaskQueueRegistrationToken) override {}
-    HRESULT STDMETHODCALLTYPE XTaskQueueTerminate(XTaskQueueHandle, BOOLEAN, void *ctx, void *cb) override
+    void STDMETHODCALLTYPE XTaskQueueUnregisterWaiter(XTaskQueueHandle, XTaskQueueRegistrationToken token) override
     {
-        using CB = void __stdcall(void *);
-        if (cb) ((CB *)cb)(ctx);
-        return S_OK;
+        taskqueue_unregister_waiter(token);
     }
-    HRESULT STDMETHODCALLTYPE XTaskQueueRegisterMonitor(XTaskQueueHandle, void *, void *, XTaskQueueRegistrationToken *token) override
+    HRESULT STDMETHODCALLTYPE XTaskQueueTerminate(XTaskQueueHandle q, BOOLEAN wait, void *ctx, void *cb) override
     {
-        if (token) token->token = 1;
-        return S_OK;
+        return taskqueue_terminate(q, wait, ctx, (TaskQueueTerminatedCallback *)cb);
     }
-    void STDMETHODCALLTYPE XTaskQueueUnregisterMonitor(XTaskQueueHandle, XTaskQueueRegistrationToken) override {}
-    void STDMETHODCALLTYPE XTaskQueueGetCurrentProcessTaskQueue(XTaskQueueHandle *out) override
+    HRESULT STDMETHODCALLTYPE XTaskQueueRegisterMonitor(XTaskQueueHandle q, void *ctx, void *cb, XTaskQueueRegistrationToken *token) override
     {
-        if (!out) return;
-        if (!g_process_queue) g_process_queue = new XTaskQueueObject();
-        InterlockedIncrement(&g_process_queue->refs);
-        *out = g_process_queue;
+        return taskqueue_register_monitor(q, ctx, (TaskQueueMonitorCallback *)cb, token);
     }
-    void STDMETHODCALLTYPE XTaskQueueSetCurrentProcessTaskQueue(XTaskQueueHandle q) override { g_process_queue = q; }
+    void STDMETHODCALLTYPE XTaskQueueUnregisterMonitor(XTaskQueueHandle q, XTaskQueueRegistrationToken token) override
+    {
+        taskqueue_unregister_monitor(q, token);
+    }
+    BOOLEAN STDMETHODCALLTYPE XTaskQueueGetCurrentProcessTaskQueue(XTaskQueueHandle *out) override
+    {
+        if (!out) return FALSE;
+        XTaskQueueObject *q = taskqueue_resolve(nullptr);
+        taskqueue_addref(q);
+        *out = q;
+        return TRUE;
+    }
+    void STDMETHODCALLTYPE XTaskQueueSetCurrentProcessTaskQueue(XTaskQueueHandle q) override
+    {
+        XTaskQueueObject *old = taskqueue_resolve(nullptr);
+        if (q) taskqueue_addref(q);
+        g_process_queue = q ? q : taskqueue_new(XTaskQueueDispatchMode::ThreadPool, XTaskQueueDispatchMode::ThreadPool);
+        (void)old; /* still referenced by whoever obtained it */
+    }
     void STDMETHODCALLTYPE XThreadSetTimeSensitive(BOOLEAN) override {}
-    BOOLEAN STDMETHODCALLTYPE XTaskQueueIsEmpty(XTaskQueueHandle, XTaskQueuePort) override { return TRUE; }
+    BOOLEAN STDMETHODCALLTYPE XTaskQueueIsEmpty(XTaskQueueHandle q, XTaskQueuePort port) override
+    {
+        return taskqueue_is_empty(q, port);
+    }
     void STDMETHODCALLTYPE XThreadAssertNotTimeSensitive() override {}
     BOOLEAN STDMETHODCALLTYPE XThreadIsTimeSensitive() override { return FALSE; }
 };

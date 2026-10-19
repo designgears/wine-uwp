@@ -39,6 +39,9 @@ static void socket_handle_closing( struct object_header *hdr )
     struct socket *socket = (struct socket *)hdr;
     BOOL pending_tasks;
 
+    /* Like a closed request's reads, a receive already running must not copy into a buffer the
+     * caller may free once WinHttpCloseHandle returns. */
+    InterlockedExchange( &socket->closing, 1 );
     pending_tasks = cancel_queue( &socket->send_q );
     pending_tasks = cancel_queue( &socket->recv_q ) || pending_tasks;
 
@@ -176,8 +179,10 @@ HINTERNET WINAPI WinHttpWebSocketCompleteUpgrade( HINTERNET hrequest, DWORD_PTR 
     InitializeSRWLock( &socket->send_lock );
     init_queue( &socket->send_q );
     init_queue( &socket->recv_q );
-    netconn_addref( request->netconn );
+    /* The connection now belongs to the WebSocket. The caller closes the request handle next, and
+     * closing a request cancels its I/O: a shared connection would be closed under the socket. */
     socket->netconn = request->netconn;
+    request->netconn = NULL;
 
     netconn_set_timeout( socket->netconn, FALSE, socket->keepalive_interval );
 
@@ -845,6 +850,7 @@ static DWORD socket_receive( struct socket *socket, void *buf, DWORD len, DWORD 
             if (ret) break;
         }
     }
+    if (!ret && socket->closing) ret = ERROR_WINHTTP_OPERATION_CANCELLED;
     if (!ret)
     {
         socket->last_receive_final = final;
