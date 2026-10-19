@@ -123,6 +123,7 @@ struct media_player
     LONG ref;
 
     ISystemMediaTransportControls *controls;
+    struct data_source *data_source;
     IUnknown *command_manager;
     IUnknown *break_manager;
     HWND window;
@@ -401,6 +402,8 @@ static ULONG WINAPI media_player_AddRef( IMediaPlayer *iface )
     return ref;
 }
 
+static void media_player_drop_data_source( struct media_player *impl );
+
 static ULONG WINAPI media_player_Release( IMediaPlayer *iface )
 {
     struct media_player *impl = impl_from_IMediaPlayer( iface );
@@ -410,6 +413,7 @@ static ULONG WINAPI media_player_Release( IMediaPlayer *iface )
 
     if (!ref)
     {
+        media_player_drop_data_source( impl );
         playback_destroy( impl->playback );
         event_list_clear( &impl->media_opened );
         event_list_clear( &impl->media_ended );
@@ -761,6 +765,163 @@ static HRESULT WINAPI media_player_remove_BufferingEnded( IMediaPlayer *iface, E
 }
 
 static HRESULT media_player_resolve_source( struct media_player *impl );
+
+/*
+ * IMediaPlaybackDataSource, {c4f66b80-df04-4f79-afc2-bee3fc7c46e3}: private, IUnknown-based. The
+ * slot names are those of MediaTransportControlsServerPriv's vtable in Windows.Media.MediaControl's
+ * public PDB. XAML's MediaTransportControls get it from the player's SystemMediaTransportControls
+ * (see dlls/windows.media.mediacontrol) and send their play, pause, seek and rate requests to it;
+ * this one carries them straight to the player. It refers to the player weakly: the player owns
+ * the controls, which hold this object, and the player clears the pointer when it goes.
+ */
+static const GUID IID_IMediaPlaybackDataSource_local =
+    {0xc4f66b80,0xdf04,0x4f79,{0xaf,0xc2,0xbe,0xe3,0xfc,0x7c,0x46,0xe3}};
+static const GUID IID_IWineMediaControlDataSourceSink =
+    {0xcd4cabde,0x8598,0x4b25,{0xa7,0x36,0xc3,0x15,0x6e,0xa1,0x42,0x0c}};
+
+struct data_source
+{
+    const void **vtbl;
+    LONG ref;
+    struct media_player *player;
+};
+
+static HRESULT WINAPI ds_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct data_source *impl = iface;
+
+    if (!out) return E_POINTER;
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
+        IsEqualGUID( iid, &IID_IMediaPlaybackDataSource_local ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = iface;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI ds_AddRef( void *iface )
+{
+    return InterlockedIncrement( &((struct data_source *)iface)->ref );
+}
+static ULONG WINAPI ds_Release( void *iface )
+{
+    struct data_source *impl = iface;
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref) free( impl );
+    return ref;
+}
+static HRESULT WINAPI ds_not_implemented( void *iface, void *arg )
+{
+    FIXME( "iface %p, arg %p stub!\n", iface, arg );
+    return E_NOTIMPL;
+}
+/* MediaPlaybackCommands: Play, Pause, Stop, Record, FastForward, Rewind, Next, Previous, ... */
+static HRESULT WINAPI ds_SendMediaPlaybackCommand( void *iface, INT32 command )
+{
+    struct media_player *player = ((struct data_source *)iface)->player;
+
+    TRACE( "iface %p, command %d.\n", iface, command );
+
+    if (!player) return RPC_E_DISCONNECTED;
+    switch (command)
+    {
+    case 0: return IMediaPlayer_Play( &player->IMediaPlayer_iface );
+    case 1: return IMediaPlayer_Pause( &player->IMediaPlayer_iface );
+    case 2:
+        IMediaPlayer_Pause( &player->IMediaPlayer_iface );
+        return player->playback ? playback_seek( player->playback, 0 ) : S_OK;
+    default:
+        FIXME( "command %d not supported.\n", command );
+        return S_OK;
+    }
+}
+static HRESULT WINAPI ds_RegisterEventHandler( void *iface, void *handler, EventRegistrationToken *token )
+{
+    TRACE( "iface %p, handler %p.\n", iface, handler );
+    if (token) token->value = 0;
+    return S_OK;
+}
+static HRESULT WINAPI ds_UnregisterEventHandler( void *iface, EventRegistrationToken token )
+{
+    return S_OK;
+}
+static HRESULT WINAPI ds_SendRepeatModeChangeRequest( void *iface, INT32 mode )
+{
+    struct media_player *player = ((struct data_source *)iface)->player;
+    TRACE( "iface %p, mode %d.\n", iface, mode );
+    if (!player) return RPC_E_DISCONNECTED;
+    return IMediaPlayer_put_IsLoopingEnabled( &player->IMediaPlayer_iface, mode != 0 );
+}
+static HRESULT WINAPI ds_SendPlaybackRateChangeRequest( void *iface, DOUBLE rate )
+{
+    struct media_player *player = ((struct data_source *)iface)->player;
+    TRACE( "iface %p, rate %f.\n", iface, rate );
+    if (!player) return RPC_E_DISCONNECTED;
+    return IMediaPlayer_put_PlaybackRate( &player->IMediaPlayer_iface, rate );
+}
+static HRESULT WINAPI ds_SendShuffleEnabledChangeRequest( void *iface, BOOL enabled )
+{
+    TRACE( "iface %p, enabled %d.\n", iface, enabled );
+    return S_OK;
+}
+static HRESULT WINAPI ds_SendPlaybackPositionChangeRequest( void *iface, INT64 position )
+{
+    struct media_player *player = ((struct data_source *)iface)->player;
+    TRACE( "iface %p, position %I64d.\n", iface, position );
+    if (!player || !player->playback) return RPC_E_DISCONNECTED;
+    return playback_seek( player->playback, position );
+}
+static HRESULT WINAPI ds_GetIsRunningInGuestContainer( void *iface, BOOL *value )
+{
+    if (!value) return E_POINTER;
+    *value = FALSE;
+    return S_OK;
+}
+static const void *data_source_vtbl[] =
+{
+    ds_QueryInterface, ds_AddRef, ds_Release,
+    ds_not_implemented,                     /* GetMediaPlaybackInfo */
+    ds_SendMediaPlaybackCommand,
+    ds_not_implemented,                     /* GetMediaObjectInfo */
+    ds_not_implemented,                     /* GetMediaTimelineProperties */
+    ds_RegisterEventHandler,
+    ds_UnregisterEventHandler,
+    ds_SendRepeatModeChangeRequest,
+    ds_SendPlaybackRateChangeRequest,
+    ds_SendShuffleEnabledChangeRequest,
+    ds_SendPlaybackPositionChangeRequest,
+    ds_not_implemented,                     /* GetParentApplicationId */
+    ds_not_implemented,                     /* GetMediaObjectInfoAsSet */
+    ds_GetIsRunningInGuestContainer,
+};
+
+/* Hand the controls a data source (or, with NULL, take it back). */
+static void media_player_set_data_source( struct media_player *impl, struct data_source *source )
+{
+    HRESULT (WINAPI *set)( IUnknown *, IUnknown * );
+    IUnknown *sink;
+
+    if (FAILED(ISystemMediaTransportControls_QueryInterface( impl->controls, &IID_IWineMediaControlDataSourceSink,
+                                                            (void **)&sink )))
+    {
+        WARN( "the controls take no data source; XAML's transport buttons will do nothing.\n" );
+        return;
+    }
+    set = (void *)(*(void ***)sink)[3];
+    set( sink, (IUnknown *)source );
+    IUnknown_Release( sink );
+}
+
+static void media_player_drop_data_source( struct media_player *impl )
+{
+    if (!impl->data_source) return;
+    media_player_set_data_source( impl, NULL );
+    impl->data_source->player = NULL;
+    ds_Release( impl->data_source );
+    impl->data_source = NULL;
+}
 
 /*
  * IMediaPlayer4, {80035db0-7448-4770-afcf-2a57450914c5}: SetSurfaceSize and GetSurface.
@@ -2118,22 +2279,31 @@ static HRESULT WINAPI media_player3_put_StereoscopicVideoRenderMode( IMediaPlaye
  * lists come straight out of Windows.Media.winmd - but Wine's IDL declares
  * IMediaPlaybackCommandManager with no members, so these use raw vtables rather than the header's
  * empty one. Media Player asks for the command manager during startup and an E_NOTIMPL there is
- * the NotImplementedException it stops on; nothing raises these commands here, so the behaviours
- * are all disabled and the events never fire. A behaviour getter must still hand back an object:
- * the app dereferences what it gets.
+ * the NotImplementedException it stops on. Nothing raises the *Received commands here (there are
+ * no system media keys), but the behaviours report what the Auto rule would enable, since an app's
+ * own transport may follow them. A behaviour getter must hand back an object: the app
+ * dereferences what it gets.
  */
+enum command_kind
+{
+    COMMAND_PLAY, COMMAND_PAUSE, COMMAND_NEXT, COMMAND_PREVIOUS, COMMAND_FAST_FORWARD, COMMAND_REWIND,
+    COMMAND_SHUFFLE, COMMAND_AUTO_REPEAT, COMMAND_POSITION, COMMAND_RATE, COMMAND_COUNT
+};
 struct command_behavior
 {
     const void **vtbl;
     LONG ref;
     IUnknown *manager;
+    enum command_kind kind;
+    INT32 rule;                 /* MediaCommandEnablingRule: 0 Auto, 1 Always, 2 Never */
 };
 struct command_manager
 {
     const void **vtbl;
     LONG ref;
     IUnknown *player;
-    struct command_behavior *behavior;
+    boolean enabled;
+    struct command_behavior *behaviors[COMMAND_COUNT];
 };
 
 static const GUID IID_IMediaPlaybackCommandManager_local =
@@ -2179,19 +2349,43 @@ static HRESULT WINAPI cb_get_CommandManager( void *iface, void **value )
     if ((*value = impl->manager)) IUnknown_AddRef( impl->manager );
     return S_OK;
 }
+/* The Auto rule as Windows applies it to a single item: play and pause whenever something is
+ * open, seeking whenever the media can seek, nothing that needs a playlist. */
 static HRESULT WINAPI cb_get_IsEnabled( void *iface, boolean *value )
 {
+    struct command_behavior *impl = iface;
+    struct command_manager *manager = (struct command_manager *)impl->manager;
+    IMediaPlayer *player = (IMediaPlayer *)manager->player;
+    boolean can_pause = FALSE, can_seek = FALSE;
+
     if (!value) return E_POINTER;
-    *value = FALSE;
+    if (impl->rule == 1) *value = TRUE;
+    else if (impl->rule == 2 || !player) *value = FALSE;
+    else
+    {
+        IMediaPlayer_get_CanPause( player, &can_pause );
+        IMediaPlayer_get_CanSeek( player, &can_seek );
+        switch (impl->kind)
+        {
+        case COMMAND_PLAY: case COMMAND_PAUSE: case COMMAND_RATE: *value = can_pause; break;
+        case COMMAND_FAST_FORWARD: case COMMAND_REWIND: case COMMAND_POSITION: *value = can_seek; break;
+        default: *value = FALSE; break;
+        }
+    }
     return S_OK;
 }
 static HRESULT WINAPI cb_get_EnablingRule( void *iface, INT32 *value )
 {
     if (!value) return E_POINTER;
-    *value = 0;
+    *value = ((struct command_behavior *)iface)->rule;
     return S_OK;
 }
-static HRESULT WINAPI cb_put_EnablingRule( void *iface, INT32 value ) { return S_OK; }
+static HRESULT WINAPI cb_put_EnablingRule( void *iface, INT32 value )
+{
+    TRACE( "behavior %p kind %u, rule %d.\n", iface, ((struct command_behavior *)iface)->kind, value );
+    ((struct command_behavior *)iface)->rule = value;
+    return S_OK;
+}
 static HRESULT WINAPI cb_add_event( void *iface, void *handler, EventRegistrationToken *token )
 {
     if (!token) return E_POINTER;
@@ -2229,7 +2423,8 @@ static ULONG WINAPI cm_Release( void *iface )
     ULONG ref = InterlockedDecrement( &impl->ref );
     if (!ref)
     {
-        if (impl->behavior) cb_Release( impl->behavior );
+        unsigned int i;
+        for (i = 0; i < COMMAND_COUNT; i++) if (impl->behaviors[i]) cb_Release( impl->behaviors[i] );
         free( impl );
     }
     return ref;
@@ -2243,10 +2438,15 @@ static HRESULT WINAPI cm_GetTrustLevel( void *iface, TrustLevel *l ) { *l = Base
 static HRESULT WINAPI cm_get_IsEnabled( void *iface, boolean *value )
 {
     if (!value) return E_POINTER;
-    *value = FALSE;
+    *value = ((struct command_manager *)iface)->enabled;
     return S_OK;
 }
-static HRESULT WINAPI cm_put_IsEnabled( void *iface, boolean value ) { return S_OK; }
+static HRESULT WINAPI cm_put_IsEnabled( void *iface, boolean value )
+{
+    TRACE( "iface %p, value %d.\n", iface, value );
+    ((struct command_manager *)iface)->enabled = value;
+    return S_OK;
+}
 static HRESULT WINAPI cm_get_MediaPlayer( void *iface, void **value )
 {
     struct command_manager *impl = iface;
@@ -2254,14 +2454,27 @@ static HRESULT WINAPI cm_get_MediaPlayer( void *iface, void **value )
     if ((*value = impl->player)) IUnknown_AddRef( impl->player );
     return S_OK;
 }
-static HRESULT WINAPI cm_get_Behavior( void *iface, void **value )
+static HRESULT cm_get_behavior( void *iface, enum command_kind kind, void **value )
 {
     struct command_manager *impl = iface;
     if (!value) return E_POINTER;
-    cb_AddRef( impl->behavior );
-    *value = impl->behavior;
+    cb_AddRef( impl->behaviors[kind] );
+    *value = impl->behaviors[kind];
     return S_OK;
 }
+#define CM_BEHAVIOR(name, kind) \
+    static HRESULT WINAPI cm_get_##name( void *iface, void **value ) { return cm_get_behavior( iface, kind, value ); }
+CM_BEHAVIOR(PlayBehavior, COMMAND_PLAY)
+CM_BEHAVIOR(PauseBehavior, COMMAND_PAUSE)
+CM_BEHAVIOR(NextBehavior, COMMAND_NEXT)
+CM_BEHAVIOR(PreviousBehavior, COMMAND_PREVIOUS)
+CM_BEHAVIOR(FastForwardBehavior, COMMAND_FAST_FORWARD)
+CM_BEHAVIOR(RewindBehavior, COMMAND_REWIND)
+CM_BEHAVIOR(ShuffleBehavior, COMMAND_SHUFFLE)
+CM_BEHAVIOR(AutoRepeatModeBehavior, COMMAND_AUTO_REPEAT)
+CM_BEHAVIOR(PositionBehavior, COMMAND_POSITION)
+CM_BEHAVIOR(RateBehavior, COMMAND_RATE)
+#undef CM_BEHAVIOR
 static HRESULT WINAPI cm_add_event( void *iface, void *handler, EventRegistrationToken *token )
 {
     if (!token) return E_POINTER;
@@ -2275,8 +2488,9 @@ static const void *command_manager_vtbl[39] =
     cm_QueryInterface, cm_AddRef, cm_Release, cm_GetIids, cm_GetRuntimeClassName, cm_GetTrustLevel,
     cm_get_IsEnabled, cm_put_IsEnabled, cm_get_MediaPlayer,
     /* Play, Pause, Next, Previous, FastForward, Rewind, Shuffle, AutoRepeatMode, Position, Rate */
-    cm_get_Behavior, cm_get_Behavior, cm_get_Behavior, cm_get_Behavior, cm_get_Behavior,
-    cm_get_Behavior, cm_get_Behavior, cm_get_Behavior, cm_get_Behavior, cm_get_Behavior,
+    cm_get_PlayBehavior, cm_get_PauseBehavior, cm_get_NextBehavior, cm_get_PreviousBehavior,
+    cm_get_FastForwardBehavior, cm_get_RewindBehavior, cm_get_ShuffleBehavior,
+    cm_get_AutoRepeatModeBehavior, cm_get_PositionBehavior, cm_get_RateBehavior,
     /* the ten *Received event pairs */
     cm_add_event, cm_remove_event, cm_add_event, cm_remove_event, cm_add_event, cm_remove_event,
     cm_add_event, cm_remove_event, cm_add_event, cm_remove_event, cm_add_event, cm_remove_event,
@@ -2287,19 +2501,28 @@ static const void *command_manager_vtbl[39] =
 static HRESULT create_command_manager( IUnknown *player, void **out )
 {
     struct command_manager *impl;
+    unsigned int i;
 
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
-    if (!(impl->behavior = calloc( 1, sizeof(*impl->behavior) )))
+    for (i = 0; i < COMMAND_COUNT; i++)
     {
-        free( impl );
-        return E_OUTOFMEMORY;
+        if (!(impl->behaviors[i] = calloc( 1, sizeof(*impl->behaviors[i]) )))
+        {
+            while (i--) free( impl->behaviors[i] );
+            free( impl );
+            return E_OUTOFMEMORY;
+        }
+        impl->behaviors[i]->vtbl = command_behavior_vtbl;
+        impl->behaviors[i]->ref = 1;
+        impl->behaviors[i]->manager = (IUnknown *)impl;
+        impl->behaviors[i]->kind = i;
     }
     impl->vtbl = command_manager_vtbl;
     impl->ref = 1;
     impl->player = player;
-    impl->behavior->vtbl = command_behavior_vtbl;
-    impl->behavior->ref = 1;
-    impl->behavior->manager = (IUnknown *)impl;
+    /* The Windows default. XAML's MediaTransportControls only send their commands while the
+     * manager is enabled, through the controls' data source (see data_source above). */
+    impl->enabled = TRUE;
     *out = impl;
     return S_OK;
 }
@@ -2801,6 +3024,13 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
     }
 
     impl->IMediaPlayer_iface.lpVtbl = &media_player_vtbl;
+    if ((impl->data_source = calloc( 1, sizeof(*impl->data_source) )))
+    {
+        impl->data_source->vtbl = data_source_vtbl;
+        impl->data_source->ref = 1;
+        impl->data_source->player = impl;
+        media_player_set_data_source( impl, impl->data_source );
+    }
     if (FAILED(playback_create( media_player_notify, impl, &impl->playback )))
         WARN( "no playback engine; the player will not produce audio.\n" );
     impl->IMediaPlayer2_iface.lpVtbl = &media_player2_vtbl;

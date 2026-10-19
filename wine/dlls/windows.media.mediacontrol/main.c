@@ -508,10 +508,32 @@ static const struct ISystemMediaTransportControlsDisplayUpdaterVtbl display_upda
     display_updater_Update,
 };
 
+/*
+ * ISystemMediaTransportControlsInternal, {74570402-01a3-4274-81eb-9028daae65fc}: not in any
+ * metadata. XAML's MediaTransportControls (GetMediaPlaybackDataSource) asks the player's controls
+ * for it and calls slot 6, (REFIID, void **), for the IMediaPlaybackDataSource
+ * {c4f66b80-df04-4f79-afc2-bee3fc7c46e3} that its play, pause, seek and rate buttons drive. On
+ * Windows that data source is the controls server, which hands the commands to the player through
+ * ButtonPressed and the command manager; here the player supplies the data source itself, through
+ * the Wine-private sink below, so the commands reach it directly.
+ */
+static const GUID IID_ISystemMediaTransportControlsInternal =
+    {0x74570402,0x01a3,0x4274,{0x81,0xeb,0x90,0x28,0xda,0xae,0x65,0xfc}};
+/* Wine-private, {cd4cabde-8598-4b25-a736-c3156ea1420c}: slot 3 SetDataSource(IUnknown *). */
+static const GUID IID_IWineMediaControlDataSourceSink =
+    {0xcd4cabde,0x8598,0x4b25,{0xa7,0x36,0xc3,0x15,0x6e,0xa1,0x42,0x0c}};
+
+static const void *internal_vtbl[7];
+static const void *sink_vtbl[4];
+
 struct media_control
 {
     ISystemMediaTransportControls ISystemMediaTransportControls_iface;
+    const void **internal_vtbl;     /* ISystemMediaTransportControlsInternal */
+    const void **sink_vtbl;         /* IWineMediaControlDataSourceSink */
     LONG ref;
+    IUnknown *data_source;
+    SRWLOCK lock;
 
     HWND window;
     MediaPlaybackStatus media_playback_status;
@@ -544,6 +566,20 @@ static HRESULT WINAPI media_control_QueryInterface( ISystemMediaTransportControl
         return S_OK;
     }
 
+    if (IsEqualGUID( iid, &IID_ISystemMediaTransportControlsInternal ))
+    {
+        *out = &impl->internal_vtbl;
+        ISystemMediaTransportControls_AddRef( &impl->ISystemMediaTransportControls_iface );
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_IWineMediaControlDataSourceSink ))
+    {
+        *out = &impl->sink_vtbl;
+        ISystemMediaTransportControls_AddRef( &impl->ISystemMediaTransportControls_iface );
+        return S_OK;
+    }
+
     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
     *out = NULL;
     return E_NOINTERFACE;
@@ -564,7 +600,11 @@ static ULONG WINAPI media_control_Release( ISystemMediaTransportControls *iface 
 
     TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
 
-    if (!ref) free( impl );
+    if (!ref)
+    {
+        if (impl->data_source) IUnknown_Release( impl->data_source );
+        free( impl );
+    }
     return ref;
 }
 
@@ -891,6 +931,8 @@ static HRESULT WINAPI media_control_statics_GetForWindow( ISystemMediaTransportC
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
 
     impl->ISystemMediaTransportControls_iface.lpVtbl = &media_control_vtbl;
+    impl->internal_vtbl = internal_vtbl;
+    impl->sink_vtbl = sink_vtbl;
     impl->ref = 2;
     impl->window = window;
 
@@ -943,3 +985,94 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
     if (*factory) return S_OK;
     return CLASS_E_CLASSNOTAVAILABLE;
 }
+
+/* ISystemMediaTransportControlsInternal and the data source sink, as raw vtables. */
+static struct media_control *impl_from_internal( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct media_control, internal_vtbl );
+}
+static struct media_control *impl_from_sink( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct media_control, sink_vtbl );
+}
+static HRESULT WINAPI internal_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return ISystemMediaTransportControls_QueryInterface( &impl_from_internal( iface )->ISystemMediaTransportControls_iface, iid, out );
+}
+static ULONG WINAPI internal_AddRef( void *iface )
+{
+    return ISystemMediaTransportControls_AddRef( &impl_from_internal( iface )->ISystemMediaTransportControls_iface );
+}
+static ULONG WINAPI internal_Release( void *iface )
+{
+    return ISystemMediaTransportControls_Release( &impl_from_internal( iface )->ISystemMediaTransportControls_iface );
+}
+static HRESULT WINAPI internal_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    *count = 0;
+    *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI internal_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( L"Windows.Media.SystemMediaTransportControls", 42, name );
+}
+static HRESULT WINAPI internal_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    *level = BaseTrust;
+    return S_OK;
+}
+static HRESULT WINAPI internal_GetDataSource( void *iface, REFIID iid, void **out )
+{
+    struct media_control *impl = impl_from_internal( iface );
+    HRESULT hr = E_NOINTERFACE;
+
+    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
+
+    if (!out) return E_POINTER;
+    *out = NULL;
+    AcquireSRWLockShared( &impl->lock );
+    if (impl->data_source) hr = IUnknown_QueryInterface( impl->data_source, iid, out );
+    else WARN( "no player has supplied a data source.\n" );
+    ReleaseSRWLockShared( &impl->lock );
+    return hr;
+}
+static const void *internal_vtbl[7] =
+{
+    internal_QueryInterface, internal_AddRef, internal_Release,
+    internal_GetIids, internal_GetRuntimeClassName, internal_GetTrustLevel,
+    internal_GetDataSource,
+};
+
+static HRESULT WINAPI sink_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return ISystemMediaTransportControls_QueryInterface( &impl_from_sink( iface )->ISystemMediaTransportControls_iface, iid, out );
+}
+static ULONG WINAPI sink_AddRef( void *iface )
+{
+    return ISystemMediaTransportControls_AddRef( &impl_from_sink( iface )->ISystemMediaTransportControls_iface );
+}
+static ULONG WINAPI sink_Release( void *iface )
+{
+    return ISystemMediaTransportControls_Release( &impl_from_sink( iface )->ISystemMediaTransportControls_iface );
+}
+static HRESULT WINAPI sink_SetDataSource( void *iface, IUnknown *source )
+{
+    struct media_control *impl = impl_from_sink( iface );
+    IUnknown *old;
+
+    TRACE( "iface %p, source %p.\n", iface, source );
+
+    if (source) IUnknown_AddRef( source );
+    AcquireSRWLockExclusive( &impl->lock );
+    old = impl->data_source;
+    impl->data_source = source;
+    ReleaseSRWLockExclusive( &impl->lock );
+    if (old) IUnknown_Release( old );
+    return S_OK;
+}
+static const void *sink_vtbl[4] =
+{
+    sink_QueryInterface, sink_AddRef, sink_Release,
+    sink_SetDataSource,
+};
