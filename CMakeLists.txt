@@ -143,7 +143,7 @@ target_link_libraries(dmprocessxml PRIVATE oleaut32.lib)
 # Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager for the Microsoft Store.
 add_library(appinstallmanager SHARED shims/appinstallmanager/appinstallmanager.cpp)
 set_target_properties(appinstallmanager PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_appinstallmanager")
-target_link_libraries(appinstallmanager PRIVATE runtimeobject.lib)
+target_link_libraries(appinstallmanager PRIVATE runtimeobject.lib winhttp.lib ole32.lib)
 # Windows.System.Profile.WindowsIntegrityPolicy: not in S mode (Windows' asks a lockdown-policy service over RPC).
 add_library(integritypolicy SHARED shims/integritypolicy/integritypolicy.cpp)
 set_target_properties(integritypolicy PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_integritypolicy")

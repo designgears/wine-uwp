@@ -48,6 +48,8 @@ static void tracef(const char *fmt, ...)
     fflush(stderr);
 }
 
+#include "../common/storeservices.h"
+
 struct gp_slot { int slot; const char *name; int kind; /* 0 a method, 1 add_ event, 2 remove_ event */ };
 struct gp_class { const wchar_t *name; GUID statics; unsigned count; const gp_slot *slots; };
 #include "slots.h"
@@ -770,39 +772,6 @@ static HRESULT WINAPI pk_Create(Factory *, HSTRING source, INT32 type, IInspecta
 /* Store.QueryProductDetails: what Gaming Services knows of a Store product before it is installed.     */
 /* Gaming Services reads it from the Store catalogue; so does this, from the public display catalogue       */
 /* (displaycatalog.mp.microsoft.com, no account needed).                                                     */
-
-static std::string http_get(const wchar_t *host, const std::wstring &path, DWORD *status_out)
-{
-    std::string out;
-    DWORD status = 0, size = sizeof(status);
-    HINTERNET s = WinHttpOpen(L"wineuwp-gameplatform/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
-                              WINHTTP_NO_PROXY_BYPASS, 0), c = nullptr, r = nullptr;
-    if (!s) s = WinHttpOpen(L"wineuwp-gameplatform/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (s && (c = WinHttpConnect(s, host, INTERNET_DEFAULT_HTTPS_PORT, 0)) &&
-        (r = WinHttpOpenRequest(c, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)))
-    {
-        WinHttpSetTimeouts(r, 15000, 15000, 30000, 30000);
-        if (WinHttpSendRequest(r, L"Accept: application/json\r\n", (DWORD)-1, nullptr, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr))
-        {
-            WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &status, &size, nullptr);
-            for (;;)
-            {
-                DWORD avail = 0, got = 0;
-                if (!WinHttpQueryDataAvailable(r, &avail) || !avail) break;
-                size_t old = out.size();
-                out.resize(old + avail);
-                if (!WinHttpReadData(r, &out[old], avail, &got)) { out.resize(old); break; }
-                out.resize(old + got);
-                if (out.size() > (32u << 20)) break;
-            }
-        }
-    }
-    if (r) WinHttpCloseHandle(r);
-    if (c) WinHttpCloseHandle(c);
-    if (s) WinHttpCloseHandle(s);
-    if (status_out) *status_out = status;
-    return out;
-}
 
 struct ProductDetails { GUID content_id = {}; std::wstring family, store_id, wu_category; UINT64 size = 0; INT32 type = 2; bool uwp = true, encrypted = false; bool found = false; };
 

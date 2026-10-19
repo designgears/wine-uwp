@@ -12840,3 +12840,47 @@ Library opens too (`docs/screenshots/msstore-library.png`): Updates & downloads 
 listed (its "Modified 12/31/1600" is a zero FILETIME from our package data). Get updates goes through AppInstallManager,
 whose stand-in (`shims/appinstallmanager`) still answers empty lists, so the in-app self-update needs a real
 implementation there, backed by the FE3 download and `install-app.py` path the Xbox app's Gaming Services shim uses.
+
+### Microsoft Store: updating itself in-app, 22401 -> 22608 (2026-10-19)
+
+**Get updates works.** It asks for `AppUpdateOptions` (a class we did not register: the click did nothing) and then
+calls `IAppInstallManager6::SearchForAllUpdatesForUserAsync` with `AutomaticallyDownloadAndInstallUpdateIfFound` set.
+`shims/appinstallmanager` now registers `AppUpdateOptions` and answers the searches for real:
+- the running package's family and version come from `WINE_UWP_PACKAGE_FULL_NAME`;
+- the display catalogue's `products/lookup?alternateId=PackageFamilyName` gives the product id and Windows Update
+  category (`9WZDNCRFJBMP`, `64293252-...`);
+- FE3 lists the category's packages; the newest for the family is compared with the installed version;
+- a newer one becomes an `AppInstallItem` whose install runs `install-app.py URL DATADIR --stage NAME` into the
+  package's own stage directory, with `StatusChanged`/`ItemStatusChanged`/`ItemCompleted` raised from its
+  `PROGRESS`/`INSTALLED`/`EXIT` lines.
+
+The FE3 and catalogue code moved out of `shims/gameplatform/install.inc` into `shims/common/storeservices.h` for
+both shims. One click installed Microsoft Store 22608.1401.7.0 (frameworks UI.Xaml 2.8 8.2511 and VCLibs 33519 from
+the Windows tree) over `uwp-bin/stage/store`; the old stage is kept as `uwp-bin/stage/store.pre-update-22401`. The
+Library page still said "up to date" afterwards: it does not show the item while it installs, not looked at yet.
+
+**22608 then needed, in order:**
+1. `IPHLPAPI.GetNetworkConnectivityHint` (wosc.dll, unimplemented-function crash at start-up). Implemented:
+   internet access when a default route exists.
+2. CommunityToolkit's `ImplicitAnimationSet` builds its groups with `collection.Compositor.CreateAnimationGroup()`.
+   A recording `ImplicitAnimationCollection` answered `ICompositionObject` with its own table, so "Compositor" was a
+   new recording object and the cast of its "group" threw (splash screen forever). It now hands out the
+   compositor-aware object view, as lights already did. Found by logging every IID asked of that kind: the object
+   that was asked for `ICompositor` had been born a moment earlier from slot 6 of a collection.
+3. `IAnimationObject` on visuals (`AnimatedFrame`) and on interaction objects (`ResponsiveItemsRepeaterList`'s
+   tracker); `IVector<CompositionShape>` (`{42d4219a}`) on both Shapes collections, which XAML used as raw pointers
+   and .NET asks for first.
+4. `IWeakReferenceSource` from the catch-all: slot 3 is `GetWeakReference`, and the primary table's slot 3,
+   `GetIids`, wrote through a garbage third argument. A tear-off now answers it; the reference it gives is strong,
+   because our objects cannot tell a weak reference they are gone.
+
+The cast sites were found without symbols: the managed stack's top frame calls a QI stub with the IID loaded just
+before it (`movups <rip>`), or kept in a static the runtime fills, read with `WINE_UWP_BP=winstore.app.dll+<call>@rdx+0:4`.
+A parameterised IID nobody recognises is worth brute-forcing over IVector/IIterable/... of every Windows.UI type.
+**Get dcomp's base from a `BP armed` line before symbolising a fault address**: assuming the previous run's base sent
+me to two wrong functions.
+
+Now: the 22608 Home page shows its nav rail (Themes, What's New, Downloads, Library), search box and skeleton cards,
+then dies in `stop_collection_Clear` called from XAML's `CGradientStopCollection::AddWUCStops` (a dangling color
+stop in a brush's ColorStops), and under `warn+heap` timing in a generic slot writing a recording object through a
+non-pointer. Both are catch-all misuse still to be traced. Start-up takes ~2 minutes before the Home skeleton.

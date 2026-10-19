@@ -2624,6 +2624,82 @@ static HRESULT expr_anim2_create( IUnknown *owner, void **out )
     return S_OK;
 }
 
+/* IWeakReferenceSource {00000038} for any object answered by the catch-all below. Its slot 3 is
+ * GetWeakReference(IWeakReference **); handed the primary table, the Microsoft Store 22608's call landed in
+ * GetIids and wrote through a garbage third argument. The reference this gives out is strong: our objects have no
+ * hook for telling a weak reference they are gone, so Resolve keeps succeeding while the reference lives. */
+static const GUID IID_IWeakReferenceSource_local = { 0x00000038, 0, 0, { 0xc0, 0, 0, 0, 0, 0, 0, 0x46 } };
+static const GUID IID_IWeakReference_local = { 0x00000037, 0, 0, { 0xc0, 0, 0, 0, 0, 0, 0, 0x46 } };
+struct weak_view
+{
+    const void **vtbl;
+    LONG ref;
+    IUnknown *owner;
+};
+static HRESULT create_weak_view( IUnknown *owner, const void **vtbl, void **out )
+{
+    struct weak_view *view;
+
+    if (!(view = calloc( 1, sizeof(*view) ))) { *out = NULL; return E_OUTOFMEMORY; }
+    view->vtbl = vtbl;
+    view->ref = 1;
+    IUnknown_AddRef( (view->owner = owner) );
+    *out = view;
+    return S_OK;
+}
+static ULONG WINAPI weak_view_AddRef( void *iface )
+{
+    return InterlockedIncrement( &((struct weak_view *)iface)->ref );
+}
+static ULONG WINAPI weak_view_Release( void *iface )
+{
+    struct weak_view *view = iface;
+    ULONG ref = InterlockedDecrement( &view->ref );
+    if (!ref)
+    {
+        IUnknown_Release( view->owner );
+        free( view );
+    }
+    return ref;
+}
+static HRESULT WINAPI weak_ref_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IWeakReference_local ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ))
+    {
+        weak_view_AddRef( iface );
+        *out = iface;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+/* IWeakReference::Resolve(REFIID, IInspectable **) */
+static HRESULT WINAPI weak_ref_Resolve( void *iface, REFIID iid, void **out )
+{
+    struct weak_view *view = iface;
+    TRACE( "%p, owner %p, iid %s.\n", view, view->owner, debugstr_guid( iid ) );
+    return IUnknown_QueryInterface( view->owner, iid, out );
+}
+static const void *weak_ref_vtbl[] =
+{
+    weak_ref_QueryInterface, weak_view_AddRef, weak_view_Release, weak_ref_Resolve,
+};
+static HRESULT WINAPI weak_source_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return IUnknown_QueryInterface( ((struct weak_view *)iface)->owner, iid, out );
+}
+/* IWeakReferenceSource::GetWeakReference(IWeakReference **) */
+static HRESULT WINAPI weak_source_GetWeakReference( void *iface, void **out )
+{
+    if (!out) return E_POINTER;
+    return create_weak_view( ((struct weak_view *)iface)->owner, weak_ref_vtbl, out );
+}
+static const void *weak_source_vtbl[] =
+{
+    weak_source_QueryInterface, weak_view_AddRef, weak_view_Release, weak_source_GetWeakReference,
+};
+
 /* Windows.Foundation.IClosable for any object answered by the catch-all below. Its slot 6 is Close(), and handing
  * out the primary table made Close() run whatever typed method sits there: the Microsoft Store disposing a surface
  * brush ran get_BitmapInterpolationMode, which wrote through Close's missing argument and fail-fasted the app. Close
@@ -2708,8 +2784,13 @@ static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void 
     /* Composition lights are the exception: XAML's reveal lights (Windows.UI.Xaml.Controls'
      * RevealHoverLight) take the light's ICompositionObject, ask it for the compositor and build
      * their animations from that; the recording view answered nothing and the light code then
-     * dereferenced the animation it never got. */
-    if (IsEqualGUID( iid, &IID_ICompositionObject ) && object->kind && strstr( object->kind, "Light" ))
+     * dereferenced the animation it never got. So are implicit-animation collections: the Windows Community
+     * Toolkit (ImplicitAnimationSet.GetImplicitAnimationCollection) builds each entry's group with
+     * collection.Compositor.CreateAnimationGroup(); answered by this table, "Compositor" was a new recording object,
+     * its CreateAnimationGroup another collection, and the cast to CompositionAnimationGroup threw (the Microsoft
+     * Store 22608 stopped on its splash screen). */
+    if (IsEqualGUID( iid, &IID_ICompositionObject ) && object->kind &&
+        (strstr( object->kind, "Light" ) || !strcmp( object->kind, "ImplicitAnimationCollection" )))
         return create_composition_object_view( (IUnknown *)&object->vtbl, out );
     if (IsEqualGUID( iid, &IID_IMap_animations_local ))
         return comp_map_for_owner( (IUnknown *)&object->vtbl, out );
@@ -2724,6 +2805,8 @@ static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void 
         return surface_copy_query( iface, __builtin_return_address( 0 ), out );
     if (IsEqualGUID( iid, &IID_IClosable ))
         return create_closable_view( (IUnknown *)&object->vtbl, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local ))
+        return create_weak_view( (IUnknown *)&object->vtbl, weak_source_vtbl, out );
     InterlockedIncrement( &object->ref );
     *out = &object->vtbl;
     return S_OK;
@@ -11439,6 +11522,9 @@ static HRESULT visual_qi( struct visual *impl, REFIID iid, void **out )
         *out = &impl->visual4_vtbl;
     else if (IsEqualGUID( iid, &IID_ICompositionObject ))
         *out = &impl->ICompositionObject_iface;
+    /* Visual is an IAnimationObject on Windows; the Microsoft Store's AnimatedFrame casts its visual to it */
+    else if (IsEqualGUID( iid, &IID_IAnimationObject_local ))
+        return create_anim_object_view( (IUnknown *)&impl->ICompositionObject_iface, out );
     else if (IsEqualGUID( iid, &IID_IClosable ))
         *out = &impl->closable_vtbl;
     else if (IsEqualGUID( iid, &IID_IInteropVisual_private ) ||
@@ -11451,7 +11537,8 @@ static HRESULT visual_qi( struct visual *impl, REFIID iid, void **out )
                                              : (void *)&impl->IContainerVisual_iface;
     else
     {
-        FIXME( "visual: no interface %s.\n", debugstr_guid(iid) );
+        /* {7a1c3d02-...} are our own shape probes (IID_comp_shape_private), asked of anything */
+        if (iid->Data1 != 0x7a1c3d02) FIXME( "visual: no interface %s.\n", debugstr_guid(iid) );
         *out = NULL;
         return E_NOINTERFACE;
     }
@@ -11988,18 +12075,22 @@ static struct visual *impl_from_shapes( void *iface )
 {
     return CONTAINING_RECORD( iface, struct visual, shapes_vtbl );
 }
+/* IVector<CompositionShape>: XAML uses the get_Shapes pointer as it is, .NET asks for the interface first (the
+ * Microsoft Store's animated icons) */
+static const GUID IID_IVector_CompositionShape_local =
+    { 0x42d4219a, 0xbe1b, 0x5091, { 0x8f, 0x1e, 0x90, 0x27, 0x08, 0x40, 0xfc, 0x2d } };
 static HRESULT WINAPI shapes_QueryInterface( void *iface, REFIID iid, void **out )
 {
     struct visual *impl = impl_from_shapes( iface );
 
     if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
-        IsEqualGUID( iid, &IID_IAgileObject ))
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IVector_CompositionShape_local ))
     {
         visual_addref( impl );
         *out = iface;
         return S_OK;
     }
-    TRACE( "shapes %p: no interface %s.\n", impl, debugstr_guid(iid) );
+    FIXME( "shapes %p: no interface %s.\n", impl, debugstr_guid(iid) );
     *out = NULL;
     return E_NOINTERFACE;
 }
@@ -13652,6 +13743,7 @@ static const void *kfa3_vtbl[] =
 static HRESULT WINAPI kf_animation_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct kf_animation *impl = CONTAINING_RECORD( iface, struct kf_animation, vtbl );
 
@@ -13962,6 +14054,7 @@ static struct comp_clip *clip_from_any( void *iface )
 static HRESULT WINAPI clip_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct comp_clip *impl = CONTAINING_RECORD( iface, struct comp_clip, vtbl );
 
@@ -14256,6 +14349,7 @@ static ULONG WINAPI comp_batch_Release( void *iface )
 static HRESULT WINAPI comp_batch_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct comp_batch *batch = CONTAINING_RECORD( iface, struct comp_batch, vtbl );
 
@@ -14615,6 +14709,7 @@ static struct anim_controller *anim_controller_from_any( void *object )
 static HRESULT WINAPI anim_controller_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct anim_controller *ctrl = CONTAINING_RECORD( iface, struct anim_controller, vtbl );
 
@@ -14860,6 +14955,7 @@ static HRESULT WINAPI matrix_transform_SetMatrix( void *iface, const D2D_MATRIX_
 static HRESULT WINAPI matrix_transform_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct matrix_transform *impl = CONTAINING_RECORD( iface, struct matrix_transform, vtbl );
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
@@ -14896,6 +14992,7 @@ static struct matrix_transform *matrix_transform_from( IUnknown *object )
 static HRESULT WINAPI manip_transform_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct manip_transform *impl = CONTAINING_RECORD( iface, struct manip_transform, vtbl );
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
@@ -14928,6 +15025,7 @@ static struct expr_animation *expr_from_anim_view( void *iface )
 static HRESULT WINAPI expr_animation_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     struct expr_animation *impl = CONTAINING_RECORD( iface, struct expr_animation, vtbl );
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
     if (is_animation_group_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
@@ -15805,7 +15903,7 @@ static BOOL expr_resolve_colorrgb( void *animation, Color *color )
     if (vtbl == (void **)expr_animation_vtbl) expr = CONTAINING_RECORD( animation, struct expr_animation, vtbl );
     else if (vtbl == (void **)expr_anim_view_vtbl) expr = CONTAINING_RECORD( animation, struct expr_animation, anim_vtbl );
     else return FALSE;
-    if (wcsncmp( expr->expression, L"ColorRGB(", 9 )) return FALSE;
+    if (!expr->expression || wcsncmp( expr->expression, L"ColorRGB(", 9 )) return FALSE;
     e = expr->expression + 9;
     if (!(dot = wcschr( e, '.' )) || !(dot2 = wcschr( dot + 1, '.' ))) return FALSE;
     if ((n = dot - e) >= ARRAY_SIZE(ref) || dot2 - dot - 1 >= ARRAY_SIZE(prop)) return FALSE;
@@ -15883,7 +15981,7 @@ static struct propset_value *expr_resolve_value( void *animation, enum propset_t
     if (vtbl == (void **)expr_animation_vtbl) expr = CONTAINING_RECORD( animation, struct expr_animation, vtbl );
     else if (vtbl == (void **)expr_anim_view_vtbl) expr = CONTAINING_RECORD( animation, struct expr_animation, anim_vtbl );
     else return NULL;
-    if (!(dot = wcschr( expr->expression, '.' )) || dot - expr->expression >= ARRAY_SIZE(ref)) return NULL;
+    if (!expr->expression || !(dot = wcschr( expr->expression, '.' )) || dot - expr->expression >= ARRAY_SIZE(ref)) return NULL;
     for (e = expr->expression; e < dot; e++) if (!iswalnum( *e ) && *e != '_') return NULL;
     for (e = dot + 1; *e; e++) if (!iswalnum( *e ) && *e != '_') return NULL;
     lstrcpynW( ref, expr->expression, dot - expr->expression + 1 );
@@ -15924,6 +16022,7 @@ static struct path_geometry *geometry_from_view( void *iface ) { return CONTAINI
 static HRESULT WINAPI comp_shape_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     struct comp_shape *shape = CONTAINING_RECORD( iface, struct comp_shape, vtbl );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     TRACE( "%s %p, iid %s.\n", shape->kind, shape, debugstr_guid( iid ) );
@@ -16108,13 +16207,14 @@ static HRESULT WINAPI container_get_Shapes( void *iface, void **value )
 static HRESULT WINAPI shape_children_QueryInterface( void *iface, REFIID iid, void **out )
 {
     struct comp_shape *shape = shape_from_children( iface );
-    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ))
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
+        IsEqualGUID( iid, &IID_IVector_CompositionShape_local ))
     {
         InterlockedIncrement( &shape->ref );
         *out = iface;
         return S_OK;
     }
-    TRACE( "shape children %p: no interface %s.\n", shape, debugstr_guid( iid ) );
+    FIXME( "shape children %p: no interface %s.\n", shape, debugstr_guid( iid ) );
     *out = NULL;
     return E_NOINTERFACE;
 }
@@ -16228,6 +16328,7 @@ static const void *shape_children_vtbl[] =
 static HRESULT WINAPI path_geometry_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct path_geometry *geometry = CONTAINING_RECORD( iface, struct path_geometry, vtbl );
     TRACE( "%p, iid %s.\n", geometry, debugstr_guid( iid ) );
@@ -16609,6 +16710,7 @@ static LONG cubic_bezier_vtbl_ready;
 static HRESULT WINAPI cubic_bezier_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct cubic_bezier_easing *impl = CONTAINING_RECORD( iface, struct cubic_bezier_easing, vtbl );
 
@@ -16957,6 +17059,7 @@ static LONG effect_vtbls_ready;
 static HRESULT WINAPI effect_brush_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     struct effect_brush *brush = CONTAINING_RECORD( iface, struct effect_brush, vtbl );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
 
@@ -17093,6 +17196,7 @@ static const void *effect_brush_iface_vtbl[] =
 static HRESULT WINAPI effect_factory_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     struct effect_factory *factory = CONTAINING_RECORD( iface, struct effect_factory, vtbl );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
 
@@ -18718,6 +18822,7 @@ static struct nine_grid_brush *nine_grid_from( void *iface )
 static HRESULT WINAPI nine_grid_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     struct nine_grid_brush *brush = nine_grid_from( iface );
 
     static const GUID IID_ICompositionSurfaceBrush_local =
@@ -18956,6 +19061,7 @@ static struct mask_brush *mask_brush_from( void *iface )
 static HRESULT WINAPI mask_brush_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     struct mask_brush *brush = mask_brush_from( iface );
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
 
@@ -20343,6 +20449,7 @@ static struct animation_group *animation_group_from( void *iface )
 static HRESULT WINAPI animation_group_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
+    if (IsEqualGUID( iid, &IID_IWeakReferenceSource_local )) return create_weak_view( iface, weak_source_vtbl, out );
     struct animation_group *group = animation_group_from( iface );
 
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
@@ -21730,7 +21837,11 @@ static HRESULT WINAPI interactions_QueryInterface( void *iface, REFIID iid, void
         }
         return hr;
     }
-    TRACE( "%s: no interface %s.\n", object->kind, debugstr_guid( iid ) );
+    /* an InteractionTracker is a CompositionObject, so an IAnimationObject: the Microsoft Store's
+     * ResponsiveItemsRepeaterList casts its tracker to one */
+    if (IsEqualGUID( iid, &IID_IAnimationObject_local ))
+        return create_anim_object_view( (IUnknown *)&object->vtbl, out );
+    FIXME( "%s: no interface %s.\n", object->kind, debugstr_guid( iid ) );
     *out = NULL;
     return E_NOINTERFACE;
 }
