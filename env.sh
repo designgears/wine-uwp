@@ -22,3 +22,25 @@ export WINE_SRC=${WINE_SRC:-$HOME/src/wine}
 WINE_BUILD=${WINE_BUILD:-${WINE_BIN_DIR:-$HOME/src/wine-build}}
 export WINE_BUILD=${WINE_BUILD%/}
 export WINE_BIN_DIR="$WINE_BUILD/"
+
+# Proton normally adds these directories in ntdll from PROTON_EAC_RUNTIME.
+# Our Wine accepts WINEDLLPATH instead. Keep PE bridges and their Unix partners
+# together; copying just the DLLs into system32 loses the .so lookup path.
+if [ -z "${PROTON_EAC_RUNTIME:-}" ]; then
+  for eac_candidate in "$WINEPREFIX/drive_c/Program Files (x86)/Proton EasyAntiCheat Runtime" \
+      "$UWP_BIN/ext/ProtonEasyAntiCheatRuntime"; do
+    if [ -s "$eac_candidate/v2/lib64/easyanticheat.so" ]; then
+      export PROTON_EAC_RUNTIME=$(readlink -f "$eac_candidate")
+      break
+    fi
+  done
+fi
+if [ -n "${PROTON_EAC_RUNTIME:-}" ]; then
+  for eac_lib in "$PROTON_EAC_RUNTIME/v2/lib32" "$PROTON_EAC_RUNTIME/v2/lib64"; do
+    case :${WINEDLLPATH:-}: in
+      *:"$eac_lib":*) ;;
+      *) export WINEDLLPATH="${WINEDLLPATH:+$WINEDLLPATH:}$eac_lib" ;;
+    esac
+  done
+fi
+unset eac_candidate eac_lib

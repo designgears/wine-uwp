@@ -108,9 +108,9 @@ UWP_LOG=${UWP_LOG:-/tmp/wine-uwp-last.log}
 # UWP_VDESKTOP=WxH runs the app inside a Wine virtual desktop of that size (e.g. under Xvfb, where
 # `import -display :N -window root` can screenshot it regardless of the host session).
 if [ -n "${UWP_VDESKTOP:-}" ]; then
-  timeout "${UWP_TIMEOUT:-60}" wine explorer "/desktop=uwp,$UWP_VDESKTOP" "$exe" "$@" > "$UWP_LOG" 2>&1
+  stdbuf -oL -eL timeout "${UWP_TIMEOUT:-60}" wine explorer "/desktop=uwp,$UWP_VDESKTOP" "$exe" "$@" > "$UWP_LOG" 2>&1
 else
-  timeout "${UWP_TIMEOUT:-60}" wine "$exe" "$@" > "$UWP_LOG" 2>&1
+  stdbuf -oL -eL timeout "${UWP_TIMEOUT:-60}" wine "$exe" "$@" > "$UWP_LOG" 2>&1
 fi
 status=$?
 grep -vE "MESA|pci id|winemac|Loaded .*system32" "$UWP_LOG"

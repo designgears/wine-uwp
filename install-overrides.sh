@@ -7,6 +7,11 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]:-$0}")/./env.sh"
 export WINEPREFIX=${WINEPREFIX}
+# Runtime downloads are explicit (packaging/install-eac-runtime.sh --download).
+# Once available, attach it to new prefixes even when the DLL stamp is unchanged.
+if [ -n "${PROTON_EAC_RUNTIME:-}" ]; then
+  "$(dirname "$0")/packaging/install-eac-runtime.sh" >/dev/null
+fi
 SYS32=$WINEPREFIX/drive_c/windows/system32
 WINE_BIN=$WINE_BIN_DIR   # from env.sh, sourced above; always ends in a slash
 # The Windows file tree: uwp-bin/win11 (copied from an installation) or one harvested from an ISO
@@ -28,7 +33,7 @@ STAMP=$WINEPREFIX/.install-overrides.stamp
 # The shim DLLs have to be in the stamp: without them, rebuilding a shim leaves the stamp
 # unchanged, the installer skips itself, and the prefix keeps running the previous build - which
 # looks exactly like the code change having no effect.
-stamp=$( { find "$SRC" "$(dirname "$SRC")/Globalization" "$(dirname "$SRC")/Fonts" -printf '%p %s %T@\n' 2>/dev/null; stat -c '%Y' "$SYS32" "$(wine_pe ntdll)" "$(wine_pe wineuwp)" "$0" "$(dirname "$0")/globalization.reg" 2>/dev/null; stat -c '%n %s %Y' ${SHIM_DIR}/wineuwp_*.dll 2>/dev/null; echo "${1:-}"; } | md5sum | cut -d' ' -f1 )
+stamp=$( { find "$SRC" "$(dirname "$SRC")/Globalization" "$(dirname "$SRC")/Fonts" -printf '%p %s %T@\n' 2>/dev/null; stat -c '%Y' "$SYS32" "$(wine_pe ntdll)" "$(wine_pe wineuwp)" "$0" "$(dirname "$0")/globalization.reg" 2>/dev/null; stat -c '%n %s %Y' ${SHIM_DIR}/wineuwp_*.dll ${SHIM_DIR}/xgameruntime.dll 2>/dev/null; echo "${1:-}"; } | md5sum | cut -d' ' -f1 )
 if [ -z "${WINE_UWP_FORCE_OVERRIDES:-}" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$stamp" ]; then
   echo "overrides unchanged"
   exit 0
@@ -406,6 +411,16 @@ fi
 # Microsoft.GamePlatform.Services.*: the Gaming Services client classes (see shims/gameplatform). They
 # replace the package's own Microsoft.GamePlatform.Services.dll (OverridesPackage=1, read by combase),
 # whose NT services cannot run under Wine.
+# GDK titles LoadLibrary xgameruntime.dll through GdkSupport. Our stand-in answers
+# XPackageFindChunkAvailability from the stage's .wine-uwp-chunks.json.
+GR_SHIM=${SHIM_DIR}/xgameruntime.dll
+if [ -f "$GR_SHIM" ]; then
+  GR_DST=$SYS32/xgameruntime.dll
+  if ! cmp -s "$GR_SHIM" "$GR_DST"; then cp -f --reflink=auto "$GR_SHIM" "$GR_DST"; fi
+  "${WINE_BIN}wine" reg add 'HKCU\Software\Wine\DllOverrides' /v xgameruntime /t REG_SZ /d native /f >/dev/null 2>&1
+  echo "installed: xgameruntime (GDK package availability)"
+fi
+
 GP_SHIM=${SHIM_DIR}/wineuwp_gameplatform.dll
 if [ -f "$GP_SHIM" ]; then
   GP_DST=$SYS32/wineuwp_gameplatform.dll
