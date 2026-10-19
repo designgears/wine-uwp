@@ -8,7 +8,7 @@ by its prefix path so the process never maps two copies (Findings-M4.md). DLLs W
 itself keep their builtin registration.
 Usage: gen-clsid-reg.py <SOFTWARE hive> <extracted System32 dir> <out.reg>
 """
-import os, sys
+import os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import uwppaths
 import sys, os
@@ -26,6 +26,36 @@ keep_builtin = {"ole32.dll", "combase.dll", "oleaut32.dll", "rpcrt4.dll", "actxp
                 "d2d1.dll", "d3d11.dll", "dxgi.dll", "dwrite.dll", "mf.dll", "mfplat.dll", "msxml6.dll",
                 "iertutil.dll", "windowscodecs.dll", "uiautomationcore.dll"}
 
+def wine_builtin_clsids():
+    """CLSIDs the prefix already registers to a Wine builtin. Wine implements some classes in a different DLL than
+    Windows does (the Media Foundation File Scheme Handler is mfcore.dll on Windows, mf.dll in Wine), so the DLL
+    name test above misses them, and importing Windows' entry after wineboot would replace Wine's working class
+    with a native DLL it cannot run (Halo Infinite crashed in mfcore on its first video)."""
+    reg = os.path.join(uwppaths.PREFIX, "system.reg")
+    if not os.path.isfile(reg):
+        return set()
+    builtin = {}
+    def is_builtin(base):
+        if base not in builtin:
+            try:
+                with open(os.path.join(prefix_sys32, base), "rb") as f:
+                    builtin[base] = b"Wine builtin DLL" in f.read(128)
+            except OSError:
+                builtin[base] = False
+        return builtin[base]
+    found, key = set(), None
+    for line in open(reg, encoding="utf-8", errors="replace"):
+        if line.startswith("["):
+            m = re.match(r"\[Software\\\\Classes\\\\CLSID\\\\(\{[^}]+\})\\\\InprocServer32\]", line, re.I)
+            key = m.group(1).upper() if m else None
+        elif key and line.startswith("@="):
+            path = line[2:].strip().strip('"').replace("\\\\", "\\")
+            if path.lower().startswith("c:\\windows\\system32\\") and is_builtin(path.rsplit("\\", 1)[-1].lower()):
+                found.add(key)
+    return found
+
+wine_clsids = wine_builtin_clsids()
+
 def esc(s):
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
@@ -40,7 +70,7 @@ for c in h.subkeys(h.key(r"\Classes\CLSID")):
     if not isinstance(dll, str) or not dll:
         continue
     base = dll.replace("\\", "/").rsplit("/", 1)[-1].lower()
-    if base in keep_builtin or base not in present:
+    if base in keep_builtin or base not in present or h.name(c).upper() in wine_clsids:
         nskip += 1; continue
     name = h.values(c).get("(default)", "")
     lines.append(r"[HKEY_LOCAL_MACHINE\Software\Classes\CLSID\%s]" % h.name(c))

@@ -12744,3 +12744,42 @@ WebSocket, `AMQPWSB10`; Halo's telemetry stream carries its own log text), and `
 `WinHttpWebSocketShutdown` naming XsapiThunks (libHttpClient) and the game as the caller. Both were removed again.
 Still open: "The Microsoft Store user is not the same as the logged in Xbox Live user" at start-up (only blocks
 real-money purchases; no Store call precedes it).
+
+## Halo Infinite from a fresh prefix (2026-10-19)
+
+`packaging/new-prefix.sh uwp-bin/win11 uwp-bin/prefix-fresh-halo` (WoW64 build), the sign-in store copied in, an empty
+data directory `uwp-bin/xbox-fresh`. Result: Xbox app signed in, Halo installs from it, and Halo reaches its main menu
+online (`docs/screenshots/halo-fresh-prefix-main-menu.png`). The Xbox app's own install flow was verified up to a
+running download (Choose what to install -> drive -> Install -> Downloading); the 80 GB payload was then reflinked
+from the existing install instead, with every hand-made addition stripped. Four bugs a long-lived prefix had hidden:
+
+- **Xbox app crashed on start** in `Microsoft.ReactNative.dll+0x69505`: our `MessageWebSocketControl.SupportedProtocols`
+  returned NULL and React Native appends to it. Older prefixes never registered `MessageWebSocket`, so RN took
+  another path. Now a real `IVector<HSTRING>` (`windows.networking/hstringvector.c`), offered as
+  `Sec-WebSocket-Protocol`, with the server's choice in `Information.Protocol`.
+- **Xbox app stayed signed out.** Its own `XboxAuthManager` (client `000000004424DA1F`, title 704208617) was taken for
+  a GDK title context, which pins a Win32 device token; SISU refuses this client with Win32 (401). Only a package with
+  `MicrosoftGame.Config` sets a title context now. This affected every prefix since the Halo title-context work.
+- **Drive picker: "0 B available"** for an empty data directory (no `stage/` yet); free space is now measured on the
+  nearest existing folder.
+- **Halo: "Package exe running outside of a package"** (`0xe343000a`, info[0] the string in `game/HaloInfinite.exe`).
+  `kernelbase` reads `WINE_UWP_PACKAGE_FULL_NAME` from the Windows environment; EAC's bootstrapper starts the game
+  through its native helper, whose Wine process imports the host environment, and a child's host environment was
+  always its parent's. `run.sh` hid this by exporting everything host-side. ntdll's `spawn_process` now copies
+  `WINEDLLOVERRIDES`, `WINE_HACK_NATIVE_SYSCALLS` and `WINE_UWP_*` from the child's block into its host environment.
+  That also retires the per-exe `AppDefaults` override for `concrt140`.
+- **Halo crashed in Windows' `mfcore.dll`** on its first video: `gen-clsid-reg.py` registered the Media Foundation
+  File Scheme Handler `{477EC299}` to `mfcore.dll`, where Windows keeps it; Wine implements it in `mf.dll`. Old
+  prefixes survived because a later wineboot re-registered Wine's. The generator now skips any CLSID the prefix
+  already registers to a Wine builtin.
+
+The manual Halo setup is now the installer's: `packaging/install-d3d-runtime.sh [--download]` provides DXVK 3.1.1 and
+vkd3d-proton 3.0.1 (Proton Experimental's if installed, else the pinned GitHub releases, checked by SHA256) in
+`uwp-bin/ext/d3d-runtime`; `install-app.py` links them, and copies the VCLibs `concrt140.dll`, next to each executable
+of a GDK package that names `d3d12.dll` / `concrt140.dll` in its bytes (Halo's campaign exe is packed and imports only
+`Arbiter.dll`), and lists those modules `n,b` in `launch.env`. Not needed in the fresh stage: copies of
+`xgameruntime.dll` and `wineuwp_xboxauth.dll` in `game/`, and running `EasyAntiCheat_EOS_Setup.exe` (EAC reports 301
+without it). The fresh test used the release DXVK/vkd3d-proton downloads, not Proton's.
+
+Not yet done: the shared `~/src/wine-build` still has the old ntdll and windows.networking (built only in
+`uwp-bin/wine-build-wow64`); the regression suite has not been run on them.

@@ -35,6 +35,7 @@ import fcntl
 import json
 import hashlib
 import io
+import mmap
 import os
 import re
 import shutil
@@ -1035,6 +1036,62 @@ def publish_stage(dest, final):
     remove_staging_entry(backup)
 
 
+GDK_D3D_DLLS = ("dxgi.dll", "d3d11.dll", "d3d12.dll", "d3d12core.dll")
+
+
+def d3d_runtime_dir():
+    """packaging/install-d3d-runtime.sh's output: DXVK's dxgi/d3d11 and vkd3d-proton's d3d12/d3d12core."""
+    if os.environ.get("WINE_UWP_D3D_RUNTIME"):
+        return os.environ["WINE_UWP_D3D_RUNTIME"]
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(os.environ.get("UWP_BIN", os.path.join(root, "uwp-bin")), "ext", "d3d-runtime",
+                        "x86_64-windows")
+
+
+def link_gdk_native_dlls(dest, framework_dirs):
+    """A GDK game's native copies of DLLs Wine also builds, put next to each executable that names them; returns
+    the module names, which launch.env then marks native,builtin (for that game only).
+
+    Wine's d3d12 lacks what these games check for at start (Halo Infinite: Tiled Resources Tier 2), so a game that
+    names d3d12.dll gets vkd3d-proton and the DXVK dxgi it presents through. Wine's concrt140 lacks parts of the
+    Concurrency Runtime (STATUS_WINE_STUB in Halo), so one that names concrt140.dll gets the VCLibs framework's. The
+    test is the name in the file's bytes, not its import table: a packed executable (Halo's campaign) imports only
+    its unpacker."""
+    if not os.path.isfile(os.path.join(dest, "MicrosoftGame.Config")):
+        return []
+    runtime = d3d_runtime_dir()
+    have_d3d = all(os.path.exists(os.path.join(runtime, n)) for n in GDK_D3D_DLLS)
+    concrt = next((os.path.join(d, f) for d in framework_dirs if os.path.isdir(d)
+                   for f in os.listdir(d) if f.lower() == "concrt140.dll"), None)
+    used = set()
+    for dirpath, dirs, files in os.walk(dest):
+        dirs[:] = [d for d in dirs if d.lower() != "easyanticheat"]
+        for f in files:
+            path = os.path.join(dirpath, f)
+            if not f.lower().endswith(".exe") or os.path.islink(path) or not os.path.getsize(path):
+                continue
+            with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
+                want = []
+                if re.search(rb"(?i)d3d12\.dll", m):
+                    if have_d3d:
+                        want += [(os.path.join(runtime, n), n, True) for n in GDK_D3D_DLLS]
+                    else:
+                        say(f"warning: {f} uses Direct3D 12 and there is no {runtime}; "
+                            "run packaging/install-d3d-runtime.sh --download")
+                if concrt and re.search(rb"(?i)concrt140\.dll", m):
+                    want.append((concrt, "concrt140.dll", False))
+            names = {n.lower() for n in os.listdir(dirpath)}
+            for src, name, link in want:
+                target = os.path.join(dirpath, name)
+                if name.lower() not in names:
+                    if link:
+                        os.symlink(os.path.realpath(src), target)
+                    else:
+                        shutil.copy2(src, target)
+                used.add(name[:-4].lower())
+    return sorted(used)
+
+
 def write_gdk_chunk_metadata(pkg, dest, package_full_name):
     """Record which GDK chunks were installed so xgameruntime can answer availability queries."""
     if not isinstance(pkg, MsixvcPackage):
@@ -1223,6 +1280,12 @@ def install_package(args, resources):
                        for d in frameworks)
         f.write(f"export WINE_UWP_PACKAGE_DEPENDENCIES='{deps}'\n")
         f.write("export WINEPATH='" + ":".join(os.path.abspath(os.path.join(fw_root, d)) for d in frameworks) + "'\n")
+        native = link_gdk_native_dlls(dest, [os.path.join(fw_root, d) for d in frameworks])
+        if native:
+            # literal, as wineuwp-launch expands nothing; the defaults' list plus this game's own native DLLs
+            base = re.findall(r"^export WINEDLLOVERRIDES='([^']*)'", open(defaults).read() if os.path.exists(defaults)
+                              else "", re.M)
+            f.write("export WINEDLLOVERRIDES='" + ";".join(base[-1:] + [",".join(native) + "=n,b"]) + "'\n")
     shim_dir = os.environ.get("SHIM_DIR") or os.path.join(os.environ.get("UWP_BIN", os.path.join(root, "uwp-bin")),
                                                           "build-probes")
     launcher = os.path.join(shim_dir, "wineuwp-launch.exe")
