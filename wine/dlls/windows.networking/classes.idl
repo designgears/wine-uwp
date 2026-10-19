@@ -28,4 +28,5 @@ import "windows.networking.sockets.idl";
 
 namespace Windows.Networking.Sockets {
     runtimeclass StreamSocket;
+    runtimeclass MessageWebSocket;
 }

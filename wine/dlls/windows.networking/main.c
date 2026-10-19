@@ -38,6 +38,9 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
     if (!wcscmp( buffer, RuntimeClass_Windows_Networking_Sockets_StreamSocket ))
         IActivationFactory_QueryInterface( stream_socket_factory, &IID_IActivationFactory, (void **)factory );
 
+    if (!wcscmp( buffer, RuntimeClass_Windows_Networking_Sockets_MessageWebSocket ))
+        IActivationFactory_QueryInterface( message_websocket_factory, &IID_IActivationFactory, (void **)factory );
+
     if (*factory) return S_OK;
     return CLASS_E_CLASSNOTAVAILABLE;
 }

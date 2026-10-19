@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     c1c46c4126fd28e4e06f4d33a8fd45c2b27f7108
-                 Antialias SVG and Win2D geometry and filter reduced composition surfaces
+  wine HEAD:     2951a4ae1c1e52cf1df90c88f9628f9abb13452e
+                 ws2_32: Trace send destinations and the first bytes sent.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-16T23:31:01Z
+  captured:      2026-10-19T03:44:31Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

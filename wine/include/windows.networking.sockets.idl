@@ -30,14 +30,36 @@ import "windows.storage.streams.idl";
 namespace Windows.Networking.Sockets {
     typedef enum SocketProtectionLevel SocketProtectionLevel;
     typedef enum SocketQualityOfService SocketQualityOfService;
+    typedef enum SocketMessageType SocketMessageType;
+
+    typedef struct BandwidthStatistics BandwidthStatistics;
 
     interface IStreamSocket;
     interface IStreamSocketControl;
     interface IStreamSocketInformation;
+    interface IWebSocket;
+    interface IWebSocketControl;
+    interface IWebSocketInformation;
+    interface IWebSocketClosedEventArgs;
+    interface IMessageWebSocket;
+    interface IMessageWebSocketControl;
+    interface IMessageWebSocketMessageReceivedEventArgs;
 
     runtimeclass StreamSocket;
     runtimeclass StreamSocketControl;
     runtimeclass StreamSocketInformation;
+    runtimeclass MessageWebSocket;
+    runtimeclass MessageWebSocketControl;
+    runtimeclass MessageWebSocketInformation;
+    runtimeclass MessageWebSocketMessageReceivedEventArgs;
+    runtimeclass WebSocketClosedEventArgs;
+
+    declare
+    {
+        interface Windows.Foundation.Collections.IVector<HSTRING>;
+        interface Windows.Foundation.TypedEventHandler<Windows.Networking.Sockets.IWebSocket *, Windows.Networking.Sockets.WebSocketClosedEventArgs *>;
+        interface Windows.Foundation.TypedEventHandler<Windows.Networking.Sockets.MessageWebSocket *, Windows.Networking.Sockets.MessageWebSocketMessageReceivedEventArgs *>;
+    }
 
     [contract(Windows.Foundation.UniversalApiContract, 1.0)]
     enum SocketProtectionLevel
@@ -68,6 +90,24 @@ namespace Windows.Networking.Sockets {
     {
         Normal            = 0,
         LowLatency        = 1,
+    };
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    enum SocketMessageType
+    {
+        Binary = 0,
+        Utf8   = 1,
+    };
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    struct BandwidthStatistics
+    {
+        UINT64 OutboundBitsPerSecond;
+        UINT64 InboundBitsPerSecond;
+        UINT64 OutboundBitsPerSecondInstability;
+        UINT64 InboundBitsPerSecondInstability;
+        boolean OutboundBandwidthPeaked;
+        boolean InboundBandwidthPeaked;
     };
 
     [
@@ -165,5 +205,149 @@ namespace Windows.Networking.Sockets {
     runtimeclass StreamSocketInformation
     {
         [default] interface Windows.Networking.Sockets.IStreamSocketInformation;
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(ceb78d07-d0a8-4703-a091-c8c2c0915bc3)
+    ]
+    interface IWebSocketClosedEventArgs : IInspectable
+    {
+        [propget] HRESULT Code([out, retval] UINT16 *value);
+        [propget] HRESULT Reason([out, retval] HSTRING *value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(478c22ac-4c4b-42ed-9ed7-1ef9f94fa3d5)
+    ]
+    interface IMessageWebSocketMessageReceivedEventArgs : IInspectable
+    {
+        [propget] HRESULT MessageType([out, retval] Windows.Networking.Sockets.SocketMessageType *value);
+        HRESULT GetDataReader([out, retval] IInspectable **data_reader);
+        HRESULT GetDataStream([out, retval] Windows.Storage.Streams.IInputStream **input_stream);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(2ec4bdc3-d9a5-455a-9811-de24d45337e9)
+    ]
+    interface IWebSocketControl : IInspectable
+    {
+        [propget] HRESULT OutboundBufferSizeInBytes([out, retval] UINT32 *value);
+        [propput] HRESULT OutboundBufferSizeInBytes([in] UINT32 value);
+        [propget] HRESULT ServerCredential([out, retval] IInspectable **value);
+        [propput] HRESULT ServerCredential([in] IInspectable *value);
+        [propget] HRESULT ProxyCredential([out, retval] IInspectable **value);
+        [propput] HRESULT ProxyCredential([in] IInspectable *value);
+        [propget] HRESULT SupportedProtocols([out, retval] Windows.Foundation.Collections.IVector<HSTRING> **value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Networking.Sockets.MessageWebSocketControl),
+        uuid(8118388a-c629-4f0a-80fb-81fc05538862)
+    ]
+    interface IMessageWebSocketControl : IInspectable
+    {
+        [propget] HRESULT MaxMessageSize([out, retval] UINT32 *value);
+        [propput] HRESULT MaxMessageSize([in] UINT32 value);
+        [propget] HRESULT MessageType([out, retval] Windows.Networking.Sockets.SocketMessageType *value);
+        [propput] HRESULT MessageType([in] Windows.Networking.Sockets.SocketMessageType value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(5e01e316-c92a-47a5-b25f-07847639d181)
+    ]
+    interface IWebSocketInformation : IInspectable
+    {
+        [propget] HRESULT LocalAddress([out, retval] Windows.Networking.HostName **value);
+        [propget] HRESULT BandwidthStatistics([out, retval] Windows.Networking.Sockets.BandwidthStatistics *value);
+        [propget] HRESULT Protocol([out, retval] HSTRING *value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        uuid(f877396f-99b1-4e18-bc08-850c9adf156e)
+    ]
+    interface IWebSocket : IInspectable
+    {
+        [propget] HRESULT OutputStream([out, retval] Windows.Storage.Streams.IOutputStream **value);
+        HRESULT ConnectAsync([in] Windows.Foundation.Uri *uri,
+                [out, retval] Windows.Foundation.IAsyncAction **operation);
+        HRESULT SetRequestHeader([in] HSTRING header_name, [in] HSTRING header_value);
+        [eventadd] HRESULT Closed(
+                [in] Windows.Foundation.TypedEventHandler<Windows.Networking.Sockets.IWebSocket *, Windows.Networking.Sockets.WebSocketClosedEventArgs *> *handler,
+                [out, retval] EventRegistrationToken *token);
+        [eventremove] HRESULT Closed([in] EventRegistrationToken token);
+        [overload("Close")] HRESULT CloseWithStatus([in] UINT16 code, [in] HSTRING reason);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Networking.Sockets.MessageWebSocket),
+        uuid(33727d08-34d5-4746-ad7b-8dde5bc2ef88)
+    ]
+    interface IMessageWebSocket : IInspectable
+    {
+        [propget] HRESULT Control([out, retval] Windows.Networking.Sockets.IMessageWebSocketControl **value);
+        [propget] HRESULT Information([out, retval] Windows.Networking.Sockets.IWebSocketInformation **value);
+        [eventadd] HRESULT MessageReceived(
+                [in] Windows.Foundation.TypedEventHandler<Windows.Networking.Sockets.MessageWebSocket *, Windows.Networking.Sockets.MessageWebSocketMessageReceivedEventArgs *> *handler,
+                [out, retval] EventRegistrationToken *token);
+        [eventremove] HRESULT MessageReceived([in] EventRegistrationToken token);
+    }
+
+    [
+        activatable(Windows.Foundation.UniversalApiContract, 1.0),
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile),
+        threading(both)
+    ]
+    runtimeclass MessageWebSocket
+    {
+        [default] interface Windows.Networking.Sockets.IMessageWebSocket;
+        interface Windows.Networking.Sockets.IWebSocket;
+        interface Windows.Foundation.IClosable;
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile),
+        threading(both)
+    ]
+    runtimeclass MessageWebSocketControl
+    {
+        [default] interface Windows.Networking.Sockets.IMessageWebSocketControl;
+        interface Windows.Networking.Sockets.IWebSocketControl;
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile),
+        threading(both)
+    ]
+    runtimeclass MessageWebSocketInformation
+    {
+        [default] interface Windows.Networking.Sockets.IWebSocketInformation;
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile)
+    ]
+    runtimeclass MessageWebSocketMessageReceivedEventArgs
+    {
+        [default] interface Windows.Networking.Sockets.IMessageWebSocketMessageReceivedEventArgs;
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile)
+    ]
+    runtimeclass WebSocketClosedEventArgs
+    {
+        [default] interface Windows.Networking.Sockets.IWebSocketClosedEventArgs;
     }
 }

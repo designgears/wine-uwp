@@ -2636,15 +2636,22 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         RIP_sig(sigcontext) -= 2;  /* retry the syscall */
         return;
     }
-    /* Proton's native-module interop opt-in. Linux helpers live above Wine's
-     * Windows address range and must retain Linux syscall semantics. */
+    /* Proton's native-module interop opt-in. Linux helpers (EAC EOS at
+     * 0x700100000000) must retain Linux syscall semantics. Cap the allow
+     * window at Wine's high PE reserve (0x7ffffe000000): that range holds
+     * Windows Nt* stubs, and treating them as Linux syscalls (e.g. rax 0x50
+     * → chmod instead of NtProtectVirtualMemory) aborts native DLL
+     * PROCESS_ATTACH with STATUS_DLL_INIT_FAILED. Still include the usual
+     * 0x7f………… ELF/libc mappings — the prctl selector replaces the prior
+     * libc-only window, so cutting those out turns Linux close(3) into
+     * NtMapUserPhysicalPagesScatter and hangs the EAC Wine mapper. */
     if (allow_native_syscalls && RIP_sig(sigcontext) >= 0x700100000000 &&
-        RIP_sig(sigcontext) < 0x7fffffff0000)
+        RIP_sig(sigcontext) < 0x7ffffe000000)
     {
         struct amd64_thread_data *thread_data = amd64_thread_data( data );
 
         if (thread_data && !prctl( PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_ON,
-                                  0x700100000000, 0x7fffffff0000 - 0x700100000000,
+                                  0x700100000000, 0x7ffffe000000 - 0x700100000000,
                                   &thread_data->syscall_dispatch ))
         {
             TRACE_(seh)( "allowing native syscall %#lx at %p\n", (long)RAX_sig(sigcontext),
