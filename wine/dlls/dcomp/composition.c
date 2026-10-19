@@ -10149,6 +10149,8 @@ struct visual
     const void **closable_vtbl; /* Windows.Foundation.IClosable, see visual_closable_vtbl */
     const void **sprite2_vtbl;  /* ISpriteVisual2 (Shadow), see visual_sprite2_vtbl */
     const void **visual2_vtbl;  /* IVisual2 (RelativeOffset/SizeAdjustment), see visual_visual2_vtbl */
+    const void **visual4_vtbl;  /* IVisual4 (IsPixelSnappingEnabled), see visual_visual4_vtbl */
+    boolean pixel_snapping;
     IUnknown *parent_for_transform; /* IVisual2.ParentForTransform: kept, not applied yet */
     IUnknown *shadow;           /* the CompositionShadow set through ISpriteVisual2, kept but not drawn */
     Vector2 relative_offset, relative_size; /* InteropVisual SetRelativeOffset/Width/Height, fractions of the parent */
@@ -11300,6 +11302,43 @@ static HRESULT WINAPI visual2_put_RelativeSizeAdjustment( void *iface, Vector2 v
     scene_changed();
     return S_OK;
 }
+/* IVisual4: only IsPixelSnappingEnabled. The Microsoft Store's tile cards cast their SpriteVisual to it in the
+ * constructor, so refusing it threw InvalidCastException and left every card list empty. Kept and reported; the
+ * painter places visuals on whole pixels at the scales these apps use. */
+static const GUID IID_IVisual4_local = { 0x9476bf11, 0xe24b, 0x5bf9, { 0x9e, 0xbe, 0x62, 0x74, 0x10, 0x9b, 0x27, 0x11 } };
+static struct visual *impl_from_visual4( void *iface ) { return CONTAINING_RECORD( iface, struct visual, visual4_vtbl ); }
+static HRESULT WINAPI visual4_QueryInterface( void *iface, REFIID iid, void **out ) { return visual_qi( impl_from_visual4( iface ), iid, out ); }
+static ULONG WINAPI visual4_AddRef( void *iface ) { return ISpriteVisual_AddRef( &impl_from_visual4( iface )->ISpriteVisual_iface ); }
+static ULONG WINAPI visual4_Release( void *iface ) { return ISpriteVisual_Release( &impl_from_visual4( iface )->ISpriteVisual_iface ); }
+static HRESULT WINAPI visual4_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return ISpriteVisual_GetIids( &impl_from_visual4( iface )->ISpriteVisual_iface, count, iids );
+}
+static HRESULT WINAPI visual4_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return ISpriteVisual_GetRuntimeClassName( &impl_from_visual4( iface )->ISpriteVisual_iface, name );
+}
+static HRESULT WINAPI visual4_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return ISpriteVisual_GetTrustLevel( &impl_from_visual4( iface )->ISpriteVisual_iface, level );
+}
+static HRESULT WINAPI visual4_get_IsPixelSnappingEnabled( void *iface, boolean *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_visual4( iface )->pixel_snapping;
+    return S_OK;
+}
+static HRESULT WINAPI visual4_put_IsPixelSnappingEnabled( void *iface, boolean value )
+{
+    impl_from_visual4( iface )->pixel_snapping = value;
+    return S_OK;
+}
+static const void *visual_visual4_vtbl[] =
+{
+    visual4_QueryInterface, visual4_AddRef, visual4_Release, visual4_GetIids, visual4_GetRuntimeClassName,
+    visual4_GetTrustLevel, visual4_get_IsPixelSnappingEnabled, visual4_put_IsPixelSnappingEnabled,
+};
+
 static const void *visual_visual2_vtbl[] =
 {
     visual2_QueryInterface, visual2_AddRef, visual2_Release,
@@ -11396,6 +11435,8 @@ static HRESULT visual_qi( struct visual *impl, REFIID iid, void **out )
         *out = &impl->IVisual_iface;
     else if (IsEqualGUID( iid, &IID_IVisual2_local ))
         *out = &impl->visual2_vtbl;
+    else if (IsEqualGUID( iid, &IID_IVisual4_local ))
+        *out = &impl->visual4_vtbl;
     else if (IsEqualGUID( iid, &IID_ICompositionObject ))
         *out = &impl->ICompositionObject_iface;
     else if (IsEqualGUID( iid, &IID_IClosable ))
@@ -11410,7 +11451,7 @@ static HRESULT visual_qi( struct visual *impl, REFIID iid, void **out )
                                              : (void *)&impl->IContainerVisual_iface;
     else
     {
-        TRACE( "visual: no interface %s.\n", debugstr_guid(iid) );
+        FIXME( "visual: no interface %s.\n", debugstr_guid(iid) );
         *out = NULL;
         return E_NOINTERFACE;
     }
@@ -12166,6 +12207,7 @@ static HRESULT create_visual( ICompositor *compositor, enum visual_kind kind, vo
     impl->closable_vtbl = visual_closable_vtbl;
     impl->sprite2_vtbl = visual_sprite2_vtbl;
     impl->visual2_vtbl = visual_visual2_vtbl;
+    impl->visual4_vtbl = visual_visual4_vtbl;
     impl->collection.IVisualCollection_iface.lpVtbl = &collection_vtbl;
     impl->collection.iterable_vtbl = iterable_vtbl;
     impl->collection.owner = impl;

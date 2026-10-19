@@ -12829,3 +12829,9 @@ primary table, so Close ran whatever getter sits in slot 6 and wrote through its
 typed objects with their own catch-all; Close releases nothing (the painter holds raw pointers). Navigation works
 (`docs/screenshots/msstore-apps-skeleton.png`), but pages stay on their loading skeletons: the content lists are the
 next problem, the same one as the empty Home tiles. Also visible: the nav rail icons are drawn oversized and offset.
+
+The skeletons were an `InvalidCastException` in `WinStore.UX.Controls.Tiles.AnimatedCurveClipCard..ctor()`: it casts
+its SpriteVisual to `IVisual4` `{9476bf11}` (IsPixelSnappingEnabled), which visuals refused. With IVisual4 the Apps
+page shows its collection cards with artwork (`docs/screenshots/msstore-apps-cards.png`). `visual_qi` now logs every
+refused IID as a FIXME (`visual: no interface`), so the next missing one is a grep away. Still open: the hero banner
+area is empty on Home and Apps, and Home's "Best selling games" tiles stay blank grey.
