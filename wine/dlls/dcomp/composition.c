@@ -6510,7 +6510,11 @@ static HRESULT WINAPI dcv_SetContent( void *iface, IUnknown *content )
     void *surface;
 
     TRACE( "%p content %p.\n", iface, content );
-    if (content && SUCCEEDED( IUnknown_QueryInterface( content, &IID_IDXGISwapChain, (void **)&chain ) ))
+    /* A surface of ours first: generic dcomp objects answer every QI with themselves, so asking a
+     * surface (one made from a surface handle, say) for IDXGISwapChain "succeeds" and its slot 12
+     * then gets called as GetDesc. */
+    if (content && !surface_from_iface( content ) &&
+        SUCCEEDED( IUnknown_QueryInterface( content, &IID_IDXGISwapChain, (void **)&chain ) ))
     {
         /* XAML's SwapChainPanel hands the DXGI swap chain itself; the painter wants a surface */
         HRESULT hr = create_swapchain_surface( content, &surface );
