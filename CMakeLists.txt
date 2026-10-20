@@ -88,11 +88,6 @@ target_link_libraries(xboxauth PRIVATE runtimeobject.lib winhttp.lib crypt32.lib
 add_executable(probe-xboxauth probes/probe-xboxauth.cpp)
 set_target_properties(probe-xboxauth PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
 
-# Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager for the Microsoft Store.
-add_library(appinstallmanager SHARED shims/appinstallmanager/appinstallmanager.cpp)
-set_target_properties(appinstallmanager PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_appinstallmanager")
-target_link_libraries(appinstallmanager PRIVATE runtimeobject.lib winhttp.lib ole32.lib)
-target_compile_definitions(appinstallmanager PRIVATE "APPXINSTALL_H=\"$ENV{WINE_SRC}/include/wine/appxinstall.h\"")
 # Windows.System.Profile.WindowsIntegrityPolicy: not in S mode (Windows' asks a lockdown-policy service over RPC).
 
 

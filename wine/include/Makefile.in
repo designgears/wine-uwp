@@ -1025,6 +1025,7 @@ SOURCES = \
 	windows.applicationmodel.datatransfer.dragdrop.idl \
 	windows.applicationmodel.datatransfer.idl \
 	windows.applicationmodel.idl \
+	windows.applicationmodel.store.preview.installcontrol.idl \
 	windows.applicationmodel.useractivities.idl \
 	windows.data.json.idl \
 	windows.data.xml.dom.idl \
@@ -1139,6 +1140,7 @@ SOURCES = \
 	wine/irot.idl \
 	wine/irpcss.idl \
 	wine/itss.idl \
+	wine/json.h \
 	wine/list.h \
 	wine/lsass.idl \
 	wine/mfinternal.idl \

@@ -1,0 +1,486 @@
+/*
+ * Copyright 2026 wine-uwp contributors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#ifdef __WIDL__
+#pragma winrt ns_prefix
+#endif
+
+import "inspectable.idl";
+import "asyncinfo.idl";
+import "eventtoken.idl";
+import "windowscontracts.idl";
+import "windows.foundation.idl";
+import "windows.system.idl";
+
+namespace Windows.ApplicationModel.Store.Preview.InstallControl {
+    typedef enum AppInstallState AppInstallState;
+    typedef enum AppInstallType AppInstallType;
+    typedef enum AppInstallationToastNotificationMode AppInstallationToastNotificationMode;
+    typedef enum AutoUpdateSetting AutoUpdateSetting;
+
+    interface IAppInstallItem;
+    interface IAppInstallItem2;
+    interface IAppInstallItem3;
+    interface IAppInstallItem4;
+    interface IAppInstallItem5;
+    interface IAppInstallManager;
+    interface IAppInstallManager2;
+    interface IAppInstallManager3;
+    interface IAppInstallManager4;
+    interface IAppInstallManager5;
+    interface IAppInstallManager6;
+    interface IAppInstallManager7;
+    interface IAppInstallManagerItemEventArgs;
+    interface IAppInstallStatus;
+    interface IAppInstallStatus2;
+    interface IAppInstallStatus3;
+    interface IAppUpdateOptions;
+    interface IAppUpdateOptions2;
+    /* AppInstallOptions' default interface, not defined here yet: the same ABI as the runtimeclass */
+    interface IAppInstallOptions;
+
+    runtimeclass AppInstallItem;
+    runtimeclass AppInstallManager;
+    runtimeclass AppInstallManagerItemEventArgs;
+    runtimeclass AppInstallStatus;
+    runtimeclass AppUpdateOptions;
+
+    declare {
+        interface Windows.Foundation.Collections.IIterable<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *>;
+        interface Windows.Foundation.Collections.IIterator<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *>;
+        interface Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *>;
+        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *>;
+        interface Windows.Foundation.IAsyncOperation<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *>;
+        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> *>;
+        interface Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> *>;
+        interface Windows.Foundation.TypedEventHandler<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *, IInspectable *>;
+        interface Windows.Foundation.TypedEventHandler<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager *, Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManagerItemEventArgs *>;
+    }
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    enum AppInstallState
+    {
+        Pending               = 0,
+        Starting              = 1,
+        AcquiringLicense      = 2,
+        Downloading           = 3,
+        RestoringData         = 4,
+        Installing            = 5,
+        Completed             = 6,
+        Canceled              = 7,
+        Paused                = 8,
+        Error                 = 9,
+        PausedLowBattery      = 10,
+        PausedWiFiRecommended = 11,
+        PausedWiFiRequired    = 12,
+        ReadyToDownload       = 13,
+    };
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    enum AppInstallType
+    {
+        Install = 0,
+        Update  = 1,
+        Repair  = 2,
+    };
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    enum AppInstallationToastNotificationMode
+    {
+        Default           = 0,
+        Toast             = 1,
+        ToastWithoutPopup = 2,
+        NoToast           = 3,
+    };
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    enum AutoUpdateSetting
+    {
+        Disabled         = 0,
+        Enabled          = 1,
+        DisabledByPolicy = 2,
+        EnabledByPolicy  = 3,
+    };
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem),
+        uuid(49d3dfab-168a-4cbf-a93a-9e448c82737d)
+    ]
+    interface IAppInstallItem : IInspectable
+    {
+        [propget] HRESULT ProductId([out, retval] HSTRING *value);
+        [propget] HRESULT PackageFamilyName([out, retval] HSTRING *value);
+        [propget] HRESULT InstallType([out, retval] Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallType *value);
+        [propget] HRESULT IsUserInitiated([out, retval] boolean *value);
+        HRESULT GetCurrentStatus([out, retval] Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallStatus **status);
+        HRESULT Cancel();
+        HRESULT Pause();
+        HRESULT Restart();
+        [eventadd] HRESULT Completed([in] Windows.Foundation.TypedEventHandler<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *, IInspectable *> *handler,
+                                     [out, retval] EventRegistrationToken *token);
+        [eventremove] HRESULT Completed([in] EventRegistrationToken token);
+        [eventadd] HRESULT StatusChanged([in] Windows.Foundation.TypedEventHandler<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *, IInspectable *> *handler,
+                                         [out, retval] EventRegistrationToken *token);
+        [eventremove] HRESULT StatusChanged([in] EventRegistrationToken token);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem),
+        uuid(d3972af8-40c0-4fd7-aa6c-0aa13ca6188c)
+    ]
+    interface IAppInstallItem2 : IInspectable
+    {
+        [overload("Cancel")] HRESULT CancelWithTelemetry([in] HSTRING correlation_vector);
+        [overload("Pause")] HRESULT PauseWithTelemetry([in] HSTRING correlation_vector);
+        [overload("Restart")] HRESULT RestartWithTelemetry([in] HSTRING correlation_vector);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem),
+        uuid(6f3dc998-dd47-433c-9234-560172d67a45)
+    ]
+    interface IAppInstallItem3 : IInspectable
+    {
+        [propget] HRESULT Children([out, retval] Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> **value);
+        [propget] HRESULT ItemOperationsMightAffectOtherItems([out, retval] boolean *value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem),
+        uuid(c2d1ce12-71ff-4fc8-b540-453d4b37e1d1)
+    ]
+    interface IAppInstallItem4 : IInspectable
+    {
+        [propget] HRESULT LaunchAfterInstall([out, retval] boolean *value);
+        [propput] HRESULT LaunchAfterInstall([in] boolean value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem),
+        uuid(5510e7cc-4076-4a0b-9472-c21d9d380e55)
+    ]
+    interface IAppInstallItem5 : IInspectable
+    {
+        [propget] HRESULT PinToDesktopAfterInstall([out, retval] boolean *value);
+        [propput] HRESULT PinToDesktopAfterInstall([in] boolean value);
+        [propget] HRESULT PinToStartAfterInstall([out, retval] boolean *value);
+        [propput] HRESULT PinToStartAfterInstall([in] boolean value);
+        [propget] HRESULT PinToTaskbarAfterInstall([out, retval] boolean *value);
+        [propput] HRESULT PinToTaskbarAfterInstall([in] boolean value);
+        [propget] HRESULT CompletedInstallToastNotificationMode([out, retval] Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallationToastNotificationMode *value);
+        [propput] HRESULT CompletedInstallToastNotificationMode([in] Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallationToastNotificationMode value);
+        [propget] HRESULT InstallInProgressToastNotificationMode([out, retval] Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallationToastNotificationMode *value);
+        [propput] HRESULT InstallInProgressToastNotificationMode([in] Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallationToastNotificationMode value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager),
+        uuid(9353e170-8441-4b45-bd72-7c2fa925beee)
+    ]
+    interface IAppInstallManager : IInspectable
+    {
+        [propget] HRESULT AppInstallItems([out, retval] Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> **value);
+        HRESULT Cancel([in] HSTRING product_id);
+        HRESULT Pause([in] HSTRING product_id);
+        HRESULT Restart([in] HSTRING product_id);
+        [eventadd] HRESULT ItemCompleted([in] Windows.Foundation.TypedEventHandler<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager *, Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManagerItemEventArgs *> *handler,
+                                         [out, retval] EventRegistrationToken *token);
+        [eventremove] HRESULT ItemCompleted([in] EventRegistrationToken token);
+        [eventadd] HRESULT ItemStatusChanged([in] Windows.Foundation.TypedEventHandler<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager *, Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManagerItemEventArgs *> *handler,
+                                             [out, retval] EventRegistrationToken *token);
+        [eventremove] HRESULT ItemStatusChanged([in] EventRegistrationToken token);
+        [propget] HRESULT AutoUpdateSetting([out, retval] Windows.ApplicationModel.Store.Preview.InstallControl.AutoUpdateSetting *value);
+        [propput] HRESULT AutoUpdateSetting([in] Windows.ApplicationModel.Store.Preview.InstallControl.AutoUpdateSetting value);
+        [propget] HRESULT AcquisitionIdentity([out, retval] HSTRING *value);
+        [propput] HRESULT AcquisitionIdentity([in] HSTRING value);
+        HRESULT GetIsApplicableAsync([in] HSTRING product_id, [in] HSTRING sku_id,
+                                     [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        HRESULT StartAppInstallAsync([in] HSTRING product_id, [in] HSTRING sku_id, [in] boolean repair, [in] boolean force_non_removable,
+                                     [out, retval] Windows.Foundation.IAsyncOperation<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> **operation);
+        HRESULT UpdateAppByPackageFamilyNameAsync([in] HSTRING package_family_name,
+                                                  [out, retval] Windows.Foundation.IAsyncOperation<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> **operation);
+        HRESULT SearchForUpdatesAsync([in] HSTRING product_id, [in] HSTRING sku_id,
+                                      [out, retval] Windows.Foundation.IAsyncOperation<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> **operation);
+        HRESULT SearchForAllUpdatesAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> *> **operation);
+        HRESULT IsStoreBlockedByPolicyAsync([in] HSTRING client_name, [in] HSTRING client_publisher,
+                                            [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        HRESULT GetIsAppAllowedToInstallAsync([in] HSTRING product_id, [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager),
+        uuid(16937851-ed37-480d-8314-52e27c03f04a)
+    ]
+    interface IAppInstallManager2 : IInspectable
+    {
+        [overload("StartAppInstallAsync")] HRESULT StartAppInstallWithTelemetryAsync([in] HSTRING product_id, [in] HSTRING sku_id,
+                [in] boolean repair, [in] boolean force_non_removable, [in] HSTRING catalog_id, [in] HSTRING bundle_id,
+                [in] HSTRING correlation_vector,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> **operation);
+        [overload("UpdateAppByPackageFamilyNameAsync")] HRESULT UpdateAppByPackageFamilyNameWithTelemetryAsync([in] HSTRING package_family_name,
+                [in] HSTRING correlation_vector,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> **operation);
+        [overload("SearchForUpdatesAsync")] HRESULT SearchForUpdatesWithTelemetryAsync([in] HSTRING product_id, [in] HSTRING sku_id,
+                [in] HSTRING catalog_id, [in] HSTRING correlation_vector,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> **operation);
+        [overload("SearchForAllUpdatesAsync")] HRESULT SearchForAllUpdatesWithTelemetryAsync([in] HSTRING correlation_vector,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> *> **operation);
+        [overload("GetIsAppAllowedToInstallAsync")] HRESULT GetIsAppAllowedToInstallWithTelemetryAsync([in] HSTRING product_id, [in] HSTRING sku_id,
+                [in] HSTRING catalog_id, [in] HSTRING correlation_vector, [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        [overload("Cancel")] HRESULT CancelWithTelemetry([in] HSTRING product_id, [in] HSTRING correlation_vector);
+        [overload("Pause")] HRESULT PauseWithTelemetry([in] HSTRING product_id, [in] HSTRING correlation_vector);
+        [overload("Restart")] HRESULT RestartWithTelemetry([in] HSTRING product_id, [in] HSTRING correlation_vector);
+    }
+
+    /* targetVolume is a Windows.Management.Deployment.PackageVolume, not declared here; an interface
+     * pointer either way */
+    [
+        contract(Windows.Foundation.UniversalApiContract, 3.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager),
+        uuid(95b24b17-e96a-4d0e-84e1-c8cb417a0178)
+    ]
+    interface IAppInstallManager3 : IInspectable
+    {
+        HRESULT StartProductInstallAsync([in] HSTRING product_id, [in] HSTRING catalog_id, [in] HSTRING flight_id, [in] HSTRING client_id,
+                [in] boolean repair, [in] boolean force_non_removable, [in] HSTRING correlation_vector, [in] IInspectable *target_volume,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> *> **operation);
+        HRESULT StartProductInstallForUserAsync([in] Windows.System.User *user, [in] HSTRING product_id, [in] HSTRING catalog_id,
+                [in] HSTRING flight_id, [in] HSTRING client_id, [in] boolean repair, [in] boolean force_non_removable,
+                [in] HSTRING correlation_vector, [in] IInspectable *target_volume,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> *> **operation);
+        HRESULT UpdateAppByPackageFamilyNameForUserAsync([in] Windows.System.User *user, [in] HSTRING package_family_name,
+                [in] HSTRING correlation_vector,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> **operation);
+        HRESULT SearchForUpdatesForUserAsync([in] Windows.System.User *user, [in] HSTRING product_id, [in] HSTRING sku_id,
+                [in] HSTRING catalog_id, [in] HSTRING correlation_vector,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> **operation);
+        HRESULT SearchForAllUpdatesForUserAsync([in] Windows.System.User *user, [in] HSTRING correlation_vector,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> *> **operation);
+        HRESULT GetIsAppAllowedToInstallForUserAsync([in] Windows.System.User *user, [in] HSTRING product_id, [in] HSTRING sku_id,
+                [in] HSTRING catalog_id, [in] HSTRING correlation_vector, [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        HRESULT GetIsApplicableForUserAsync([in] Windows.System.User *user, [in] HSTRING product_id, [in] HSTRING sku_id,
+                [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        HRESULT MoveToFrontOfDownloadQueue([in] HSTRING product_id, [in] HSTRING correlation_vector);
+    }
+
+    /* the operations' results are GetEntitlementResults, not declared here */
+    [
+        contract(Windows.Foundation.UniversalApiContract, 4.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager),
+        uuid(260a2a16-5a9e-4ebd-b944-f2ba75c31159)
+    ]
+    interface IAppInstallManager4 : IInspectable
+    {
+        HRESULT GetFreeUserEntitlementAsync([in] HSTRING store_id, [in] HSTRING campaign_id, [in] HSTRING correlation_vector,
+                                            [out, retval] IInspectable **operation);
+        HRESULT GetFreeUserEntitlementForUserAsync([in] Windows.System.User *user, [in] HSTRING store_id, [in] HSTRING campaign_id,
+                                                   [in] HSTRING correlation_vector, [out, retval] IInspectable **operation);
+        HRESULT GetFreeDeviceEntitlementAsync([in] HSTRING store_id, [in] HSTRING campaign_id, [in] HSTRING correlation_vector,
+                                              [out, retval] IInspectable **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 5.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager),
+        uuid(3cd7be4c-1be9-4f7f-b675-aa1d64a529b2)
+    ]
+    interface IAppInstallManager5 : IInspectable
+    {
+        [propget] HRESULT AppInstallItemsWithGroupSupport([out, retval] Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> **value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 7.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager),
+        uuid(c9e7d408-f27a-4471-b2f4-e76efcbebcca)
+    ]
+    interface IAppInstallManager6 : IInspectable
+    {
+        HRESULT SearchForAllUpdatesWithUpdateOptionsAsync([in] HSTRING correlation_vector, [in] HSTRING client_id,
+                [in] Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions *update_options,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> *> **operation);
+        HRESULT SearchForAllUpdatesWithUpdateOptionsForUserAsync([in] Windows.System.User *user, [in] HSTRING correlation_vector,
+                [in] HSTRING client_id, [in] Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions *update_options,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> *> **operation);
+        HRESULT SearchForUpdatesWithUpdateOptionsAsync([in] HSTRING product_id, [in] HSTRING sku_id, [in] HSTRING correlation_vector,
+                [in] HSTRING client_id, [in] Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions *update_options,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> **operation);
+        HRESULT SearchForUpdatesWithUpdateOptionsForUserAsync([in] Windows.System.User *user, [in] HSTRING product_id, [in] HSTRING sku_id,
+                [in] HSTRING correlation_vector, [in] HSTRING client_id,
+                [in] Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions *update_options,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> **operation);
+        HRESULT StartProductInstallWithOptionsAsync([in] HSTRING product_id, [in] HSTRING flight_id, [in] HSTRING client_id,
+                [in] HSTRING correlation_vector, [in] Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallOptions *install_options,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> *> **operation);
+        HRESULT StartProductInstallWithOptionsForUserAsync([in] Windows.System.User *user, [in] HSTRING product_id, [in] HSTRING flight_id,
+                [in] HSTRING client_id, [in] HSTRING correlation_vector,
+                [in] Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallOptions *install_options,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem *> *> **operation);
+        HRESULT GetIsPackageIdentityAllowedToInstallAsync([in] HSTRING correlation_vector, [in] HSTRING package_identity_name,
+                [in] HSTRING publisher_certificate_name, [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        HRESULT GetIsPackageIdentityAllowedToInstallForUserAsync([in] Windows.System.User *user, [in] HSTRING correlation_vector,
+                [in] HSTRING package_identity_name, [in] HSTRING publisher_certificate_name,
+                [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 8.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager),
+        uuid(a5ee7b30-d5e4-49a3-9853-3db03203321d)
+    ]
+    interface IAppInstallManager7 : IInspectable
+    {
+        [propget] HRESULT CanInstallForAllUsers([out, retval] boolean *value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManagerItemEventArgs),
+        uuid(bc505743-4674-4dd1-957e-c25682086a14)
+    ]
+    interface IAppInstallManagerItemEventArgs : IInspectable
+    {
+        [propget] HRESULT Item([out, retval] Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem **value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallStatus),
+        uuid(936dccfa-2450-4126-88b1-6127a644dd5c)
+    ]
+    interface IAppInstallStatus : IInspectable
+    {
+        [propget] HRESULT InstallState([out, retval] Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState *value);
+        [propget] HRESULT DownloadSizeInBytes([out, retval] UINT64 *value);
+        [propget] HRESULT BytesDownloaded([out, retval] UINT64 *value);
+        [propget] HRESULT PercentComplete([out, retval] DOUBLE *value);
+        [propget] HRESULT ErrorCode([out, retval] HRESULT *value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 3.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallStatus),
+        uuid(96e7818a-5e92-4aa9-8edc-58fed4b87e00)
+    ]
+    interface IAppInstallStatus2 : IInspectable
+    {
+        [propget] HRESULT User([out, retval] Windows.System.User **value);
+        [propget] HRESULT ReadyForLaunch([out, retval] boolean *value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 6.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallStatus),
+        uuid(cb880c56-837b-4b4c-9ebb-6d44a0a96307)
+    ]
+    interface IAppInstallStatus3 : IInspectable
+    {
+        [propget] HRESULT IsStaged([out, retval] boolean *value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 7.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions),
+        uuid(26f0b02f-c2f3-4aea-af8c-6308dd9db85f)
+    ]
+    interface IAppUpdateOptions : IInspectable
+    {
+        [propget] HRESULT CatalogId([out, retval] HSTRING *value);
+        [propput] HRESULT CatalogId([in] HSTRING value);
+        [propget] HRESULT AllowForcedAppRestart([out, retval] boolean *value);
+        [propput] HRESULT AllowForcedAppRestart([in] boolean value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 9.0),
+        exclusiveto(Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions),
+        uuid(f4646e08-ed26-4bf9-9679-48f628e53df8)
+    ]
+    interface IAppUpdateOptions2 : IInspectable
+    {
+        [propget] HRESULT AutomaticallyDownloadAndInstallUpdateIfFound([out, retval] boolean *value);
+        [propput] HRESULT AutomaticallyDownloadAndInstallUpdateIfFound([in] boolean value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile)
+    ]
+    runtimeclass AppInstallItem
+    {
+        [default] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallItem;
+        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallItem2;
+        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallItem3;
+        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallItem4;
+        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallItem5;
+    }
+
+    [
+        activatable(Windows.Foundation.UniversalApiContract, 1.0),
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile)
+    ]
+    runtimeclass AppInstallManager
+    {
+        [default] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallManager;
+        [contract(Windows.Foundation.UniversalApiContract, 1.0)] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallManager2;
+        [contract(Windows.Foundation.UniversalApiContract, 3.0)] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallManager3;
+        [contract(Windows.Foundation.UniversalApiContract, 4.0)] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallManager4;
+        [contract(Windows.Foundation.UniversalApiContract, 5.0)] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallManager5;
+        [contract(Windows.Foundation.UniversalApiContract, 7.0)] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallManager6;
+        [contract(Windows.Foundation.UniversalApiContract, 8.0)] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallManager7;
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile)
+    ]
+    runtimeclass AppInstallManagerItemEventArgs
+    {
+        [default] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallManagerItemEventArgs;
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile)
+    ]
+    runtimeclass AppInstallStatus
+    {
+        [default] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallStatus;
+        [contract(Windows.Foundation.UniversalApiContract, 3.0)] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallStatus2;
+        [contract(Windows.Foundation.UniversalApiContract, 6.0)] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppInstallStatus3;
+    }
+
+    [
+        activatable(Windows.Foundation.UniversalApiContract, 7.0),
+        contract(Windows.Foundation.UniversalApiContract, 7.0),
+        marshaling_behavior(agile)
+    ]
+    runtimeclass AppUpdateOptions
+    {
+        [default] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppUpdateOptions;
+        [contract(Windows.Foundation.UniversalApiContract, 9.0)] interface Windows.ApplicationModel.Store.Preview.InstallControl.IAppUpdateOptions2;
+    }
+}

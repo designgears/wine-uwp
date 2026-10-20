@@ -1,0 +1,8 @@
+MODULE  = windows.applicationmodel.store.preview.installcontrol.dll
+IMPORTS = combase appxinstall
+
+SOURCES = \
+	async.c \
+	async_private.idl \
+	classes.idl \
+	main.c

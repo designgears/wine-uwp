@@ -437,3 +437,12 @@ dlls/windows.storage.pickers/windows.storage.pickers.spec
 dlls/windows.staterepositorycore/staterepository.c
 dlls/windows.staterepositorycore/staterepository_slots.h
 dlls/appxinstall/store.c
+include/windows.applicationmodel.store.preview.installcontrol.idl
+include/wine/json.h
+dlls/windows.applicationmodel.store.preview.installcontrol/Makefile.in
+dlls/windows.applicationmodel.store.preview.installcontrol/async.c
+dlls/windows.applicationmodel.store.preview.installcontrol/async_private.idl
+dlls/windows.applicationmodel.store.preview.installcontrol/classes.idl
+dlls/windows.applicationmodel.store.preview.installcontrol/main.c
+dlls/windows.applicationmodel.store.preview.installcontrol/private.h
+dlls/windows.applicationmodel.store.preview.installcontrol/windows.applicationmodel.store.preview.installcontrol.spec

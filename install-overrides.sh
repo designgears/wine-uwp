@@ -445,14 +445,12 @@ if [ -n "$WV2_APP" ] && [ -f "$WV2_HOST" ]; then
   echo "installed: WebView2 runtime $WV2_VER with the wine-uwp host"
 fi
 
-# Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager (see shims/appinstallmanager): Windows'
-# InstallService.dll is a client of an InstallService broker that does not exist here; the Microsoft Store
-# fail-fasts at start-up without the class. Registered in the SHIM_CLASSES pass below.
-AIM_SHIM=${SHIM_DIR}/wineuwp_appinstallmanager.dll
-if [ -f "$AIM_SHIM" ]; then
-  cmp -s "$AIM_SHIM" "$SYS32/wineuwp_appinstallmanager.dll" || cp -f --reflink=auto "$AIM_SHIM" "$SYS32/wineuwp_appinstallmanager.dll"
-  echo "installed: AppInstallManager (Microsoft Store installs) stand-in"
-fi
+# Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager is Wine's
+# windows.applicationmodel.store.preview.installcontrol: Windows' InstallService.dll is a client of an InstallService
+# broker that does not exist here, and the Microsoft Store fail-fasts at start-up without the class. Registered in
+# the SHIM_CLASSES pass below. Prefixes set up before that used a stand-in DLL, kept until the Wine one is there.
+IC_DLL=windows.applicationmodel.store.preview.installcontrol.dll
+[ -f "$SYS32/$IC_DLL" ] && rm -f "$SYS32/wineuwp_appinstallmanager.dll"
 # Windows.System.Profile.WindowsIntegrityPolicy is Wine's windows.system.profile.integritypolicy. Windows registers it
 # in Windows.Security.Integrity.dll, and that registration is in the prefix, so it is re-pointed here.
 if [ -f "$SYS32/windows.system.profile.integritypolicy.dll" ]; then
@@ -537,8 +535,10 @@ SHIM_CLASSES=""
 [ -f "$SYS32/windows.system.user.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.System.UserPicker:windows.system.user.dll Windows.System.User:windows.system.user.dll"
 [ -f "$SYS32/windows.system.memorymanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.System.MemoryManager:windows.system.memorymanager.dll"
 [ -f "$SYS32/windows.devices.enumeration.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Devices.Enumeration.DeviceInformation:windows.devices.enumeration.dll"
-[ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager:wineuwp_appinstallmanager.dll"
-[ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions:wineuwp_appinstallmanager.dll"
+for c in AppInstallManager AppUpdateOptions; do
+  [ -f "$SYS32/$IC_DLL" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.$c:$IC_DLL"
+  [ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.$c:wineuwp_appinstallmanager.dll"
+done
 [ -f "$SYS32/windows.ui.shell.taskbarmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Shell.TaskbarManager:windows.ui.shell.taskbarmanager.dll"
 [ -f "$SYS32/windows.services.store.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Services.Store.StoreContext:windows.services.store.dll"
 [ -f "$SYS32/wineuwp_xboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager:wineuwp_xboxauth.dll"
