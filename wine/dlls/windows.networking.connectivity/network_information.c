@@ -20,10 +20,14 @@
 #include "private.h"
 #include "initguid.h"
 #include "netlistmgr.h"
+#include "winsock2.h"
+#include "ws2ipdef.h"
+#include "iphlpapi.h"
+#include "netioapi.h"
+#include "wine/list.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(connectivity);
 
-static EventRegistrationToken dummy_cookie = {.value = 0xdeadbeef};
 
 struct network_information_statics
 {
@@ -357,10 +361,153 @@ static HRESULT WINAPI connection_profile_GetDataPlanStatus( IConnectionProfile *
     return E_NOTIMPL;
 }
 
-static HRESULT WINAPI connection_profile_get_NetworkAdapter( IConnectionProfile *iface, INetworkAdapter **value )
+struct network_adapter
+{
+    INetworkAdapter INetworkAdapter_iface;
+    LONG ref;
+
+    MIB_IF_ROW2 row;
+};
+
+static inline struct network_adapter *impl_from_INetworkAdapter( INetworkAdapter *iface )
+{
+    return CONTAINING_RECORD( iface, struct network_adapter, INetworkAdapter_iface );
+}
+
+static HRESULT WINAPI network_adapter_QueryInterface( INetworkAdapter *iface, REFIID iid, void **out )
+{
+    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_INetworkAdapter ))
+    {
+        *out = iface;
+        INetworkAdapter_AddRef( iface );
+        return S_OK;
+    }
+    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI network_adapter_AddRef( INetworkAdapter *iface )
+{
+    return InterlockedIncrement( &impl_from_INetworkAdapter( iface )->ref );
+}
+
+static ULONG WINAPI network_adapter_Release( INetworkAdapter *iface )
+{
+    struct network_adapter *impl = impl_from_INetworkAdapter( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref) free( impl );
+    return ref;
+}
+
+static HRESULT WINAPI network_adapter_GetIids( INetworkAdapter *iface, ULONG *iid_count, IID **iids )
+{
+    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI network_adapter_GetRuntimeClassName( INetworkAdapter *iface, HSTRING *class_name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_Networking_Connectivity_NetworkAdapter,
+                                wcslen( RuntimeClass_Windows_Networking_Connectivity_NetworkAdapter ), class_name );
+}
+
+static HRESULT WINAPI network_adapter_GetTrustLevel( INetworkAdapter *iface, TrustLevel *trust_level )
+{
+    *trust_level = BaseTrust;
+    return S_OK;
+}
+
+static HRESULT WINAPI network_adapter_get_OutboundMaxBitsPerSecond( INetworkAdapter *iface, UINT64 *value )
+{
+    TRACE( "iface %p, value %p.\n", iface, value );
+    if (!value) return E_POINTER;
+    *value = impl_from_INetworkAdapter( iface )->row.TransmitLinkSpeed;
+    return S_OK;
+}
+
+static HRESULT WINAPI network_adapter_get_InboundMaxBitsPerSecond( INetworkAdapter *iface, UINT64 *value )
+{
+    TRACE( "iface %p, value %p.\n", iface, value );
+    if (!value) return E_POINTER;
+    *value = impl_from_INetworkAdapter( iface )->row.ReceiveLinkSpeed;
+    return S_OK;
+}
+
+static HRESULT WINAPI network_adapter_get_IanaInterfaceType( INetworkAdapter *iface, UINT32 *value )
+{
+    TRACE( "iface %p, value %p.\n", iface, value );
+    if (!value) return E_POINTER;
+    *value = impl_from_INetworkAdapter( iface )->row.Type;
+    return S_OK;
+}
+
+static HRESULT WINAPI network_adapter_get_NetworkItem( INetworkAdapter *iface, INetworkItem **value )
 {
     FIXME( "iface %p, value %p stub!\n", iface, value );
     return E_NOTIMPL;
+}
+
+static HRESULT WINAPI network_adapter_get_NetworkAdapterId( INetworkAdapter *iface, GUID *value )
+{
+    TRACE( "iface %p, value %p.\n", iface, value );
+    if (!value) return E_POINTER;
+    *value = impl_from_INetworkAdapter( iface )->row.InterfaceGuid;
+    return S_OK;
+}
+
+static HRESULT WINAPI network_adapter_GetConnectedProfileAsync( INetworkAdapter *iface, IAsyncOperation_ConnectionProfile **value )
+{
+    FIXME( "iface %p, value %p stub!\n", iface, value );
+    return E_NOTIMPL;
+}
+
+static const struct INetworkAdapterVtbl network_adapter_vtbl =
+{
+    network_adapter_QueryInterface,
+    network_adapter_AddRef,
+    network_adapter_Release,
+    /* IInspectable methods */
+    network_adapter_GetIids,
+    network_adapter_GetRuntimeClassName,
+    network_adapter_GetTrustLevel,
+    /* INetworkAdapter methods */
+    network_adapter_get_OutboundMaxBitsPerSecond,
+    network_adapter_get_InboundMaxBitsPerSecond,
+    network_adapter_get_IanaInterfaceType,
+    network_adapter_get_NetworkItem,
+    network_adapter_get_NetworkAdapterId,
+    network_adapter_GetConnectedProfileAsync,
+};
+
+/* The adapter the Internet is reached through: the interface of the best route to a public address. Apps read its
+ * type and speed to tell a wired link from a metered one (Solitaire's reachability handler gave up on E_NOTIMPL here,
+ * and every component waiting on reachability waited for ever). */
+static HRESULT WINAPI connection_profile_get_NetworkAdapter( IConnectionProfile *iface, INetworkAdapter **value )
+{
+    struct network_adapter *impl;
+    DWORD index, err;
+
+    TRACE( "iface %p, value %p.\n", iface, value );
+
+    if (!value) return E_POINTER;
+    *value = NULL;
+    /* 8.8.8.8: a public address, and the same in either byte order */
+    if ((err = GetBestInterface( 0x08080808, &index ))) return HRESULT_FROM_WIN32( err );
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->INetworkAdapter_iface.lpVtbl = &network_adapter_vtbl;
+    impl->ref = 1;
+    impl->row.InterfaceIndex = index;
+    if ((err = GetIfEntry2( &impl->row )))
+    {
+        free( impl );
+        return HRESULT_FROM_WIN32( err );
+    }
+    *value = &impl->INetworkAdapter_iface;
+    return S_OK;
 }
 
 static HRESULT WINAPI connection_profile_GetLocalUsage( IConnectionProfile *iface, DateTime start, DateTime end, IDataUsage **value )
@@ -595,17 +742,105 @@ static HRESULT WINAPI network_information_statics_GetSortedEndpointPairs( INetwo
     return E_NOTIMPL;
 }
 
+/* NetworkStatusChanged. Nothing here watches the network for changes, but apps take their initial reachability from
+ * the first notification (the handler re-reads the status itself; the sender is NULL on Windows too): Solitaire waited
+ * on its splash screen for ever with a registration that never fired. So each handler is notified after it registers,
+ * and again for a while: an app often fans one handler out to components that only start listening seconds later,
+ * and Windows raises the event whenever the network moves, so repeating it keeps to the contract. */
+#define STATUS_NOTIFY_COUNT  20
+#define STATUS_NOTIFY_PERIOD 1500
+
+struct status_registration
+{
+    struct list entry;
+    LONG ref;
+    BOOL removed;
+    EventRegistrationToken token;
+    INetworkStatusChangedEventHandler *handler;
+};
+
+static CRITICAL_SECTION status_cs;
+static CRITICAL_SECTION_DEBUG status_cs_debug =
+{
+    0, 0, &status_cs,
+    { &status_cs_debug.ProcessLocksList, &status_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": status_cs") }
+};
+static CRITICAL_SECTION status_cs = { &status_cs_debug, -1, 0, 0, 0, 0 };
+static struct list status_registrations = LIST_INIT( status_registrations );
+static INT64 status_next_token;
+
+static void status_registration_release( struct status_registration *reg )
+{
+    if (InterlockedDecrement( &reg->ref )) return;
+    INetworkStatusChangedEventHandler_Release( reg->handler );
+    free( reg );
+}
+
+static DWORD WINAPI status_notify_thread( void *arg )
+{
+    struct status_registration *reg = arg;
+    BOOL removed;
+    int i;
+
+    Sleep( 250 );
+    for (i = 0; i < STATUS_NOTIFY_COUNT; i++)
+    {
+        EnterCriticalSection( &status_cs );
+        removed = reg->removed;
+        LeaveCriticalSection( &status_cs );
+        if (removed) break;
+        TRACE( "notifying handler %p (%d)\n", reg->handler, i + 1 );
+        INetworkStatusChangedEventHandler_Invoke( reg->handler, NULL );
+        Sleep( STATUS_NOTIFY_PERIOD );
+    }
+    status_registration_release( reg );
+    return 0;
+}
+
 static HRESULT WINAPI network_information_statics_add_NetworkStatusChanged( INetworkInformationStatics *iface, INetworkStatusChangedEventHandler *handler,
                                                                             EventRegistrationToken *cookie )
 {
-    FIXME( "iface %p, handler %p, cookie %p stub!\n", iface, handler, cookie );
-    *cookie = dummy_cookie;
+    struct status_registration *reg;
+    HANDLE thread;
+
+    TRACE( "iface %p, handler %p, cookie %p.\n", iface, handler, cookie );
+
+    if (!cookie) return E_POINTER;
+    if (!handler) return E_INVALIDARG;
+    if (!(reg = calloc( 1, sizeof(*reg) ))) return E_OUTOFMEMORY;
+    reg->ref = 1;
+    reg->handler = handler;
+    INetworkStatusChangedEventHandler_AddRef( handler );
+    EnterCriticalSection( &status_cs );
+    reg->token.value = ++status_next_token;
+    list_add_tail( &status_registrations, &reg->entry );
+    LeaveCriticalSection( &status_cs );
+    *cookie = reg->token;
+
+    InterlockedIncrement( &reg->ref );
+    if ((thread = CreateThread( NULL, 0, status_notify_thread, reg, 0, NULL ))) CloseHandle( thread );
+    else status_registration_release( reg );
     return S_OK;
 }
 
 static HRESULT WINAPI network_information_statics_remove_NetworkStatusChanged( INetworkInformationStatics *iface, EventRegistrationToken cookie )
 {
-    FIXME( "iface %p, cookie %#I64x stub!\n", iface, cookie.value );
+    struct status_registration *reg, *found = NULL;
+
+    TRACE( "iface %p, cookie %#I64x.\n", iface, cookie.value );
+
+    EnterCriticalSection( &status_cs );
+    LIST_FOR_EACH_ENTRY( reg, &status_registrations, struct status_registration, entry )
+    {
+        if (reg->token.value != cookie.value) continue;
+        list_remove( &reg->entry );
+        reg->removed = TRUE;
+        found = reg;
+        break;
+    }
+    LeaveCriticalSection( &status_cs );
+    if (found) status_registration_release( found );
     return S_OK;
 }
 

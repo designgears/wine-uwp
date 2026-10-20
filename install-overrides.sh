@@ -312,17 +312,11 @@ fi
 # api-ms-win-appmodel-runtime's GetPackageFamilyNameFromToken is in Wine's kernelbase now; a leftover file of that
 # apiset's name in system32 is ignored (the schema maps it to kernelbase).
 
-# NetworkInformation stand-in (see shims/networkstatus): fires NetworkStatusChanged once.
-NS=${SHIM_DIR}/wineuwp_networkstatus.dll
-if [ -f "$NS" ]; then
-  if ! cmp -s "$NS" "$SYS32/wineuwp_networkstatus.dll"; then cp -f --reflink=auto "$NS" "$SYS32/wineuwp_networkstatus.dll"; fi
-  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Networking.Connectivity.NetworkInformation"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_networkstatus.dll' /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: NetworkInformation stand-in"
-fi
+# NetworkInformation is Wine's windows.networking.connectivity, which now raises NetworkStatusChanged and hands out the
+# connection profile's NetworkAdapter (a shim used to supply both: Solitaire waited on its splash screen without them).
+# Prefixes that had the shim keep its DllPath until reset here.
+K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Networking.Connectivity.NetworkInformation"
+"${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.networking.connectivity.dll' /f >/dev/null 2>&1
 
 # SpatialAudioDeviceConfiguration stand-in (see shims/spatialaudio).
 SA=${SHIM_DIR}/wineuwp_spatialaudio.dll
@@ -628,7 +622,7 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_xboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.StoreConfiguration:wineuwp_xboxauth.dll"
 [ -f "$SYS32/wineuwp_spatialaudio.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioDeviceConfiguration:wineuwp_spatialaudio.dll"
 [ -f "$SYS32/wineuwp_spatialaudio.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioFormatSubtype:wineuwp_spatialaudio.dll"
-[ -f "$SYS32/wineuwp_networkstatus.dll" ]     && SHIM_CLASSES="$SHIM_CLASSES Windows.Networking.Connectivity.NetworkInformation:wineuwp_networkstatus.dll"
+[ -f "$SYS32/windows.networking.connectivity.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Networking.Connectivity.NetworkInformation:windows.networking.connectivity.dll"
 [ -f "$SYS32/windows.applicationmodel.useractivities.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.UserActivities.UserActivityChannel:windows.applicationmodel.useractivities.dll"
 [ -f "$SYS32/windows.system.profile.integritypolicy.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.System.Profile.WindowsIntegrityPolicy:windows.system.profile.integritypolicy.dll"
 [ -f "$SYS32/windows.ui.notifications.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Notifications.ToastNotificationManager:windows.ui.notifications.dll"

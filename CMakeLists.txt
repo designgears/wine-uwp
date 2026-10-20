@@ -75,9 +75,6 @@ target_link_libraries(probe-memorymanager PRIVATE runtimeobject.lib)
 # Windows.Networking.Connectivity.NetworkInformation. Wine registers NetworkStatusChanged and then
 # never raises it, so an app that takes its initial reachability from the first callback waits for
 # ever. Forwards everything and fires the event once after registration.
-add_library(networkstatus SHARED shims/networkstatus/networkstatus.cpp)
-set_target_properties(networkstatus PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_networkstatus")
-target_link_libraries(networkstatus PRIVATE runtimeobject.lib)
 
 # Windows.Media.Audio.SpatialAudioDeviceConfiguration. Wine routes the class to
 # windows.media.devices, whose factory refuses ISpatialAudioDeviceConfigurationStatics; Wwise asks

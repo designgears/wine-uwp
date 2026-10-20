@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     82706b9820e8c4f70740701cd70154149ce0b2b1
-                 windows.devices.enumeration: DeviceClass overloads; keep Updated and Removed registrations.
+  wine HEAD:     6a1aa85a2e71cc75c696da4ab8c668a2099ef314
+                 windows.networking.connectivity: raise NetworkStatusChanged; ConnectionProfile.NetworkAdapter.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-20T09:12:17Z
+  captured:      2026-10-20T09:16:26Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
