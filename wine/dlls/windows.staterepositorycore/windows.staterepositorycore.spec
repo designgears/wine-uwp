@@ -20,3 +20,4 @@
 @ stdcall SRCache_Free(ptr)
 @ stdcall SRCache_ExpandMacros(ptr wstr ptr)
 @ stdcall SRCache_GetDefaultAccountSid(ptr)
+@ stdcall -private DllGetActivationFactory(ptr ptr)

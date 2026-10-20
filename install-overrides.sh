@@ -170,21 +170,18 @@ sed "s|@WIN11_WINPATH@|${WIN11_WINPATH_SED}|g" "$(dirname "$0")/wineuwp.reg" > "
 "${WINE_BIN}wine" reg import "$WINEPREFIX/.wineuwp.reg.tmp" >/dev/null 2>&1
 rm -f "$WINEPREFIX/.wineuwp.reg.tmp"
 
-# Windows.Internal.StateRepository.* stand-in. Those classes are service-activated in the Windows
-# hive (ActivationType=1, Server=StateRepository) with no DllPath, so gen-classes-reg.py skips them
-# and RoGetActivationFactory returns REGDB_E_CLASSNOTREG. See shims/staterepository.
-SR_SHIM=${SHIM_DIR}/wineuwp_staterepository.dll
-if [ -f "$SR_SHIM" ]; then
-  SR_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_staterepository.dll
-  if ! cmp -s "$SR_SHIM" "$SR_DST"; then cp -f --reflink=auto "$SR_SHIM" "$SR_DST"; fi
+# Windows.Internal.StateRepository.* are Wine's windows.staterepositorycore. Those classes are service-activated in
+# the Windows hive (ActivationType=1, Server=StateRepository) with no DllPath, so gen-classes-reg.py skips them and
+# RoGetActivationFactory returns REGDB_E_CLASSNOTREG. Prefixes set up before that used a stand-in DLL.
+if [ -f "$WINEPREFIX/drive_c/windows/system32/windows.staterepositorycore.dll" ]; then
+  rm -f "$WINEPREFIX/drive_c/windows/system32/wineuwp_staterepository.dll"
   for cls in User Application MrtApplication Package PackageFamily MrtPackage PackageUser TargetDeviceFamily; do
     K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Internal.StateRepository.$cls"
-    "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_staterepository.dll' /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.staterepositorycore.dll' /f >/dev/null 2>&1
     "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
     "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
     "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
   done
-  echo "installed: Windows.Internal.StateRepository stand-in"
 fi
 
 # Windows.Security.Authorization.AppCapabilityAccess.AppCapability is Wine's

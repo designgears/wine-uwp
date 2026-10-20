@@ -12962,3 +12962,19 @@ the control, not by a single capture.
 - 10-20: the Store's self-update through the C installer first failed with 0x80070020 at the final swap. The running app's working directory is its stage directory, opened without FILE_SHARE_DELETE, so Wine (like Windows) refuses to rename it; the Python got away with a host rename. `appxinstall` now has a Unix side whose `rename_dir` is the fallback, and the update then completed (22609). Also: a builtin DLL that is new to the build is not found by `LoadLibrary` (126) in a prefix that has not been updated since, so `install-overrides.sh` copies `appxinstall.dll` into system32.
 - 10-20: Wine's delay-load failure path had two bugs, found by removing `mrt100.dll` from a Calculator stage (`mrt100_app.dll failed to initialize`, an access violation in `_strnicmp`). `LdrResolveDelayLoadedAPI` stored `LOWORD(ordinal)` in `DELAYLOAD_INFO.TargetApiDescriptor.Description` for imports by name, so the DLL's failure hook compared a wild pointer; and when that hook declined (NULL) Wine returned NULL instead of calling the system hook. Windows' kernelbase `DelayLoadFailureHook` (26100, read with its PDB) raises `0x505` noncontinuable with (dll, function); Wine raised `EXCEPTION_WINE_STUB`. With all three fixed, `mrt100_app` takes its in-DLL fallback and the `shims/mrt100` stand-in is gone. Note for regression runs on `prefix-test` + `wine-build-wow64`: calc AE 3924, Feedback Hub blank with 16 fail-fasts and `kb` failing to start Calculator happen with or without this change.
 - 10-20: a Wine module named after a Windows DLL takes over *every* class registered to that DLL, not only the ones it implements: Wine's builtin wins by module name even when the class's DllPath names the Windows file. A toast stand-in built as `wpnapps.dll` broke Solitaire, which creates `ScheduledToastNotification` from Windows' own wpnapps (`Class ... not found in ...\wpnapps.dll`). Name a stand-in for one class of a native DLL something of its own (here `windows.ui.notifications.dll`), and re-point only that class. Also: a prefix update copies a builtin into system32 (not a placeholder), so removing a module leaves its copy behind to delete by hand.
+
+## 2026-10-20: Shims to C - storage, launcher, pickers, state repository
+
+`storagelibrary` and `accesscache` are Wine's `windows.storage` now, `launcher` is `dlls/windows.system.hostlauncher`, `filepicker` is
+`dlls/windows.storage.pickers`, and `staterepository` is served by Wine's `windows.staterepositorycore`
+(`gen-staterepository.py` writes its slot table there, as C). Details and evidence in `docs/Port-to-C.md`.
+
+**Media Player fails its first start after a forced `install-overrides.sh` on `prefix-test`**, with the .NET
+`A type initializer threw an exception` (hr 0x80131534) just after it reads ApplicationData and before it asks for
+anything from `windows.storage`; the next start is clean. It reproduced with the `install-overrides.sh` of d4f388b,
+from before these ports, so it is not theirs. Not investigated further: after any forced override run, start the app
+once before judging it.
+
+Two bugs in the shims came out in the port: `LaunchUriForUserAsync` handed back a bool operation where the interface
+returns `IAsyncOperation<LaunchUriStatus>` (its "true" read as AppUnavailable), and the save picker's FileTypeChoices
+was a PropertySet, which does not keep the app's order; the dialog's type list follows it.

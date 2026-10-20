@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Emit the slot table the Windows.Internal.StateRepository stand-in uses.
+"""Emit the slot table of Windows.Internal.StateRepository in Wine (dlls/windows.staterepositorycore).
 
 The shim cannot guess which argument of a slot is the out-parameter - that is exactly the mistake
 that corrupts typed out-parameters (see Findings-M4.md, the composition default slot). It does not
@@ -9,11 +9,14 @@ family the out-parameter is the *last* parameter, so knowing the arity is enough
 right place - and the last parameter's type says what to write.
 
   gen-staterepository.py <Windows.StateRepository.dll> <pdb.syms> <out.h> [Class ...]
+
+The output is $WINE_SRC/dlls/windows.staterepositorycore/staterepository_slots.h.
 """
 import bisect, re, struct, subprocess, sys
 
 dll, symfile, outfile = sys.argv[1:4]
-classes = sys.argv[4:] or ["User", "Application", "MrtApplication"]
+classes = sys.argv[4:] or ["User", "Application", "Package", "PackageUser", "Activation", "PackageFamily",
+                           "MrtApplication", "MrtPackage", "TargetDeviceFamily"]
 
 f = open(dll, "rb").read()
 e = struct.unpack_from("<I", f, 0x3c)[0]; coff = e + 4
@@ -153,7 +156,7 @@ with open(outfile, "w") as h:
             "                 const WCHAR *element; const char *name; };\n")
     h.write("static const struct sr_slot sr_slots[] =\n{\n")
     for cls, statics, slot, argc, kind, method, elem in rows:
-        e = ('L"Windows.Internal.StateRepository.%s"' % elem) if elem else "nullptr"
+        e = ('L"Windows.Internal.StateRepository.%s"' % elem) if elem else "NULL"
         h.write('    { L"Windows.Internal.StateRepository.%s", %d, %d, %d, %s, %s, "%s" },\n'
                 % (cls, statics, slot, argc, kind, e, method))
     h.write("};\n")

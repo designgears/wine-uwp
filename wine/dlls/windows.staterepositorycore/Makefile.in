@@ -1,5 +1,6 @@
 MODULE    = windows.staterepositorycore.dll
-IMPORTS   = kernelbase
+IMPORTS   = uuid combase advapi32 kernelbase
 
 SOURCES = \
-	main.c
+	main.c \
+	staterepository.c
