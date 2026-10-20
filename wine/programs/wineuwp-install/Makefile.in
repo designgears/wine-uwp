@@ -1,0 +1,7 @@
+MODULE    = wineuwp-install.exe
+IMPORTS   = appxinstall
+
+EXTRADLLFLAGS = -mconsole -municode
+
+SOURCES = \
+	main.c

@@ -1114,6 +1114,7 @@ SOURCES = \
 	windowscontracts.idl \
 	windowsx.h \
 	wine/afd.h \
+	wine/appxinstall.h \
 	wine/asm.h \
 	wine/atsvc.idl \
 	wine/condrv.h \

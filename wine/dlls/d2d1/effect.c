@@ -1287,6 +1287,45 @@ static HRESULT __stdcall crop_factory(IUnknown **effect)
     return d2d_effect_create_impl(effect, &properties, sizeof(properties));
 }
 
+static const WCHAR border_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Border'/>           \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Border'/>           \
+    <Inputs >                                                             \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+    <Property name='EdgeModeX' type='enum' />                             \
+    <Property name='EdgeModeY' type='enum' />                             \
+  </Effect>";
+
+struct border_properties
+{
+    D2D1_BORDER_EDGE_MODE edge_mode_x;
+    D2D1_BORDER_EDGE_MODE edge_mode_y;
+};
+
+EFFECT_PROPERTY_RW(border, edge_mode_x, ENUM)
+EFFECT_PROPERTY_RW(border, edge_mode_y, ENUM)
+
+static const D2D1_PROPERTY_BINDING border_bindings[] =
+{
+    { L"EdgeModeX", BINDING_RW(border, edge_mode_x) },
+    { L"EdgeModeY", BINDING_RW(border, edge_mode_y) },
+};
+
+static HRESULT __stdcall border_factory(IUnknown **effect)
+{
+    static const struct border_properties properties =
+    {
+        .edge_mode_x = D2D1_BORDER_EDGE_MODE_CLAMP,
+        .edge_mode_y = D2D1_BORDER_EDGE_MODE_CLAMP,
+    };
+    return d2d_effect_create_impl(effect, &properties, sizeof(properties));
+}
+
 static const WCHAR shadow_description[] =
 L"<?xml version='1.0'?>                                                   \
   <Effect>                                                                \
@@ -1344,6 +1383,40 @@ L"<?xml version='1.0'?>                                                   \
   </Effect>";
 
 static HRESULT __stdcall grayscale_factory(IUnknown **effect)
+{
+    return d2d_effect_create_impl(effect, NULL, 0);
+}
+
+static const WCHAR premultiply_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Premultiply'/>      \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Premultiply'/>      \
+    <Inputs >                                                             \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+  </Effect>";
+
+static HRESULT __stdcall premultiply_factory(IUnknown **effect)
+{
+    return d2d_effect_create_impl(effect, NULL, 0);
+}
+
+static const WCHAR unpremultiply_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='UnPremultiply'/>      \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='UnPremultiply'/>      \
+    <Inputs >                                                             \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+  </Effect>";
+
+static HRESULT __stdcall unpremultiply_factory(IUnknown **effect)
 {
     return d2d_effect_create_impl(effect, NULL, 0);
 }
@@ -1858,8 +1931,11 @@ void d2d_effects_init_builtins(struct d2d_factory *factory)
         { &CLSID_D2D13DPerspectiveTransform, X2(_3d_perspective_transform) },
         { &CLSID_D2D1Composite, X2(composite) },
         { &CLSID_D2D1Crop, X2(crop) },
+        { &CLSID_D2D1Border, X2(border) },
         { &CLSID_D2D1Shadow, X2(shadow) },
         { &CLSID_D2D1Grayscale, X(grayscale) },
+        { &CLSID_D2D1Premultiply, X(premultiply) },
+        { &CLSID_D2D1UnPremultiply, X(unpremultiply) },
         { &CLSID_D2D1ColorMatrix, X2(color_matrix) },
         { &CLSID_D2D1Flood, X2(flood) },
         { &CLSID_D2D1GaussianBlur, X2(gaussian_blur) },
@@ -3286,7 +3362,10 @@ static ULONG STDMETHODCALLTYPE d2d_draw_info_Release(ID2D1DrawInfo *iface)
     TRACE("iface %p refcount %lu.\n", iface, refcount);
 
     if (!refcount)
+    {
+        free(render_info->ps_constants);
         free(render_info);
+    }
 
     return refcount;
 }
@@ -3294,17 +3373,24 @@ static ULONG STDMETHODCALLTYPE d2d_draw_info_Release(ID2D1DrawInfo *iface)
 static HRESULT STDMETHODCALLTYPE d2d_draw_info_SetInputDescription(ID2D1DrawInfo *iface,
         UINT32 index, D2D1_INPUT_DESCRIPTION description)
 {
-    FIXME("iface %p, index %u stub.\n", iface, index);
+    /* Recorded nothing to act on yet: custom draw transforms are not rendered. Refusing made Win2D's
+     * PixelShaderEffect fail to be created ("Call failed" in the Microsoft Store). */
+    TRACE("iface %p, index %u, filter %#x, level of detail %u.\n", iface, index, description.filter,
+            description.levelOfDetailCount);
 
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_draw_info_SetOutputBuffer(ID2D1DrawInfo *iface,
         D2D1_BUFFER_PRECISION precision, D2D1_CHANNEL_DEPTH depth)
 {
-    FIXME("iface %p, precision %u, depth %u stub.\n", iface, precision, depth);
+    struct d2d_render_info *render_info = impl_from_ID2D1DrawInfo(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, precision %u, depth %u.\n", iface, precision, depth);
+
+    render_info->output_precision = precision;
+    render_info->output_depth = depth;
+    return S_OK;
 }
 
 static void STDMETHODCALLTYPE d2d_draw_info_SetCached(ID2D1DrawInfo *iface, BOOL is_cached)
@@ -3321,9 +3407,21 @@ static void STDMETHODCALLTYPE d2d_draw_info_SetInstructionCountHint(ID2D1DrawInf
 static HRESULT STDMETHODCALLTYPE d2d_draw_info_SetPixelShaderConstantBuffer(ID2D1DrawInfo *iface,
         const BYTE *buffer, UINT32 size)
 {
-    FIXME("iface %p, buffer %p, size %u stub.\n", iface, buffer, size);
+    struct d2d_render_info *render_info = impl_from_ID2D1DrawInfo(iface);
+    BYTE *copy = NULL;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, buffer %p, size %u.\n", iface, buffer, size);
+
+    if (size && !buffer)
+        return E_INVALIDARG;
+    if (size && !(copy = malloc(size)))
+        return E_OUTOFMEMORY;
+    if (size)
+        memcpy(copy, buffer, size);
+    free(render_info->ps_constants);
+    render_info->ps_constants = copy;
+    render_info->ps_constants_size = size;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_draw_info_SetResourceTexture(ID2D1DrawInfo *iface,

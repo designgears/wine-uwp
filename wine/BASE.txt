@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     33c24ecc564be3e1868bce1fd0d12e95dbb04d06
-                 dcomp: dcomp visuals answer IInspectable, IVisual2 and IAnimationObject.
+  wine HEAD:     bb67e9e4cf25cfa7d8450837591f0e60f88aeaf9
+                 appxinstall, wineuwp-install: the package installer in C.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-19T23:49:47Z
+  captured:      2026-10-20T05:19:27Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

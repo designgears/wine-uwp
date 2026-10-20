@@ -1,0 +1,14 @@
+MODULE    = appxinstall.dll
+IMPORTLIB = appxinstall
+IMPORTS   = bcrypt winhttp xmllite shlwapi ole32 $(ZLIB_PE_LIBS)
+EXTRAINCL = $(ZLIB_PE_CFLAGS)
+
+SOURCES = \
+	crypto.c \
+	install.c \
+	manifest.c \
+	package.c \
+	source.c \
+	util.c \
+	xml.c \
+	zip.c

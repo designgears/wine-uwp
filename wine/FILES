@@ -328,3 +328,17 @@ dlls/iphlpapi/iphlpapi.spec
 dlls/iphlpapi/iphlpapi_main.c
 include/netioapi.h
 include/nldef.h
+dlls/appxinstall/Makefile.in
+dlls/appxinstall/appxinstall.spec
+dlls/appxinstall/appxinstall_private.h
+dlls/appxinstall/crypto.c
+dlls/appxinstall/install.c
+dlls/appxinstall/manifest.c
+dlls/appxinstall/package.c
+dlls/appxinstall/source.c
+dlls/appxinstall/util.c
+dlls/appxinstall/xml.c
+dlls/appxinstall/zip.c
+programs/wineuwp-install/Makefile.in
+programs/wineuwp-install/main.c
+include/wine/appxinstall.h

@@ -24,6 +24,11 @@ the same way, and the original is then deleted in the same commit. Nothing is po
 - `dlls/appxinstall/`: the installer as a library with a C API. Gaming Services and AppInstallManager call it
   directly, on their own thread, and get progress through a callback, pause and cancel through function calls, and
   failures as HRESULTs.
+Test with `/tmp/cmp-install.sh PACKAGE` in the 10-19 session: both installers into empty data directories, then
+`diff -r`. The test prefix needs a `wineboot -u` once so Wine finds the new DLL and program (it installs their stubs);
+start the program by name (`wine wineuwp-install`), not by its build-tree path. Wine's zlib has no default allocators:
+set `zalloc`/`zfree` or `inflateInit2` fails with `Z_STREAM_ERROR`.
+
 - `programs/wineuwp-install/`: a thin command-line front end over the library with the options and stdout protocol
   `install-app.py` has today (`PID`, `STAGE`, `PROGRESS`, `INSTALLED`, `--info` JSON, `--latest`), for
   `packaging/wine-uwp` and the shapr3d-linux setup UI (`wine wineuwp-install.exe ...`) until those are ported too.
@@ -65,7 +70,7 @@ cases become tests of the C installer.
 
 | Piece | State |
 | --- | --- |
-| Installer | planned (this document) |
+| Installer | `dlls/appxinstall` + `programs/wineuwp-install` (10-19): plain packages, bundles and `.appinstaller` install byte for byte as `install-app.py` (Calculator .msix, 282 files; Gaming Services bundle, 729 files; only the data-directory path differs in launch.env). Not yet: EAppx, MSIXVC/GDK (`.wine-uwp-chunks.json`, native D3D DLL links), reuse of an installed copy (needs a reflink-aware copy in Wine), and the callers (gameplatform, appinstallmanager, packaging/wine-uwp) still run the Python |
 | Shims | not started |
 | Scripts | not started |
 | Tooling | not started |
