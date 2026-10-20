@@ -1093,6 +1093,7 @@ SOURCES = \
 	windows.storage.accesscache.idl \
 	windows.storage.fileproperties.idl \
 	windows.storage.idl \
+	windows.storage.pickers.idl \
 	windows.storage.search.idl \
 	windows.storage.streams.idl \
 	windows.system.idl \

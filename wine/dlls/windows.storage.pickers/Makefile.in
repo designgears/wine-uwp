@@ -1,0 +1,9 @@
+MODULE  = windows.storage.pickers.dll
+IMPORTS = combase comdlg32 shell32 user32
+
+SOURCES = \
+	async.c \
+	async_private.idl \
+	classes.idl \
+	collections.c \
+	main.c

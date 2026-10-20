@@ -1,0 +1,169 @@
+/*
+ * Copyright 2026 wine-uwp contributors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#ifdef __WIDL__
+#pragma winrt ns_prefix
+#endif
+
+import "inspectable.idl";
+import "asyncinfo.idl";
+import "eventtoken.idl";
+import "windowscontracts.idl";
+import "windows.foundation.idl";
+import "windows.storage.idl";
+
+namespace Windows.Storage.Pickers {
+    typedef enum PickerLocationId PickerLocationId;
+    typedef enum PickerViewMode PickerViewMode;
+
+    interface IFileOpenPicker;
+    interface IFileSavePicker;
+    interface IFolderPicker;
+
+    runtimeclass FileOpenPicker;
+    runtimeclass FileSavePicker;
+    runtimeclass FolderPicker;
+
+    declare {
+        interface Windows.Foundation.Collections.IIterable<Windows.Storage.StorageFile *>;
+        interface Windows.Foundation.Collections.IIterator<Windows.Storage.StorageFile *>;
+        interface Windows.Foundation.Collections.IIterable<HSTRING>;
+        interface Windows.Foundation.Collections.IIterator<HSTRING>;
+        interface Windows.Foundation.Collections.IVectorView<HSTRING>;
+        interface Windows.Foundation.Collections.IVector<HSTRING>;
+        interface Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.Foundation.Collections.IVector<HSTRING> *>;
+        interface Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.Foundation.Collections.IVector<HSTRING> *> *>;
+        interface Windows.Foundation.Collections.IIterator<Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.Foundation.Collections.IVector<HSTRING> *> *>;
+        interface Windows.Foundation.Collections.IMapView<HSTRING, Windows.Foundation.Collections.IVector<HSTRING> *>;
+        interface Windows.Foundation.Collections.IMap<HSTRING, Windows.Foundation.Collections.IVector<HSTRING> *>;
+    }
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    enum PickerLocationId
+    {
+        DocumentsLibrary = 0,
+        ComputerFolder   = 1,
+        Desktop          = 2,
+        Downloads        = 3,
+        HomeGroup        = 4,
+        MusicLibrary     = 5,
+        PicturesLibrary  = 6,
+        VideosLibrary    = 7,
+        Objects3D        = 8,
+        Unspecified      = 9,
+    };
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    enum PickerViewMode
+    {
+        List      = 0,
+        Thumbnail = 1,
+    };
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Storage.Pickers.FileOpenPicker),
+        uuid(2ca8278a-12c5-4c5f-8977-94547793c241)
+    ]
+    interface IFileOpenPicker : IInspectable
+    {
+        [propget] HRESULT ViewMode([out, retval] Windows.Storage.Pickers.PickerViewMode *value);
+        [propput] HRESULT ViewMode([in] Windows.Storage.Pickers.PickerViewMode value);
+        [propget] HRESULT SettingsIdentifier([out, retval] HSTRING *value);
+        [propput] HRESULT SettingsIdentifier([in] HSTRING value);
+        [propget] HRESULT SuggestedStartLocation([out, retval] Windows.Storage.Pickers.PickerLocationId *value);
+        [propput] HRESULT SuggestedStartLocation([in] Windows.Storage.Pickers.PickerLocationId value);
+        [propget] HRESULT CommitButtonText([out, retval] HSTRING *value);
+        [propput] HRESULT CommitButtonText([in] HSTRING value);
+        [propget] HRESULT FileTypeFilter([out, retval] Windows.Foundation.Collections.IVector<HSTRING> **value);
+        HRESULT PickSingleFileAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation);
+        HRESULT PickMultipleFilesAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.Storage.StorageFile *> *> **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Storage.Pickers.FileSavePicker),
+        uuid(3286ffcb-617f-4cc5-af6a-b3fdf29ad145)
+    ]
+    interface IFileSavePicker : IInspectable
+    {
+        [propget] HRESULT SettingsIdentifier([out, retval] HSTRING *value);
+        [propput] HRESULT SettingsIdentifier([in] HSTRING value);
+        [propget] HRESULT SuggestedStartLocation([out, retval] Windows.Storage.Pickers.PickerLocationId *value);
+        [propput] HRESULT SuggestedStartLocation([in] Windows.Storage.Pickers.PickerLocationId value);
+        [propget] HRESULT CommitButtonText([out, retval] HSTRING *value);
+        [propput] HRESULT CommitButtonText([in] HSTRING value);
+        [propget] HRESULT FileTypeChoices([out, retval] Windows.Foundation.Collections.IMap<HSTRING, Windows.Foundation.Collections.IVector<HSTRING> *> **value);
+        [propget] HRESULT DefaultFileExtension([out, retval] HSTRING *value);
+        [propput] HRESULT DefaultFileExtension([in] HSTRING value);
+        [propget] HRESULT SuggestedSaveFile([out, retval] Windows.Storage.StorageFile **value);
+        [propput] HRESULT SuggestedSaveFile([in] Windows.Storage.StorageFile *value);
+        [propget] HRESULT SuggestedFileName([out, retval] HSTRING *value);
+        [propput] HRESULT SuggestedFileName([in] HSTRING value);
+        HRESULT PickSaveFileAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Storage.Pickers.FolderPicker),
+        uuid(084f7799-f3fb-400a-99b1-7b4a772fd60d)
+    ]
+    interface IFolderPicker : IInspectable
+    {
+        [propget] HRESULT ViewMode([out, retval] Windows.Storage.Pickers.PickerViewMode *value);
+        [propput] HRESULT ViewMode([in] Windows.Storage.Pickers.PickerViewMode value);
+        [propget] HRESULT SettingsIdentifier([out, retval] HSTRING *value);
+        [propput] HRESULT SettingsIdentifier([in] HSTRING value);
+        [propget] HRESULT SuggestedStartLocation([out, retval] Windows.Storage.Pickers.PickerLocationId *value);
+        [propput] HRESULT SuggestedStartLocation([in] Windows.Storage.Pickers.PickerLocationId value);
+        [propget] HRESULT CommitButtonText([out, retval] HSTRING *value);
+        [propput] HRESULT CommitButtonText([in] HSTRING value);
+        [propget] HRESULT FileTypeFilter([out, retval] Windows.Foundation.Collections.IVector<HSTRING> **value);
+        HRESULT PickSingleFolderAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFolder *> **operation);
+    }
+
+    [
+        activatable(Windows.Foundation.UniversalApiContract, 1.0),
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(standard)
+    ]
+    runtimeclass FileOpenPicker
+    {
+        [default] interface Windows.Storage.Pickers.IFileOpenPicker;
+    }
+
+    [
+        activatable(Windows.Foundation.UniversalApiContract, 1.0),
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(standard)
+    ]
+    runtimeclass FileSavePicker
+    {
+        [default] interface Windows.Storage.Pickers.IFileSavePicker;
+    }
+
+    [
+        activatable(Windows.Foundation.UniversalApiContract, 1.0),
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(standard)
+    ]
+    runtimeclass FolderPicker
+    {
+        [default] interface Windows.Storage.Pickers.IFolderPicker;
+    }
+}

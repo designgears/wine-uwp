@@ -425,3 +425,12 @@ dlls/windows.system.hostlauncher/classes.idl
 dlls/windows.system.hostlauncher/main.c
 dlls/windows.system.hostlauncher/private.h
 dlls/windows.system.hostlauncher/windows.system.hostlauncher.spec
+include/windows.storage.pickers.idl
+dlls/windows.storage.pickers/Makefile.in
+dlls/windows.storage.pickers/async.c
+dlls/windows.storage.pickers/async_private.idl
+dlls/windows.storage.pickers/classes.idl
+dlls/windows.storage.pickers/collections.c
+dlls/windows.storage.pickers/main.c
+dlls/windows.storage.pickers/private.h
+dlls/windows.storage.pickers/windows.storage.pickers.spec

@@ -203,22 +203,6 @@ K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Storag
 "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.storage.dll' /f >/dev/null 2>&1
 rm -f "$WINEPREFIX/drive_c/windows/system32/wineuwp_storagelibrary.dll"
 
-# Windows.Storage.Pickers.FileOpenPicker stand-in. The registered DllPath is the native
-# twinui.appcore.dll, whose picker is a shell UI in a broker process the prefix does not have, so
-# PickSingleFileAsync never completes and an app's "open file" button does nothing. The stand-in
-# returns the file named by WINE_UWP_PICKER_FILE. See shims/filepicker.
-FP_SHIM=${SHIM_DIR}/wineuwp_filepicker.dll
-if [ -f "$FP_SHIM" ]; then
-  FP_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_filepicker.dll
-  if ! cmp -s "$FP_SHIM" "$FP_DST"; then cp -f --reflink=auto "$FP_SHIM" "$FP_DST"; fi
-  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Storage.Pickers.FileOpenPicker"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_filepicker.dll' /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: FileOpenPicker stand-in"
-fi
-
 # Windows.System.User and Windows.System.UserPicker are Wine's windows.system.user. Windows registers both as
 # out-of-process classes of the UserManager service (ActivationType 1, no DllPath), which a prefix does not have:
 # the Xbox app could not find its shell user and XAL (Solitaire's Xbox sign-in) failed to initialise.
@@ -570,13 +554,16 @@ SHIM_CLASSES=""
 [ -f "$SYS32/windows.ui.notifications.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Notifications.ToastNotificationManager:windows.ui.notifications.dll"
 # api-ms-win-net-isolation-l1-1-1 and ext-ms-win-devmgmt-policy-l1-1-1 are Wine's firewallapi and policymanager now,
 # through the apiset schema; a leftover file of either name in system32 is ignored.
-# Windows.Storage.Pickers.FileSavePicker (see shims/filepicker): the native constructor fails
-# without the shell broker, and Shapr3D builds one with its dashboard, straight after sign-in.
-if [ -f "$SYS32/wineuwp_filepicker.dll" ]; then
-  reassert_activatable Windows.Storage.Pickers.FileSavePicker wineuwp_filepicker.dll 1
-  SHIM_CLASSES="$SHIM_CLASSES Windows.Storage.Pickers.FileSavePicker:wineuwp_filepicker.dll:1"
-  reassert_activatable Windows.Storage.Pickers.FolderPicker wineuwp_filepicker.dll 1
-  SHIM_CLASSES="$SHIM_CLASSES Windows.Storage.Pickers.FolderPicker:wineuwp_filepicker.dll:1"
+# Windows.Storage.Pickers are Wine's windows.storage.pickers. Windows registers them in twinui.appcore.dll, whose
+# picker is a shell UI in a broker process the prefix does not have: PickSingleFileAsync never completes, and the
+# FileSavePicker constructor fails, which Shapr3D builds with its dashboard straight after sign-in. Prefixes set up
+# before that used a stand-in DLL, kept until the Wine one is in the prefix.
+if [ -f "$SYS32/windows.storage.pickers.dll" ]; then
+  rm -f "$SYS32/wineuwp_filepicker.dll"
+  for c in FileOpenPicker FileSavePicker FolderPicker; do
+    reassert_activatable Windows.Storage.Pickers.$c windows.storage.pickers.dll 1
+    SHIM_CLASSES="$SHIM_CLASSES Windows.Storage.Pickers.$c:windows.storage.pickers.dll:1"
+  done
 fi
 # Windows.Security.Cryptography.Certificates.Certificate is Wine's windows.security.cryptography.certificates:
 # Windows registers it in certenroll.dll, which the image lacks, and without it Windows.Web.Http abandons every HTTPS

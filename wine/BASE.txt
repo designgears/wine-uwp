@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     a20e98ce3822a15c1e9bb5cd5faae7fb9f8230e2
-                 windows.system.hostlauncher: Implement Windows.System.Launcher on the host.
+  wine HEAD:     a23822f87eb8f8b3726ce5619484d36e5e8ad79b
+                 windows.storage.pickers: Implement FileOpenPicker, FileSavePicker and FolderPicker.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-20T10:30:14Z
+  captured:      2026-10-20T10:42:30Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
