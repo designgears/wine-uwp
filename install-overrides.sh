@@ -229,20 +229,17 @@ if [ -f "$FP_SHIM" ]; then
   echo "installed: FileOpenPicker stand-in"
 fi
 
-# Windows.System.UserPicker stand-in. Registered on Windows as ActivationType=1 with
-# Server=UserManager - an out-of-process class with no DllPath - so RoGetActivationFactory fails
-# outright and Xbox Live auth (XAL) reports E_FAIL. Solitaire logs that as its first two lines.
-# See shims/userpicker.
-UP_SHIM=${SHIM_DIR}/wineuwp_userpicker.dll
-if [ -f "$UP_SHIM" ]; then
-  UP_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_userpicker.dll
-  if ! cmp -s "$UP_SHIM" "$UP_DST"; then cp -f --reflink=auto "$UP_SHIM" "$UP_DST"; fi
-  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.System.UserPicker"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_userpicker.dll' /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: UserPicker stand-in"
+# Windows.System.User and Windows.System.UserPicker are Wine's windows.system.user. Windows registers both as
+# out-of-process classes of the UserManager service (ActivationType 1, no DllPath), which a prefix does not have:
+# the Xbox app could not find its shell user and XAL (Solitaire's Xbox sign-in) failed to initialise.
+if [ -f "$SYS32/windows.system.user.dll" ]; then
+  for c in Windows.System.User Windows.System.UserPicker; do
+    K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\$c"
+    "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.system.user.dll' /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 0 /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
+  done
 fi
 
 # MemoryManager's native rmclient event registration requires an absent Windows service: Solitaire throws out of its
@@ -349,18 +346,6 @@ if [ -f "$SYS32/windows.services.store.dll" ]; then
   "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
 fi
 
-# Windows.System.User: the local user (see shims/user). Windows serves it from the UserManager service.
-US_SHIM=${SHIM_DIR}/wineuwp_user.dll
-if [ -f "$US_SHIM" ]; then
-  US_DST=$SYS32/wineuwp_user.dll
-  if ! cmp -s "$US_SHIM" "$US_DST"; then cp -f --reflink=auto "$US_SHIM" "$US_DST"; fi
-  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.System.User"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_user.dll' /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: Windows.System.User stand-in"
-fi
 
 # Microsoft.GamePlatform.Services.*: the Gaming Services client classes (see shims/gameplatform). They
 # replace the package's own Microsoft.GamePlatform.Services.dll (OverridesPackage=1, read by combase),
@@ -586,7 +571,7 @@ activatable_dllpath() {
 }
 
 SHIM_CLASSES=""
-[ -f "$SYS32/wineuwp_userpicker.dll" ]       && SHIM_CLASSES="$SHIM_CLASSES Windows.System.UserPicker:wineuwp_userpicker.dll"
+[ -f "$SYS32/windows.system.user.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.System.UserPicker:windows.system.user.dll Windows.System.User:windows.system.user.dll"
 [ -f "$SYS32/windows.system.memorymanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.System.MemoryManager:windows.system.memorymanager.dll"
 [ -f "$SYS32/windows.devices.enumeration.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Devices.Enumeration.DeviceInformation:windows.devices.enumeration.dll"
 [ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager:wineuwp_appinstallmanager.dll"

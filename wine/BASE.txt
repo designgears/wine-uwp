@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     0289c1b8820eeba8b4fdbe7704c677fd3205bd01
-                 windows.security.authorization.appcapabilityaccess: AppCapability from the package manifest; formerly a wine-uwp shim.
+  wine HEAD:     7e1cb7c361e67a0558b1664a0ca6254b710cfadf
+                 windows.system.user: Windows.System.User and UserPicker without the UserManager service; formerly wine-uwp shims.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-20T09:34:01Z
+  captured:      2026-10-20T09:40:47Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

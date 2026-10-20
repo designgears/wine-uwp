@@ -44,6 +44,8 @@ namespace Windows.System
     typedef enum ProcessorArchitecture ProcessorArchitecture;
     typedef enum UserAuthenticationStatus UserAuthenticationStatus;
     typedef enum UserPictureSize UserPictureSize;
+    typedef enum UserAgeConsentGroup UserAgeConsentGroup;
+    typedef enum UserAgeConsentResult UserAgeConsentResult;
     typedef enum UserType UserType;
     typedef enum VirtualKey VirtualKey;
     typedef enum VirtualKeyModifiers VirtualKeyModifiers;
@@ -61,7 +63,13 @@ namespace Windows.System
     interface IMemoryManagerStatics2;
     interface IProcessMemoryReport;
     interface IUser;
+    interface IUser2;
+    interface IUserPicker;
+    interface IUserPickerStatics;
     interface IUserStatics;
+    interface IUserStatics2;
+    /* UserWatcher's default interface, not defined here yet: returning it is the same ABI as returning the runtimeclass */
+    interface IUserWatcher;
     interface IUserChangedEventArgs;
     interface IUserChangedEventArgs2;
 
@@ -75,6 +83,7 @@ namespace Windows.System
     runtimeclass ProcessMemoryReport;
     runtimeclass User;
     runtimeclass UserChangedEventArgs;
+    runtimeclass UserPicker;
 
     declare
     {
@@ -86,6 +95,15 @@ namespace Windows.System
         interface Windows.Foundation.TypedEventHandler<Windows.System.DispatcherQueue *, IInspectable *>;
         interface Windows.Foundation.TypedEventHandler<Windows.System.DispatcherQueue *, Windows.System.DispatcherQueueShutdownStartingEventArgs *>;
         interface Windows.Foundation.TypedEventHandler<Windows.System.DispatcherQueueTimer *, IInspectable *>;
+        interface Windows.Foundation.Collections.IIterable<Windows.System.User *>;
+        interface Windows.Foundation.Collections.IIterator<Windows.System.User *>;
+        interface Windows.Foundation.Collections.IVectorView<Windows.System.User *>;
+        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Foundation.Collections.IVectorView<Windows.System.User *> *>;
+        interface Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.System.User *> *>;
+        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.System.User *>;
+        interface Windows.Foundation.IAsyncOperation<Windows.System.User *>;
+        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.System.UserAgeConsentResult>;
+        interface Windows.Foundation.IAsyncOperation<Windows.System.UserAgeConsentResult>;
     }
 
     [
@@ -543,12 +561,14 @@ namespace Windows.System
     [
         contract(Windows.Foundation.UniversalApiContract, 1.0),
         marshaling_behavior(agile),
-        /* static(Windows.System.IUserStatics, Windows.Foundation.UniversalApiContract, 1.0), */
+        static(Windows.System.IUserStatics, Windows.Foundation.UniversalApiContract, 1.0),
+        static(Windows.System.IUserStatics2, Windows.Foundation.UniversalApiContract, 10.0),
         threading(both),
     ]
     runtimeclass User
     {
         [default] interface Windows.System.IUser;
+        [contract(Windows.Foundation.UniversalApiContract, 14.0)] interface Windows.System.IUser2;
     }
 
     [
@@ -674,5 +694,97 @@ namespace Windows.System
     runtimeclass ProcessMemoryReport
     {
         [default] interface Windows.System.IProcessMemoryReport;
+    }
+
+    [contract(Windows.Foundation.UniversalApiContract, 14.0)]
+    enum UserAgeConsentGroup
+    {
+        Child = 0,
+        Minor = 1,
+        Adult = 2,
+    };
+
+    [contract(Windows.Foundation.UniversalApiContract, 14.0)]
+    enum UserAgeConsentResult
+    {
+        NotEnforced = 0,
+        Included = 1,
+        NotIncluded = 2,
+        Unknown = 3,
+        Ambiguous = 4,
+    };
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 14.0),
+        exclusiveto(Windows.System.User),
+        uuid(98ba5628-a6e3-518e-89d9-d3b2b1991a10)
+    ]
+    interface IUser2 : IInspectable
+    {
+        HRESULT CheckUserAgeConsentGroupAsync([in] Windows.System.UserAgeConsentGroup group,
+                                              [out, retval] Windows.Foundation.IAsyncOperation<Windows.System.UserAgeConsentResult> **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.System.User),
+        uuid(155eb23b-242a-45e0-a2e9-3171fc6a7fdd)
+    ]
+    interface IUserStatics : IInspectable
+    {
+        HRESULT CreateWatcher([out, retval] Windows.System.IUserWatcher **result);
+        [overload("FindAllAsync")] HRESULT FindAllAsync(
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.System.User *> *> **operation);
+        [overload("FindAllAsync")] HRESULT FindAllAsyncByType([in] Windows.System.UserType type,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.System.User *> *> **operation);
+        [overload("FindAllAsync")] HRESULT FindAllAsyncByTypeAndStatus([in] Windows.System.UserType type,
+                [in] Windows.System.UserAuthenticationStatus status,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<Windows.System.User *> *> **operation);
+        HRESULT GetFromId([in] HSTRING id, [out, retval] Windows.System.User **result);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 10.0),
+        exclusiveto(Windows.System.User),
+        uuid(74a37e11-2eb5-4487-b0d5-2c6790e013e9)
+    ]
+    interface IUserStatics2 : IInspectable
+    {
+        HRESULT GetDefault([out, retval] Windows.System.User **result);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.System.UserPicker),
+        uuid(7d548008-f1e3-4a6c-8ddc-a9bb0f488aed)
+    ]
+    interface IUserPicker : IInspectable
+    {
+        [propget] HRESULT AllowGuestAccounts([out, retval] boolean *value);
+        [propput] HRESULT AllowGuestAccounts([in] boolean value);
+        [propget] HRESULT SuggestedSelectedUser([out, retval] Windows.System.User **value);
+        [propput] HRESULT SuggestedSelectedUser([in] Windows.System.User *value);
+        HRESULT PickSingleUserAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.System.User *> **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.System.UserPicker),
+        uuid(de3290dc-7e73-4df6-a1ae-4d7eca82b40d)
+    ]
+    interface IUserPickerStatics : IInspectable
+    {
+        HRESULT IsSupported([out, retval] boolean *result);
+    }
+
+    [
+        activatable(Windows.Foundation.UniversalApiContract, 1.0),
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile),
+        static(Windows.System.IUserPickerStatics, Windows.Foundation.UniversalApiContract, 1.0)
+    ]
+    runtimeclass UserPicker
+    {
+        [default] interface Windows.System.IUserPicker;
     }
 }

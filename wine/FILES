@@ -402,3 +402,10 @@ dlls/windows.security.authorization.appcapabilityaccess/Makefile.in
 dlls/windows.security.authorization.appcapabilityaccess/classes.idl
 dlls/windows.security.authorization.appcapabilityaccess/main.c
 dlls/windows.security.authorization.appcapabilityaccess/windows.security.authorization.appcapabilityaccess.spec
+dlls/windows.system.user/Makefile.in
+dlls/windows.system.user/async.c
+dlls/windows.system.user/async_private.idl
+dlls/windows.system.user/classes.idl
+dlls/windows.system.user/main.c
+dlls/windows.system.user/private.h
+dlls/windows.system.user/windows.system.user.spec
