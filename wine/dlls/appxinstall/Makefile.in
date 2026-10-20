@@ -5,10 +5,12 @@ EXTRAINCL = $(ZLIB_PE_CFLAGS)
 
 SOURCES = \
 	crypto.c \
+	eappx.c \
 	install.c \
 	manifest.c \
 	package.c \
 	source.c \
 	util.c \
 	xml.c \
+	xvd.c \
 	zip.c

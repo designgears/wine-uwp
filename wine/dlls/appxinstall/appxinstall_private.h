@@ -90,6 +90,39 @@ WCHAR *path_join( const WCHAR *dir, const WCHAR *name );
 WCHAR *strdupW( const WCHAR *s );
 BOOL create_directories( const WCHAR *dir );
 char *utf8_dup( const WCHAR *s );
+BOOL find_content_key( const char *keys, const BYTE kid[16], BYTE key[32] );
+
+/* xvd.c: GDK packages */
+struct xvd;
+struct xvd_region
+{
+    UINT32 id, first_segment;
+    UINT16 key;             /* content key slot; 0xffff (>= 192) plain */
+    UINT64 first_page, pages;
+    WCHAR **tags, **languages;
+    unsigned int tag_count, language_count;
+};
+HRESULT xvd_open( struct source *source, const struct appx_install_params *params, struct xvd **xvd );
+unsigned int xvd_count( const struct xvd *xvd );
+const WCHAR *xvd_name( const struct xvd *xvd, unsigned int index );
+UINT64 xvd_size( const struct xvd *xvd, unsigned int index );
+UINT32 xvd_member_region( const struct xvd *xvd, unsigned int index );
+const BYTE *xvd_content_id( const struct xvd *xvd );
+unsigned int xvd_region_count( const struct xvd *xvd );
+const struct xvd_region *xvd_region( const struct xvd *xvd, unsigned int index );
+HRESULT xvd_extract( struct xvd *xvd, unsigned int index,
+                     BOOL (*write)( void *context, const BYTE *data, ULONG size ), void *context );
+void xvd_close( struct xvd *xvd );
+
+/* eappx.c: encrypted packages and bundles */
+struct eappx;
+HRESULT eappx_open( struct source *source, const struct appx_install_params *params, struct eappx **eappx );
+unsigned int eappx_count( const struct eappx *eappx );
+const WCHAR *eappx_name( const struct eappx *eappx, unsigned int index );
+UINT64 eappx_size( const struct eappx *eappx, unsigned int index );
+HRESULT eappx_extract( struct eappx *eappx, unsigned int index,
+                       BOOL (*write)( void *context, const BYTE *data, ULONG size ), void *context );
+void eappx_close( struct eappx *eappx );
 
 /* package.c */
 struct package;
@@ -105,6 +138,7 @@ HRESULT package_extract( const struct package *pkg, unsigned int index,
                          BOOL (*write)( void *context, const BYTE *data, ULONG size ), void *context );
 HRESULT package_read( const struct package *pkg, unsigned int index, BYTE **data, ULONG *size );
 void package_close( struct package *pkg );
+struct xvd *package_xvd( const struct package *pkg );   /* NULL unless a GDK package */
 
 /* manifest.c */
 struct dependency { WCHAR *name, *min_version, *publisher; };

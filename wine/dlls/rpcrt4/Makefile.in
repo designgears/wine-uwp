@@ -19,8 +19,8 @@ SOURCES = \
 	ndr_ole.c \
 	ndr_stubless.c \
 	ndr_typelib.c \
-	ndr_types.idl \
 	ndr_winmd.c \
+	ndr_types.idl \
 	rpc_assoc.c \
 	rpc_async.c \
 	rpc_binding.c \

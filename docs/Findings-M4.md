@@ -12950,3 +12950,12 @@ drawn over them. Tried and ruled out:
 Not yet known: what hides the skeleton on Windows (Visibility, an opacity binding, or a batch completion).
 `trace+dcompanim` slows start-up enough that content sometimes never loads within 120 s, so judge such runs by
 the control, not by a single capture.
+
+## 2026-10-19/20: the installer in C, GDK and EAppx included
+
+`dlls/appxinstall` now reads XVD (`xvd.c`) and EAppx/EXBH (`eappx.c`) as well as zip packages, and `shims/gameplatform` and `shims/appinstallmanager` call `appx_install()` in-process instead of `sh -c python3 install-app.py`. Verified: Bad Magpie's `.msixvc` installs to the same 750 files as the Python; from the Xbox app on `prefix-test` (games data `uwp-bin/xbox-capi-test`) Install went to Play and the game reached its title menu; pause/resume and cancel over HTTP behave as before (cancel at 121 MB leaves no staging, only the lock).
+
+- The mutable-data page count at XVD 0x470 is a single byte (u32 there reads 257 on Bad Magpie). The Python was right.
+- The Bad Magpie licence's content id is the GUID in the CDN path (`27275b31-...`), not the content id in the XVC info (`2d6bbb0b-...`, which licensing rejects as ContentIdNotInCatalog).
+- Native D3D DLLs are now hard links to the runtime (Wine cannot make a host symlink); falls back to a copy.
+- No real EAppx is on disk; the EAppx reader is checked against synthetic packages that follow the Python's description of the format.

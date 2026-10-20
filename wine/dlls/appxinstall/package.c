@@ -35,6 +35,8 @@ struct package
     struct source *inner;       /* a bundle's package, in place */
     struct zip *bundle;
     struct zip *zip;            /* the package's members */
+    struct xvd *xvd;            /* or a GDK package's */
+    struct eappx *eappx;        /* or an encrypted package's */
     WCHAR *temp;                /* a bundle's package extracted here, deleted on close */
     WCHAR **names;              /* member names, percent-decoded, '/'-separated */
 };
@@ -142,6 +144,13 @@ HRESULT package_open( const WCHAR *path, const struct appx_install_params *param
 
     if (!(pkg = calloc( 1, sizeof(*pkg) ))) return E_OUTOFMEMORY;
     if (FAILED(hr = source_open( path, params, &pkg->outer ))) goto fail;
+    if (FAILED(hr = eappx_open( pkg->outer, params, &pkg->eappx ))) goto fail;
+    if (hr == S_FALSE && FAILED(hr = xvd_open( pkg->outer, params, &pkg->xvd ))) goto fail;
+    if (pkg->eappx || pkg->xvd)
+    {
+        *out = pkg;
+        return S_OK;
+    }
     if (FAILED(hr = zip_open( pkg->outer, &pkg->bundle )))
     {
         ERR( "%s is not an app package\n", debugstr_w(path) );
@@ -169,24 +178,32 @@ fail:
     return hr;
 }
 
+struct xvd *package_xvd( const struct package *pkg )
+{
+    return pkg->xvd;
+}
+
 unsigned int package_count( const struct package *pkg )
 {
-    return zip_count( pkg->zip );
+    if (pkg->eappx) return eappx_count( pkg->eappx );
+    return pkg->xvd ? xvd_count( pkg->xvd ) : zip_count( pkg->zip );
 }
 
 const WCHAR *package_name( const struct package *pkg, unsigned int index )
 {
-    return pkg->names[index];
+    if (pkg->eappx) return eappx_name( pkg->eappx, index );
+    return pkg->xvd ? xvd_name( pkg->xvd, index ) : pkg->names[index];
 }
 
 UINT64 package_size( const struct package *pkg, unsigned int index )
 {
-    return zip_entry( pkg->zip, index )->size;
+    if (pkg->eappx) return eappx_size( pkg->eappx, index );
+    return pkg->xvd ? xvd_size( pkg->xvd, index ) : zip_entry( pkg->zip, index )->size;
 }
 
 BOOL package_is_dir( const struct package *pkg, unsigned int index )
 {
-    const WCHAR *name = pkg->names[index];
+    const WCHAR *name = package_name( pkg, index );
     return *name && name[wcslen( name ) - 1] == '/';
 }
 
@@ -195,19 +212,47 @@ int package_find( const struct package *pkg, const WCHAR *name )
     unsigned int i;
 
     for (i = 0; i < package_count( pkg ); i++)
-        if (path_equal( pkg->names[i], name )) return i;
+        if (path_equal( package_name( pkg, i ), name )) return i;
     return -1;
 }
 
 HRESULT package_extract( const struct package *pkg, unsigned int index,
                          BOOL (*write)( void *context, const BYTE *data, ULONG size ), void *context )
 {
+    if (pkg->eappx) return eappx_extract( pkg->eappx, index, write, context );
+    if (pkg->xvd) return xvd_extract( pkg->xvd, index, write, context );
     return zip_extract( pkg->zip, zip_entry( pkg->zip, index ), write, context );
+}
+
+struct buffer { BYTE *data; ULONG size, capacity; };
+
+static BOOL append( void *context, const BYTE *data, ULONG size )
+{
+    struct buffer *b = context;
+    if (b->size + size > b->capacity) return FALSE;
+    memcpy( b->data + b->size, data, size );
+    b->size += size;
+    return TRUE;
 }
 
 HRESULT package_read( const struct package *pkg, unsigned int index, BYTE **data, ULONG *size )
 {
-    return zip_read( pkg->zip, zip_entry( pkg->zip, index ), data, size );
+    struct buffer b = { 0 };
+    HRESULT hr;
+
+    if (!pkg->xvd && !pkg->eappx) return zip_read( pkg->zip, zip_entry( pkg->zip, index ), data, size );
+    if (package_size( pkg, index ) > 64u << 20) return HRESULT_FROM_WIN32( ERROR_FILE_TOO_LARGE );
+    b.capacity = package_size( pkg, index );
+    if (!(b.data = malloc( b.capacity + 1 ))) return E_OUTOFMEMORY;
+    if (FAILED(hr = package_extract( pkg, index, append, &b )))
+    {
+        free( b.data );
+        return hr;
+    }
+    b.data[b.size] = 0;
+    *data = b.data;
+    if (size) *size = b.size;
+    return S_OK;
 }
 
 void package_close( struct package *pkg )
@@ -220,6 +265,8 @@ void package_close( struct package *pkg )
         for (i = 0; pkg->names[i]; i++) free( pkg->names[i] );
         free( pkg->names );
     }
+    xvd_close( pkg->xvd );
+    eappx_close( pkg->eappx );
     if (pkg->zip != pkg->bundle) zip_close( pkg->zip );
     zip_close( pkg->bundle );
     source_close( pkg->inner );

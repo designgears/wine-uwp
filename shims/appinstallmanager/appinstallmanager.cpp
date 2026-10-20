@@ -14,6 +14,7 @@
 #include <activation.h>
 #include <eventtoken.h>
 #include <winhttp.h>
+#include APPXINSTALL_H
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -404,7 +405,7 @@ HRESULT UO2::put_AutomaticallyDownloadAndInstallUpdateIfFound(boolean v) { outer
 
 /* ---- updates: what the Store's delivery service has that is newer than what is staged ----
  * The catalogue maps a package family to its Windows Update category, FE3 lists that category's packages, and
- * wine-uwp's installer (WINE_UWP_INSTALLER, the host's Python) stages the newest one over the running package's own
+ * wine-uwp's installer (Wine's appxinstall.dll) stages the newest one over the running package's own
  * stage directory, the way shims/gameplatform installs a game. Only the calling package is looked at: the
  * Store's Library lists nothing else here. */
 static const GUID IID_IAppInstallItem_  = {0x49d3dfab,0x168a,0x4cbf,{0xa9,0x3a,0x9e,0x44,0x8c,0x82,0x73,0x7d}};
@@ -652,7 +653,7 @@ struct UpdateItem : IAppInstallItemAbi
     UINT64 total = 0, done = 0;
     HRESULT error = S_OK;
     bool started = false, cancel = false, launch_after = false;
-    DWORD host_pid = 0;
+    volatile LONG cancel_flag = 0;      /* what the installer polls */
     std::vector<Handler> completed, status_changed;
     Item2 i2; Item3 i3; Item4 i4; Item5 i5;
     UpdateItem() { i2.outer = i3.outer = i4.outer = i5.outer = this; }
@@ -771,28 +772,14 @@ void UpdateItem::set_state(int st, HRESULT hr)
     args->Release();
 }
 
-static bool signal_host_installer(DWORD pid)
-{
-    if (!pid) return false;
-    /* the launcher handle of a Unix child is not the Python process: signal the PID the installer reports */
-    std::wstring cmd = L"\"Z:\\bin\\kill\" -TERM " + std::to_wstring(pid);
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi;
-    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return false;
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return true;
-}
-
 HRESULT UpdateItem::Cancel()
 {
     trace("item %ls: Cancel", family.c_str());
     AcquireSRWLockExclusive(&lock);
     cancel = true;
-    DWORD pid = host_pid;
+    InterlockedExchange(&cancel_flag, 1);
     bool running = started && state != AIS_COMPLETED && state != AIS_ERROR && state != AIS_CANCELED;
     ReleaseSRWLockExclusive(&lock);
-    if (pid) signal_host_installer(pid);
     if (!running) set_state(AIS_CANCELED);
     return S_OK;
 }
@@ -801,7 +788,7 @@ void UpdateItem::start()
 {
     AcquireSRWLockExclusive(&lock);
     bool go = !started || state == AIS_ERROR || state == AIS_CANCELED;
-    if (go) { started = true; cancel = false; state = AIS_PENDING; done = 0; error = S_OK; }
+    if (go) { started = true; cancel = false; cancel_flag = 0; state = AIS_PENDING; done = 0; error = S_OK; }
     ReleaseSRWLockExclusive(&lock);
     if (!go) return;
     AddRef();
@@ -810,113 +797,101 @@ void UpdateItem::start()
     else { Release(); set_state(AIS_ERROR, HRESULT_FROM_WIN32(GetLastError())); }
 }
 
-/* the host's Python stages the package over our own stage directory: install-app.py URL DATADIR --stage NAME
- * (stage directories are DATADIR/stage/NAME), with PROGRESS, INSTALLED and EXIT lines in a log we read back */
+struct InstallerProgress
+{
+    UpdateItem *it;
+    int last_state;
+    ULONGLONG report_t0;
+    bool installed;
+    std::string last;               /* the installer's last message: why, when it fails */
+};
+
+static void CALLBACK installer_event(void *context, enum appx_event event, UINT64 completed, UINT64 total, const WCHAR *text)
+{
+    InstallerProgress *p = (InstallerProgress *)context;
+    UpdateItem *it = p->it;
+
+    switch (event)
+    {
+    case APPX_EVENT_STAGE:
+        trace("install: %ls", text);
+        if (p->last_state == AIS_DOWNLOADING && wcsstr(text, L"framework")) it->set_state(p->last_state = AIS_INSTALLING);
+        break;
+    case APPX_EVENT_MESSAGE: trace("install: %ls", text); p->last = utf8(text); break;
+    case APPX_EVENT_INSTALLED: p->installed = true; break;
+    case APPX_EVENT_PROGRESS:
+    {
+        if (!total) break;
+        AcquireSRWLockExclusive(&it->lock);
+        it->total = total;
+        it->done = (std::min)(completed, total);
+        ReleaseSRWLockExclusive(&it->lock);
+        ULONGLONG now = GetTickCount64();
+        if (p->last_state != AIS_DOWNLOADING || now - p->report_t0 >= 500 || completed >= total)
+        {
+            p->report_t0 = now;
+            p->last_state = AIS_DOWNLOADING;
+            it->set_state(AIS_DOWNLOADING);
+        }
+        break;
+    }
+    }
+}
+
+/* a Unix path as a Windows one */
+static std::wstring dos_path(std::wstring unix_path)
+{
+    std::replace(unix_path.begin(), unix_path.end(), L'/', L'\\');
+    return L"Z:" + unix_path;
+}
+
+/* wine-uwp's installer stages the package over our own stage directory (stage directories are DATADIR\stage\NAME) */
 DWORD WINAPI UpdateItem::install_thread(void *param)
 {
+    typedef HRESULT (CDECL *install_fn)(const struct appx_install_params *);
     UpdateItem *it = (UpdateItem *)param;
-    std::wstring script = env_w(L"WINE_UWP_INSTALLER"), tree = env_w(L"WINE_UWP_WINDOWS_TREE");
+    std::wstring tree = env_w(L"WINE_UWP_WINDOWS_TREE"), root = env_w(L"WINE_UWP_ROOT");
+    std::wstring shim_dir = env_w(L"SHIM_DIR"), uwp_bin = env_w(L"UWP_BIN");
     size_t slash = it->stage_unix.rfind(L'/');
     std::wstring stage_name = it->stage_unix.substr(slash + 1), stage_root = it->stage_unix.substr(0, slash);
     std::wstring data = stage_root.substr(0, stage_root.rfind(L'/'));
-    if (script.empty() || tree.empty() || slash == std::wstring::npos || stage_root.compare(stage_root.size() - 6, 6, L"/stage"))
+    HMODULE lib = LoadLibraryW(L"appxinstall.dll");
+    install_fn appx_install = lib ? (install_fn)GetProcAddress(lib, "appx_install") : nullptr;
+    if (!appx_install || tree.empty() || slash == std::wstring::npos || stage_root.compare(stage_root.size() - 6, 6, L"/stage"))
     {
-        trace("install: no installer, Windows tree or stage directory (%ls)", it->stage_unix.c_str());
+        trace("install: no appxinstall.dll, Windows tree or stage directory (%ls)", it->stage_unix.c_str());
         it->set_state(AIS_ERROR, HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND));
         it->Release();
         return 0;
     }
-    std::wstring log_unix = data + L"/install-" + stage_name + L".log";
-    std::wstring log_win = L"Z:" + log_unix;
-    std::replace(log_win.begin(), log_win.end(), L'/', L'\\');
-    DeleteFileW(log_win.c_str());
-    std::wstring cmd = L"\"Z:\\bin\\sh\" -c \"python3 '" + script + L"' '" + wide(it->url) + L"' '" + data + L"' --windows '" + tree +
-                       L"' --stage '" + stage_name + L"' > '" + log_unix + L"' 2>&1; echo EXIT $? >> '" + log_unix + L"'\"";
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi;
+    std::wstring package = wide(it->url), data_dos = dos_path(data), tree_dos = dos_path(tree);
+    std::wstring defaults = root.empty() ? L"" : dos_path(root + L"/launch-defaults.env");
+    std::wstring launcher = !shim_dir.empty() ? dos_path(shim_dir + L"/wineuwp-launch.exe")
+                          : !uwp_bin.empty() ? dos_path(uwp_bin + L"/build-probes/wineuwp-launch.exe") : L"";
+    InstallerProgress progress = { it, AIS_STARTING };
+    struct appx_install_params params = {};
+    params.package = package.c_str();
+    params.data_dir = data_dos.c_str();
+    params.windows_tree = tree_dos.c_str();
+    params.stage = stage_name.c_str();
+    params.launch_defaults = defaults.empty() ? nullptr : defaults.c_str();
+    params.launcher = launcher.empty() ? nullptr : launcher.c_str();
+    params.cancel = &it->cancel_flag;
+    params.callback = installer_event;
+    params.context = &progress;
     it->set_state(AIS_STARTING);
-    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
-    {
-        trace("install: cannot start the installer (%lu)", GetLastError());
-        it->set_state(AIS_ERROR, HRESULT_FROM_WIN32(GetLastError()));
-        it->Release();
-        return 0;
-    }
-    CloseHandle(pi.hThread);
     trace("install: %ls %s into stage %ls", it->family.c_str(), it->version.c_str(), stage_name.c_str());
-    std::string seen;
-    size_t parsed = 0;
-    bool installed = false, exited = false;
-    int exit_code = -1, grace = 0, last_state = AIS_STARTING;
-    ULONGLONG report_t0 = 0;
-    for (;;)
-    {
-        DWORD wait = WaitForSingleObject(pi.hProcess, 500);
-        HANDLE f = CreateFileW(log_win.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (f != INVALID_HANDLE_VALUE)
-        {
-            std::string all;
-            char buf[8192];
-            DWORD got;
-            while (ReadFile(f, buf, sizeof(buf), &got, nullptr) && got) all.append(buf, got);
-            CloseHandle(f);
-            if (all.size() > seen.size()) seen = all;
-            while (parsed < seen.size())
-            {
-                size_t e = seen.find('\n', parsed);
-                if (e == std::string::npos) break;
-                std::string line = seen.substr(parsed, e - parsed);
-                parsed = e + 1;
-                unsigned long long completed, total;
-                if (!line.compare(0, 4, "PID "))
-                {
-                    AcquireSRWLockExclusive(&it->lock);
-                    it->host_pid = strtoul(line.c_str() + 4, nullptr, 10);
-                    ReleaseSRWLockExclusive(&it->lock);
-                }
-                else if (sscanf(line.c_str(), "PROGRESS %llu %llu", &completed, &total) == 2 && total)
-                {
-                    AcquireSRWLockExclusive(&it->lock);
-                    it->total = total;
-                    it->done = (std::min)(completed, total);
-                    ReleaseSRWLockExclusive(&it->lock);
-                    ULONGLONG now = GetTickCount64();
-                    if (last_state != AIS_DOWNLOADING || now - report_t0 >= 500 || completed >= total)
-                    {
-                        report_t0 = now;
-                        last_state = AIS_DOWNLOADING;
-                        it->set_state(AIS_DOWNLOADING);
-                    }
-                }
-                else if (!line.compare(0, 10, "INSTALLED ")) installed = true;
-                else if (!line.compare(0, 5, "EXIT ")) { exit_code = atoi(line.c_str() + 5); exited = true; }
-                else if (!line.compare(0, 6, "STAGE "))
-                {
-                    trace("install: %s", line.c_str() + 6);
-                    if (last_state == AIS_DOWNLOADING && line.find("framework") != std::string::npos)
-                        it->set_state(last_state = AIS_INSTALLING);
-                }
-            }
-        }
-        if (exited) break;
-        if (wait != WAIT_TIMEOUT && wait != WAIT_OBJECT_0) Sleep(500);
-        if (wait == WAIT_OBJECT_0 && ++grace > 10) break;
-    }
-    CloseHandle(pi.hProcess);
+    HRESULT hr = appx_install(&params);
     AcquireSRWLockExclusive(&it->lock);
     bool canceled = it->cancel;
-    it->host_pid = 0;
     ReleaseSRWLockExclusive(&it->lock);
-    trace("install: installer exited %d%s", exit_code, installed ? ", installed" : "");
-    if (installed && !exit_code) it->set_state(AIS_COMPLETED);
+    trace("install: installer -> %#lx%s", (unsigned long)hr, progress.installed ? ", installed" : "");
+    if (SUCCEEDED(hr) && progress.installed) it->set_state(AIS_COMPLETED);
     else if (canceled) it->set_state(AIS_CANCELED);
     else
     {
-        size_t x = seen.rfind("EXIT");
-        size_t e = x == std::string::npos || !x ? std::string::npos : seen.find_last_not_of("\r\n", x - 1);
-        size_t b = seen.rfind('\n', e == std::string::npos ? 0 : e);
-        trace("install: %s", seen.substr(b == std::string::npos ? 0 : b + 1, e == std::string::npos ? 0 : e - b).c_str());
-        it->set_state(AIS_ERROR, E_FAIL);
+        if (!progress.last.empty()) trace("install: %s", progress.last.c_str());
+        it->set_state(AIS_ERROR, FAILED(hr) ? hr : E_FAIL);
     }
     it->Release();
     return 0;

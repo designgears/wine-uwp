@@ -92,3 +92,39 @@ char *utf8_dup( const WCHAR *s )
     if (r) WideCharToMultiByte( CP_UTF8, 0, s, -1, r, n, NULL, NULL );
     return r;
 }
+
+/* the content key named by key id kid, from "kid:key;..." (hex) */
+BOOL find_content_key( const char *keys, const BYTE kid[16], BYTE key[32] )
+{
+    const char *p = keys;
+
+    while (p && *p)
+    {
+        const char *colon = strchr( p, ':' ), *end = strchr( p, ';' );
+        BYTE id[16];
+        unsigned int i, n;
+
+        if (!end) end = p + strlen( p );
+        if (colon && colon < end)
+        {
+            for (i = n = 0; p + i + 1 < colon && n < 16; i += 2)
+            {
+                int hi = hex_value( p[i] ), lo = hex_value( p[i + 1] );
+                if (hi < 0 || lo < 0) break;
+                id[n++] = hi * 16 + lo;
+            }
+            if (n == 16 && p + i == colon && !memcmp( id, kid, 16 ) && end - colon - 1 == 64)
+            {
+                for (i = 0; i < 32; i++)
+                {
+                    int hi = hex_value( colon[1 + 2 * i] ), lo = hex_value( colon[2 + 2 * i] );
+                    if (hi < 0 || lo < 0) return FALSE;
+                    key[i] = hi * 16 + lo;
+                }
+                return TRUE;
+            }
+        }
+        p = *end ? end + 1 : end;
+    }
+    return FALSE;
+}

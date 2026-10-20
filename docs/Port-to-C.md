@@ -62,7 +62,7 @@ cases become tests of the C installer.
 ### Known quirks to keep or fix deliberately (from the line-by-line map)
 
 - `children()` matches all descendants by local name, not direct children.
-- the XVD mutable-data page count is read as one byte at 0x470: verify against a real package before porting.
+- the XVD mutable-data page count at 0x470 **is** one byte: Bad Magpie has 1 there and 257 as a u32.
 - `UWP_EXE` is written unquoted in identity.env: quote it in the port (names with spaces).
 - the stage name is validated after the final path is built: validate first.
 
@@ -70,7 +70,7 @@ cases become tests of the C installer.
 
 | Piece | State |
 | --- | --- |
-| Installer | `dlls/appxinstall` + `programs/wineuwp-install` (10-19): plain packages, bundles and `.appinstaller` install byte for byte as `install-app.py` (Calculator .msix, 282 files; Gaming Services bundle, 729 files; only the data-directory path differs in launch.env). Not yet: EAppx, MSIXVC/GDK (`.wine-uwp-chunks.json`, native D3D DLL links), reuse of an installed copy (needs a reflink-aware copy in Wine), and the callers (gameplatform, appinstallmanager, packaging/wine-uwp) still run the Python |
+| Installer | `dlls/appxinstall` + `programs/wineuwp-install` (10-19/20). Every format `install-app.py` reads installs the same: plain packages, bundles and `.appinstaller` (Calculator .msix, 282 files; Gaming Services bundle, 729 files), GDK/XVD (Bad Magpie, 750 files, `.wine-uwp-chunks.json` identical; `--tags`/`--languages` region filters; native D3D/concrt140 placement and the game's `WINEDLLOVERRIDES`, checked on a synthetic package) and EAppx/EXBH (a synthetic encrypted package and bundle made with OpenSSL, including encrypted-then-compressed files; no real one on disk yet). Only the data-directory path differs in `launch.env`; `--info` output is byte-identical. Pause/resume and cancel are tested over HTTP. **`shims/gameplatform` calls `appx_install` directly** (no Python, no log scraping; progress by callback, pause/cancel by flags): the Xbox app installed Bad Magpie through it and the game starts (`docs/screenshots/xbox-install-c-installer-ready.png`, `badmagpie-c-installer-running.png`). `shims/appinstallmanager` is switched too but its Store self-update is not yet re-tested. Not yet: reuse of an installed copy (needs a reflink-aware copy in Wine), `packaging/wine-uwp`, and deleting `install-app.py` |
 | Shims | not started |
 | Scripts | not started |
 | Tooling | not started |

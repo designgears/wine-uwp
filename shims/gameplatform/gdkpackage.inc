@@ -701,16 +701,19 @@ static UINT64 gdk_request_size(const std::wstring &store_id, const std::vector<s
 }
 
 /* " --tags 'a;b' --languages 'EN-US;EN'" for install-app.py; nothing for a package without install features */
-static std::wstring gdk_installer_args(const std::wstring &store_id, const std::vector<std::string> *features)
+/* the install-feature tags and languages to install; false to install every region */
+static bool gdk_installer_choice(const std::wstring &store_id, const std::vector<std::string> *features,
+                                 std::wstring &tags, std::wstring &languages)
 {
     auto pkg = gdk_package(store_id);
-    if (!pkg->ok || pkg->features.empty()) return L"";
-    std::string tags, langs;
-    for (auto &t : gdk_tags(*pkg, gdk_selected_features(*pkg, features))) tags += (tags.empty() ? "" : ";") + t;
-    for (auto &l : user_languages()) langs += (langs.empty() ? "" : ";") + l;
-    for (auto c : tags + langs) if (c == '\'' || c == '"' || c == '\\') return L"";   /* nothing that could leave the quotes */
-    tracef("install: features -> tags %s, languages %s", tags.c_str(), langs.c_str());
-    return L" --tags '" + wide(tags) + L"' --languages '" + wide(langs) + L"'";
+    if (!pkg->ok || pkg->features.empty()) return false;
+    std::string t, l;
+    for (auto &tag : gdk_tags(*pkg, gdk_selected_features(*pkg, features))) t += (t.empty() ? "" : ";") + tag;
+    for (auto &lang : user_languages()) l += (l.empty() ? "" : ";") + lang;
+    tracef("install: features -> tags %s, languages %s", t.c_str(), l.c_str());
+    tags = wide(t);
+    languages = wide(l);
+    return true;
 }
 
 HRESULT STDMETHODCALLTYPE PackageRequest::QuerySize(IInspectable **v)

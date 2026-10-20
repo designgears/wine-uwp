@@ -123,6 +123,8 @@ set_target_properties(probe-gdkchunks PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE"
 add_library(gameplatform SHARED shims/gameplatform/gameplatform.cpp)
 set_target_properties(gameplatform PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_gameplatform")
 target_link_libraries(gameplatform PRIVATE runtimeobject.lib advapi32.lib winhttp.lib ole32.lib)
+# appxinstall.dll's API, from our Wine source (the header alone: the shims build against the Windows SDK)
+target_compile_definitions(gameplatform PRIVATE "APPXINSTALL_H=\"$ENV{WINE_SRC}/include/wine/appxinstall.h\"")
 # Microsoft.GamePlatform.Services.Identity: Xbox sign-in (MSA device code + Xbox Live tokens) for the Xbox app.
 add_library(xboxauth SHARED shims/xboxauth/xboxauth.cpp)
 set_target_properties(xboxauth PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_xboxauth")
@@ -144,6 +146,7 @@ target_link_libraries(dmprocessxml PRIVATE oleaut32.lib)
 add_library(appinstallmanager SHARED shims/appinstallmanager/appinstallmanager.cpp)
 set_target_properties(appinstallmanager PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_appinstallmanager")
 target_link_libraries(appinstallmanager PRIVATE runtimeobject.lib winhttp.lib ole32.lib)
+target_compile_definitions(appinstallmanager PRIVATE "APPXINSTALL_H=\"$ENV{WINE_SRC}/include/wine/appxinstall.h\"")
 # Windows.System.Profile.WindowsIntegrityPolicy: not in S mode (Windows' asks a lockdown-policy service over RPC).
 add_library(integritypolicy SHARED shims/integritypolicy/integritypolicy.cpp)
 set_target_properties(integritypolicy PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_integritypolicy")

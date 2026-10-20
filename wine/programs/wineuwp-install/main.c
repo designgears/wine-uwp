@@ -179,7 +179,7 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
 {
     struct appx_install_params params = { 0 };
     const WCHAR *positional[2] = { NULL }, *keys = NULL, *icon = NULL;
-    WCHAR *package = NULL, *data_dir = NULL, *windows = NULL, *launch_defaults = NULL, *launcher = NULL, *env;
+    WCHAR *package = NULL, *data_dir = NULL, *windows = NULL, *launch_defaults = NULL, *launcher = NULL, *d3d = NULL, *env;
     BOOL info = FALSE, latest = FALSE, keys_once = FALSE;
     unsigned int npos = 0;
     HRESULT hr;
@@ -219,11 +219,17 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
         appx_free( version );
         return 0;
     }
+    if (keys) params.content_keys = read_keys( keys, keys_once );
+    else if ((env = _wgetenv( L"WINE_UWP_CONTENT_KEYS" )))
+    {
+        params.content_keys = utf8( env );
+        SetEnvironmentVariableW( L"WINE_UWP_CONTENT_KEYS", NULL );
+    }
     if (info)
     {
         char *json;
         DWORD written;
-        if (FAILED(hr = appx_info( package, windows, data_dir, icon, &json ))) { fail( "--info: error %#lx", hr ); return 1; }
+        if (FAILED(hr = appx_info( package, windows, data_dir, icon, params.content_keys, &json ))) { fail( "--info: error %#lx", hr ); return 1; }
         WriteFile( GetStdHandle( STD_OUTPUT_HANDLE ), json, strlen( json ), &written, NULL );
         appx_free( json );
         return 0;
@@ -245,7 +251,18 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
         launcher = path_arg( buf );
     }
 
+    /* packaging/install-d3d-runtime.sh's output: DXVK's dxgi/d3d11 and vkd3d-proton's d3d12/d3d12core */
+    if ((env = _wgetenv( L"WINE_UWP_D3D_RUNTIME" ))) d3d = path_arg( env );
+    else if ((env = _wgetenv( L"UWP_BIN" )) || (env = _wgetenv( L"WINE_UWP_ROOT" )))
+    {
+        WCHAR buf[MAX_PATH];
+        swprintf( buf, ARRAY_SIZE(buf), _wgetenv( L"UWP_BIN" ) ? L"%s/ext/d3d-runtime/x86_64-windows"
+                                                                : L"%s/uwp-bin/ext/d3d-runtime/x86_64-windows", env );
+        d3d = path_arg( buf );
+    }
+
     params.package = package;
+    params.d3d_runtime = d3d;
     params.data_dir = data_dir;
     params.windows_tree = windows;
     params.launch_defaults = launch_defaults;
@@ -253,12 +270,6 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
     params.pause = &paused;
     params.cancel = &cancelled;
     params.callback = progress;
-    if (keys) params.content_keys = read_keys( keys, keys_once );
-    else if ((env = _wgetenv( L"WINE_UWP_CONTENT_KEYS" )))
-    {
-        params.content_keys = utf8( env );
-        SetEnvironmentVariableW( L"WINE_UWP_CONTENT_KEYS", NULL );
-    }
     if (pause_file) CloseHandle( CreateThread( NULL, 0, watch_pause, NULL, 0, NULL ) );
     SetConsoleCtrlHandler( on_signal, TRUE );
 

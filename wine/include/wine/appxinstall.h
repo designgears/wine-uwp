@@ -46,6 +46,7 @@ struct appx_install_params
     const char *content_keys;   /* encrypted packages: "kid:key;..." in hex; NULL if none */
     const WCHAR *launch_defaults; /* launch-defaults.env, copied into each app's launch.env; NULL if none */
     const WCHAR *launcher;      /* wineuwp-launch.exe, copied into the stage; NULL if none */
+    const WCHAR *d3d_runtime;   /* GDK games: DXVK's dxgi/d3d11 and vkd3d-proton's d3d12/d3d12core; NULL if none */
     volatile LONG *pause;       /* non-zero: wait between chunks */
     volatile LONG *cancel;      /* non-zero: stop, leave the installed copy as it was */
     appx_callback callback;
@@ -56,9 +57,10 @@ HRESULT CDECL appx_install( const struct appx_install_params *params );
 
 /* A JSON description of a package (name, title, publisher, version, protocols, frameworks and whether the Windows
  * tree or DATA_DIR\stage\frameworks has them), as `install-app.py --info` printed it. icon, when given, receives the
- * package's logo. windows_tree and data_dir may be NULL. Free *json with appx_free(). */
+ * package's logo. windows_tree, data_dir and content_keys (an encrypted package's, as for appx_install) may be
+ * NULL. Free *json with appx_free(). */
 HRESULT CDECL appx_info( const WCHAR *package, const WCHAR *windows_tree, const WCHAR *data_dir, const WCHAR *icon,
-                         char **json );
+                         const char *content_keys, char **json );
 
 /* The version of the main bundle an .appinstaller (a file or URL) serves, for update checks. Free *version with
  * appx_free(). */

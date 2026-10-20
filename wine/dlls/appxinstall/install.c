@@ -23,6 +23,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -326,6 +327,341 @@ static void text_add( struct text *t, const char *format, ... )
         t->cap = max( t->cap * 2, t->len + (n > 0 ? n : 256) + 1 );
         if (!(t->data = realloc( t->data, t->cap ))) { t->len = t->cap = 0; return; }
     }
+}
+
+/* a JSON string as Python's json module writes it: ASCII, everything else as \uXXXX (UTF-16 units) */
+static void json_string( struct text *t, const WCHAR *s )
+{
+    if (!s) { text_add( t, "null" ); return; }
+    text_add( t, "\"" );
+    for (; *s; s++)
+    {
+        if (*s == '"' || *s == '\\') text_add( t, "\\%c", (char)*s );
+        else if (*s == '\n') text_add( t, "\\n" );
+        else if (*s == '\r') text_add( t, "\\r" );
+        else if (*s == '\t') text_add( t, "\\t" );
+        else if (*s == '\b') text_add( t, "\\b" );
+        else if (*s == '\f') text_add( t, "\\f" );
+        else if (*s < 0x20 || *s > 0x7e) text_add( t, "\\u%04x", *s );
+        else text_add( t, "%c", (char)*s );
+    }
+    text_add( t, "\"" );
+}
+
+static BOOL exists( const WCHAR *path );
+
+/* ---- GDK packages ---- */
+
+static void json_list( struct text *t, WCHAR **items, unsigned int count, const char *indent )
+{
+    unsigned int i;
+
+    if (!count) { text_add( t, "[]" ); return; }
+    text_add( t, "[" );
+    for (i = 0; i < count; i++)
+    {
+        text_add( t, "%s\n%s  ", i ? "," : "", indent );
+        json_string( t, items[i] );
+    }
+    text_add( t, "\n%s]", indent );
+}
+
+/* a ;-separated attribute as a list, empty items dropped */
+static WCHAR **split_attr( const WCHAR *value, unsigned int *count )
+{
+    WCHAR **list = NULL, **l;
+    const WCHAR *p = value;
+
+    *count = 0;
+    while (p && *p)
+    {
+        const WCHAR *end = p + wcscspn( p, L";" );
+        if (end > p && (l = realloc( list, (*count + 1) * sizeof(*l) )))
+        {
+            list = l;
+            if ((list[*count] = malloc( (end - p + 1) * sizeof(WCHAR) )))
+            {
+                memcpy( list[*count], p, (end - p) * sizeof(WCHAR) );
+                list[(*count)++][end - p] = 0;
+            }
+        }
+        p = *end ? end + 1 : end;
+    }
+    return list;
+}
+
+static void free_split( WCHAR **list, unsigned int count )
+{
+    while (count) free( list[--count] );
+    free( list );
+}
+
+static BOOL region_installed( const struct xvd *xvd, UINT32 id )
+{
+    unsigned int i;
+    for (i = 0; i < xvd_count( xvd ); i++) if (xvd_member_region( xvd, i ) == id) return TRUE;
+    return FALSE;
+}
+
+static void json_region( struct text *t, BOOL first, UINT32 id, BOOL ready, WCHAR **tags, unsigned int ntags,
+                         WCHAR **langs, unsigned int nlangs )
+{
+    text_add( t, "%s\n    {\n      \"id\": %u,\n      \"ready\": %s,\n      \"tags\": ", first ? "" : ",", id,
+              ready ? "true" : "false" );
+    json_list( t, tags, ntags, "      " );
+    text_add( t, ",\n      \"languages\": " );
+    json_list( t, langs, nlangs, "      " );
+    text_add( t, "\n    }" );
+}
+
+/* .wine-uwp-chunks.json: which GDK chunks were installed, so xgameruntime can answer availability queries */
+static HRESULT write_chunk_metadata( const struct package *pkg, const WCHAR *dest, const WCHAR *full,
+                                     const struct appx_install_params *params )
+{
+    struct xvd *xvd = package_xvd( pkg );
+    struct xml_node *layout = NULL;
+    const struct xml_node *doc = NULL, *node;
+    const BYTE *cid;
+    unsigned int i, nregions = 0, ready = 0, nfeatures = 0;
+    struct text t = { 0 };
+    HRESULT hr;
+
+    if (!xvd) return S_OK;
+    for (i = 0; i < package_count( pkg ); i++)
+    {
+        const WCHAR *name = package_name( pkg, i );
+        size_t len = wcslen( name );
+        BYTE *data;
+        ULONG size;
+
+        if (wcsnicmp( name, L"layout_", 7 ) || len < 4 || wcsicmp( name + len - 4, L".xml" )) continue;
+        if (SUCCEEDED(package_read( pkg, i, &data, &size )))
+        {
+            if (FAILED(xml_parse( data, size, &layout ))) layout = NULL;
+            free( data );
+        }
+        break;
+    }
+    if (layout) for (doc = layout->children; doc && !doc->name; doc = doc->next);
+
+    cid = xvd_content_id( xvd );
+    text_add( &t, "{\n  \"version\": 1,\n  \"package\": " );
+    json_string( &t, full );
+    /* what XPackageGetCurrentProcessPackageIdentifier answers: at most 32 characters, so not the full name; the
+     * content id as a GUID's canonical hex */
+    text_add( &t, ",\n  \"identifier\": \"%02X%02X%02X%02X%02X%02X%02X%02X", cid[3], cid[2], cid[1], cid[0], cid[5],
+              cid[4], cid[7], cid[6] );
+    for (i = 8; i < 16; i++) text_add( &t, "%02X", cid[i] );
+    text_add( &t, "\",\n  \"features\": [" );
+    for (node = doc ? doc->children : NULL; node; node = node->next)
+    {
+        const struct xml_node *f;
+        if (wcscmp( node->name, L"Features" )) continue;
+        for (f = node->children; f; f = f->next)
+        {
+            const WCHAR *id = xml_attr( f, L"Id" ), *name = xml_attr( f, L"DisplayName" ), *hidden = xml_attr( f, L"Hidden" );
+            unsigned int ntags;
+            WCHAR **tags = split_attr( xml_attr( f, L"Tags" ), &ntags );
+
+            text_add( &t, "%s\n    {\n      \"id\": ", nfeatures++ ? "," : "" );
+            json_string( &t, id && *id ? id : L"" );
+            text_add( &t, ",\n      \"name\": " );
+            json_string( &t, name && *name ? name : L"" );
+            text_add( &t, ",\n      \"hidden\": %s,\n      \"tags\": ", hidden && !wcscmp( hidden, L"true" ) ? "true" : "false" );
+            json_list( &t, tags, ntags, "      " );
+            text_add( &t, "\n    }" );
+            free_split( tags, ntags );
+        }
+        break;
+    }
+    text_add( &t, nfeatures ? "\n  ],\n  \"regions\": [" : "],\n  \"regions\": [" );
+    for (node = doc ? doc->children : NULL; node; node = node->next)
+    {
+        const WCHAR *id = xml_attr( node, L"Id" );
+        unsigned int ntags, nlangs;
+        WCHAR **tags, **langs, *end;
+        long rid;
+
+        if (wcscmp( node->name, L"Chunk" ) || !id) continue;
+        while (iswspace( *id )) id++;
+        rid = wcstol( id, &end, 10 );
+        while (iswspace( *end )) end++;
+        if (end == id || *end) continue;
+        tags = split_attr( xml_attr( node, L"Tags" ), &ntags );
+        langs = split_attr( xml_attr( node, L"Languages" ), &nlangs );
+        if (region_installed( xvd, rid )) ready++;
+        json_region( &t, !nregions++, rid, region_installed( xvd, rid ), tags, ntags, langs, nlangs );
+        free_split( tags, ntags );
+        free_split( langs, nlangs );
+    }
+    if (!nregions)
+    {
+        /* the XVC region table when the package has no layout XML, in id order */
+        UINT32 last = 0;
+        for (;;)
+        {
+            const struct xvd_region *next = NULL;
+            for (i = 0; i < xvd_region_count( xvd ); i++)
+            {
+                const struct xvd_region *r = xvd_region( xvd, i );
+                if (r->id >= 0x40000000 && r->id != 0x40000003) continue;
+                if ((nregions && r->id <= last) || (next && r->id >= next->id)) continue;
+                next = r;
+            }
+            if (!next) break;
+            last = next->id;
+            if (region_installed( xvd, next->id )) ready++;
+            json_region( &t, !nregions++, next->id, region_installed( xvd, next->id ), next->tags, next->tag_count,
+                         next->languages, next->language_count );
+        }
+    }
+    text_add( &t, nregions ? "\n  ]\n}\n" : "]\n}\n" );
+    xml_free( layout );
+    if (!t.data) return E_OUTOFMEMORY;
+    hr = write_text( dest, L".wine-uwp-chunks.json", t.data );
+    free( t.data );
+    report( params, APPX_EVENT_MESSAGE, 0, 0, L"GDK chunks: %u/%u ready", ready, nregions );
+    return hr;
+}
+
+/* whether a file's bytes name a module, case-insensitively: a packed executable (Halo's campaign) imports only its
+ * unpacker, so the import table is not enough */
+static BOOL file_mentions( const WCHAR *path, const char *name )
+{
+    HANDLE file, mapping;
+    LARGE_INTEGER size;
+    const BYTE *view;
+    size_t len = strlen( name ), i;
+    BOOL found = FALSE;
+
+    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    if (GetFileSizeEx( file, &size ) && size.QuadPart >= (LONGLONG)len &&
+        (mapping = CreateFileMappingW( file, NULL, PAGE_READONLY, 0, 0, NULL )))
+    {
+        if ((view = MapViewOfFile( mapping, FILE_MAP_READ, 0, 0, 0 )))
+        {
+            for (i = 0; i + len <= (size_t)size.QuadPart && !found; i++)
+                found = tolower( view[i] ) == name[0] && !_strnicmp( (const char *)view + i, name, len );
+            UnmapViewOfFile( view );
+        }
+        CloseHandle( mapping );
+    }
+    CloseHandle( file );
+    return found;
+}
+
+static const WCHAR *gdk_d3d_dlls[] = { L"dxgi.dll", L"d3d11.dll", L"d3d12.dll", L"d3d12core.dll" };
+
+struct native_dlls
+{
+    const WCHAR *runtime, *concrt;
+    BOOL have_d3d;
+    BOOL used[ARRAY_SIZE(gdk_d3d_dlls) + 1];   /* the last: concrt140 */
+    const struct appx_install_params *params;
+};
+
+/* puts src next to an executable as name unless the directory has one: a link to the shared runtime, or a copy */
+static void place_dll( const WCHAR *dir, const WCHAR *src, const WCHAR *name, BOOL link )
+{
+    WCHAR *target = path_join( dir, name );
+
+    if (target && !exists( target ) && !(link && CreateHardLinkW( target, src, NULL ))) CopyFileW( src, target, TRUE );
+    free( target );
+}
+
+static void scan_executables( const WCHAR *dir, struct native_dlls *n )
+{
+    WCHAR *pattern = path_join( dir, L"*" );
+    WIN32_FIND_DATAW fd;
+    HANDLE find;
+
+    if (!pattern) return;
+    find = FindFirstFileW( pattern, &fd );
+    free( pattern );
+    if (find == INVALID_HANDLE_VALUE) return;
+    do
+    {
+        WCHAR *path;
+        size_t len = wcslen( fd.cFileName );
+
+        if (!wcscmp( fd.cFileName, L"." ) || !wcscmp( fd.cFileName, L".." )) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        if (!(path = path_join( dir, fd.cFileName ))) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            if (wcsicmp( fd.cFileName, L"easyanticheat" )) scan_executables( path, n );
+        }
+        else if (len > 4 && !wcsicmp( fd.cFileName + len - 4, L".exe" ) && (fd.nFileSizeLow || fd.nFileSizeHigh))
+        {
+            unsigned int i;
+            if (file_mentions( path, "d3d12.dll" ))
+            {
+                if (n->have_d3d)
+                {
+                    for (i = 0; i < ARRAY_SIZE(gdk_d3d_dlls); i++)
+                    {
+                        WCHAR *src = path_join( n->runtime, gdk_d3d_dlls[i] );
+                        if (src) place_dll( dir, src, gdk_d3d_dlls[i], TRUE );
+                        free( src );
+                        n->used[i] = TRUE;
+                    }
+                }
+                else report( n->params, APPX_EVENT_MESSAGE, 0, 0, L"warning: %s uses Direct3D 12 and there is no %s; "
+                             L"run packaging/install-d3d-runtime.sh --download", fd.cFileName,
+                             n->runtime ? n->runtime : L"D3D runtime" );
+            }
+            if (n->concrt && file_mentions( path, "concrt140.dll" ))
+            {
+                place_dll( dir, n->concrt, L"concrt140.dll", FALSE );
+                n->used[ARRAY_SIZE(gdk_d3d_dlls)] = TRUE;
+            }
+        }
+        free( path );
+    } while (FindNextFileW( find, &fd ));
+    FindClose( find );
+}
+
+/* A GDK game's native copies of DLLs Wine also builds, next to each executable that names them; returns the module
+ * names, comma-separated and sorted, which launch.env then marks native,builtin for that game only (NULL: none).
+ *
+ * Wine's d3d12 lacks what these games check for at start (Halo Infinite: Tiled Resources Tier 2), so a game that names
+ * d3d12.dll gets vkd3d-proton and the DXVK dxgi it presents through. Wine's concrt140 lacks parts of the Concurrency
+ * Runtime (STATUS_WINE_STUB in Halo), so one that names concrt140.dll gets the VCLibs framework's. */
+static char *link_gdk_native_dlls( const WCHAR *dest, const WCHAR *fw_root, WCHAR **frameworks, unsigned int count,
+                                   const struct appx_install_params *params )
+{
+    static const char *names[] = { "concrt140", "d3d11", "d3d12", "d3d12core", "dxgi" };   /* sorted */
+    static const unsigned int slot[] = { 4, 1, 2, 3, 0 };
+    struct native_dlls n = { 0 };
+    WCHAR *config = path_join( dest, L"MicrosoftGame.Config" ), *concrt = NULL;
+    struct text t = { 0 };
+    unsigned int i;
+
+    if (!config || !exists( config )) { free( config ); return NULL; }
+    free( config );
+    n.params = params;
+    n.runtime = params->d3d_runtime;
+    n.have_d3d = !!n.runtime;
+    for (i = 0; i < ARRAY_SIZE(gdk_d3d_dlls) && n.have_d3d; i++)
+    {
+        WCHAR *p = path_join( n.runtime, gdk_d3d_dlls[i] );
+        n.have_d3d = p && exists( p );
+        free( p );
+    }
+    for (i = 0; i < count && !concrt; i++)
+    {
+        WCHAR *dir = path_join( fw_root, frameworks[i] ), *p = dir ? path_join( dir, L"concrt140.dll" ) : NULL;
+        if (p && exists( p )) { concrt = p; p = NULL; }
+        free( p );
+        free( dir );
+    }
+    n.concrt = concrt;
+    scan_executables( dest, &n );
+    free( concrt );
+    for (i = 0; i < ARRAY_SIZE(names); i++)
+        if (n.used[slot[i]]) text_add( &t, "%s%s", t.len ? "," : "", names[i] );
+    return t.data;
 }
 
 /* ---- extraction ---- */
@@ -635,6 +971,7 @@ HRESULT CDECL appx_install( const struct appx_install_params *params )
     else if (m->logo) report( params, APPX_EVENT_MESSAGE, 0, 0, L"warning: manifest logo %s was not included; "
                               L"installing without a launcher icon", m->logo );
     CHECK( extract( pkg, dest, params ) );
+    CHECK( write_chunk_metadata( pkg, dest, full, params ) );
     package_close( pkg );
     pkg = NULL;
 
@@ -709,6 +1046,23 @@ HRESULT CDECL appx_install( const struct appx_install_params *params )
         free( dir );
     }
     text_add( &t, "'\n" );
+    if ((s = link_gdk_native_dlls( dest, fw_root, fw_names, fw_count, params )))
+    {
+        /* literal, as wineuwp-launch expands nothing: the defaults' list plus this game's own native DLLs */
+        char *defaults = params->launch_defaults ? read_text( params->launch_defaults ) : NULL, *base = NULL, *line;
+        int base_len = 0;
+        for (line = defaults; line; line = strchr( line, '\n' ) ? strchr( line, '\n' ) + 1 : NULL)
+        {
+            static const char key[] = "export WINEDLLOVERRIDES='";
+            char *end;
+            if (strncmp( line, key, sizeof(key) - 1 )) continue;
+            end = line + sizeof(key) - 1 + strcspn( line + sizeof(key) - 1, "'\n" );
+            if (*end == '\'') { base = line + sizeof(key) - 1; base_len = end - base; }
+        }
+        text_add( &t, "export WINEDLLOVERRIDES='%.*s%s%s=n,b'\n", base_len, base ? base : "", base ? ";" : "", s );
+        free( defaults );
+        free( s );
+    }
     if (!t.data || FAILED(hr = write_text( dest, L"launch.env", t.data ))) { hr = t.data ? hr : E_OUTOFMEMORY; goto done; }
     t.len = 0;
     if (params->launcher)
@@ -797,29 +1151,9 @@ done:
 
 /* ---- --info ---- */
 
-static void json_string( struct text *t, const WCHAR *s )
-{
-    char *u, *p;
-
-    if (!s) { text_add( t, "null" ); return; }
-    if (!(u = utf8_dup( s ))) return;
-    text_add( t, "\"" );
-    for (p = u; *p; p++)
-    {
-        unsigned char c = *p;
-        if (c == '"' || c == '\\') text_add( t, "\\%c", c );
-        else if (c == '\n') text_add( t, "\\n" );
-        else if (c == '\r') text_add( t, "\\r" );
-        else if (c == '\t') text_add( t, "\\t" );
-        else if (c < 0x20) text_add( t, "\\u%04x", c );
-        else text_add( t, "%c", c );
-    }
-    text_add( t, "\"" );
-    free( u );
-}
 
 HRESULT CDECL appx_info( const WCHAR *package, const WCHAR *windows_tree, const WCHAR *data_dir, const WCHAR *icon,
-                         char **json )
+                         const char *content_keys, char **json )
 {
     struct appx_install_params params = { 0 };
     WCHAR *apps_dir = NULL, *fw_root = NULL, *temp = NULL, *name;
@@ -834,6 +1168,7 @@ HRESULT CDECL appx_info( const WCHAR *package, const WCHAR *windows_tree, const 
 
     if (!package || !json) return E_INVALIDARG;
     params.package = package;
+    params.content_keys = content_keys;
     if (windows_tree && !(apps_dir = path_join( windows_tree, L"Program Files\\WindowsApps" ))) return E_OUTOFMEMORY;
     if (data_dir && !(fw_root = path_join( data_dir, L"stage\\frameworks" ))) { hr = E_OUTOFMEMORY; goto done; }
     {
