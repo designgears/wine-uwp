@@ -851,7 +851,6 @@ DWORD WINAPI UpdateItem::install_thread(void *param)
     typedef HRESULT (CDECL *install_fn)(const struct appx_install_params *);
     UpdateItem *it = (UpdateItem *)param;
     std::wstring tree = env_w(L"WINE_UWP_WINDOWS_TREE"), root = env_w(L"WINE_UWP_ROOT");
-    std::wstring shim_dir = env_w(L"SHIM_DIR"), uwp_bin = env_w(L"UWP_BIN");
     size_t slash = it->stage_unix.rfind(L'/');
     std::wstring stage_name = it->stage_unix.substr(slash + 1), stage_root = it->stage_unix.substr(0, slash);
     std::wstring data = stage_root.substr(0, stage_root.rfind(L'/'));
@@ -866,8 +865,6 @@ DWORD WINAPI UpdateItem::install_thread(void *param)
     }
     std::wstring package = wide(it->url), data_dos = dos_path(data), tree_dos = dos_path(tree);
     std::wstring defaults = root.empty() ? L"" : dos_path(root + L"/launch-defaults.env");
-    std::wstring launcher = !shim_dir.empty() ? dos_path(shim_dir + L"/wineuwp-launch.exe")
-                          : !uwp_bin.empty() ? dos_path(uwp_bin + L"/build-probes/wineuwp-launch.exe") : L"";
     InstallerProgress progress = { it, AIS_STARTING };
     struct appx_install_params params = {};
     params.package = package.c_str();
@@ -875,7 +872,6 @@ DWORD WINAPI UpdateItem::install_thread(void *param)
     params.windows_tree = tree_dos.c_str();
     params.stage = stage_name.c_str();
     params.launch_defaults = defaults.empty() ? nullptr : defaults.c_str();
-    params.launcher = launcher.empty() ? nullptr : launcher.c_str();
     params.cancel = &it->cancel_flag;
     params.callback = installer_event;
     params.context = &progress;

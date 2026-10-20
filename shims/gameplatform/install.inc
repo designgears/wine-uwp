@@ -14,7 +14,7 @@
 /*                                                                                               */
 /* Where things live comes from the environment run.sh sets, all Unix paths: WINE_UWP_GAMES_DATA (the data    */
 /* directory with stage/), WINE_UWP_WINDOWS_TREE (the harvested Windows files the frameworks come from),       */
-/* WINE_UWP_ROOT (launch-defaults.env), SHIM_DIR or UWP_BIN (wineuwp-launch.exe) and WINE_UWP_D3D_RUNTIME.     */
+/* WINE_UWP_ROOT (launch-defaults.env) and WINE_UWP_D3D_RUNTIME; wineuwp-launch.exe is Wine's, from system32.    */
 
 static const GUID IID_IPackageRequest = {0x25198e18,0xd58c,0x5ee2,{0x9c,0x59,0x62,0xf3,0xd4,0x8d,0x84,0x0f}};
 static const GUID IID_IPackageRequestSize = {0x929c3222,0x99f2,0x512b,{0x9a,0x55,0xf4,0x91,0x3b,0x1e,0xf8,0x7f}};
@@ -644,8 +644,6 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
     data = unix_to_windows(data);
     CreateDirectoryW(data.c_str(), nullptr);
     std::wstring package = wide(url), defaults = env_path(L"WINE_UWP_ROOT", L"/launch-defaults.env");
-    std::wstring launcher = env_path(L"SHIM_DIR", L"/wineuwp-launch.exe");
-    if (launcher.empty()) launcher = env_path(L"UWP_BIN", L"/build-probes/wineuwp-launch.exe");
     std::wstring d3d = env_path(L"WINE_UWP_D3D_RUNTIME");
     if (d3d.empty()) d3d = env_path(L"UWP_BIN", L"/ext/d3d-runtime/x86_64-windows");
 
@@ -663,7 +661,6 @@ static HRESULT run_installer(Install *in, const std::string &url, const std::wst
     /* an encrypted package's content keys go to the installer in memory, never into a file or a log */
     params.content_keys = keys.empty() ? nullptr : keys.c_str();
     params.launch_defaults = defaults.empty() ? nullptr : defaults.c_str();
-    params.launcher = launcher.empty() ? nullptr : launcher.c_str();
     params.d3d_runtime = d3d.empty() ? nullptr : d3d.c_str();
     params.pause = &in->pause_flag;
     params.cancel = &in->cancel_flag;

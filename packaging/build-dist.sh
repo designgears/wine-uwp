@@ -49,7 +49,7 @@ cp "$here"/{gen-classes-reg.py,gen-clsid-reg.py,gen-interfaces-reg.py,gen-single
 cp -r "$here"/packaging/{harvest,new-prefix.sh,install-app.py,install-eac-runtime.sh,install-d3d-runtime.sh} "$share/packaging"/
 find "$share" -name __pycache__ -prune -exec rm -rf {} +
 shims=$(grep -ohE '\$\{SHIM_DIR\}/[A-Za-z0-9_.-]+\.dll' "$here/install-overrides.sh" | sed 's|${SHIM_DIR}/||' | sort -u)
-for s in $shims wineuwp-launch.exe; do cp "$UWP_BIN/build-probes/$s" "$share/shims/"; done
+for s in $shims; do cp "$UWP_BIN/build-probes/$s" "$share/shims/"; done
 install -m755 "$here/packaging/wine-uwp" "$out/bin/wine-uwp"
 git -C "$here" rev-parse --short HEAD > "$share/VERSION"
 echo "STAGE Done: $out ($(du -sh "$out" | cut -f1))"

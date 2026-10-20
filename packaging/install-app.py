@@ -1305,6 +1305,9 @@ def install_package(args, resources):
     shim_dir = os.environ.get("SHIM_DIR") or os.path.join(os.environ.get("UWP_BIN", os.path.join(root, "uwp-bin")),
                                                           "build-probes")
     launcher = os.path.join(shim_dir, "wineuwp-launch.exe")
+    if not os.path.exists(launcher) and os.environ.get("WINEPREFIX"):
+        # Wine's own (programs/wineuwp-launch), from the prefix's system32
+        launcher = os.path.join(os.environ["WINEPREFIX"], "drive_c", "windows", "system32", "wineuwp-launch.exe")
     if os.path.exists(launcher):
         shutil.copy2(launcher, dest)
     else:

@@ -1144,11 +1144,18 @@ HRESULT CDECL appx_install( const struct appx_install_params *params )
     }
     if (!t.data || FAILED(hr = write_text( dest, L"launch.env", t.data ))) { hr = t.data ? hr : E_OUTOFMEMORY; goto done; }
     t.len = 0;
-    if (params->launcher)
     {
-        WCHAR *target = path_join( dest, L"wineuwp-launch.exe" );
-        if (!target || !CopyFileW( params->launcher, target, FALSE ))
-            report( params, APPX_EVENT_MESSAGE, 0, 0, L"warning: no %s; the app starts through run.sh only", params->launcher );
+        WCHAR system_launcher[MAX_PATH], *target = path_join( dest, L"wineuwp-launch.exe" );
+        const WCHAR *launcher = params->launcher;
+
+        if (!launcher)
+        {
+            GetSystemDirectoryW( system_launcher, MAX_PATH - 20 );
+            wcscat( system_launcher, L"\\wineuwp-launch.exe" );
+            launcher = system_launcher;
+        }
+        if (!target || !CopyFileW( launcher, target, FALSE ))
+            report( params, APPX_EVENT_MESSAGE, 0, 0, L"warning: no %s; the app starts through run.sh only", launcher );
         free( target );
     }
 

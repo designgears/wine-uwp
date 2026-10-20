@@ -170,10 +170,6 @@ add_executable(probe-a8perf probes/probe-a8perf.cpp)
 target_link_libraries(probe-a8perf PRIVATE d3d11.lib dxguid.lib)
 set_target_properties(probe-a8perf PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
 
-# Starts a staged package from a plain `wine wineuwp-launch.exe` (Bottles, Lutris, desktop entries): identity and
-# launch environment from the files next to it, the AppContainer key, CoreMessagingRegistrar, then the app.
-add_executable(wineuwp-launch WIN32 shims/launch/wineuwp-launch.cpp)
-target_link_libraries(wineuwp-launch PRIVATE advapi32.lib user32.lib)
 add_executable(probe-xchild probes/probe-xchild.cpp)
 target_link_libraries(probe-xchild PRIVATE user32.lib gdi32.lib)
 set_target_properties(probe-xchild PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")

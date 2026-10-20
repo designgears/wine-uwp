@@ -179,7 +179,7 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
 {
     struct appx_install_params params = { 0 };
     const WCHAR *positional[2] = { NULL }, *keys = NULL, *icon = NULL;
-    WCHAR *package = NULL, *data_dir = NULL, *windows = NULL, *launch_defaults = NULL, *launcher = NULL, *d3d = NULL, *env;
+    WCHAR *package = NULL, *data_dir = NULL, *windows = NULL, *launch_defaults = NULL, *d3d = NULL, *env;
     BOOL info = FALSE, latest = FALSE, keys_once = FALSE;
     unsigned int npos = 0;
     HRESULT hr;
@@ -236,21 +236,13 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
     }
     if (!data_dir || !windows) { fail( "DATADIR and --windows TREE are needed to install" ); return 2; }
 
-    /* the repository's launch defaults and wineuwp-launch.exe, where run.sh's environment says they are */
+    /* the repository's launch defaults, where run.sh's environment says they are */
     if ((env = _wgetenv( L"WINE_UWP_ROOT" )))
     {
         WCHAR buf[MAX_PATH];
         swprintf( buf, ARRAY_SIZE(buf), L"%s/launch-defaults.env", env );
         launch_defaults = path_arg( buf );
     }
-    if ((env = _wgetenv( L"SHIM_DIR" )) || (env = _wgetenv( L"UWP_BIN" )))
-    {
-        WCHAR buf[MAX_PATH];
-        swprintf( buf, ARRAY_SIZE(buf), _wgetenv( L"SHIM_DIR" ) ? L"%s/wineuwp-launch.exe"
-                                                                 : L"%s/build-probes/wineuwp-launch.exe", env );
-        launcher = path_arg( buf );
-    }
-
     /* packaging/install-d3d-runtime.sh's output: DXVK's dxgi/d3d11 and vkd3d-proton's d3d12/d3d12core */
     if ((env = _wgetenv( L"WINE_UWP_D3D_RUNTIME" ))) d3d = path_arg( env );
     else if ((env = _wgetenv( L"UWP_BIN" )) || (env = _wgetenv( L"WINE_UWP_ROOT" )))
@@ -266,7 +258,6 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
     params.data_dir = data_dir;
     params.windows_tree = windows;
     params.launch_defaults = launch_defaults;
-    params.launcher = launcher;
     params.pause = &paused;
     params.cancel = &cancelled;
     params.callback = progress;

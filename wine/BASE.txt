@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     199199b2842155eec1d2202aa04d2439f309461d
-                 windows.system.profile.integritypolicy: renamed from windows.security.integrity.
+  wine HEAD:     e6dba089b5aa2d7187254c5ffbecd63f80a30175
+                 wineuwp-launch: the launcher installed apps start through, in C; appxinstall copies Wine's into each stage.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-20T08:56:06Z
+  captured:      2026-10-20T08:59:51Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

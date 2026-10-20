@@ -45,7 +45,7 @@ struct appx_install_params
     const WCHAR *languages;     /* GDK: language regions to keep, ';'-separated; NULL keeps all */
     const char *content_keys;   /* encrypted packages: "kid:key;..." in hex; NULL if none */
     const WCHAR *launch_defaults; /* launch-defaults.env, copied into each app's launch.env; NULL if none */
-    const WCHAR *launcher;      /* wineuwp-launch.exe, copied into the stage; NULL if none */
+    const WCHAR *launcher;      /* wineuwp-launch.exe, copied into the stage; NULL: Wine's, from system32 */
     const WCHAR *d3d_runtime;   /* GDK games: DXVK's dxgi/d3d11 and vkd3d-proton's d3d12/d3d12core; NULL if none */
     volatile LONG *pause;       /* non-zero: wait between chunks */
     volatile LONG *cancel;      /* non-zero: stop, leave the installed copy as it was */

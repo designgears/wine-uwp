@@ -1,0 +1,7 @@
+MODULE    = wineuwp-launch.exe
+IMPORTS   = advapi32 user32
+
+EXTRADLLFLAGS = -mwindows -municode
+
+SOURCES = \
+	main.c

@@ -1829,6 +1829,7 @@ enable_winepath
 enable_winetest
 enable_wineuwp_gamingservice
 enable_wineuwp_install
+enable_wineuwp_launch
 enable_winevdm
 enable_winhlp32
 enable_winmgmt
@@ -23269,6 +23270,7 @@ wine_fn_config_makefile programs/winepath enable_winepath
 wine_fn_config_makefile programs/winetest enable_winetest
 wine_fn_config_makefile programs/wineuwp-gamingservice enable_wineuwp_gamingservice
 wine_fn_config_makefile programs/wineuwp-install enable_wineuwp_install
+wine_fn_config_makefile programs/wineuwp-launch enable_wineuwp_launch
 wine_fn_config_makefile programs/winevdm enable_winevdm
 wine_fn_config_makefile programs/winhelp.exe16 enable_win16
 wine_fn_config_makefile programs/winhlp32 enable_winhlp32

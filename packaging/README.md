@@ -16,7 +16,7 @@ A product on top of this (a setup UI, an AppImage, branding) lives in its own re
 | `harvest/resolve_symbols.py` | PDB publics from `msdl.microsoft.com` for the DLLs actually harvested |
 | `new-prefix.sh` | a working prefix from a harvested tree |
 | `install-app.py` | an `.msixbundle`/`.msix` into `stage/<app>`, with frameworks, `identity.env`, `launch.env`, icon, URI schemes; `--info` previews one |
-| `../shims/launch/wineuwp-launch.cpp` | `wineuwp-launch.exe`: starts an installed app from a plain `wine` command |
+| Wine's `programs/wineuwp-launch` | `wineuwp-launch.exe`: starts an installed app from a plain `wine` command; the installer copies it into each stage |
 | `make-test-bundle.py` | rebuilds an `.msixbundle` from a staged package, to test installs without the real download |
 | `wine-uwp` | the command: `setup`, `run`, `install`, `harvest`, `new-prefix`, `activate URI` |
 | `build-dist.sh` | an installed tree from this checkout (host Wine build + everything above) |
