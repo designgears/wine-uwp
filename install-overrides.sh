@@ -542,7 +542,12 @@ if [ -f "$AIM_SHIM" ]; then
   cmp -s "$AIM_SHIM" "$SYS32/wineuwp_appinstallmanager.dll" || cp -f --reflink=auto "$AIM_SHIM" "$SYS32/wineuwp_appinstallmanager.dll"
   echo "installed: AppInstallManager (Microsoft Store installs) stand-in"
 fi
-# Windows.System.Profile.WindowsIntegrityPolicy is Wine's windows.security.integrity (registered by Wine itself).
+# Windows.System.Profile.WindowsIntegrityPolicy is Wine's windows.system.profile.integritypolicy. Windows registers it
+# in Windows.Security.Integrity.dll, and that registration is in the prefix, so it is re-pointed here.
+if [ -f "$SYS32/windows.system.profile.integritypolicy.dll" ]; then
+  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.System.Profile.WindowsIntegrityPolicy"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.system.profile.integritypolicy.dll' /f >/dev/null 2>&1
+fi
 TB_SHIM=${SHIM_DIR}/wineuwp_taskbarmanager.dll
 if [ -f "$TB_SHIM" ]; then
   TB_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_taskbarmanager.dll
@@ -644,6 +649,7 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_spatialaudio.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioFormatSubtype:wineuwp_spatialaudio.dll"
 [ -f "$SYS32/wineuwp_networkstatus.dll" ]     && SHIM_CLASSES="$SHIM_CLASSES Windows.Networking.Connectivity.NetworkInformation:wineuwp_networkstatus.dll"
 [ -f "$SYS32/windows.applicationmodel.useractivities.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.UserActivities.UserActivityChannel:windows.applicationmodel.useractivities.dll"
+[ -f "$SYS32/windows.system.profile.integritypolicy.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.System.Profile.WindowsIntegrityPolicy:windows.system.profile.integritypolicy.dll"
 [ -f "$SYS32/windows.ui.notifications.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Notifications.ToastNotificationManager:windows.ui.notifications.dll"
 # api-ms-win-net-isolation-l1-1-1 and ext-ms-win-devmgmt-policy-l1-1-1 are Wine's firewallapi and policymanager now,
 # through the apiset schema; a leftover file of either name in system32 is ignored.

@@ -356,10 +356,10 @@ dlls/policymanager/policymanager.spec
 dlls/dmprocessxmlfiltered/Makefile.in
 dlls/dmprocessxmlfiltered/dmprocessxmlfiltered.spec
 dlls/dmprocessxmlfiltered/main.c
-dlls/windows.security.integrity/Makefile.in
-dlls/windows.security.integrity/classes.idl
-dlls/windows.security.integrity/main.c
-dlls/windows.security.integrity/windows.security.integrity.spec
+dlls/windows.system.profile.integritypolicy/Makefile.in
+dlls/windows.system.profile.integritypolicy/classes.idl
+dlls/windows.system.profile.integritypolicy/main.c
+dlls/windows.system.profile.integritypolicy/windows.system.profile.integritypolicy.spec
 programs/wineuwp-gamingservice/Makefile.in
 programs/wineuwp-gamingservice/main.c
 include/windows.system.profile.idl

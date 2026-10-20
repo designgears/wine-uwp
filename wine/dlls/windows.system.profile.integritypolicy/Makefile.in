@@ -1,4 +1,4 @@
-MODULE  = windows.security.integrity.dll
+MODULE  = windows.system.profile.integritypolicy.dll
 IMPORTS = combase
 
 SOURCES = \

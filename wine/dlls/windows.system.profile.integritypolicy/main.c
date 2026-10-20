@@ -23,6 +23,9 @@
  * raises EPT_S_NOT_REGISTERED through the caller, and the Microsoft Store fail-fasts reading IsEnabled at start-up.
  * Wine enforces no code-integrity policy, so every property is false and PolicyChanged never fires (registering is
  * still accepted: refusing an event registration is fatal to callers).
+ *
+ * Windows registers the class in Windows.Security.Integrity.dll, along with SmartAppControlPolicy and the internal
+ * AppActivationPolicy; a builtin of that name would take those over too, so this module has a name of its own.
  */
 
 #include <stdarg.h>
