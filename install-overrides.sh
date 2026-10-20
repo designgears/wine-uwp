@@ -259,21 +259,11 @@ if [ -f "$SYS32/windows.system.memorymanager.dll" ]; then
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.system.memorymanager.dll' /f >/dev/null 2>&1
 fi
 
-# Windows.Devices.Enumeration.DeviceInformation: Wine implements every CreateWatcher overload
-# except the DeviceClass one, which returns E_NOTIMPL. Solitaire is C++/CX, so that becomes a
-# thrown Platform::Exception that abandons AppHost::EngineInitialize - including the render-window
-# event subscription it needs to resize its swap chain. See shims/deviceinformation.
-DI_SHIM=${SHIM_DIR}/wineuwp_deviceinformation.dll
-if [ -f "$DI_SHIM" ]; then
-  DI_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_deviceinformation.dll
-  if ! cmp -s "$DI_SHIM" "$DI_DST"; then cp -f --reflink=auto "$DI_SHIM" "$DI_DST"; fi
-  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Devices.Enumeration.DeviceInformation"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_deviceinformation.dll' /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: DeviceInformation CreateWatcher(DeviceClass) shim"
-fi
+# Windows.Devices.Enumeration.DeviceInformation is Wine's windows.devices.enumeration, which now has the DeviceClass
+# overloads and real Updated/Removed registrations (a shim used to supply them; Solitaire is C++/CX and a refusal
+# there became a throw that abandoned its engine start-up). Prefixes that had the shim keep its DllPath until reset.
+K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Devices.Enumeration.DeviceInformation"
+"${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.devices.enumeration.dll' /f >/dev/null 2>&1
 
 # msxml6's COM classes. Installing msxml6.dll into system32 is not enough: nothing registers its
 # CLSIDs, so CoCreateInstance returns REGDB_E_CLASSNOTREG (0x80040154). That matters because
@@ -629,7 +619,7 @@ activatable_dllpath() {
 SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_userpicker.dll" ]       && SHIM_CLASSES="$SHIM_CLASSES Windows.System.UserPicker:wineuwp_userpicker.dll"
 [ -f "$SYS32/windows.system.memorymanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.System.MemoryManager:windows.system.memorymanager.dll"
-[ -f "$SYS32/wineuwp_deviceinformation.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Devices.Enumeration.DeviceInformation:wineuwp_deviceinformation.dll"
+[ -f "$SYS32/windows.devices.enumeration.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Devices.Enumeration.DeviceInformation:windows.devices.enumeration.dll"
 [ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager:wineuwp_appinstallmanager.dll"
 [ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions:wineuwp_appinstallmanager.dll"
 [ -f "$SYS32/wineuwp_taskbarmanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Shell.TaskbarManager:wineuwp_taskbarmanager.dll"

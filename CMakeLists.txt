@@ -70,9 +70,6 @@ set_target_properties(accesscache PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_acce
 target_link_libraries(accesscache PRIVATE runtimeobject.lib)
 add_executable(probe-memorymanager probes/probe-memorymanager.cpp)
 target_link_libraries(probe-memorymanager PRIVATE runtimeobject.lib)
-add_library(deviceinformation SHARED shims/deviceinformation/deviceinformation.cpp)
-set_target_properties(deviceinformation PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_deviceinformation")
-target_link_libraries(deviceinformation PRIVATE runtimeobject.lib)
 
 
 # Windows.Networking.Connectivity.NetworkInformation. Wine registers NetworkStatusChanged and then

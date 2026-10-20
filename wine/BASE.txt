@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     f68a0d0c96a91ebe167402e3da4e9edddcdcf842
-                 windows.services.store: StoreContext without the container host; formerly a wine-uwp shim.
+  wine HEAD:     82706b9820e8c4f70740701cd70154149ce0b2b1
+                 windows.devices.enumeration: DeviceClass overloads; keep Updated and Removed registrations.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-20T09:09:50Z
+  captured:      2026-10-20T09:12:17Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
