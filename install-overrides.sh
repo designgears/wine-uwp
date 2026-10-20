@@ -370,18 +370,15 @@ if [ -f "$SYS32/windows.ui.notifications.dll" ]; then
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.ui.notifications.dll' /f >/dev/null 2>&1
 fi
 
-# Windows.Services.Store.StoreContext: traced stand-in (see shims/storecontext). The real one
-# needs ContainerHostActivation {22f5b1df-...}, which is not registered under Wine.
-SC_SHIM=${SHIM_DIR}/wineuwp_storecontext.dll
-if [ -f "$SC_SHIM" ]; then
-  SC_DST=$SYS32/wineuwp_storecontext.dll
-  if ! cmp -s "$SC_SHIM" "$SC_DST"; then cp -f --reflink=auto "$SC_SHIM" "$SC_DST"; fi
+# Windows.Services.Store.StoreContext: Wine's windows.services.store. Windows' needs ContainerHostActivation
+# {22f5b1df-...}, which is not registered under Wine, and its operations never complete. Windows' registration in the
+# prefix names Windows.ApplicationModel.Store.dll, so the class is re-pointed here.
+if [ -f "$SYS32/windows.services.store.dll" ]; then
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Services.Store.StoreContext"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_storecontext.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.services.store.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: StoreContext traced stand-in"
 fi
 
 # Windows.System.User: the local user (see shims/user). Windows serves it from the UserManager service.
@@ -636,7 +633,7 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager:wineuwp_appinstallmanager.dll"
 [ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions:wineuwp_appinstallmanager.dll"
 [ -f "$SYS32/wineuwp_taskbarmanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Shell.TaskbarManager:wineuwp_taskbarmanager.dll"
-[ -f "$SYS32/wineuwp_storecontext.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Services.Store.StoreContext:wineuwp_storecontext.dll"
+[ -f "$SYS32/windows.services.store.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Services.Store.StoreContext:windows.services.store.dll"
 [ -f "$SYS32/wineuwp_xboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager:wineuwp_xboxauth.dll"
 [ -f "$SYS32/wineuwp_xboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.StoreConfiguration:wineuwp_xboxauth.dll"
 [ -f "$SYS32/wineuwp_spatialaudio.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioDeviceConfiguration:wineuwp_spatialaudio.dll"

@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     11d6134c2ad46aa6ae5e28f42ec289f743e3b1bd
-                 windows.system.memorymanager: Windows.System.MemoryManager without the resource-manager service; formerly a wine-uwp shim.
+  wine HEAD:     f68a0d0c96a91ebe167402e3da4e9edddcdcf842
+                 windows.services.store: StoreContext without the container host; formerly a wine-uwp shim.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-20T09:06:56Z
+  captured:      2026-10-20T09:09:50Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

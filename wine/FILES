@@ -379,3 +379,6 @@ dlls/windows.system.memorymanager/Makefile.in
 dlls/windows.system.memorymanager/classes.idl
 dlls/windows.system.memorymanager/main.c
 dlls/windows.system.memorymanager/windows.system.memorymanager.spec
+dlls/windows.services.store/Makefile.in
+dlls/windows.services.store/main.c
+dlls/windows.services.store/windows.services.store.spec

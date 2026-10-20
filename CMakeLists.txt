@@ -117,9 +117,6 @@ set_target_properties(xboxauth PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_xboxaut
 target_link_libraries(xboxauth PRIVATE runtimeobject.lib winhttp.lib crypt32.lib bcrypt.lib shell32.lib ole32.lib)
 add_executable(probe-xboxauth probes/probe-xboxauth.cpp)
 set_target_properties(probe-xboxauth PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
-add_library(storecontext SHARED shims/storecontext/storecontext.cpp)
-set_target_properties(storecontext PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_storecontext")
-target_link_libraries(storecontext PRIVATE runtimeobject.lib)
 
 # Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager for the Microsoft Store.
 add_library(appinstallmanager SHARED shims/appinstallmanager/appinstallmanager.cpp)
