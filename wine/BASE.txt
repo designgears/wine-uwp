@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     0f4659118335112af33463d456d5bfc008110bea
-                 ntdll, kernelbase: delay-load failures as on Windows.
+  wine HEAD:     b162f85247b3bcba1b264e01cf2b79ca5f7f1cb7
+                 kernelbase advertising ID, dmprocessxmlfiltered, windows.security.integrity, wineuwp-gamingservice: formerly wine-uwp shims.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-20T08:29:24Z
+  captured:      2026-10-20T08:40:50Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

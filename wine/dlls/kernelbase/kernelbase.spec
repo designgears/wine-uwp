@@ -206,6 +206,7 @@
 @ stdcall CreateMutexExW(ptr wstr long long)
 @ stdcall CreateMutexW(ptr long wstr)
 @ stdcall CreateNamedPipeW(wstr long long long long long long ptr)
+@ stdcall CreateNewAdvertisingId()
 @ stdcall CreatePipe(ptr ptr ptr long)
 # @ stub CreatePrivateNamespaceW
 @ stdcall CreatePrivateObjectSecurity(ptr ptr ptr long long ptr)
@@ -1244,6 +1245,8 @@
 @ stdcall PulseEvent(long)
 @ stdcall PurgeComm(long long)
 @ stdcall QISearch(ptr ptr ptr ptr)
+@ stdcall QueryAdvertisingId()
+@ stdcall QueryAdvertisingIdStatusForUser(wstr ptr ptr)
 @ stdcall QueryActCtxSettingsW(long ptr wstr wstr ptr long ptr)
 @ stdcall QueryActCtxW(long ptr ptr long ptr long ptr)
 @ stdcall QueryDepthSList(ptr) ntdll.RtlQueryDepthSList

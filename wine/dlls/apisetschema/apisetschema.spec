@@ -1,3 +1,4 @@
+apiset api-ms-win-appmodel-advertisingid-l1-1-0 = kernelbase.dll
 apiset api-ms-win-net-isolation-l1-1-1 = firewallapi.dll
 apiset ext-ms-win-devmgmt-policy-l1-1-1 = policymanager.dll
 apiset api-ms-win-appmodel-runtime-internal-l1-1-1 = kernelbase.dll

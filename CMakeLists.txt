@@ -103,10 +103,6 @@ target_link_libraries(spatialaudio PRIVATE runtimeobject.lib)
 
 # Windows.Services.Store.StoreContext - a traced stand-in used to find out which Store methods
 # the app actually calls, before implementing any of them.
-add_executable(gamingservice shims/gamingservice/gamingservice.cpp)
-set_target_properties(gamingservice PROPERTIES OUTPUT_NAME "wineuwp_gamingservice")
-target_link_options(gamingservice PRIVATE -municode)
-target_link_libraries(gamingservice PRIVATE advapi32)
 add_library(user SHARED shims/user/user.cpp)
 set_target_properties(user PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_user")
 target_link_libraries(user PRIVATE runtimeobject.lib advapi32)
@@ -133,25 +129,12 @@ add_library(storecontext SHARED shims/storecontext/storecontext.cpp)
 set_target_properties(storecontext PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_storecontext")
 target_link_libraries(storecontext PRIVATE runtimeobject.lib)
 
-# api-ms-win-appmodel-advertisingid-l1-1-0: twinapi.appcore imports three functions from this
-# apiset and Wine implements none, so the loader's unresolved-import stub raises
-# EXCEPTION_WINE_STUB (0x80000100) mid-startup. Built with the apiset's exact file name.
-# dmprocessxmlfiltered.dll: the Microsoft Store's MDM policy query; no enrolment here, so every Get is "not found".
-add_library(dmprocessxml SHARED shims/dmprocessxml/dmprocessxml.cpp)
-set_target_properties(dmprocessxml PROPERTIES PREFIX "" OUTPUT_NAME "dmprocessxmlfiltered")
-target_link_libraries(dmprocessxml PRIVATE oleaut32.lib)
 # Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager for the Microsoft Store.
 add_library(appinstallmanager SHARED shims/appinstallmanager/appinstallmanager.cpp)
 set_target_properties(appinstallmanager PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_appinstallmanager")
 target_link_libraries(appinstallmanager PRIVATE runtimeobject.lib winhttp.lib ole32.lib)
 target_compile_definitions(appinstallmanager PRIVATE "APPXINSTALL_H=\"$ENV{WINE_SRC}/include/wine/appxinstall.h\"")
 # Windows.System.Profile.WindowsIntegrityPolicy: not in S mode (Windows' asks a lockdown-policy service over RPC).
-add_library(integritypolicy SHARED shims/integritypolicy/integritypolicy.cpp)
-set_target_properties(integritypolicy PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_integritypolicy")
-target_link_libraries(integritypolicy PRIVATE runtimeobject.lib)
-add_library(advertisingid SHARED shims/advertisingid/advertisingid.cpp)
-set_target_properties(advertisingid PROPERTIES PREFIX "" SUFFIX ""
-                      OUTPUT_NAME "api-ms-win-appmodel-advertisingid-l1-1-0.dll")
 
 # Windows.UI.Shell.TaskbarManager. The real one needs ImmersiveShell, which does not exist here,
 # and leaves its IAsyncOperation permanently incomplete - which is what stops Solitaire's startup.

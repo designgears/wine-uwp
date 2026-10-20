@@ -469,13 +469,12 @@ if [ -f "$GP_SHIM" ]; then
     "${WINE_BIN}wine" reg add "$K" /v Architecture /t REG_DWORD /d 9 /f >/dev/null 2>&1
     "${WINE_BIN}wine" reg add "$K" /v FullName /d "${dn}_${dv}_x64__8wekyb3d8bbwe" /f >/dev/null 2>&1
   done
-  # ...and its two NT services, as stand-ins that start, report RUNNING and stop (shims/gamingservice)
-  GS_SVC=${SHIM_DIR}/wineuwp_gamingservice.exe
-  if [ -f "$GS_SVC" ]; then
-    if ! cmp -s "$GS_SVC" "$SYS32/wineuwp_gamingservice.exe"; then cp -f --reflink=auto "$GS_SVC" "$SYS32/wineuwp_gamingservice.exe"; fi
+  # ...and its two NT services, as stand-ins that start, report RUNNING and stop (Wine's programs/wineuwp-gamingservice,
+  # whose stub in system32 a prefix update creates)
+  if [ -f "$SYS32/wineuwp-gamingservice.exe" ]; then
     for svc in GamingServices GamingServicesNet; do
       K="HKLM\\System\\CurrentControlSet\\Services\\$svc"
-      "${WINE_BIN}wine" reg add "$K" /v ImagePath /d 'C:\windows\system32\wineuwp_gamingservice.exe' /f >/dev/null 2>&1
+      "${WINE_BIN}wine" reg add "$K" /v ImagePath /d 'C:\windows\system32\wineuwp-gamingservice.exe' /f >/dev/null 2>&1
       "${WINE_BIN}wine" reg add "$K" /v Type /t REG_DWORD /d 16 /f >/dev/null 2>&1
       "${WINE_BIN}wine" reg add "$K" /v Start /t REG_DWORD /d 3 /f >/dev/null 2>&1
       "${WINE_BIN}wine" reg add "$K" /v ErrorControl /t REG_DWORD /d 1 /f >/dev/null 2>&1
@@ -518,24 +517,8 @@ if [ -f "$XA_SHIM" ]; then
   echo "installed: Xbox sign-in (XboxAuthManager, WebAuthenticationCoreManager, StoreConfiguration) stand-in"
 fi
 
-# dmprocessxmlfiltered.dll: the Microsoft Store imports DMProcessConfigXMLFiltered to read MDM policies. Windows'
-# copy needs the whole device-management enrolment stack. See shims/dmprocessxml.
-DMX=${SHIM_DIR}/dmprocessxmlfiltered.dll
-if [ -f "$DMX" ]; then
-  DMX_DST=$SYS32/dmprocessxmlfiltered.dll
-  if ! cmp -s "$DMX" "$DMX_DST"; then cp -f --reflink=auto "$DMX" "$DMX_DST"; fi
-  echo "installed: dmprocessxmlfiltered (MDM policy query) stand-in"
-fi
-
-# api-ms-win-appmodel-advertisingid-l1-1-0.dll. No registry entry: this is a plain DLL resolved by
-# name at load time, so it only has to exist in system32 for twinapi.appcore's imports to bind to
-# it instead of Wine's raising stub.
-ADID=${SHIM_DIR}/api-ms-win-appmodel-advertisingid-l1-1-0.dll
-if [ -f "$ADID" ]; then
-  ADID_DST=$SYS32/api-ms-win-appmodel-advertisingid-l1-1-0.dll
-  if ! cmp -s "$ADID" "$ADID_DST"; then cp -f --reflink=auto "$ADID" "$ADID_DST"; fi
-  echo "installed: advertising-id apiset stand-in"
-fi
+# dmprocessxmlfiltered.dll (the Microsoft Store's MDM policy query) and the advertising-ID apiset are Wine's own now:
+# dlls/dmprocessxmlfiltered, and kernelbase through the apiset schema.
 
 # The WebView2 runtime (Edge's EBWebView, from a Windows ISO's install.wim: Program Files (x86)/Microsoft/EdgeWebView),
 # with shims/webview2 in front of its EmbeddedBrowserWebView.dll. The Xbox app's purchase dialog and other React
@@ -573,13 +556,7 @@ if [ -f "$AIM_SHIM" ]; then
   cmp -s "$AIM_SHIM" "$SYS32/wineuwp_appinstallmanager.dll" || cp -f --reflink=auto "$AIM_SHIM" "$SYS32/wineuwp_appinstallmanager.dll"
   echo "installed: AppInstallManager (Microsoft Store installs) stand-in"
 fi
-# Windows.System.Profile.WindowsIntegrityPolicy (see shims/integritypolicy): Windows' implementation raises
-# EPT_S_NOT_REGISTERED from wldp's RPC to the lockdown-policy service, which kills the Microsoft Store.
-WIP_SHIM=${SHIM_DIR}/wineuwp_integritypolicy.dll
-if [ -f "$WIP_SHIM" ]; then
-  cmp -s "$WIP_SHIM" "$SYS32/wineuwp_integritypolicy.dll" || cp -f --reflink=auto "$WIP_SHIM" "$SYS32/wineuwp_integritypolicy.dll"
-  echo "installed: WindowsIntegrityPolicy (not in S mode) stand-in"
-fi
+# Windows.System.Profile.WindowsIntegrityPolicy is Wine's windows.security.integrity (registered by Wine itself).
 TB_SHIM=${SHIM_DIR}/wineuwp_taskbarmanager.dll
 if [ -f "$TB_SHIM" ]; then
   TB_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_taskbarmanager.dll
@@ -673,7 +650,6 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_deviceinformation.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Devices.Enumeration.DeviceInformation:wineuwp_deviceinformation.dll"
 [ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager:wineuwp_appinstallmanager.dll"
 [ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions:wineuwp_appinstallmanager.dll"
-[ -f "$SYS32/wineuwp_integritypolicy.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.System.Profile.WindowsIntegrityPolicy:wineuwp_integritypolicy.dll"
 [ -f "$SYS32/wineuwp_taskbarmanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Shell.TaskbarManager:wineuwp_taskbarmanager.dll"
 [ -f "$SYS32/wineuwp_storecontext.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Services.Store.StoreContext:wineuwp_storecontext.dll"
 [ -f "$SYS32/wineuwp_xboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager:wineuwp_xboxauth.dll"

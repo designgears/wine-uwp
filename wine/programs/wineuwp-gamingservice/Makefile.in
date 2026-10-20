@@ -1,0 +1,7 @@
+MODULE    = wineuwp-gamingservice.exe
+IMPORTS   = advapi32
+
+EXTRADLLFLAGS = -mconsole -municode
+
+SOURCES = \
+	main.c

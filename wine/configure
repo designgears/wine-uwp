@@ -1140,6 +1140,7 @@ enable_dmband
 enable_dmcompos
 enable_dmime
 enable_dmloader
+enable_dmprocessxmlfiltered
 enable_dmscript
 enable_dmstyle
 enable_dmsynth
@@ -1557,6 +1558,7 @@ enable_windows_networking
 enable_windows_perception_stub
 enable_windows_security_authentication_onlineid
 enable_windows_security_credentials_ui_userconsentverifier
+enable_windows_security_integrity
 enable_windows_staterepositorycore
 enable_windows_storage_applicationdata
 enable_windows_storage
@@ -1823,6 +1825,7 @@ enable_winemine
 enable_winemsibuilder
 enable_winepath
 enable_winetest
+enable_wineuwp_gamingservice
 enable_wineuwp_install
 enable_winevdm
 enable_winhlp32
@@ -22262,6 +22265,7 @@ wine_fn_config_makefile dlls/dmime enable_dmime
 wine_fn_config_makefile dlls/dmime/tests enable_tests
 wine_fn_config_makefile dlls/dmloader enable_dmloader
 wine_fn_config_makefile dlls/dmloader/tests enable_tests
+wine_fn_config_makefile dlls/dmprocessxmlfiltered enable_dmprocessxmlfiltered
 wine_fn_config_makefile dlls/dmscript enable_dmscript
 wine_fn_config_makefile dlls/dmscript/tests enable_tests
 wine_fn_config_makefile dlls/dmstyle enable_dmstyle
@@ -22933,6 +22937,7 @@ wine_fn_config_makefile dlls/windows.security.authentication.onlineid enable_win
 wine_fn_config_makefile dlls/windows.security.authentication.onlineid/tests enable_tests
 wine_fn_config_makefile dlls/windows.security.credentials.ui.userconsentverifier enable_windows_security_credentials_ui_userconsentverifier
 wine_fn_config_makefile dlls/windows.security.credentials.ui.userconsentverifier/tests enable_tests
+wine_fn_config_makefile dlls/windows.security.integrity enable_windows_security_integrity
 wine_fn_config_makefile dlls/windows.staterepositorycore enable_windows_staterepositorycore
 wine_fn_config_makefile dlls/windows.storage.applicationdata enable_windows_storage_applicationdata
 wine_fn_config_makefile dlls/windows.storage.applicationdata/tests enable_tests
@@ -23258,6 +23263,7 @@ wine_fn_config_makefile programs/winemine enable_winemine
 wine_fn_config_makefile programs/winemsibuilder enable_winemsibuilder
 wine_fn_config_makefile programs/winepath enable_winepath
 wine_fn_config_makefile programs/winetest enable_winetest
+wine_fn_config_makefile programs/wineuwp-gamingservice enable_wineuwp_gamingservice
 wine_fn_config_makefile programs/wineuwp-install enable_wineuwp_install
 wine_fn_config_makefile programs/winevdm enable_winevdm
 wine_fn_config_makefile programs/winhelp.exe16 enable_win16

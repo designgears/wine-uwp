@@ -353,3 +353,13 @@ dlls/firewallapi/main.c
 dlls/policymanager/Makefile.in
 dlls/policymanager/main.c
 dlls/policymanager/policymanager.spec
+dlls/dmprocessxmlfiltered/Makefile.in
+dlls/dmprocessxmlfiltered/dmprocessxmlfiltered.spec
+dlls/dmprocessxmlfiltered/main.c
+dlls/windows.security.integrity/Makefile.in
+dlls/windows.security.integrity/classes.idl
+dlls/windows.security.integrity/main.c
+dlls/windows.security.integrity/windows.security.integrity.spec
+programs/wineuwp-gamingservice/Makefile.in
+programs/wineuwp-gamingservice/main.c
+include/windows.system.profile.idl

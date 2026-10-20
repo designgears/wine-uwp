@@ -95,6 +95,45 @@ LONG WINAPI AppPolicyGetMediaFoundationCodecLoading(HANDLE token, AppPolicyMedia
 }
 
 /***********************************************************************
+ *          CreateNewAdvertisingId (KERNELBASE.@)
+ *
+ * The advertising ID (api-ms-win-appmodel-advertisingid-l1-1-0, kernel.appcore on Windows). There is none here:
+ * callers take their documented no-ID path. The real signatures are in no header or metadata, so the two that
+ * would hand one out write nothing and fail.
+ */
+HRESULT WINAPI CreateNewAdvertisingId(void)
+{
+    TRACE( "\n" );
+    return E_NOTIMPL;
+}
+
+/***********************************************************************
+ *          QueryAdvertisingId (KERNELBASE.@)
+ */
+HRESULT WINAPI QueryAdvertisingId(void)
+{
+    TRACE( "\n" );
+    return E_NOTIMPL;
+}
+
+/***********************************************************************
+ *          QueryAdvertisingIdStatusForUser (KERNELBASE.@)
+ *
+ * The signature is read from its one caller, twinapi.appcore's AdvertisingManagerHelperImpl::
+ * GetAdvertisingIdTurnedOnForUser: the user's SID (or NULL), a status it presets to 2 and treats 1 as "turned on",
+ * and flags preset to 0. Answering "turned off" is what Windows says when the user switched it off, and the manager
+ * then hands out an empty AdvertisingId; E_NOTIMPL made AdvertisingManager.GetForUser fail, and Solitaire threw on
+ * that during start-up. Without any of these the unresolved import's stub raised in twinapi.appcore.
+ */
+HRESULT WINAPI QueryAdvertisingIdStatusForUser( const WCHAR *sid, DWORD *status, DWORD *flags )
+{
+    TRACE( "%s %p %p\n", debugstr_w(sid), status, flags );
+    if (status) *status = 2;
+    if (flags) *flags = 0;
+    return S_OK;
+}
+
+/***********************************************************************
  *          AppPolicyGetProcessTerminationMethod (KERNELBASE.@)
  */
 LONG WINAPI AppPolicyGetProcessTerminationMethod(HANDLE token, AppPolicyProcessTerminationMethod *policy)
