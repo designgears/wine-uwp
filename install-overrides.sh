@@ -588,8 +588,8 @@ fi
 # Windows.System.Launcher is Wine's windows.system.hostlauncher: the genuine one goes through the
 # shell broker and fail-fasts the app; this one hands the URI to ShellExecute, i.e. the host's
 # browser. Prefixes set up before that used a stand-in DLL.
-rm -f "$SYS32/wineuwp_launcher.dll"
 if [ -f "$SYS32/windows.system.hostlauncher.dll" ]; then
+  rm -f "$SYS32/wineuwp_launcher.dll"
   reassert_activatable Windows.System.Launcher windows.system.hostlauncher.dll 0
   SHIM_CLASSES="$SHIM_CLASSES Windows.System.Launcher:windows.system.hostlauncher.dll:0"
 fi
