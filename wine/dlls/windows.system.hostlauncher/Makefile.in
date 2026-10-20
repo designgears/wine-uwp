@@ -1,0 +1,8 @@
+MODULE  = windows.system.hostlauncher.dll
+IMPORTS = combase shell32
+
+SOURCES = \
+	async.c \
+	async_private.idl \
+	classes.idl \
+	main.c

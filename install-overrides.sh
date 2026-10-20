@@ -585,13 +585,13 @@ if [ -f "$SYS32/windows.security.cryptography.certificates.dll" ]; then
   reassert_activatable Windows.Security.Cryptography.Certificates.Certificate windows.security.cryptography.certificates.dll 0
   SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Cryptography.Certificates.Certificate:windows.security.cryptography.certificates.dll:0"
 fi
-# Windows.System.Launcher (see shims/launcher): the genuine one goes through the shell broker and
-# fail-fasts the app; this one hands the URI to ShellExecute, i.e. the host's browser.
-LAUNCHER_SHIM=${SHIM_DIR}/wineuwp_launcher.dll
-if [ -f "$LAUNCHER_SHIM" ]; then
-  cmp -s "$LAUNCHER_SHIM" "$SYS32/wineuwp_launcher.dll" || cp -f --reflink=auto "$LAUNCHER_SHIM" "$SYS32/wineuwp_launcher.dll"
-  reassert_activatable Windows.System.Launcher wineuwp_launcher.dll 0
-  SHIM_CLASSES="$SHIM_CLASSES Windows.System.Launcher:wineuwp_launcher.dll:0"
+# Windows.System.Launcher is Wine's windows.system.hostlauncher: the genuine one goes through the
+# shell broker and fail-fasts the app; this one hands the URI to ShellExecute, i.e. the host's
+# browser. Prefixes set up before that used a stand-in DLL.
+rm -f "$SYS32/wineuwp_launcher.dll"
+if [ -f "$SYS32/windows.system.hostlauncher.dll" ]; then
+  reassert_activatable Windows.System.Launcher windows.system.hostlauncher.dll 0
+  SHIM_CLASSES="$SHIM_CLASSES Windows.System.Launcher:windows.system.hostlauncher.dll:0"
 fi
 
 # Windows.Graphics.dll's classes that Wine's builtin windows.graphics does not implement, served by

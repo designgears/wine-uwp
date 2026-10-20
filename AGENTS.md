@@ -305,7 +305,7 @@ gitignored `uwp-bin`, so a fresh clone has to recreate it.
 | Where did a Sentry/crashpad minidump crash? | `./minidump.py <file.dmp>` - exception, module+offset, and a module-resolved scan of the faulting stack. Wine builtins carry DWARF: `llvm-symbolizer --obj=~/src/wine-build/dlls/<dll>/x86_64-windows/<dll>.dll 0x180000000+<offset>` names the function and line. That is how the dcomp use-after-free and the d3d11 NULL write were found in minutes |
 | What is Shapr3D itself logging? | `sqlite3 LocalState/telemetry.db "select data from Records"`: its structured log (file, line, message) sits there until it is uploaded. For any app, request bodies can be seen by temporarily dumping `lpOptional`/`HTTPREQ_WriteFile` buffers in `dlls/wininet/http.c`; the native `Windows.Web.Http` runs on WinINet |
 | The app ships a crash reporter (Sentry/crashpad) | read its minidump and breadcrumbs, in `LocalState/crash_report/` for Shapr3D: the dump's exception stream names the thread and address, the breadcrumbs the app's own error text |
-| Open a URI or file from an app without touching the real desktop | `WINE_UWP_LAUNCHER=log` makes the Launcher shim log instead of `ShellExecute` |
+| Open a URI or file from an app without touching the real desktop | `WINE_UWP_LAUNCHER=log` makes Wine's `windows.system.hostlauncher` log instead of `ShellExecute`; `probe-launcher.exe` exercises it without an app |
 | Deliver a URI to the running app (sign-in callbacks, `scheme:` links) | `./activate-uri.sh <uri>` - a Protocol activation of the running instance, via the inbox `wineuwp` watches. `./browser-callback.sh <scheme>` does a whole browser sign-in and delivers its callback |
 | Does a drag reach its drop target? | `WINEDEBUG=+timestamp,trace+dataexchange`: every `TargetRequested`, `EnterAsync`/`OverAsync`/`DropAsync` with the position and the operation the target accepted. Drag with a move every ~15 ms (`/tmp/dodrag.sh`), and only in a project of our own |
 | Which visual state did the app switch a control to, and when? | `WINE_UWP_BP=windows.ui.xaml.dll+18c80@r8+0:6` (`VisualStateManagerFactory::GoToState`): .NET Native passes reference HSTRINGs, so dwords 4-5 are a pointer into `Shapr3D.dll` and dword 1 the length - read the literal from the DLL image. `+111338@r8+0:2` (`CEventManager::RaiseRoutedEvent`) gives the routed-event stream with each source's vtable. An app's own XAML is in `resources.pri` as `XBF` blobs with UTF-16 string tables |
@@ -719,7 +719,7 @@ through `CapturePreview` frames in a popup instead.
 
 **A process started from a hosted app inherits its whole environment.** The Xbox app's package identity, DLL overrides,
 `WINEPATH` and `WINE_UWP_BP` all reached the game it launched. Launch other packages with a clean environment block
-(`clean_environment()` in `shims/gameplatform/install.inc` and `shims/launcher`).
+(`clean_environment()` in `shims/gameplatform/install.inc` and `dlls/windows.system.hostlauncher`).
 
 **In a hosted app, `CoreApplication.MainView` can be a view with no window.** The activation stands up its own view and
 the CoreWindow lives there; combase's `get_MainView` wrapper answers the view that has the window (Findings-M4

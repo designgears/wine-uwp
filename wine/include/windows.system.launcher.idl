@@ -1,0 +1,208 @@
+/*
+ * Copyright 2026 wine-uwp contributors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+/* Windows.System.Launcher. It is apart from windows.system.idl because it needs Windows.Storage,
+ * which imports that file. */
+
+#ifdef __WIDL__
+#pragma winrt ns_prefix
+#endif
+
+import "inspectable.idl";
+import "asyncinfo.idl";
+import "eventtoken.idl";
+import "windowscontracts.idl";
+import "windows.foundation.idl";
+import "windows.storage.idl";
+import "windows.system.idl";
+
+namespace Windows.System {
+    typedef enum LaunchQuerySupportStatus LaunchQuerySupportStatus;
+    typedef enum LaunchQuerySupportType LaunchQuerySupportType;
+    typedef enum LaunchUriStatus LaunchUriStatus;
+
+    /* the default interfaces of LauncherOptions and FolderLauncherOptions, not defined here yet:
+     * passing one is the same ABI as passing the runtimeclass */
+    interface ILauncherOptions;
+    interface IFolderLauncherOptions;
+
+    interface ILauncherStatics;
+    interface ILauncherStatics2;
+    interface ILauncherStatics3;
+    interface ILauncherStatics4;
+    interface ILauncherStatics5;
+
+    runtimeclass Launcher;
+
+    declare {
+        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.System.LaunchQuerySupportStatus>;
+        interface Windows.Foundation.IAsyncOperation<Windows.System.LaunchQuerySupportStatus>;
+        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.System.LaunchUriStatus>;
+        interface Windows.Foundation.IAsyncOperation<Windows.System.LaunchUriStatus>;
+    }
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    enum LaunchQuerySupportStatus
+    {
+        Available       = 0,
+        AppNotInstalled = 1,
+        AppUnavailable  = 2,
+        NotSupported    = 3,
+        Unknown         = 4,
+    };
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    enum LaunchQuerySupportType
+    {
+        Uri           = 0,
+        UriForResults = 1,
+    };
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    enum LaunchUriStatus
+    {
+        Success             = 0,
+        AppUnavailable      = 1,
+        ProtocolUnavailable = 2,
+        Unknown             = 3,
+    };
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.System.Launcher),
+        uuid(277151c3-9e3e-42f6-91a4-5dfdeb232451)
+    ]
+    interface ILauncherStatics : IInspectable
+    {
+        [overload("LaunchFileAsync")] HRESULT LaunchFileAsync([in] Windows.Storage.IStorageFile *file,
+                [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        [overload("LaunchFileAsync")] HRESULT LaunchFileWithOptionsAsync([in] Windows.Storage.IStorageFile *file,
+                [in] Windows.System.ILauncherOptions *options, [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        [overload("LaunchUriAsync")] HRESULT LaunchUriAsync([in] Windows.Foundation.Uri *uri,
+                [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        [overload("LaunchUriAsync")] HRESULT LaunchUriWithOptionsAsync([in] Windows.Foundation.Uri *uri,
+                [in] Windows.System.ILauncherOptions *options, [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+    }
+
+    /* The input data is a ValueSet, and the ForResults and Find operations return types not
+     * declared here; they are interface pointers either way. */
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.System.Launcher),
+        uuid(59ba2fbb-24cb-4c02-a4c4-8294569d54f1)
+    ]
+    interface ILauncherStatics2 : IInspectable
+    {
+        [overload("LaunchUriForResultsAsync")] HRESULT LaunchUriForResultsAsync([in] Windows.Foundation.Uri *uri,
+                [in] Windows.System.ILauncherOptions *options, [out, retval] IInspectable **operation);
+        [overload("LaunchUriForResultsAsync")] HRESULT LaunchUriForResultsWithDataAsync([in] Windows.Foundation.Uri *uri,
+                [in] Windows.System.ILauncherOptions *options, [in] IInspectable *data, [out, retval] IInspectable **operation);
+        [overload("LaunchUriAsync")] HRESULT LaunchUriWithDataAsync([in] Windows.Foundation.Uri *uri,
+                [in] Windows.System.ILauncherOptions *options, [in] IInspectable *data,
+                [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        [overload("QueryUriSupportAsync")] HRESULT QueryUriSupportAsync([in] Windows.Foundation.Uri *uri,
+                [in] Windows.System.LaunchQuerySupportType type,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.System.LaunchQuerySupportStatus> **operation);
+        [overload("QueryUriSupportAsync")] HRESULT QueryUriSupportWithPackageFamilyNameAsync([in] Windows.Foundation.Uri *uri,
+                [in] Windows.System.LaunchQuerySupportType type, [in] HSTRING package_family_name,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.System.LaunchQuerySupportStatus> **operation);
+        [overload("QueryFileSupportAsync")] HRESULT QueryFileSupportAsync([in] Windows.Storage.StorageFile *file,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.System.LaunchQuerySupportStatus> **operation);
+        [overload("QueryFileSupportAsync")] HRESULT QueryFileSupportWithPackageFamilyNameAsync([in] Windows.Storage.StorageFile *file,
+                [in] HSTRING package_family_name,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.System.LaunchQuerySupportStatus> **operation);
+        [overload("FindUriSchemeHandlersAsync")] HRESULT FindUriSchemeHandlersAsync([in] HSTRING scheme,
+                [out, retval] IInspectable **operation);
+        [overload("FindUriSchemeHandlersAsync")] HRESULT FindUriSchemeHandlersWithLaunchUriTypeAsync([in] HSTRING scheme,
+                [in] Windows.System.LaunchQuerySupportType type, [out, retval] IInspectable **operation);
+        HRESULT FindFileHandlersAsync([in] HSTRING extension, [out, retval] IInspectable **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.System.Launcher),
+        uuid(234261a8-9db3-4683-aa42-dc6f51d33847)
+    ]
+    interface ILauncherStatics3 : IInspectable
+    {
+        [overload("LaunchFolderAsync")] HRESULT LaunchFolderAsync([in] Windows.Storage.IStorageFolder *folder,
+                [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        [overload("LaunchFolderAsync")] HRESULT LaunchFolderWithOptionsAsync([in] Windows.Storage.IStorageFolder *folder,
+                [in] Windows.System.IFolderLauncherOptions *options, [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.System.Launcher),
+        uuid(b9ec819f-b5a5-41c6-b3b3-dd1b3178bcf2)
+    ]
+    interface ILauncherStatics4 : IInspectable
+    {
+        [overload("QueryAppUriSupportAsync")] HRESULT QueryAppUriSupportAsync([in] Windows.Foundation.Uri *uri,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.System.LaunchQuerySupportStatus> **operation);
+        [overload("QueryAppUriSupportAsync")] HRESULT QueryAppUriSupportWithPackageFamilyNameAsync([in] Windows.Foundation.Uri *uri,
+                [in] HSTRING package_family_name,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.System.LaunchQuerySupportStatus> **operation);
+        HRESULT FindAppUriHandlersAsync([in] Windows.Foundation.Uri *uri, [out, retval] IInspectable **operation);
+        [overload("LaunchUriForUserAsync")] HRESULT LaunchUriForUserAsync([in] Windows.System.User *user,
+                [in] Windows.Foundation.Uri *uri,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.System.LaunchUriStatus> **operation);
+        [overload("LaunchUriForUserAsync")] HRESULT LaunchUriWithOptionsForUserAsync([in] Windows.System.User *user,
+                [in] Windows.Foundation.Uri *uri, [in] Windows.System.ILauncherOptions *options,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.System.LaunchUriStatus> **operation);
+        [overload("LaunchUriForUserAsync")] HRESULT LaunchUriWithDataForUserAsync([in] Windows.System.User *user,
+                [in] Windows.Foundation.Uri *uri, [in] Windows.System.ILauncherOptions *options, [in] IInspectable *data,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.System.LaunchUriStatus> **operation);
+        [overload("LaunchUriForResultsForUserAsync")] HRESULT LaunchUriForResultsForUserAsync([in] Windows.System.User *user,
+                [in] Windows.Foundation.Uri *uri, [in] Windows.System.ILauncherOptions *options, [out, retval] IInspectable **operation);
+        [overload("LaunchUriForResultsForUserAsync")] HRESULT LaunchUriForResultsWithDataForUserAsync([in] Windows.System.User *user,
+                [in] Windows.Foundation.Uri *uri, [in] Windows.System.ILauncherOptions *options, [in] IInspectable *data,
+                [out, retval] IInspectable **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 6.0),
+        exclusiveto(Windows.System.Launcher),
+        uuid(5b24ef84-d895-5fea-9153-1ac49aed9ba9)
+    ]
+    interface ILauncherStatics5 : IInspectable
+    {
+        [overload("LaunchFolderPathAsync")] HRESULT LaunchFolderPathAsync([in] HSTRING path,
+                [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        [overload("LaunchFolderPathAsync")] HRESULT LaunchFolderPathWithOptionsAsync([in] HSTRING path,
+                [in] Windows.System.IFolderLauncherOptions *options, [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        [overload("LaunchFolderPathForUserAsync")] HRESULT LaunchFolderPathForUserAsync([in] Windows.System.User *user, [in] HSTRING path,
+                [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        [overload("LaunchFolderPathForUserAsync")] HRESULT LaunchFolderPathWithOptionsForUserAsync([in] Windows.System.User *user,
+                [in] HSTRING path, [in] Windows.System.IFolderLauncherOptions *options,
+                [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile),
+        static(Windows.System.ILauncherStatics, Windows.Foundation.UniversalApiContract, 1.0),
+        static(Windows.System.ILauncherStatics2, Windows.Foundation.UniversalApiContract, 1.0),
+        static(Windows.System.ILauncherStatics3, Windows.Foundation.UniversalApiContract, 1.0),
+        static(Windows.System.ILauncherStatics4, Windows.Foundation.UniversalApiContract, 1.0),
+        static(Windows.System.ILauncherStatics5, Windows.Foundation.UniversalApiContract, 6.0)
+    ]
+    runtimeclass Launcher
+    {
+    }
+}

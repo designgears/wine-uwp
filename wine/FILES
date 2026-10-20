@@ -417,3 +417,11 @@ dlls/windows.security.cryptography.certificates/windows.security.cryptography.ce
 dlls/windows.storage/storagelibrary.c
 dlls/windows.storage/accesscache.c
 include/windows.storage.accesscache.idl
+include/windows.system.launcher.idl
+dlls/windows.system.hostlauncher/Makefile.in
+dlls/windows.system.hostlauncher/async.c
+dlls/windows.system.hostlauncher/async_private.idl
+dlls/windows.system.hostlauncher/classes.idl
+dlls/windows.system.hostlauncher/main.c
+dlls/windows.system.hostlauncher/private.h
+dlls/windows.system.hostlauncher/windows.system.hostlauncher.spec

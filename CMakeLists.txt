@@ -101,9 +101,6 @@ target_link_libraries(appinstallmanager PRIVATE runtimeobject.lib winhttp.lib ol
 target_compile_definitions(appinstallmanager PRIVATE "APPXINSTALL_H=\"$ENV{WINE_SRC}/include/wine/appxinstall.h\"")
 # Windows.System.Profile.WindowsIntegrityPolicy: not in S mode (Windows' asks a lockdown-policy service over RPC).
 
-add_library(launcher SHARED shims/launcher/launcher.cpp)
-set_target_properties(launcher PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_launcher")
-target_link_libraries(launcher PRIVATE runtimeobject.lib shell32.lib)
 
 add_executable(probe-useractivity probes/probe-useractivity.cpp)
 target_link_libraries(probe-useractivity PRIVATE runtimeobject.lib ole32.lib)
@@ -151,3 +148,5 @@ endif()
 add_executable(probe-widen probes/probe-widen.cpp)
 target_link_libraries(probe-widen PRIVATE d2d1.lib)
 set_target_properties(probe-widen PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
+add_executable(probe-launcher probes/probe-launcher.cpp)
+target_link_libraries(probe-launcher PRIVATE runtimeobject.lib)

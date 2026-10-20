@@ -1096,6 +1096,7 @@ SOURCES = \
 	windows.storage.search.idl \
 	windows.storage.streams.idl \
 	windows.system.idl \
+	windows.system.launcher.idl \
 	windows.system.power.idl \
 	windows.system.profile.idl \
 	windows.system.profile.systemmanufacturers.idl \
