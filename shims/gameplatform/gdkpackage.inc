@@ -1057,6 +1057,18 @@ static HRESULT WINAPI pv_Create(Factory *, HSTRING source, INT32 type, IInspecta
     {
         InstalledGame g;
         if (find_installed(p->store_id, g)) p->store_id = g.store_id;
+        else
+        {
+            /* an install in the queue, also a failed one: the Xbox app previews its features by installation id
+             * after a failure, and a preview that knew no product reported no size or features and the app's
+             * catalogue then crashed reading them (Fortnite, Command_ProcessDevicesChanged) */
+            GUID id;
+            bool is_guid = SUCCEEDED(CLSIDFromString(p->store_id.c_str(), &id));
+            AcquireSRWLockShared(&installs_lock);
+            if (Install *in = find_install(&p->store_id, is_guid ? &id : nullptr))
+                if (!in->store_id.empty()) p->store_id = in->store_id;
+            ReleaseSRWLockShared(&installs_lock);
+        }
     }
     tracef("PackagePreview.Create(%ls, type %d)", p->store_id.c_str(), type);
     *out = static_cast<IPackagePreviewAbi *>(p);
