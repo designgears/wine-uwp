@@ -409,3 +409,8 @@ dlls/windows.system.user/classes.idl
 dlls/windows.system.user/main.c
 dlls/windows.system.user/private.h
 dlls/windows.system.user/windows.system.user.spec
+include/windows.security.cryptography.certificates.idl
+dlls/windows.security.cryptography.certificates/Makefile.in
+dlls/windows.security.cryptography.certificates/classes.idl
+dlls/windows.security.cryptography.certificates/main.c
+dlls/windows.security.cryptography.certificates/windows.security.cryptography.certificates.spec

@@ -1,0 +1,92 @@
+/*
+ * Copyright 2026 wine-uwp contributors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+/* the Certificate part of Windows.Security.Cryptography.Certificates */
+
+#ifdef __WIDL__
+#pragma winrt ns_prefix
+#endif
+
+import "inspectable.idl";
+import "asyncinfo.idl";
+import "windowscontracts.idl";
+import "windows.foundation.idl";
+import "windows.storage.streams.idl";
+
+namespace Windows.Security.Cryptography.Certificates {
+    interface ICertificate;
+    interface ICertificateFactory;
+    runtimeclass Certificate;
+
+    declare {
+        interface Windows.Foundation.Collections.IIterable<Windows.Security.Cryptography.Certificates.Certificate *>;
+        interface Windows.Foundation.Collections.IIterator<Windows.Security.Cryptography.Certificates.Certificate *>;
+    }
+
+    /* BuildChainAsync hands back an IAsyncOperation<CertificateChain> and takes ChainBuildingParameters, types not
+     * defined here yet: they appear as IInspectable, the same ABI */
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Security.Cryptography.Certificates.Certificate),
+        uuid(333f740c-04d8-43b3-b278-8c5fcc9be5a0)
+    ]
+    interface ICertificate : IInspectable
+    {
+        [overload("BuildChainAsync")] HRESULT BuildChainAsync(
+                [in] Windows.Foundation.Collections.IIterable<Windows.Security.Cryptography.Certificates.Certificate *> *certificates,
+                [out, retval] IInspectable **operation);
+        [overload("BuildChainAsync")] HRESULT BuildChainWithParametersAsync(
+                [in] Windows.Foundation.Collections.IIterable<Windows.Security.Cryptography.Certificates.Certificate *> *certificates,
+                [in] IInspectable *parameters, [out, retval] IInspectable **operation);
+        [propget] HRESULT SerialNumber([out] UINT32 *value_size, [out, retval, size_is(, *value_size)] BYTE **value);
+        [overload("GetHashValue")] HRESULT GetHashValue([out] UINT32 *value_size, [out, retval, size_is(, *value_size)] BYTE **value);
+        [overload("GetHashValue")] HRESULT GetHashValueWithAlgorithm([in] HSTRING algorithm, [out] UINT32 *value_size,
+                [out, retval, size_is(, *value_size)] BYTE **value);
+        HRESULT GetCertificateBlob([out, retval] Windows.Storage.Streams.IBuffer **value);
+        [propget] HRESULT Subject([out, retval] HSTRING *value);
+        [propget] HRESULT Issuer([out, retval] HSTRING *value);
+        [propget] HRESULT HasPrivateKey([out, retval] boolean *value);
+        [propget] HRESULT IsStronglyProtected([out, retval] boolean *value);
+        [propget] HRESULT ValidFrom([out, retval] Windows.Foundation.DateTime *value);
+        [propget] HRESULT ValidTo([out, retval] Windows.Foundation.DateTime *value);
+        [propget] HRESULT EnhancedKeyUsages([out, retval] Windows.Foundation.Collections.IVectorView<HSTRING> **value);
+        [propput] HRESULT FriendlyName([in] HSTRING value);
+        [propget] HRESULT FriendlyName([out, retval] HSTRING *value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Security.Cryptography.Certificates.Certificate),
+        uuid(17b4221c-4baf-44a2-9608-04fb62b16942)
+    ]
+    interface ICertificateFactory : IInspectable
+    {
+        HRESULT CreateCertificate([in] Windows.Storage.Streams.IBuffer *certificate,
+                                  [out, retval] Windows.Security.Cryptography.Certificates.Certificate **value);
+    }
+
+    [
+        activatable(Windows.Security.Cryptography.Certificates.ICertificateFactory, Windows.Foundation.UniversalApiContract, 1.0),
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile)
+    ]
+    runtimeclass Certificate
+    {
+        [default] interface Windows.Security.Cryptography.Certificates.ICertificate;
+    }
+}

@@ -1,0 +1,6 @@
+MODULE  = windows.security.cryptography.certificates.dll
+IMPORTS = combase crypt32
+
+SOURCES = \
+	classes.idl \
+	main.c

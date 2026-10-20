@@ -596,13 +596,12 @@ if [ -f "$SYS32/wineuwp_filepicker.dll" ]; then
   reassert_activatable Windows.Storage.Pickers.FolderPicker wineuwp_filepicker.dll 1
   SHIM_CLASSES="$SHIM_CLASSES Windows.Storage.Pickers.FolderPicker:wineuwp_filepicker.dll:1"
 fi
-# Windows.Security.Cryptography.Certificates.Certificate (see shims/certificate): certenroll.dll is
-# missing, and without the class Windows.Web.Http abandons every HTTPS request.
-CERT_SHIM=${SHIM_DIR}/wineuwp_certificate.dll
-if [ -f "$CERT_SHIM" ]; then
-  cmp -s "$CERT_SHIM" "$SYS32/wineuwp_certificate.dll" || cp -f --reflink=auto "$CERT_SHIM" "$SYS32/wineuwp_certificate.dll"
-  reassert_activatable Windows.Security.Cryptography.Certificates.Certificate wineuwp_certificate.dll 0
-  SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Cryptography.Certificates.Certificate:wineuwp_certificate.dll:0"
+# Windows.Security.Cryptography.Certificates.Certificate is Wine's windows.security.cryptography.certificates:
+# Windows registers it in certenroll.dll, which the image lacks, and without it Windows.Web.Http abandons every HTTPS
+# request.
+if [ -f "$SYS32/windows.security.cryptography.certificates.dll" ]; then
+  reassert_activatable Windows.Security.Cryptography.Certificates.Certificate windows.security.cryptography.certificates.dll 0
+  SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Cryptography.Certificates.Certificate:windows.security.cryptography.certificates.dll:0"
 fi
 # Windows.System.Launcher (see shims/launcher): the genuine one goes through the shell broker and
 # fail-fasts the app; this one hands the URI to ShellExecute, i.e. the host's browser.

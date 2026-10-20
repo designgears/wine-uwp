@@ -107,13 +107,6 @@ target_link_libraries(appinstallmanager PRIVATE runtimeobject.lib winhttp.lib ol
 target_compile_definitions(appinstallmanager PRIVATE "APPXINSTALL_H=\"$ENV{WINE_SRC}/include/wine/appxinstall.h\"")
 # Windows.System.Profile.WindowsIntegrityPolicy: not in S mode (Windows' asks a lockdown-policy service over RPC).
 
-# Windows.UI.Shell.TaskbarManager. The real one needs ImmersiveShell, which does not exist here,
-# and leaves its IAsyncOperation permanently incomplete - which is what stops Solitaire's startup.
-# Windows.Security.Cryptography.Certificates.Certificate: lives in certenroll.dll, which this image
-# lacks, and Windows.Web.Http needs it for every HTTPS response.
-add_library(certificate SHARED shims/certificate/certificate.cpp)
-set_target_properties(certificate PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_certificate")
-target_link_libraries(certificate PRIVATE runtimeobject.lib crypt32.lib ole32.lib)
 add_library(launcher SHARED shims/launcher/launcher.cpp)
 set_target_properties(launcher PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_launcher")
 target_link_libraries(launcher PRIVATE runtimeobject.lib shell32.lib)
