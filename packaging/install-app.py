@@ -44,6 +44,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -98,10 +99,24 @@ class HttpFile(io.RawIOBase):
             self.size = int(r.headers["Content-Length"])
 
     def _open(self, method="GET", rng=None):
-        req = urllib.request.Request(self.url, method=method, headers={"User-Agent": "wine-uwp"})
-        if rng:
-            req.add_header("Range", "bytes=%d-%d" % rng)
-        return urllib.request.urlopen(req, timeout=60)
+        """Connection failures are retried for about two minutes: a network that drops for a moment (Wi-Fi, a VPN
+        coming up) failed whole installs with "Network is unreachable" on the first request. An HTTP error reply
+        is an answer, not an outage, and is raised at once."""
+        delay = 2
+        while True:
+            req = urllib.request.Request(self.url, method=method, headers={"User-Agent": "wine-uwp"})
+            if rng:
+                req.add_header("Range", "bytes=%d-%d" % rng)
+            try:
+                return urllib.request.urlopen(req, timeout=60)
+            except urllib.error.HTTPError:
+                raise
+            except OSError as e:
+                if delay > 32:
+                    raise
+                say(f"network: {getattr(e, 'reason', e)}; retrying in {delay} s")
+                time.sleep(delay)
+                delay *= 2
 
     def _fetch(self, start, end):
         expected = end - start
@@ -126,6 +141,7 @@ class HttpFile(io.RawIOBase):
                 if attempts == 5:
                     raise SystemExit(f"download failed: {e}")
                 data.clear()
+                time.sleep(2 * attempts)
                 continue
             if len(data) == expected:
                 return bytes(data)
