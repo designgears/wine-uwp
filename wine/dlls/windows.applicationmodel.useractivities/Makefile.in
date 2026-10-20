@@ -1,0 +1,6 @@
+MODULE  = windows.applicationmodel.useractivities.dll
+IMPORTS = combase
+
+SOURCES = \
+	classes.idl \
+	main.c

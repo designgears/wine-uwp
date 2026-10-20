@@ -46,3 +46,9 @@ HRESULT WINAPI PolicyManager_FreeGetPolicyData( void *data )
     TRACE( "%p\n", data );
     return S_OK;   /* nothing is ever handed out */
 }
+
+HRESULT WINAPI PolicyManager_GetPolicyInt( const WCHAR *area, const WCHAR *name, int *value )
+{
+    TRACE( "%s %s %p\n", debugstr_w(area), debugstr_w(name), value );
+    return HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
+}

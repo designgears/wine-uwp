@@ -325,14 +325,8 @@ if [ -f "$AXDLL" ] && ! cmp -s "$AXDLL" "$SYS32/appxinstall.dll"; then
   echo "refreshed: appxinstall.dll in the prefix"
 fi
 
-# api-ms-win-appmodel-runtime-l1-1-1.dll: forwards the apiset to kernelbase plus the one function
-# Wine lacks. Resolved by name at load time, so it only has to exist in system32.
-AMR=${SHIM_DIR}/api-ms-win-appmodel-runtime-l1-1-1.dll
-if [ -f "$AMR" ]; then
-  AMR_DST=$SYS32/api-ms-win-appmodel-runtime-l1-1-1.dll
-  if ! cmp -s "$AMR" "$AMR_DST"; then cp -f --reflink=auto "$AMR" "$AMR_DST"; fi
-  echo "installed: appmodel-runtime apiset stand-in"
-fi
+# api-ms-win-appmodel-runtime's GetPackageFamilyNameFromToken is in Wine's kernelbase now; a leftover file of that
+# apiset's name in system32 is ignored (the schema maps it to kernelbase).
 
 # NetworkInformation stand-in (see shims/networkstatus): fires NetworkStatusChanged once.
 NS=${SHIM_DIR}/wineuwp_networkstatus.dll
@@ -363,31 +357,23 @@ if [ -f "$SA" ]; then
   echo "installed: SpatialAudioDeviceConfiguration + FormatSubtype stand-ins"
 fi
 
-# UserActivityChannel.GetDefault needs cdp.dll in the native implementation. Its failure
-# unwinds out of Solitaire's startup subscriber and terminates the engine thread.
-UA_SHIM=${SHIM_DIR}/wineuwp_useractivitychannel.dll
-if [ -f "$UA_SHIM" ]; then
-  UA_DST=$SYS32/wineuwp_useractivitychannel.dll
-  if ! cmp -s "$UA_SHIM" "$UA_DST"; then cp -f --reflink=auto "$UA_SHIM" "$UA_DST"; fi
+# UserActivityChannel.GetDefault needs cdp.dll in the native implementation (twinapi.appcore), and its failure
+# unwinds out of Solitaire's startup subscriber and ends the engine thread: Wine's
+# windows.applicationmodel.useractivities instead. Wine registers it on a prefix update, but the Windows registration
+# imported into the prefix names twinapi.appcore, so it is asserted here (and verified below).
+if [ -f "$SYS32/windows.applicationmodel.useractivities.dll" ]; then
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.ApplicationModel.UserActivities.UserActivityChannel"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_useractivitychannel.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.applicationmodel.useractivities.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: UserActivityChannel stand-in"
 fi
-
-# The notification service is absent; expose its disabled availability to apps.
-TN_SHIM=${SHIM_DIR}/wineuwp_toastnotifier.dll
-if [ -f "$TN_SHIM" ]; then
-  TN_DST=$SYS32/wineuwp_toastnotifier.dll
-  if ! cmp -s "$TN_SHIM" "$TN_DST"; then cp -f --reflink=auto "$TN_SHIM" "$TN_DST"; fi
+# ToastNotificationManager is Wine's windows.ui.notifications: the notification service is absent, so its notifier
+# reports DisabledForUser and drops what it is given. Only that class: Windows registers all its notification classes in
+# wpnapps.dll, and the others (ScheduledToastNotification, which Solitaire creates) stay Windows'.
+if [ -f "$SYS32/windows.ui.notifications.dll" ]; then
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.UI.Notifications.ToastNotificationManager"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_toastnotifier.dll' /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: ToastNotifier availability stand-in"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.ui.notifications.dll' /f >/dev/null 2>&1
 fi
 
 # Windows.Services.Store.StoreContext: traced stand-in (see shims/storecontext). The real one
@@ -657,8 +643,8 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_spatialaudio.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioDeviceConfiguration:wineuwp_spatialaudio.dll"
 [ -f "$SYS32/wineuwp_spatialaudio.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioFormatSubtype:wineuwp_spatialaudio.dll"
 [ -f "$SYS32/wineuwp_networkstatus.dll" ]     && SHIM_CLASSES="$SHIM_CLASSES Windows.Networking.Connectivity.NetworkInformation:wineuwp_networkstatus.dll"
-[ -f "$SYS32/wineuwp_useractivitychannel.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.UserActivities.UserActivityChannel:wineuwp_useractivitychannel.dll"
-[ -f "$SYS32/wineuwp_toastnotifier.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Notifications.ToastNotificationManager:wineuwp_toastnotifier.dll"
+[ -f "$SYS32/windows.applicationmodel.useractivities.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.UserActivities.UserActivityChannel:windows.applicationmodel.useractivities.dll"
+[ -f "$SYS32/windows.ui.notifications.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Notifications.ToastNotificationManager:windows.ui.notifications.dll"
 # api-ms-win-net-isolation-l1-1-1 and ext-ms-win-devmgmt-policy-l1-1-1 are Wine's firewallapi and policymanager now,
 # through the apiset schema; a leftover file of either name in system32 is ignored.
 # Windows.Storage.Pickers.FileSavePicker (see shims/filepicker): the native constructor fails

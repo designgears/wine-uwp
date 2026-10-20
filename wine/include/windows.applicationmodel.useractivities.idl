@@ -1,0 +1,120 @@
+/*
+ * Copyright 2026 wine-uwp contributors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#ifdef __WIDL__
+#pragma winrt ns_prefix
+#endif
+
+import "inspectable.idl";
+import "asyncinfo.idl";
+import "eventtoken.idl";
+import "windowscontracts.idl";
+import "windows.foundation.idl";
+
+namespace Windows.ApplicationModel.UserActivities {
+    typedef enum UserActivityState UserActivityState;
+
+    interface IUserActivity;
+    interface IUserActivityChannel;
+    interface IUserActivityChannelStatics;
+    interface IUserActivityContentInfo;
+    /* the default interfaces of UserActivitySession and UserActivityVisualElements, not defined here yet: IUserActivity
+     * passes them directly, which is the same ABI as passing the runtimeclasses */
+    interface IUserActivitySession;
+    interface IUserActivityVisualElements;
+    runtimeclass UserActivity;
+    runtimeclass UserActivityChannel;
+
+    declare {
+        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.ApplicationModel.UserActivities.UserActivity *>;
+        interface Windows.Foundation.IAsyncOperation<Windows.ApplicationModel.UserActivities.UserActivity *>;
+    }
+
+    [contract(Windows.Foundation.UniversalApiContract, 5.0)]
+    enum UserActivityState
+    {
+        New = 0,
+        Published = 1,
+    };
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 5.0),
+        exclusiveto(Windows.ApplicationModel.UserActivities.UserActivity),
+        uuid(fc103e9e-2cab-4d36-aea2-b4bb556cef0f)
+    ]
+    interface IUserActivity : IInspectable
+    {
+        [propget] HRESULT State([out, retval] Windows.ApplicationModel.UserActivities.UserActivityState *value);
+        [propget] HRESULT ActivityId([out, retval] HSTRING *value);
+        [propget] HRESULT VisualElements([out, retval] Windows.ApplicationModel.UserActivities.IUserActivityVisualElements **value);
+        [propget] HRESULT ContentUri([out, retval] Windows.Foundation.Uri **value);
+        [propput] HRESULT ContentUri([in] Windows.Foundation.Uri *value);
+        [propget] HRESULT ContentType([out, retval] HSTRING *value);
+        [propput] HRESULT ContentType([in] HSTRING value);
+        [propget] HRESULT FallbackUri([out, retval] Windows.Foundation.Uri **value);
+        [propput] HRESULT FallbackUri([in] Windows.Foundation.Uri *value);
+        [propget] HRESULT ActivationUri([out, retval] Windows.Foundation.Uri **value);
+        [propput] HRESULT ActivationUri([in] Windows.Foundation.Uri *value);
+        [propget] HRESULT ContentInfo([out, retval] Windows.ApplicationModel.UserActivities.IUserActivityContentInfo **value);
+        [propput] HRESULT ContentInfo([in] Windows.ApplicationModel.UserActivities.IUserActivityContentInfo *value);
+        HRESULT SaveAsync([out, retval] Windows.Foundation.IAsyncAction **operation);
+        HRESULT CreateSession([out, retval] Windows.ApplicationModel.UserActivities.IUserActivitySession **result);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 5.0),
+        exclusiveto(Windows.ApplicationModel.UserActivities.UserActivityChannel),
+        uuid(bac0f8b8-a0e4-483b-b948-9cbabd06070c)
+    ]
+    interface IUserActivityChannel : IInspectable
+    {
+        HRESULT GetOrCreateUserActivityAsync([in] HSTRING activity_id,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.ApplicationModel.UserActivities.UserActivity *> **operation);
+        HRESULT DeleteActivityAsync([in] HSTRING activity_id, [out, retval] Windows.Foundation.IAsyncAction **operation);
+        HRESULT DeleteAllActivitiesAsync([out, retval] Windows.Foundation.IAsyncAction **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 5.0),
+        exclusiveto(Windows.ApplicationModel.UserActivities.UserActivityChannel),
+        uuid(c8c005ab-198d-4d80-abb2-c9775ec4a729)
+    ]
+    interface IUserActivityChannelStatics : IInspectable
+    {
+        HRESULT GetDefault([out, retval] Windows.ApplicationModel.UserActivities.UserActivityChannel **result);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 5.0),
+        marshaling_behavior(agile)
+    ]
+    runtimeclass UserActivity
+    {
+        [default] interface Windows.ApplicationModel.UserActivities.IUserActivity;
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 5.0),
+        marshaling_behavior(agile),
+        static(Windows.ApplicationModel.UserActivities.IUserActivityChannelStatics, Windows.Foundation.UniversalApiContract, 5.0)
+    ]
+    runtimeclass UserActivityChannel
+    {
+        [default] interface Windows.ApplicationModel.UserActivities.IUserActivityChannel;
+    }
+}

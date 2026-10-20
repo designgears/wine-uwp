@@ -1537,6 +1537,7 @@ enable_wimgapi
 enable_win32u
 enable_winbio
 enable_winbrand
+enable_windows_applicationmodel_useractivities
 enable_windows_applicationmodel
 enable_windows_devices_bluetooth
 enable_windows_devices_enumeration
@@ -1565,6 +1566,7 @@ enable_windows_storage
 enable_windows_system_profile_systemid
 enable_windows_system_profile_systemmanufacturers
 enable_windows_ui_core_textinput
+enable_windows_ui_notifications
 enable_windows_ui_xaml
 enable_windows_ui
 enable_windows_web
@@ -22896,6 +22898,7 @@ wine_fn_config_makefile dlls/winaspi.dll16 enable_win16
 wine_fn_config_makefile dlls/winbio enable_winbio
 wine_fn_config_makefile dlls/winbrand enable_winbrand
 wine_fn_config_makefile dlls/windebug.dll16 enable_win16
+wine_fn_config_makefile dlls/windows.applicationmodel.useractivities enable_windows_applicationmodel_useractivities
 wine_fn_config_makefile dlls/windows.applicationmodel enable_windows_applicationmodel
 wine_fn_config_makefile dlls/windows.applicationmodel/tests enable_tests
 wine_fn_config_makefile dlls/windows.devices.bluetooth enable_windows_devices_bluetooth
@@ -22949,6 +22952,7 @@ wine_fn_config_makefile dlls/windows.system.profile.systemmanufacturers enable_w
 wine_fn_config_makefile dlls/windows.system.profile.systemmanufacturers/tests enable_tests
 wine_fn_config_makefile dlls/windows.ui.core.textinput enable_windows_ui_core_textinput
 wine_fn_config_makefile dlls/windows.ui.core.textinput/tests enable_tests
+wine_fn_config_makefile dlls/windows.ui.notifications enable_windows_ui_notifications
 wine_fn_config_makefile dlls/windows.ui.xaml enable_windows_ui_xaml
 wine_fn_config_makefile dlls/windows.ui.xaml/tests enable_tests
 wine_fn_config_makefile dlls/windows.ui enable_windows_ui

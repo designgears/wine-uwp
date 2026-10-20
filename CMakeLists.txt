@@ -77,11 +77,6 @@ add_library(deviceinformation SHARED shims/deviceinformation/deviceinformation.c
 set_target_properties(deviceinformation PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_deviceinformation")
 target_link_libraries(deviceinformation PRIVATE runtimeobject.lib)
 
-# api-ms-win-appmodel-runtime-l1-1-1: forwards the apiset to kernelbase and adds the one function
-# Wine is missing (GetPackageFamilyNameFromToken). Must provide the whole apiset, not just the gap.
-add_library(appmodelruntime SHARED shims/appmodelruntime/appmodelruntime.cpp)
-set_target_properties(appmodelruntime PROPERTIES PREFIX "" SUFFIX ""
-                      OUTPUT_NAME "api-ms-win-appmodel-runtime-l1-1-1.dll")
 
 # Windows.Networking.Connectivity.NetworkInformation. Wine registers NetworkStatusChanged and then
 # never raises it, so an app that takes its initial reachability from the first callback waits for
@@ -152,15 +147,9 @@ target_link_libraries(taskbarmanager PRIVATE runtimeobject.lib)
 
 add_executable(probe-useractivity probes/probe-useractivity.cpp)
 target_link_libraries(probe-useractivity PRIVATE runtimeobject.lib ole32.lib)
-add_library(useractivitychannel SHARED shims/useractivitychannel/useractivitychannel.cpp)
-set_target_properties(useractivitychannel PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_useractivitychannel")
-target_link_libraries(useractivitychannel PRIVATE runtimeobject.lib ole32.lib)
 add_executable(probe-toast probes/probe-toast.cpp)
 target_link_libraries(probe-toast PRIVATE runtimeobject.lib ole32.lib)
 
-add_library(toastnotifier SHARED shims/toastnotifier/toastnotifier.cpp)
-set_target_properties(toastnotifier PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_toastnotifier")
-target_link_libraries(toastnotifier PRIVATE runtimeobject.lib ole32.lib)
 add_executable(probe-uchar probes/probe-uchar.cpp)
 set_target_properties(probe-uchar PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
 add_executable(probe-wicscale probes/probe-wicscale.cpp)

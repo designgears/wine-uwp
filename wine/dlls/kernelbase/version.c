@@ -2158,6 +2158,17 @@ LONG WINAPI GetPackageFullNameFromToken(HANDLE token, UINT32 *len, WCHAR *name)
 }
 
 /***********************************************************************
+ *         GetPackageFamilyNameFromToken   (kernelbase.@)
+ *
+ * Xbox Live authentication in twinapi.appcore asks who the app is with it.
+ */
+LONG WINAPI GetPackageFamilyNameFromToken(HANDLE token, UINT32 *len, WCHAR *name)
+{
+    TRACE( "(%p %p %p)\n", token, len, name );
+    return GetCurrentPackageFamilyName( len, name );
+}
+
+/***********************************************************************
  *         GetApplicationUserModelIdFromToken   (kernelbase.@)
  */
 LONG WINAPI GetApplicationUserModelIdFromToken(HANDLE token, UINT32 *len, WCHAR *aumid)

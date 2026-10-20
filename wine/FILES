@@ -363,3 +363,12 @@ dlls/windows.security.integrity/windows.security.integrity.spec
 programs/wineuwp-gamingservice/Makefile.in
 programs/wineuwp-gamingservice/main.c
 include/windows.system.profile.idl
+include/windows.applicationmodel.useractivities.idl
+dlls/windows.applicationmodel.useractivities/Makefile.in
+dlls/windows.applicationmodel.useractivities/classes.idl
+dlls/windows.applicationmodel.useractivities/main.c
+dlls/windows.applicationmodel.useractivities/windows.applicationmodel.useractivities.spec
+dlls/windows.ui.notifications/Makefile.in
+dlls/windows.ui.notifications/classes.idl
+dlls/windows.ui.notifications/main.c
+dlls/windows.ui.notifications/windows.ui.notifications.spec
