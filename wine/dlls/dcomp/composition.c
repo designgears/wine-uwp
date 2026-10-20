@@ -2274,6 +2274,8 @@ struct kf_animation
 static struct kf_animation *kf_animation_from( void *animation );
 static BOOL kf_sample( struct kf_animation *kf, float progress, struct kf_key *out );
 static HRESULT create_comp_object_vtbl( const char *kind, void **vtbl, void **out );
+static const GUID IID_IVisual2_public = { 0x3052b611, 0x56c3, 0x4c3e, { 0x8b, 0xf3, 0xf6, 0xe1, 0xad, 0x47, 0x3f, 0x06 } };
+static HRESULT create_dcv_visual2_view( IUnknown *owner, void **out );
 static const GUID IID_IAnimationObject_local =
     { 0xe7141e0a, 0x04b8, 0x4fc5, { 0xa4, 0xdc, 0x19, 0x53, 0x92, 0xe5, 0x78, 0x07 } };
 static HRESULT create_anim_prop_info( void **out );
@@ -6405,6 +6407,22 @@ static HRESULT WINAPI dcv_QueryInterface( void *iface, REFIID iid, void **out )
         *out = &v->object_vtbl;
         return S_OK;
     }
+    /* IAnimationObject (Visual is one on Windows): the catch-all put its PopulatePropertyInfo on SetOffsetX, and the
+     * Microsoft Store 22608's page frame went to x = -1.9e26 (a pointer read as a float) */
+    if (IsEqualGUID( iid, &IID_IAnimationObject_local ))
+        return create_anim_object_view( (IUnknown *)&dcomp_visual_from( iface )->object_vtbl, out );
+    if (IsEqualGUID( iid, &IID_IVisual2_public ))
+        return create_dcv_visual2_view( (IUnknown *)&dcomp_visual_from( iface )->vtbl, out );
+    /* IInspectable: this table is IDCompositionVisual, whose slot 4 is SetOffsetX, and .NET calls
+     * GetRuntimeClassName (slot 4) on what it gets: the HSTRING pointer became the visual's x (-1.9e26, the Microsoft
+     * Store 22608's pages). The ICompositionObject view is an IInspectable. Identity stays with IUnknown. */
+    if (IsEqualGUID( iid, &IID_IInspectable ))
+    {
+        struct dcomp_visual *v = dcomp_visual_from( iface );
+        InterlockedIncrement( &v->ref );
+        *out = &v->object_vtbl;
+        return S_OK;
+    }
     /* {117e202d} is Windows.UI.Composition.IVisual. XAML drives its interop visuals through it
      * (put_Offset, put_Size, put_Clip, ...); answered with the IDCompositionVisual vtable, get_Clip
      * landed on SetClip(rect), put_Clip on SetContent and put_Size on SetWidth, and every offset and
@@ -6645,6 +6663,8 @@ static HRESULT WINAPI dcv_object_StartAnimation( void *iface, HSTRING name, void
     }
     if (kf && kf->has_value && kf->value_kind == KF_VECTOR3 && prop && !wcsicmp( prop, L"Offset" ))
     {
+        if (fabsf( kf->vector3.X ) > 1e7f || fabsf( kf->vector3.Y ) > 1e7f)
+            WARN( "%p Offset animation %p to %g,%g is not a coordinate\n", v, animation, kf->vector3.X, kf->vector3.Y );
         v->offset_x = kf->vector3.X;
         v->offset_y = kf->vector3.Y;
     }
@@ -6750,6 +6770,7 @@ static HRESULT WINAPI dcv_ok( void *iface )
 static HRESULT WINAPI dcv_SetOffsetX( void *iface, float x )
 {
     scene_changed();
+    if (fabsf( x ) > 1e7f) WARN( "%p SetOffsetX %g from %p is not a coordinate\n", iface, x, __builtin_return_address( 0 ) );
     dcomp_visual_from( iface )->offset_x = x;
     TRACE( "%p x %f.\n", iface, x );
     return S_OK;
@@ -8674,6 +8695,107 @@ static HRESULT WINAPI dcv_ok_args( void *iface, void *a, void *b, void *c )
     TRACE( "%p slot? a %p b %p c %p.\n", iface, a, b, c );
     return S_OK;
 }
+/* IVisual2 {3052b611} view of a dcomp visual: 6/7 ParentForTransform, 8/9 RelativeOffsetAdjustment, 10/11
+ * RelativeSizeAdjustment. The catch-all handed out the primary table, so the Microsoft Store 22608's
+ * put_ParentForTransform ran SetOffsetX with the parent's pointer as a float and moved its page frame to x = -1.9e26.
+ * ParentForTransform is SetTransformParent; the relative adjustments are kept on the view and not painted. */
+struct dcv_visual2_view
+{
+    const void **vtbl;
+    LONG ref;
+    IUnknown *owner;            /* the dcomp visual's primary table */
+    IUnknown *parent;
+    Vector3 relative_offset, relative_size;
+};
+static HRESULT WINAPI dcv_visual2_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct dcv_visual2_view *view = iface;
+    if (IsEqualGUID( iid, &IID_IVisual2_public ))
+    {
+        InterlockedIncrement( &view->ref );
+        *out = iface;
+        return S_OK;
+    }
+    return IUnknown_QueryInterface( view->owner, iid, out );
+}
+static ULONG WINAPI dcv_visual2_AddRef( void *iface ) { return InterlockedIncrement( &((struct dcv_visual2_view *)iface)->ref ); }
+static ULONG WINAPI dcv_visual2_Release( void *iface )
+{
+    struct dcv_visual2_view *view = iface;
+    ULONG ref = InterlockedDecrement( &view->ref );
+    if (!ref)
+    {
+        if (view->parent) IUnknown_Release( view->parent );
+        IUnknown_Release( view->owner );
+        free( view );
+    }
+    return ref;
+}
+static HRESULT WINAPI dcv_visual2_GetIids( void *iface, ULONG *count, IID **iids ) { return inspectable_get_iids( count, iids ); }
+static HRESULT WINAPI dcv_visual2_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( L"Windows.UI.Composition.Visual", 29, name );
+}
+static HRESULT WINAPI dcv_visual2_GetTrustLevel( void *iface, TrustLevel *level ) { return inspectable_trust( level ); }
+static HRESULT WINAPI dcv_visual2_get_ParentForTransform( void *iface, IUnknown **value )
+{
+    struct dcv_visual2_view *view = iface;
+    if (!value) return E_POINTER;
+    if ((*value = view->parent)) IUnknown_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI dcv_SetTransformParent( void *iface, IUnknown *parent );
+static HRESULT WINAPI dcv_visual2_put_ParentForTransform( void *iface, IUnknown *value )
+{
+    struct dcv_visual2_view *view = iface;
+    if (value) IUnknown_AddRef( value );
+    if (view->parent) IUnknown_Release( view->parent );
+    view->parent = value;
+    return dcv_SetTransformParent( view->owner, value );
+}
+static HRESULT WINAPI dcv_visual2_get_RelativeOffset( void *iface, Vector3 *value )
+{
+    if (!value) return E_POINTER;
+    *value = ((struct dcv_visual2_view *)iface)->relative_offset;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_visual2_put_RelativeOffset( void *iface, Vector3 value )
+{
+    ((struct dcv_visual2_view *)iface)->relative_offset = value;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_visual2_get_RelativeSize( void *iface, Vector2 *value )
+{
+    if (!value) return E_POINTER;
+    value->X = ((struct dcv_visual2_view *)iface)->relative_size.X;
+    value->Y = ((struct dcv_visual2_view *)iface)->relative_size.Y;
+    return S_OK;
+}
+static HRESULT WINAPI dcv_visual2_put_RelativeSize( void *iface, Vector2 value )
+{
+    ((struct dcv_visual2_view *)iface)->relative_size.X = value.X;
+    ((struct dcv_visual2_view *)iface)->relative_size.Y = value.Y;
+    return S_OK;
+}
+static const void *dcv_visual2_vtbl[] =
+{
+    dcv_visual2_QueryInterface, dcv_visual2_AddRef, dcv_visual2_Release,
+    dcv_visual2_GetIids, dcv_visual2_GetRuntimeClassName, dcv_visual2_GetTrustLevel,
+    dcv_visual2_get_ParentForTransform, dcv_visual2_put_ParentForTransform,
+    dcv_visual2_get_RelativeOffset, dcv_visual2_put_RelativeOffset,
+    dcv_visual2_get_RelativeSize, dcv_visual2_put_RelativeSize,
+};
+static HRESULT create_dcv_visual2_view( IUnknown *owner, void **out )
+{
+    struct dcv_visual2_view *view;
+    if (!(view = calloc( 1, sizeof(*view) ))) { *out = NULL; return E_OUTOFMEMORY; }
+    view->vtbl = dcv_visual2_vtbl;
+    view->ref = 1;
+    IUnknown_AddRef( (view->owner = owner) );
+    *out = view;
+    return S_OK;
+}
+
 static const void *dcomp_visual_vtbl[] =
 {
     /* 0-2 */ dcv_QueryInterface, dcv_AddRef, dcv_Release,
@@ -8857,8 +8979,10 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
     perf.visits++;
     TRACE( "visit dcomp %p size %gx%g at %g,%g children %u content %p opacity %g\n", v, w, h, x, y,
            v->child_count, v->content, v->opacity );
-    TRACE_(dcomptree)( "visit dcomp %p size %gx%g at %g,%g clip %s children %u (offset %g transform %g m42 %g expr %s)\n", v, w, h, x, y,
-                      wine_dbgstr_rect( &paint_clip ), v->child_count, v->offset_y, v->transform_y, v->transform4.M42,
+    TRACE_(dcomptree)( "visit dcomp %p size %gx%g at %g,%g clip %s children %u (offset %g,%g transform %g,%g m41 %g m42 %g "
+                       "parent-space %p expr %s)\n", v, w, h, x, y,
+                      wine_dbgstr_rect( &paint_clip ), v->child_count, v->offset_x, v->offset_y, v->transform_x, v->transform_y,
+                      v->transform4.M41, v->transform4.M42, v->transform_parent,
                       v->transform_expr ? debugstr_w( v->transform_expr->expression ) : "none" );
     /* the content root: XAML offsets it by the title bar row and it covers the rest of the window */
     if (v->offset_y > 0.5f && v->width >= back_w - 1.0f && v->offset_y + v->height >= back_h - 1.0f &&

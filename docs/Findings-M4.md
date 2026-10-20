@@ -12920,5 +12920,21 @@ Now: no managed exceptions except a P/Invoke `Win32Exception` ("Call failed", +0
 rows exist (1207 px wide, stacked) but are painted at X = -1.87e26 (`trace+dcompops`: `hidden ... at -1.87276e+26`).
 No `SetOffset` warns, so it comes through an expression or transform; candidates bound on those visuals include
 `visual.Offset.X + _repeaterVisual.Translation.X`, `this.Target.Position + visual.Translation.X` and `-clip.Left`.
-Next: `./dcomptree.py` on one row to find which ancestor carries the absurd X. **`/tmp` is wiped by a reboot**: the
+**Found: the absurd X was .NET's `GetRuntimeClassName`.** `dcomptree` put the jump on the page frame's interop
+visual, whose `offset_x` was 5e22 with no transform parent; a new warning in `dcv_SetOffsetX` caught 200 calls with
+-1.9e26 from the Store's generic interop stub. The dcomp visual's QI catch-all hands out its IDCompositionVisual
+table for anything, including `IInspectable`, and slot 4 there is `SetOffsetX` while slot 4 of IInspectable is
+`GetRuntimeClassName(HSTRING *)`: the HSTRING pointer became the X. `IInspectable` now gets the ICompositionObject
+view (identity stays with IUnknown); `IVisual2` and `IAnimationObject` got views too. **When a catch-all exists, ask
+what slots 3-5 of its table are: every WinRT caller will call them as IInspectable.**
+
+Result (`docs/screenshots/msstore-22608-home.png`): the 22608 Home page paints with real content: hero (Campaign
+Early Access, Mozilla Firefox ad, Minecraft Dungeons II, WhatsApp), carousel pips, Trending games and Trending apps.
+Apps was still on skeleton cards 45 s after the click. Item icons are empty squares.
+
+Regression check of today's dcomp on `uwp-bin/prefix-test` with the WoW64 build, against the pre-session dcomp.dll
+swapped in as a control: Calculator AE 3924.73 with both (twice each; one earlier run gave 176376 and did not
+repeat), Media Player 2835 colours with both, Solitaire 3/3 front end, `kb` "Calculator did not come up" with both
+(this prefix/display, not dcomp). Feedback Hub 261 colours / 16 fail-fasts, as already known. The shared
+`~/src/wine-build` has **not** been rebuilt with any of this. **`/tmp` is wiped by a reboot**: the
 test scripts (`store-run.sh`, `store-crash.sh`) and Xvfb `:97` have to be recreated.
