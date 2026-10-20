@@ -197,21 +197,11 @@ if [ -f "$SYS32/windows.security.authorization.appcapabilityaccess.dll" ]; then
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
 fi
 
-# Windows.Storage.StorageLibrary stand-in. Wine's windows.storage does not implement the class
-# (RoGetActivationFactory says "not found in windows.storage.dll"), and it cannot easily: Wine's
-# include/windows.storage.idl declares neither StorageLibrary nor KnownLibraryId. Media Player's
-# library pages need it once AppCapability reports musicLibrary as Allowed. See shims/storagelibrary.
-SL_SHIM=${SHIM_DIR}/wineuwp_storagelibrary.dll
-if [ -f "$SL_SHIM" ]; then
-  SL_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_storagelibrary.dll
-  if ! cmp -s "$SL_SHIM" "$SL_DST"; then cp -f --reflink=auto "$SL_SHIM" "$SL_DST"; fi
-  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Storage.StorageLibrary"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_storagelibrary.dll' /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: StorageLibrary stand-in"
-fi
+# Windows.Storage.StorageLibrary is Wine's windows.storage (dlls/windows.storage/storagelibrary.c),
+# where Windows registers it too. Prefixes set up before that pointed it at a stand-in DLL.
+K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Storage.StorageLibrary"
+"${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.storage.dll' /f >/dev/null 2>&1
+rm -f "$WINEPREFIX/drive_c/windows/system32/wineuwp_storagelibrary.dll"
 
 # Windows.Storage.Pickers.FileOpenPicker stand-in. The registered DllPath is the native
 # twinui.appcore.dll, whose picker is a shell UI in a broker process the prefix does not have, so

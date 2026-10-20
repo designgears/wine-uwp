@@ -14,5 +14,6 @@ SOURCES = \
 	queryoptions_private.idl \
 	storagefile.c \
 	storagefolder.c \
+	storagelibrary.c \
 	streamcopy.c \
 	streams.c

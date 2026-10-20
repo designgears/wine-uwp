@@ -95,6 +95,9 @@ HRESULT WINAPI __wine_storage_folder_create( const WCHAR *path, IStorageFolder *
 extern IActivationFactory *storage_file_factory;
 extern IActivationFactory *storage_folder_factory;
 extern IActivationFactory *known_folders_factory;
+extern IActivationFactory *storage_library_factory;
+HRESULT async_operation_storage_library_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+                                                IAsyncOperation_StorageLibrary **out );
 extern IActivationFactory *query_options_factory;
 HRESULT empty_hstring_vector_create( IVector_HSTRING **out );
 HRESULT content_properties_create( const WCHAR *path, IStorageItemContentPropertiesInternal **out );

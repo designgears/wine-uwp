@@ -964,6 +964,111 @@ namespace Windows.Storage {
         interface Windows.Foundation.IClosable;
     }
 #endif
+#ifndef _WINDOWS_APPLICATIONDATA
+    typedef enum KnownLibraryId KnownLibraryId;
+
+    interface IStorageLibrary;
+    interface IStorageLibrary2;
+    interface IStorageLibrary3;
+    interface IStorageLibraryStatics;
+    interface IStorageLibraryStatics2;
+
+    runtimeclass StorageLibrary;
+
+    declare {
+        interface Windows.Foundation.Collections.IObservableVector<Windows.Storage.StorageFolder *>;
+        interface Windows.Foundation.Collections.IVector<Windows.Storage.StorageFolder *>;
+        interface Windows.Foundation.Collections.IIterable<Windows.Storage.StorageFolder *>;
+        interface Windows.Foundation.Collections.IIterator<Windows.Storage.StorageFolder *>;
+        interface Windows.Foundation.Collections.VectorChangedEventHandler<Windows.Storage.StorageFolder *>;
+        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Storage.StorageLibrary *>;
+        interface Windows.Foundation.IAsyncOperation<Windows.Storage.StorageLibrary *>;
+        interface Windows.Foundation.TypedEventHandler<Windows.Storage.StorageLibrary *, IInspectable *>;
+    }
+
+    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
+    enum KnownLibraryId
+    {
+        Music     = 0,
+        Pictures  = 1,
+        Videos    = 2,
+        Documents = 3,
+    };
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Storage.StorageLibrary),
+        uuid(1edd7103-0e5e-4d6c-b5e8-9318983d6a03)
+    ]
+    interface IStorageLibrary : IInspectable
+    {
+        HRESULT RequestAddFolderAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFolder *> **operation);
+        HRESULT RequestRemoveFolderAsync([in] Windows.Storage.StorageFolder *folder,
+                                         [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        [propget] HRESULT Folders([out, retval] Windows.Foundation.Collections.IObservableVector<Windows.Storage.StorageFolder *> **value);
+        [propget] HRESULT SaveFolder([out, retval] Windows.Storage.StorageFolder **value);
+        [eventadd] HRESULT DefinitionChanged([in] Windows.Foundation.TypedEventHandler<Windows.Storage.StorageLibrary *, IInspectable *> *handler,
+                                             [out, retval] EventRegistrationToken *token);
+        [eventremove] HRESULT DefinitionChanged([in] EventRegistrationToken token);
+    }
+
+    /* ChangeTracker is a Windows.Storage.StorageLibraryChangeTracker, which is not declared here;
+     * it is an interface pointer either way. */
+    [
+        contract(Windows.Foundation.UniversalApiContract, 2.0),
+        exclusiveto(Windows.Storage.StorageLibrary),
+        uuid(5b0ce348-fcb3-4031-afb0-a68d7bd44534)
+    ]
+    interface IStorageLibrary2 : IInspectable
+    {
+        [propget] HRESULT ChangeTracker([out, retval] IInspectable **value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 6.0),
+        exclusiveto(Windows.Storage.StorageLibrary),
+        uuid(8a281291-2154-4201-8113-d2c05ce1ad23)
+    ]
+    interface IStorageLibrary3 : IInspectable
+    {
+        HRESULT AreFolderSuggestionsAvailableAsync([out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Storage.StorageLibrary),
+        uuid(4208a6db-684a-49c6-9e59-90121ee050d6)
+    ]
+    interface IStorageLibraryStatics : IInspectable
+    {
+        HRESULT GetLibraryAsync([in] Windows.Storage.KnownLibraryId id,
+                                [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageLibrary *> **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        exclusiveto(Windows.Storage.StorageLibrary),
+        uuid(ffb08ddc-fa75-4695-b9d1-7f81f97832e3)
+    ]
+    interface IStorageLibraryStatics2 : IInspectable
+    {
+        HRESULT GetLibraryForUserAsync([in] Windows.System.User *user, [in] Windows.Storage.KnownLibraryId id,
+                                       [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageLibrary *> **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 1.0),
+        marshaling_behavior(agile),
+        static(Windows.Storage.IStorageLibraryStatics, Windows.Foundation.UniversalApiContract, 1.0),
+        static(Windows.Storage.IStorageLibraryStatics2, Windows.Foundation.UniversalApiContract, 1.0)
+    ]
+    runtimeclass StorageLibrary
+    {
+        [default] interface Windows.Storage.IStorageLibrary;
+        [contract(Windows.Foundation.UniversalApiContract, 2.0)] interface Windows.Storage.IStorageLibrary2;
+        [contract(Windows.Foundation.UniversalApiContract, 6.0)] interface Windows.Storage.IStorageLibrary3;
+    }
+#endif
 }
 
 namespace Windows.Storage.Search {
@@ -1172,4 +1277,5 @@ namespace Windows.Storage.Search {
         [default] interface Windows.Storage.Search.IStorageItemQueryResult;
         interface Windows.Storage.Search.IStorageQueryResultBase;
     }
+
 }

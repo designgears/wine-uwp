@@ -2257,3 +2257,11 @@ DEFINE_IASYNCOPERATION_IFACE( random_access_stream, IRandomAccessStream,
         L"Windows.Foundation.IAsyncOperation`1<Windows.Storage.Streams.IRandomAccessStream>" )
 DEFINE_IASYNCOPERATION_IFACE( random_access_stream_ct, IRandomAccessStreamWithContentType,
         L"Windows.Foundation.IAsyncOperation`1<Windows.Storage.Streams.IRandomAccessStreamWithContentType>" )
+
+/* IAsyncOperation<StorageLibrary> is named after the class, its result after the interface. */
+#define IAsyncOperation_IStorageLibrary IAsyncOperation_StorageLibrary
+#define IAsyncOperation_IStorageLibraryVtbl IAsyncOperation_StorageLibraryVtbl
+#define IID_IAsyncOperation_IStorageLibrary IID_IAsyncOperation_StorageLibrary
+#define IAsyncOperationCompletedHandler_IStorageLibrary IAsyncOperationCompletedHandler_StorageLibrary
+DEFINE_IASYNCOPERATION_IFACE( storage_library, IStorageLibrary,
+        L"Windows.Foundation.IAsyncOperation`1<Windows.Storage.StorageLibrary>" )
