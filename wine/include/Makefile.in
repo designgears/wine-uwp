@@ -1090,6 +1090,7 @@ SOURCES = \
 	windows.security.enterprisedata.idl \
 	windows.security.exchangeactivesyncprovisioning.idl \
 	windows.security.isolation.idl \
+	windows.storage.accesscache.idl \
 	windows.storage.fileproperties.idl \
 	windows.storage.idl \
 	windows.storage.search.idl \

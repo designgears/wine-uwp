@@ -28,6 +28,7 @@ import "windows.foundation.idl";
 import "windowscontracts.idl";
 import "windows.system.idl";
 import "windows.storage.idl";
+import "windows.storage.accesscache.idl";
 
 namespace Windows.Storage {
     runtimeclass AppDataPaths;
@@ -36,6 +37,10 @@ namespace Windows.Storage {
     runtimeclass StorageFolder;
     runtimeclass KnownFolders;
     runtimeclass StorageLibrary;
+}
+
+namespace Windows.Storage.AccessCache {
+    runtimeclass StorageApplicationPermissions;
 }
 
 namespace Windows.Storage.Search {

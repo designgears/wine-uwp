@@ -485,20 +485,12 @@ if [ -f "$SYS32/windows.ui.shell.taskbarmanager.dll" ]; then
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.ui.shell.taskbarmanager.dll' /f >/dev/null 2>&1
 fi
 
-# Windows.Storage.AccessCache.StorageApplicationPermissions stand-in. An app adds a picked file to
-# its future-access list so it can reopen it later; the class does not exist in Wine, so the
-# activation throws straight out of the pick with 0x80040111. See shims/accesscache.
-AC2_SHIM=${SHIM_DIR}/wineuwp_accesscache.dll
-if [ -f "$AC2_SHIM" ]; then
-  AC2_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_accesscache.dll
-  if ! cmp -s "$AC2_SHIM" "$AC2_DST"; then cp -f --reflink=auto "$AC2_SHIM" "$AC2_DST"; fi
-  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Storage.AccessCache.StorageApplicationPermissions"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_accesscache.dll' /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: StorageApplicationPermissions stand-in"
-fi
+# Windows.Storage.AccessCache.StorageApplicationPermissions is Wine's windows.storage
+# (dlls/windows.storage/accesscache.c), where Windows registers it too. Prefixes set up before that
+# pointed it at a stand-in DLL.
+K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Storage.AccessCache.StorageApplicationPermissions"
+"${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.storage.dll' /f >/dev/null 2>&1
+rm -f "$WINEPREFIX/drive_c/windows/system32/wineuwp_accesscache.dll"
 
 # ICU data: the genuine icu.dll (used by the native windows.globalization.dll) loads
 # Windows\Globalization\ICU\icudtl.dat and the time-zone .res files next to it, and fails with

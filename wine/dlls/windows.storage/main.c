@@ -19,6 +19,8 @@
 
 #include "initguid.h"
 #include "private.h"
+#define WIDL_using_Windows_Storage_AccessCache
+#include "windows.storage.accesscache.h"
 #include "knownfolders.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(storage);
@@ -39,6 +41,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
 
     if (!wcscmp( buffer, RuntimeClass_Windows_Storage_AppDataPaths ))
         IActivationFactory_QueryInterface( appdatapaths_factory, &IID_IActivationFactory, (void **)factory );
+    if (!wcscmp( buffer, RuntimeClass_Windows_Storage_AccessCache_StorageApplicationPermissions ))
+        IActivationFactory_QueryInterface( storage_permissions_factory, &IID_IActivationFactory, (void **)factory );
     if (!wcscmp( buffer, RuntimeClass_Windows_Storage_StorageLibrary ))
         IActivationFactory_QueryInterface( storage_library_factory, &IID_IActivationFactory, (void **)factory );
     if (!wcscmp( buffer, RuntimeClass_Windows_Storage_KnownFolders ))

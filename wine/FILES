@@ -415,3 +415,5 @@ dlls/windows.security.cryptography.certificates/classes.idl
 dlls/windows.security.cryptography.certificates/main.c
 dlls/windows.security.cryptography.certificates/windows.security.cryptography.certificates.spec
 dlls/windows.storage/storagelibrary.c
+dlls/windows.storage/accesscache.c
+include/windows.storage.accesscache.idl
