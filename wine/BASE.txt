@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     5284cdc71e81ca37f0f16528de5477b469b76c02
-                 windows.media.devices: SpatialAudioDeviceConfiguration and SpatialAudioFormatSubtype; formerly a wine-uwp shim.
+  wine HEAD:     1711adfbe1f882dac2a244ef61a9566f7981cadb
+                 windows.ui.shell.taskbarmanager: TaskbarManager whose operations complete; formerly a wine-uwp shim.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-20T09:20:34Z
+  captured:      2026-10-20T09:25:15Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

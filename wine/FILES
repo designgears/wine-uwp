@@ -389,3 +389,11 @@ dlls/windows.media.devices/main.c
 dlls/windows.media.devices/spatialaudio.c
 dlls/windows.media.devices/Makefile.in
 dlls/windows.media.devices/classes.idl
+include/windows.ui.shell.idl
+dlls/windows.ui.shell.taskbarmanager/Makefile.in
+dlls/windows.ui.shell.taskbarmanager/async.c
+dlls/windows.ui.shell.taskbarmanager/async_private.idl
+dlls/windows.ui.shell.taskbarmanager/classes.idl
+dlls/windows.ui.shell.taskbarmanager/main.c
+dlls/windows.ui.shell.taskbarmanager/private.h
+dlls/windows.ui.shell.taskbarmanager/windows.ui.shell.taskbarmanager.spec

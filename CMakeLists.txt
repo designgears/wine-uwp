@@ -126,9 +126,6 @@ target_link_libraries(certificate PRIVATE runtimeobject.lib crypt32.lib ole32.li
 add_library(launcher SHARED shims/launcher/launcher.cpp)
 set_target_properties(launcher PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_launcher")
 target_link_libraries(launcher PRIVATE runtimeobject.lib shell32.lib)
-add_library(taskbarmanager SHARED shims/taskbarmanager/taskbarmanager.cpp)
-set_target_properties(taskbarmanager PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_taskbarmanager")
-target_link_libraries(taskbarmanager PRIVATE runtimeobject.lib)
 
 add_executable(probe-useractivity probes/probe-useractivity.cpp)
 target_link_libraries(probe-useractivity PRIVATE runtimeobject.lib ole32.lib)

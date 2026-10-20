@@ -1,0 +1,8 @@
+MODULE  = windows.ui.shell.taskbarmanager.dll
+IMPORTS = combase
+
+SOURCES = \
+	async.c \
+	async_private.idl \
+	classes.idl \
+	main.c

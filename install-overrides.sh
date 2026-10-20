@@ -495,10 +495,6 @@ if [ -n "$WV2_APP" ] && [ -f "$WV2_HOST" ]; then
   echo "installed: WebView2 runtime $WV2_VER with the wine-uwp host"
 fi
 
-# Windows.UI.Shell.TaskbarManager: the real implementation reaches for ImmersiveShell
-# ({c2f03a33-...}, not registered under Wine) and, when that fails, never completes the
-# IAsyncOperation the caller is waiting on. Solitaire blocks there forever and its render loop
-# never starts. See shims/taskbarmanager.
 # Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager (see shims/appinstallmanager): Windows'
 # InstallService.dll is a client of an InstallService broker that does not exist here; the Microsoft Store
 # fail-fasts at start-up without the class. Registered in the SHIM_CLASSES pass below.
@@ -513,16 +509,11 @@ if [ -f "$SYS32/windows.system.profile.integritypolicy.dll" ]; then
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.System.Profile.WindowsIntegrityPolicy"
   "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.system.profile.integritypolicy.dll' /f >/dev/null 2>&1
 fi
-TB_SHIM=${SHIM_DIR}/wineuwp_taskbarmanager.dll
-if [ -f "$TB_SHIM" ]; then
-  TB_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_taskbarmanager.dll
-  if ! cmp -s "$TB_SHIM" "$TB_DST"; then cp -f --reflink=auto "$TB_SHIM" "$TB_DST"; fi
+# Windows.UI.Shell.TaskbarManager is Wine's windows.ui.shell.taskbarmanager: its operations complete with false
+# instead of waiting for a shell that does not exist. Windows' registration names wpnapps, so it is re-pointed here.
+if [ -f "$SYS32/windows.ui.shell.taskbarmanager.dll" ]; then
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.UI.Shell.TaskbarManager"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_taskbarmanager.dll' /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: TaskbarManager stand-in"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.ui.shell.taskbarmanager.dll' /f >/dev/null 2>&1
 fi
 
 # Windows.Storage.AccessCache.StorageApplicationPermissions stand-in. An app adds a picked file to
@@ -606,7 +597,7 @@ SHIM_CLASSES=""
 [ -f "$SYS32/windows.devices.enumeration.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Devices.Enumeration.DeviceInformation:windows.devices.enumeration.dll"
 [ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager:wineuwp_appinstallmanager.dll"
 [ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions:wineuwp_appinstallmanager.dll"
-[ -f "$SYS32/wineuwp_taskbarmanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Shell.TaskbarManager:wineuwp_taskbarmanager.dll"
+[ -f "$SYS32/windows.ui.shell.taskbarmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Shell.TaskbarManager:windows.ui.shell.taskbarmanager.dll"
 [ -f "$SYS32/windows.services.store.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Services.Store.StoreContext:windows.services.store.dll"
 [ -f "$SYS32/wineuwp_xboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager:wineuwp_xboxauth.dll"
 [ -f "$SYS32/wineuwp_xboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.StoreConfiguration:wineuwp_xboxauth.dll"

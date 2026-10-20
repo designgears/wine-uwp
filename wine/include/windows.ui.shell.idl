@@ -1,0 +1,93 @@
+/*
+ * Copyright 2026 wine-uwp contributors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+/* the taskbar part of Windows.UI.Shell */
+
+#ifdef __WIDL__
+#pragma winrt ns_prefix
+#endif
+
+import "inspectable.idl";
+import "asyncinfo.idl";
+import "eventtoken.idl";
+import "windowscontracts.idl";
+import "windows.foundation.idl";
+import "windows.applicationmodel.core.idl";
+
+namespace Windows.UI.StartScreen {
+    /* SecondaryTile's default interface, not defined here yet: passing it is the same ABI as passing the runtimeclass */
+    interface ISecondaryTile;
+}
+
+namespace Windows.UI.Shell {
+    interface ITaskbarManager;
+    interface ITaskbarManager2;
+    interface ITaskbarManagerStatics;
+    runtimeclass TaskbarManager;
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 4.0),
+        exclusiveto(Windows.UI.Shell.TaskbarManager),
+        uuid(87490a19-1ad9-49f4-b2e8-86738dc5ac40)
+    ]
+    interface ITaskbarManager : IInspectable
+    {
+        [propget] HRESULT IsSupported([out, retval] boolean *value);
+        [propget] HRESULT IsPinningAllowed([out, retval] boolean *value);
+        HRESULT IsCurrentAppPinnedAsync([out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        HRESULT IsAppListEntryPinnedAsync([in] Windows.ApplicationModel.Core.AppListEntry *entry,
+                                          [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        HRESULT RequestPinCurrentAppAsync([out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        HRESULT RequestPinAppListEntryAsync([in] Windows.ApplicationModel.Core.AppListEntry *entry,
+                                            [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 8.0),
+        exclusiveto(Windows.UI.Shell.TaskbarManager),
+        uuid(79f0a06e-7b02-4911-918c-dee0bbd20ba4)
+    ]
+    interface ITaskbarManager2 : IInspectable
+    {
+        HRESULT IsSecondaryTilePinnedAsync([in] HSTRING tile_id, [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        HRESULT RequestPinSecondaryTileAsync([in] Windows.UI.StartScreen.ISecondaryTile *tile,
+                                             [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+        HRESULT TryUnpinSecondaryTileAsync([in] HSTRING tile_id, [out, retval] Windows.Foundation.IAsyncOperation<boolean> **operation);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 4.0),
+        exclusiveto(Windows.UI.Shell.TaskbarManager),
+        uuid(db32ab74-de52-4fe6-b7b6-95ff9f8395df)
+    ]
+    interface ITaskbarManagerStatics : IInspectable
+    {
+        HRESULT GetDefault([out, retval] Windows.UI.Shell.TaskbarManager **result);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 4.0),
+        marshaling_behavior(agile),
+        static(Windows.UI.Shell.ITaskbarManagerStatics, Windows.Foundation.UniversalApiContract, 4.0)
+    ]
+    runtimeclass TaskbarManager
+    {
+        [default] interface Windows.UI.Shell.ITaskbarManager;
+        [contract(Windows.Foundation.UniversalApiContract, 8.0)] interface Windows.UI.Shell.ITaskbarManager2;
+    }
+}
