@@ -1,0 +1,6 @@
+MODULE  = windows.system.memorymanager.dll
+IMPORTS = combase psapi
+
+SOURCES = \
+	classes.idl \
+	main.c

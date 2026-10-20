@@ -251,18 +251,12 @@ if [ -f "$UP_SHIM" ]; then
   echo "installed: UserPicker stand-in"
 fi
 
-# MemoryManager's native rmclient event registration requires an absent Windows service.
-# Solitaire throws out of its page constructor when registration returns 0x800706d9.
-MM_SHIM=${SHIM_DIR}/wineuwp_memorymanager.dll
-if [ -f "$MM_SHIM" ]; then
-  MM_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_memorymanager.dll
-  if ! cmp -s "$MM_SHIM" "$MM_DST"; then cp -f --reflink=auto "$MM_SHIM" "$MM_DST"; fi
+# MemoryManager's native rmclient event registration requires an absent Windows service: Solitaire throws out of its
+# page constructor when registration returns 0x800706d9. Wine's windows.system.memorymanager answers instead; Windows'
+# registration in the prefix names rmclient, so the class is re-pointed here.
+if [ -f "$SYS32/windows.system.memorymanager.dll" ]; then
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.System.MemoryManager"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_memorymanager.dll' /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: MemoryManager stand-in"
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.system.memorymanager.dll' /f >/dev/null 2>&1
 fi
 
 # Windows.Devices.Enumeration.DeviceInformation: Wine implements every CreateWatcher overload
@@ -637,7 +631,7 @@ activatable_dllpath() {
 
 SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_userpicker.dll" ]       && SHIM_CLASSES="$SHIM_CLASSES Windows.System.UserPicker:wineuwp_userpicker.dll"
-[ -f "$SYS32/wineuwp_memorymanager.dll" ]    && SHIM_CLASSES="$SHIM_CLASSES Windows.System.MemoryManager:wineuwp_memorymanager.dll"
+[ -f "$SYS32/windows.system.memorymanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.System.MemoryManager:windows.system.memorymanager.dll"
 [ -f "$SYS32/wineuwp_deviceinformation.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Devices.Enumeration.DeviceInformation:wineuwp_deviceinformation.dll"
 [ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager:wineuwp_appinstallmanager.dll"
 [ -f "$SYS32/wineuwp_appinstallmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions:wineuwp_appinstallmanager.dll"
