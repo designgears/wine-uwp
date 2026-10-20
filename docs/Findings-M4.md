@@ -12938,3 +12938,15 @@ repeat), Media Player 2835 colours with both, Solitaire 3/3 front end, `kb` "Cal
 (this prefix/display, not dcomp). Feedback Hub 261 colours / 16 fail-fasts, as already known. The shared
 `~/src/wine-build` has **not** been rebuilt with any of this. **`/tmp` is wiped by a reboot**: the
 test scripts (`store-run.sh`, `store-crash.sh`) and Xvfb `:97` have to be recreated.
+
+**Apps page (22608): content under a skeleton that never leaves** (`docs/screenshots/msstore-22608-apps-skeleton-overlay.png`).
+About 150 s after clicking Apps, Must-have free apps and Best selling apps load, but the grey skeleton placeholders stay
+drawn over them. Tried and ruled out:
+- Evaluating `<visual>.Opacity` references (`_animatedVisual.Opacity`, two visuals) made it worse: the content never
+  showed (408 colours, against 456 in two control runs with the change backed out). Reverted, not committed.
+- The 456 starts of a five-key Opacity animation (0,0,1,1,0) are the skeleton shimmer; it settles at 0 and is harmless.
+- 60 of 418 scoped batches never complete. 34 hold a facade expression run, which by design waits until stopped
+  (the Xbox Friends fix); 26 have no animations and probably no Completed handler.
+Not yet known: what hides the skeleton on Windows (Visibility, an opacity binding, or a batch completion).
+`trace+dcompanim` slows start-up enough that content sometimes never loads within 120 s, so judge such runs by
+the control, not by a single capture.
