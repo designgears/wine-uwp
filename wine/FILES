@@ -436,3 +436,4 @@ dlls/windows.storage.pickers/private.h
 dlls/windows.storage.pickers/windows.storage.pickers.spec
 dlls/windows.staterepositorycore/staterepository.c
 dlls/windows.staterepositorycore/staterepository_slots.h
+dlls/appxinstall/store.c

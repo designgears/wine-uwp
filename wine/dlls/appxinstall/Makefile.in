@@ -11,6 +11,7 @@ SOURCES = \
 	manifest.c \
 	package.c \
 	source.c \
+	store.c \
 	unixlib.c \
 	util.c \
 	xml.c \

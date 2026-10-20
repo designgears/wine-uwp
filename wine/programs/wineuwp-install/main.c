@@ -167,12 +167,59 @@ static char *read_keys( const WCHAR *source, BOOL once )
     return ret;
 }
 
+/* The Store's newest package of a family and its download address, through the catalogue and the
+ * delivery service: what an install from the Store would fetch. */
+static int store_package( const WCHAR *family )
+{
+    struct appx_store_package package;
+    char *body, *url, category[64], *p, *end;
+    WCHAR path[512];
+    DWORD status;
+    HRESULT hr;
+
+    swprintf( path, ARRAY_SIZE(path), L"/v7.0/products/lookup?alternateId=PackageFamilyName&value=%s"
+              L"&market=US&languages=en-US&fieldsTemplate=details", family );
+    if (FAILED(hr = appx_store_get( L"displaycatalog.mp.microsoft.com", path, &body, &status )))
+    {
+        fail( "--store: catalogue error %#lx", hr );
+        return 1;
+    }
+    category[0] = 0;
+    if ((p = strstr( body, "\"WuCategoryId\":\"" )) && (end = strchr( p += 16, '"' )) && end - p < sizeof(category))
+    {
+        memcpy( category, p, end - p );
+        category[end - p] = 0;
+    }
+    appx_free( body );
+    if (!category[0])
+    {
+        fail( "--store: the catalogue has no category for this family (HTTP %lu)", status );
+        return 1;
+    }
+    out( "category %s", category );
+    if (FAILED(hr = appx_store_find_package( category, family, &package )))
+    {
+        fail( "--store: no package, error %#lx", hr );
+        return 1;
+    }
+    out( "package %s", package.moniker );
+    if (FAILED(hr = appx_store_package_url( &package, &url )))
+    {
+        fail( "--store: no download address, error %#lx", hr );
+        return 1;
+    }
+    out( "url %.48s...", url );
+    appx_free( url );
+    return 0;
+}
+
 static void usage(void)
 {
     fail( "usage: wineuwp-install PACKAGE DATADIR --windows TREE [--stage NAME] [--pause-file FILE] "
           "[--tags T] [--languages L] [--keys FILE|-] [--keys-once FILE]\n"
           "       wineuwp-install PACKAGE [DATADIR] --info [--windows TREE] [--icon OUT]\n"
-          "       wineuwp-install APPINSTALLER --latest" );
+          "       wineuwp-install APPINSTALLER --latest\n"
+          "       wineuwp-install FAMILY --store" );
 }
 
 int __cdecl wmain( int argc, WCHAR *argv[] )
@@ -180,7 +227,7 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
     struct appx_install_params params = { 0 };
     const WCHAR *positional[2] = { NULL }, *keys = NULL, *icon = NULL;
     WCHAR *package = NULL, *data_dir = NULL, *windows = NULL, *launch_defaults = NULL, *d3d = NULL, *env;
-    BOOL info = FALSE, latest = FALSE, keys_once = FALSE;
+    BOOL info = FALSE, latest = FALSE, store = FALSE, keys_once = FALSE;
     unsigned int npos = 0;
     HRESULT hr;
     int i;
@@ -192,6 +239,7 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
 
         if (!wcscmp( a, L"--info" )) info = TRUE;
         else if (!wcscmp( a, L"--latest" )) latest = TRUE;
+        else if (!wcscmp( a, L"--store" )) store = TRUE;
         else if (!wcscmp( a, L"--windows" ) && has_value) windows = path_arg( argv[++i] );
         else if (!wcscmp( a, L"--stage" ) && has_value) params.stage = argv[++i];
         else if (!wcscmp( a, L"--pause-file" ) && has_value) pause_file = path_arg( argv[++i] );
@@ -219,6 +267,7 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
         appx_free( version );
         return 0;
     }
+    if (store) return store_package( positional[0] );
     if (keys) params.content_keys = read_keys( keys, keys_once );
     else if ((env = _wgetenv( L"WINE_UWP_CONTENT_KEYS" )))
     {

@@ -67,6 +67,26 @@ HRESULT CDECL appx_info( const WCHAR *package, const WCHAR *windows_tree, const 
 HRESULT CDECL appx_latest( const WCHAR *appinstaller, WCHAR **version );
 
 /* frees what appx_info and appx_latest return */
+/* The Store's public services; neither needs an account. */
+
+/* An HTTPS GET of JSON, for the display catalogue (displaycatalog.mp.microsoft.com). *body is
+ * NUL-terminated; free it with appx_free. */
+HRESULT CDECL appx_store_get( const WCHAR *host, const WCHAR *path, char **body, DWORD *status );
+
+struct appx_store_package
+{
+    char moniker[256];          /* Name_Version_Arch_ResourceId_PublisherId */
+    char update_id[64];
+    char revision[16];
+};
+
+/* The newest package of a family, x64 or neutral, in a Windows Update category (the catalogue's
+ * WuCategoryId), from the delivery service. */
+HRESULT CDECL appx_store_find_package( const char *category, const WCHAR *family, struct appx_store_package *package );
+
+/* Its download address; free it with appx_free. */
+HRESULT CDECL appx_store_package_url( const struct appx_store_package *package, char **url );
+
 void CDECL appx_free( void *ptr );
 
 #endif /* __WINE_APPXINSTALL_H */
