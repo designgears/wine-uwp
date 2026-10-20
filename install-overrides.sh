@@ -526,7 +526,7 @@ fi
 # the harvested runtime is there.
 WV2_ROOT=${WEBVIEW2_RUNTIME:-${UWP_BIN}/webview2/rt/Program Files (x86)/Microsoft/EdgeWebView}
 WV2_HOST=${SHIM_DIR}/EmbeddedBrowserWebView.dll
-WV2_APP=$(ls -d "$WV2_ROOT"/Application/[0-9]*.[0-9]*.[0-9]*.[0-9]* 2>/dev/null | tail -1)
+WV2_APP=$(ls -d "$WV2_ROOT"/Application/[0-9]*.[0-9]*.[0-9]*.[0-9]* 2>/dev/null | tail -1 || true)
 if [ -n "$WV2_APP" ] && [ -f "$WV2_HOST" ]; then
   WV2_VER=$(basename "$WV2_APP")
   WV2_DST="$WINEPREFIX/drive_c/Program Files (x86)/Microsoft/EdgeWebView/Application"
