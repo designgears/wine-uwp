@@ -22,7 +22,18 @@
 #pragma makedep unix
 #endif
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#ifdef __linux__
+#include <linux/fs.h>
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -42,6 +53,8 @@ static NTSTATUS errno_status( int err )
     case EACCES:
     case EPERM: return STATUS_ACCESS_DENIED;
     case EXDEV: return STATUS_NOT_SAME_DEVICE;
+    case EOPNOTSUPP:
+    case EINVAL: return STATUS_NOT_SUPPORTED;
     default: return STATUS_UNSUCCESSFUL;
     }
 }
@@ -53,9 +66,67 @@ static NTSTATUS rename_dir( void *args )
     return rename( params->src, params->dst ) ? errno_status( errno ) : STATUS_SUCCESS;
 }
 
+static int clone_file( const char *src, const char *dst, mode_t mode )
+{
+#ifdef FICLONE
+    int in, out, ret = -1;
+
+    if ((in = open( src, O_RDONLY )) < 0) return -1;
+    if ((out = open( dst, O_WRONLY | O_CREAT | O_EXCL, mode & 07777 )) >= 0)
+    {
+        ret = ioctl( out, FICLONE, in );
+        close( out );
+        if (ret) unlink( dst );
+    }
+    close( in );
+    return ret;
+#else
+    errno = EOPNOTSUPP;
+    return -1;
+#endif
+}
+
+static int clone_dir( const char *src, const char *dst )
+{
+    char from[PATH_MAX], to[PATH_MAX], target[PATH_MAX];
+    struct dirent *de;
+    struct stat st;
+    int ret = 0;
+    ssize_t n;
+    DIR *dir;
+
+    if (!(dir = opendir( src ))) return -1;
+    while (!ret && (de = readdir( dir )))
+    {
+        if (!strcmp( de->d_name, "." ) || !strcmp( de->d_name, ".." )) continue;
+        if (snprintf( from, sizeof(from), "%s/%s", src, de->d_name ) >= sizeof(from) ||
+            snprintf( to, sizeof(to), "%s/%s", dst, de->d_name ) >= sizeof(to) || lstat( from, &st ))
+        {
+            ret = -1;
+            break;
+        }
+        if (S_ISDIR( st.st_mode ))
+            ret = (mkdir( to, st.st_mode & 07777 ) && errno != EEXIST) ? -1 : clone_dir( from, to );
+        else if (S_ISLNK( st.st_mode ))
+            ret = ((n = readlink( from, target, sizeof(target) - 1 )) < 0) ? -1 : (target[n] = 0, symlink( target, to ));
+        else if (S_ISREG( st.st_mode ))
+            ret = clone_file( from, to, st.st_mode );
+    }
+    closedir( dir );
+    return ret;
+}
+
+static NTSTATUS clone_tree( void *args )
+{
+    const struct clone_params *params = args;
+
+    return clone_dir( params->src, params->dst ) ? errno_status( errno ) : STATUS_SUCCESS;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     rename_dir,
+    clone_tree,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
@@ -72,9 +143,18 @@ static NTSTATUS wow64_rename_dir( void *args )
     return rename_dir( &params );
 }
 
+static NTSTATUS wow64_clone_tree( void *args )
+{
+    struct { PTR32 src, dst; } const *params32 = args;
+    struct clone_params params = { ULongToPtr( params32->src ), ULongToPtr( params32->dst ) };
+
+    return clone_tree( &params );
+}
+
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 {
     wow64_rename_dir,
+    wow64_clone_tree,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );

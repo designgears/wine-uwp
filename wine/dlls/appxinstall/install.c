@@ -864,6 +864,43 @@ static BOOL move_dir( const WCHAR *src, const WCHAR *dst )
     return !status;
 }
 
+/* Starts the new copy from the installed one when it is the same package, so installing another feature
+ * (High-Resolution Textures, say) fetches only the files that are missing; extract() skips a file already there at
+ * its size. Reflinks only (the Unix side's clone_tree): a plain copy of a 100 GB game would cost more than the
+ * download it saves. */
+static void seed_from_installed( const WCHAR *final, const WCHAR *dest, const WCHAR *full,
+                                 const struct appx_install_params *params )
+{
+    static const char key[] = "\"package\": \"";
+    WCHAR *chunks = path_join( final, L".wine-uwp-chunks.json" );
+    char *json = chunks ? read_text( chunks ) : NULL, *p, *want = utf8_dup( full );
+    char *unix_src = NULL, *unix_dst = NULL;
+    struct clone_params clone;
+    NTSTATUS status;
+
+    free( chunks );
+    if (!json || !want || !(p = strstr( json, key ))) goto done;
+    p += sizeof(key) - 1;
+    if (strncmp( p, want, strlen( want ) ) || p[strlen( want )] != '"') goto done;
+    if (!(unix_src = wine_get_unix_file_name( final )) || !(unix_dst = wine_get_unix_file_name( dest ))) goto done;
+    clone.src = unix_src;
+    clone.dst = unix_dst;
+    if (!(status = WINE_UNIX_CALL( unix_clone_tree, &clone )))
+        report( params, APPX_EVENT_MESSAGE, 0, 0, L"reusing the installed files of the same package" );
+    else
+    {
+        report( params, APPX_EVENT_MESSAGE, 0, 0, L"warning: could not reuse the installed files (%#lx); "
+                L"fetching everything", status );
+        remove_tree( dest );
+        create_directories( dest );
+    }
+done:
+    HeapFree( GetProcessHeap(), 0, unix_src );
+    HeapFree( GetProcessHeap(), 0, unix_dst );
+    free( json );
+    free( want );
+}
+
 /* publishes dest as final, restoring the installed copy if the rename fails */
 static HRESULT publish( const WCHAR *dest, const WCHAR *final )
 {
@@ -1008,8 +1045,7 @@ HRESULT CDECL appx_install( const struct appx_install_params *params )
     }
     remove_tree( dest );
     if (!create_directories( dest )) { hr = HRESULT_FROM_WIN32( GetLastError() ); goto done; }
-    /* TODO: reuse the installed copy of the same package (install-app.py's seed_from_installed) once Wine has a
-     * reflink-aware copy; a plain copy of a 100 GB game costs more than the download it saves */
+    seed_from_installed( final, dest, full, params );
     if (logo >= 0) stage_logo( pkg, logo, dest );
     else if (m->logo) report( params, APPX_EVENT_MESSAGE, 0, 0, L"warning: manifest logo %s was not included; "
                               L"installing without a launcher icon", m->logo );

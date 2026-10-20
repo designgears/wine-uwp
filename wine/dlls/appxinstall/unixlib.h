@@ -28,8 +28,17 @@ struct rename_params
     const char *dst;
 };
 
+/* copies a tree by reflink only (FICLONE): a plain copy of a 100 GB game would cost more than the download it
+ * saves. Fails as a whole when the filesystem cannot share extents. */
+struct clone_params
+{
+    const char *src;        /* Unix paths; dst exists and is empty */
+    const char *dst;
+};
+
 enum appxinstall_funcs
 {
     unix_rename_dir,
+    unix_clone_tree,
     unix_funcs_count,
 };
