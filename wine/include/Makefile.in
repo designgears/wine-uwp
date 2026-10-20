@@ -1060,6 +1060,7 @@ SOURCES = \
 	windows.graphics.imaging.idl \
 	windows.h \
 	windows.management.deployment.idl \
+	windows.media.audio.idl \
 	windows.media.capture.idl \
 	windows.media.closedcaptioning.idl \
 	windows.media.core.idl \

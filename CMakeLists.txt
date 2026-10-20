@@ -79,9 +79,6 @@ target_link_libraries(probe-memorymanager PRIVATE runtimeobject.lib)
 # Windows.Media.Audio.SpatialAudioDeviceConfiguration. Wine routes the class to
 # windows.media.devices, whose factory refuses ISpatialAudioDeviceConfigurationStatics; Wwise asks
 # with .as<>() and the resulting E_NOINTERFACE throw kills Solitaire on its audio thread.
-add_library(spatialaudio SHARED shims/spatialaudio/spatialaudio.cpp)
-set_target_properties(spatialaudio PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_spatialaudio")
-target_link_libraries(spatialaudio PRIVATE runtimeobject.lib)
 
 # Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager. The Web Account Manager
 # needs the out-of-process token broker; without it its IAsyncOperation is never completed and

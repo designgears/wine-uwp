@@ -318,22 +318,12 @@ fi
 K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Networking.Connectivity.NetworkInformation"
 "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.networking.connectivity.dll' /f >/dev/null 2>&1
 
-# SpatialAudioDeviceConfiguration stand-in (see shims/spatialaudio).
-SA=${SHIM_DIR}/wineuwp_spatialaudio.dll
-if [ -f "$SA" ]; then
-  if ! cmp -s "$SA" "$SYS32/wineuwp_spatialaudio.dll"; then cp -f --reflink=auto "$SA" "$SYS32/wineuwp_spatialaudio.dll"; fi
-  K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Media.Audio.SpatialAudioDeviceConfiguration"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_spatialaudio.dll' /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  K2="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Media.Audio.SpatialAudioFormatSubtype"
-  "${WINE_BIN}wine" reg add "$K2" /v DllPath /d 'C:\windows\system32\wineuwp_spatialaudio.dll' /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K2" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K2" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K2" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: SpatialAudioDeviceConfiguration + FormatSubtype stand-ins"
-fi
+# SpatialAudioDeviceConfiguration and SpatialAudioFormatSubtype are Wine's windows.media.devices (where Windows
+# registers them too). Prefixes that had the shim keep its DllPath until reset here.
+for c in Windows.Media.Audio.SpatialAudioDeviceConfiguration Windows.Media.Audio.SpatialAudioFormatSubtype; do
+  "${WINE_BIN}wine" reg add "HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\$c" /v DllPath \
+    /d 'C:\windows\system32\windows.media.devices.dll' /f >/dev/null 2>&1
+done
 
 # UserActivityChannel.GetDefault needs cdp.dll in the native implementation (twinapi.appcore), and its failure
 # unwinds out of Solitaire's startup subscriber and ends the engine thread: Wine's
@@ -620,8 +610,8 @@ SHIM_CLASSES=""
 [ -f "$SYS32/windows.services.store.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Services.Store.StoreContext:windows.services.store.dll"
 [ -f "$SYS32/wineuwp_xboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager:wineuwp_xboxauth.dll"
 [ -f "$SYS32/wineuwp_xboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.StoreConfiguration:wineuwp_xboxauth.dll"
-[ -f "$SYS32/wineuwp_spatialaudio.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioDeviceConfiguration:wineuwp_spatialaudio.dll"
-[ -f "$SYS32/wineuwp_spatialaudio.dll" ]      && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioFormatSubtype:wineuwp_spatialaudio.dll"
+[ -f "$SYS32/windows.media.devices.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioDeviceConfiguration:windows.media.devices.dll"
+[ -f "$SYS32/windows.media.devices.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioFormatSubtype:windows.media.devices.dll"
 [ -f "$SYS32/windows.networking.connectivity.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Networking.Connectivity.NetworkInformation:windows.networking.connectivity.dll"
 [ -f "$SYS32/windows.applicationmodel.useractivities.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.UserActivities.UserActivityChannel:windows.applicationmodel.useractivities.dll"
 [ -f "$SYS32/windows.system.profile.integritypolicy.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.System.Profile.WindowsIntegrityPolicy:windows.system.profile.integritypolicy.dll"

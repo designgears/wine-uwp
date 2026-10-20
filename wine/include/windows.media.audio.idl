@@ -1,0 +1,154 @@
+/*
+ * Copyright 2026 wine-uwp contributors
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+/* the spatial-audio part of Windows.Media.Audio */
+
+#ifdef __WIDL__
+#pragma winrt ns_prefix
+#endif
+
+import "inspectable.idl";
+import "asyncinfo.idl";
+import "eventtoken.idl";
+import "windowscontracts.idl";
+import "windows.foundation.idl";
+
+namespace Windows.Media.Audio {
+    typedef enum SetDefaultSpatialAudioFormatStatus SetDefaultSpatialAudioFormatStatus;
+
+    interface ISetDefaultSpatialAudioFormatResult;
+    interface ISpatialAudioDeviceConfiguration;
+    interface ISpatialAudioDeviceConfigurationStatics;
+    interface ISpatialAudioFormatSubtypeStatics;
+    interface ISpatialAudioFormatSubtypeStatics2;
+
+    runtimeclass SetDefaultSpatialAudioFormatResult;
+    runtimeclass SpatialAudioDeviceConfiguration;
+    runtimeclass SpatialAudioFormatSubtype;
+
+    declare {
+        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Media.Audio.SetDefaultSpatialAudioFormatResult *>;
+        interface Windows.Foundation.IAsyncOperation<Windows.Media.Audio.SetDefaultSpatialAudioFormatResult *>;
+        interface Windows.Foundation.TypedEventHandler<Windows.Media.Audio.SpatialAudioDeviceConfiguration *, IInspectable *>;
+    }
+
+    [contract(Windows.Foundation.UniversalApiContract, 10.0)]
+    enum SetDefaultSpatialAudioFormatStatus
+    {
+        Succeeded = 0,
+        AccessDenied = 1,
+        LicenseExpired = 2,
+        LicenseNotValidForAudioEndpoint = 3,
+        NotSupportedOnAudioEndpoint = 4,
+        UnknownError = 5,
+    };
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 10.0),
+        exclusiveto(Windows.Media.Audio.SetDefaultSpatialAudioFormatResult),
+        uuid(1c2aa511-1400-5e70-9ea9-ae151241e8ea)
+    ]
+    interface ISetDefaultSpatialAudioFormatResult : IInspectable
+    {
+        [propget] HRESULT Status([out, retval] Windows.Media.Audio.SetDefaultSpatialAudioFormatStatus *value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 10.0),
+        exclusiveto(Windows.Media.Audio.SpatialAudioDeviceConfiguration),
+        uuid(ee830034-61cf-5749-9da4-10f0fe028199)
+    ]
+    interface ISpatialAudioDeviceConfiguration : IInspectable
+    {
+        [propget] HRESULT DeviceId([out, retval] HSTRING *value);
+        [propget] HRESULT IsSpatialAudioSupported([out, retval] boolean *value);
+        HRESULT IsSpatialAudioFormatSupported([in] HSTRING subtype, [out, retval] boolean *result);
+        [propget] HRESULT ActiveSpatialAudioFormat([out, retval] HSTRING *value);
+        [propget] HRESULT DefaultSpatialAudioFormat([out, retval] HSTRING *value);
+        HRESULT SetDefaultSpatialAudioFormatAsync([in] HSTRING subtype,
+                [out, retval] Windows.Foundation.IAsyncOperation<Windows.Media.Audio.SetDefaultSpatialAudioFormatResult *> **operation);
+        [eventadd] HRESULT ConfigurationChanged(
+                [in] Windows.Foundation.TypedEventHandler<Windows.Media.Audio.SpatialAudioDeviceConfiguration *, IInspectable *> *handler,
+                [out, retval] EventRegistrationToken *token);
+        [eventremove] HRESULT ConfigurationChanged([in] EventRegistrationToken token);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 10.0),
+        exclusiveto(Windows.Media.Audio.SpatialAudioDeviceConfiguration),
+        uuid(3ec37f7b-936d-4e04-9728-2827d9f758c4)
+    ]
+    interface ISpatialAudioDeviceConfigurationStatics : IInspectable
+    {
+        HRESULT GetForDeviceId([in] HSTRING device_id, [out, retval] Windows.Media.Audio.SpatialAudioDeviceConfiguration **result);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 10.0),
+        exclusiveto(Windows.Media.Audio.SpatialAudioFormatSubtype),
+        uuid(b3de8a47-83ee-4266-a945-bedf507afeed)
+    ]
+    interface ISpatialAudioFormatSubtypeStatics : IInspectable
+    {
+        [propget] HRESULT WindowsSonic([out, retval] HSTRING *value);
+        [propget] HRESULT DolbyAtmosForHeadphones([out, retval] HSTRING *value);
+        [propget] HRESULT DolbyAtmosForHomeTheater([out, retval] HSTRING *value);
+        [propget] HRESULT DolbyAtmosForSpeakers([out, retval] HSTRING *value);
+        [propget] HRESULT DTSHeadphoneX([out, retval] HSTRING *value);
+        [propget] HRESULT DTSXUltra([out, retval] HSTRING *value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 12.0),
+        exclusiveto(Windows.Media.Audio.SpatialAudioFormatSubtype),
+        uuid(4565e6cb-d95b-5621-b6af-0e8849c57c80)
+    ]
+    interface ISpatialAudioFormatSubtypeStatics2 : IInspectable
+    {
+        [propget] HRESULT DTSXForHomeTheater([out, retval] HSTRING *value);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 10.0),
+        marshaling_behavior(agile)
+    ]
+    runtimeclass SetDefaultSpatialAudioFormatResult
+    {
+        [default] interface Windows.Media.Audio.ISetDefaultSpatialAudioFormatResult;
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 10.0),
+        marshaling_behavior(agile),
+        static(Windows.Media.Audio.ISpatialAudioDeviceConfigurationStatics, Windows.Foundation.UniversalApiContract, 10.0)
+    ]
+    runtimeclass SpatialAudioDeviceConfiguration
+    {
+        [default] interface Windows.Media.Audio.ISpatialAudioDeviceConfiguration;
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 10.0),
+        marshaling_behavior(agile),
+        static(Windows.Media.Audio.ISpatialAudioFormatSubtypeStatics, Windows.Foundation.UniversalApiContract, 10.0),
+        static(Windows.Media.Audio.ISpatialAudioFormatSubtypeStatics2, Windows.Foundation.UniversalApiContract, 12.0)
+    ]
+    runtimeclass SpatialAudioFormatSubtype
+    {
+    }
+}

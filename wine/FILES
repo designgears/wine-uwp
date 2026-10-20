@@ -384,3 +384,8 @@ dlls/windows.services.store/main.c
 dlls/windows.services.store/windows.services.store.spec
 dlls/windows.devices.enumeration/main.c
 dlls/windows.networking.connectivity/Makefile.in
+include/windows.media.audio.idl
+dlls/windows.media.devices/main.c
+dlls/windows.media.devices/spatialaudio.c
+dlls/windows.media.devices/Makefile.in
+dlls/windows.media.devices/classes.idl
