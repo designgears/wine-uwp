@@ -397,3 +397,8 @@ dlls/windows.ui.shell.taskbarmanager/classes.idl
 dlls/windows.ui.shell.taskbarmanager/main.c
 dlls/windows.ui.shell.taskbarmanager/private.h
 dlls/windows.ui.shell.taskbarmanager/windows.ui.shell.taskbarmanager.spec
+include/windows.security.authorization.appcapabilityaccess.idl
+dlls/windows.security.authorization.appcapabilityaccess/Makefile.in
+dlls/windows.security.authorization.appcapabilityaccess/classes.idl
+dlls/windows.security.authorization.appcapabilityaccess/main.c
+dlls/windows.security.authorization.appcapabilityaccess/windows.security.authorization.appcapabilityaccess.spec

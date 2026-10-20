@@ -187,20 +187,14 @@ if [ -f "$SR_SHIM" ]; then
   echo "installed: Windows.Internal.StateRepository stand-in"
 fi
 
-# Windows.Security.Authorization.AppCapabilityAccess.AppCapability stand-in. The registered
-# DllPath is the native CapabilityAccessManagerClient.dll, which RPCs to a service the prefix does
-# not have, so every CheckAccess is denied and Media Player paints "can't access your music
-# library" instead of the library. See shims/appcapability.
-AC_SHIM=${SHIM_DIR}/wineuwp_appcapability.dll
-if [ -f "$AC_SHIM" ]; then
-  AC_DST=$WINEPREFIX/drive_c/windows/system32/wineuwp_appcapability.dll
-  if ! cmp -s "$AC_SHIM" "$AC_DST"; then cp -f --reflink=auto "$AC_SHIM" "$AC_DST"; fi
+# Windows.Security.Authorization.AppCapabilityAccess.AppCapability is Wine's
+# windows.security.authorization.appcapabilityaccess. Windows' registration names CapabilityAccessManagerClient.dll,
+# which asks a service the prefix does not have, so every CheckAccess was denied and Media Player painted "can't access
+# your music library" instead of the library. Re-pointed here.
+if [ -f "$SYS32/windows.security.authorization.appcapabilityaccess.dll" ]; then
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Security.Authorization.AppCapabilityAccess.AppCapability"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_appcapability.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\windows.security.authorization.appcapabilityaccess.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 1 /f >/dev/null 2>&1
-  "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: AppCapability stand-in"
 fi
 
 # Windows.Storage.StorageLibrary stand-in. Wine's windows.storage does not implement the class

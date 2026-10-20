@@ -1,0 +1,6 @@
+MODULE  = windows.security.authorization.appcapabilityaccess.dll
+IMPORTS = combase
+
+SOURCES = \
+	classes.idl \
+	main.c
