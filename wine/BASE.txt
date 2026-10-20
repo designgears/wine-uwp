@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     a19a53f41bfd3e8040829a397663e6335e6daad6
-                 appxinstall: reuse the installed copy of the same package by reflink.
+  wine HEAD:     1dbfdf8dbe6b472ddc12ca9814ec4d280a9ef5a6
+                 firewallapi, policymanager: the network-isolation and MDM-policy apisets, formerly wine-uwp shims.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-20T08:04:15Z
+  captured:      2026-10-20T08:12:01Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

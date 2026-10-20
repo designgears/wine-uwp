@@ -683,13 +683,8 @@ SHIM_CLASSES=""
 [ -f "$SYS32/wineuwp_networkstatus.dll" ]     && SHIM_CLASSES="$SHIM_CLASSES Windows.Networking.Connectivity.NetworkInformation:wineuwp_networkstatus.dll"
 [ -f "$SYS32/wineuwp_useractivitychannel.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.UserActivities.UserActivityChannel:wineuwp_useractivitychannel.dll"
 [ -f "$SYS32/wineuwp_toastnotifier.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Notifications.ToastNotificationManager:wineuwp_toastnotifier.dll"
-# ext-ms-win-devmgmt-policy-l1-1-1 (see shims/devmgmtpolicy): the ink stack delay-loads it.
-DP=${SHIM_DIR}/ext-ms-win-devmgmt-policy-l1-1-1.dll
-[ -f "$DP" ] && { cmp -s "$DP" "$SYS32/ext-ms-win-devmgmt-policy-l1-1-1.dll" || cp -f --reflink=auto "$DP" "$SYS32/ext-ms-win-devmgmt-policy-l1-1-1.dll"; }
-# api-ms-win-net-isolation-l1-1-1 (see shims/netisolation): not in Wine's apiset schema, so the file
-# in system32 under that name is what the delay-load finds.
-NI=${SHIM_DIR}/api-ms-win-net-isolation-l1-1-1.dll
-[ -f "$NI" ] && { cmp -s "$NI" "$SYS32/api-ms-win-net-isolation-l1-1-1.dll" || cp -f --reflink=auto "$NI" "$SYS32/api-ms-win-net-isolation-l1-1-1.dll"; }
+# api-ms-win-net-isolation-l1-1-1 and ext-ms-win-devmgmt-policy-l1-1-1 are Wine's firewallapi and policymanager now,
+# through the apiset schema; a leftover file of either name in system32 is ignored.
 # Windows.Storage.Pickers.FileSavePicker (see shims/filepicker): the native constructor fails
 # without the shell broker, and Shapr3D builds one with its dashboard, straight after sign-in.
 if [ -f "$SYS32/wineuwp_filepicker.dll" ]; then

@@ -346,3 +346,10 @@ dlls/appxinstall/zip.c
 programs/wineuwp-install/Makefile.in
 programs/wineuwp-install/main.c
 include/wine/appxinstall.h
+configure
+dlls/firewallapi/Makefile.in
+dlls/firewallapi/firewallapi.spec
+dlls/firewallapi/main.c
+dlls/policymanager/Makefile.in
+dlls/policymanager/main.c
+dlls/policymanager/policymanager.spec

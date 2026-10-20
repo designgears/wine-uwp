@@ -1,0 +1,4 @@
+MODULE    = firewallapi.dll
+
+SOURCES = \
+	main.c

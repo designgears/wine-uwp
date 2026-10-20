@@ -1,0 +1,4 @@
+MODULE    = policymanager.dll
+
+SOURCES = \
+	main.c

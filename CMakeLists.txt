@@ -157,10 +157,6 @@ set_target_properties(advertisingid PROPERTIES PREFIX "" SUFFIX ""
 
 # Windows.UI.Shell.TaskbarManager. The real one needs ImmersiveShell, which does not exist here,
 # and leaves its IAsyncOperation permanently incomplete - which is what stops Solitaire's startup.
-add_library(devmgmtpolicy SHARED shims/devmgmtpolicy/devmgmtpolicy.cpp)
-set_target_properties(devmgmtpolicy PROPERTIES PREFIX "" OUTPUT_NAME "ext-ms-win-devmgmt-policy-l1-1-1")
-add_library(netisolation SHARED shims/netisolation/netisolation.cpp)
-set_target_properties(netisolation PROPERTIES PREFIX "" OUTPUT_NAME "api-ms-win-net-isolation-l1-1-1")
 # Windows.Security.Cryptography.Certificates.Certificate: lives in certenroll.dll, which this image
 # lacks, and Windows.Web.Http needs it for every HTTPS response.
 add_library(certificate SHARED shims/certificate/certificate.cpp)
