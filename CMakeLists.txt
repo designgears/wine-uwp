@@ -15,8 +15,6 @@ add_executable(probe-activate probes/probe-activate.cpp)
 target_link_libraries(probe-activate PRIVATE runtimeobject.lib)
 add_executable(probe-bitmapimage probes/probe-bitmapimage.cpp)
 target_link_libraries(probe-bitmapimage PRIVATE runtimeobject.lib)
-add_library(mrt100 SHARED shims/mrt100/mrt100.cpp)
-set_target_properties(mrt100 PROPERTIES PREFIX "" OUTPUT_NAME "mrt100")
 # Drives a real SetWindowPos on a running app's windows: an X-side resize never reaches Wine.
 # Isolates the IXMLHTTPRequest2 layer libHttpClient uses on UWP, which is where Solitaire's
 # PlayFab login disappears without opening a socket.

@@ -3968,13 +3968,20 @@ fail:
     delayinfo.ThunkAddress = addr;
     delayinfo.TargetDllName = name;
     delayinfo.TargetApiDescriptor.ImportDescribedByName = !IMAGE_SNAP_BY_ORDINAL(pINT[id].u1.Ordinal);
-    delayinfo.TargetApiDescriptor.Description.Ordinal = LOWORD(pINT[id].u1.Ordinal);
+    /* a union: the name for an import by name. The failure callback of .NET Native's mrt100_app.dll compares
+     * it with strings, and the ordinal's low word left in it was a wild pointer that faulted in its DllMain. */
+    if (delayinfo.TargetApiDescriptor.ImportDescribedByName)
+        delayinfo.TargetApiDescriptor.Description.Name =
+            (const char *)((const IMAGE_IMPORT_BY_NAME *)get_rva(base, pINT[id].u1.AddressOfData))->Name;
+    else
+        delayinfo.TargetApiDescriptor.Description.Ordinal = LOWORD(pINT[id].u1.Ordinal);
     delayinfo.TargetModuleBase = *phmod;
     delayinfo.Unused = NULL;
     delayinfo.LastError = nts;
 
-    if (dllhook)
-        return dllhook(4, &delayinfo);
+    /* the system hook runs when the DLL's own hook declines (returns NULL), as on Windows: mrt100_app.dll's hook
+     * handles only SetProcessValidCallTargets, and returning its NULL made the caller jump to address 0 */
+    if (dllhook && (fp = dllhook(4, &delayinfo))) return fp;
 
     if (IMAGE_SNAP_BY_ORDINAL(pINT[id].u1.Ordinal))
     {

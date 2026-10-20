@@ -29,7 +29,7 @@ else
   cp "$F"/Microsoft.NET.Native.Framework.2.2/SharedLibrary.dll "$S"/
   cp "$F"/Microsoft.UI.Xaml.2.8/Microsoft.UI.Xaml.dll "$S"/
   for p in msvcp140 vcruntime140 vcruntime140_1 concrt140 vccorlib140; do cp "$F"/vclibs-desktop/$p.dll "$S"/${p}_app.dll; done
-  cp "$B"/mrt100.dll "$S"/
+  # no mrt100.dll: mrt100_app.dll falls back to its built-in runtime service when the delay load fails
 fi
 # Do NOT stage Microsoft.UI.Xaml.Controls/Themes/generic.xaml here. XAML probes that path when
 # it cannot resolve the theme resources out of the framework package, and it does find the file -
