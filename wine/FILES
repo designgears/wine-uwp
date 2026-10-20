@@ -337,6 +337,8 @@ dlls/appxinstall/install.c
 dlls/appxinstall/manifest.c
 dlls/appxinstall/package.c
 dlls/appxinstall/source.c
+dlls/appxinstall/unixlib.c
+dlls/appxinstall/unixlib.h
 dlls/appxinstall/util.c
 dlls/appxinstall/xml.c
 dlls/appxinstall/xvd.c

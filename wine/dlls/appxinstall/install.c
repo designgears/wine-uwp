@@ -29,6 +29,7 @@
 #include <string.h>
 
 #include "appxinstall_private.h"
+#include "unixlib.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(appxinstall);
 
@@ -821,6 +822,48 @@ static BOOL exists( const WCHAR *path )
     return GetFileAttributesW( path ) != INVALID_FILE_ATTRIBUTES;
 }
 
+/* renames a directory, through the host when Windows semantics refuse: an app that updates itself (the Store) has
+ * its stage directory open as its working directory, and a Windows rename of a directory with an open handle that
+ * does not share delete fails */
+static BOOL move_dir( const WCHAR *src, const WCHAR *dst )
+{
+    struct rename_params params;
+    char *unix_src, *unix_dst;
+    NTSTATUS status;
+
+    if (MoveFileW( src, dst )) return TRUE;
+    if (GetLastError() != ERROR_SHARING_VIOLATION && GetLastError() != ERROR_ACCESS_DENIED) return FALSE;
+    unix_src = wine_get_unix_file_name( src );
+    /* the destination does not exist yet: its parent's Unix path plus its name */
+    unix_dst = wine_get_unix_file_name( dst );
+    if (!unix_dst)
+    {
+        WCHAR *parent = strdupW( dst ), *slash = parent ? wcsrchr( parent, '\\' ) : NULL;
+        char *dir, *name;
+        if (slash && (*slash = 0, dir = wine_get_unix_file_name( parent )) && (name = utf8_dup( slash + 1 )))
+        {
+            if ((unix_dst = HeapAlloc( GetProcessHeap(), 0, strlen( dir ) + strlen( name ) + 2 )))
+                sprintf( unix_dst, "%s/%s", dir, name );
+            free( name );
+        }
+        else dir = NULL;
+        if (dir) HeapFree( GetProcessHeap(), 0, dir );
+        free( parent );
+    }
+    status = STATUS_NO_MEMORY;
+    if (unix_src && unix_dst)
+    {
+        params.src = unix_src;
+        params.dst = unix_dst;
+        status = WINE_UNIX_CALL( unix_rename_dir, &params );
+        TRACE( "host rename %s -> %s: %#lx\n", debugstr_a(unix_src), debugstr_a(unix_dst), status );
+    }
+    HeapFree( GetProcessHeap(), 0, unix_src );
+    HeapFree( GetProcessHeap(), 0, unix_dst );
+    if (status) SetLastError( RtlNtStatusToDosError( status ) );
+    return !status;
+}
+
 /* publishes dest as final, restoring the installed copy if the rename fails */
 static HRESULT publish( const WCHAR *dest, const WCHAR *final )
 {
@@ -829,11 +872,11 @@ static HRESULT publish( const WCHAR *dest, const WCHAR *final )
 
     if (!backup) return E_OUTOFMEMORY;
     remove_tree( backup );
-    if (exists( final ) && !MoveFileW( final, backup )) hr = HRESULT_FROM_WIN32( GetLastError() );
-    else if (!MoveFileW( dest, final ))
+    if (exists( final ) && !move_dir( final, backup )) hr = HRESULT_FROM_WIN32( GetLastError() );
+    else if (!move_dir( dest, final ))
     {
         hr = HRESULT_FROM_WIN32( GetLastError() );
-        if (exists( backup ) && !exists( final )) MoveFileW( backup, final );
+        if (exists( backup ) && !exists( final )) move_dir( backup, final );
     }
     else remove_tree( backup );
     free( backup );
@@ -1268,4 +1311,14 @@ HRESULT CDECL appx_latest( const WCHAR *appinstaller, WCHAR **version )
 void CDECL appx_free( void *ptr )
 {
     free( ptr );
+}
+
+BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
+{
+    if (reason == DLL_PROCESS_ATTACH)
+    {
+        DisableThreadLibraryCalls( instance );
+        if (__wine_init_unix_call()) ERR( "no Unix side: renames of a running app's stage will fail\n" );
+    }
+    return TRUE;
 }

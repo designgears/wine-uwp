@@ -316,6 +316,15 @@ if [ -f "$UWPDLL" ] && [ -f "$SYS32/wineuwp.dll" ] && ! cmp -s "$UWPDLL" "$SYS32
   echo "refreshed: stale wineuwp.dll in the prefix"
 fi
 
+# appxinstall.dll (the package installer the Gaming Services and AppInstallManager stand-ins load) is
+# newer than most prefixes: a builtin with no file in system32 is not found (LoadLibrary error 126)
+# until a prefix update, which nothing triggers for a new module. Put it there, and keep it in step.
+AXDLL=$(wine_pe appxinstall)
+if [ -f "$AXDLL" ] && ! cmp -s "$AXDLL" "$SYS32/appxinstall.dll"; then
+  cp -f --reflink=auto "$AXDLL" "$SYS32/appxinstall.dll"
+  echo "refreshed: appxinstall.dll in the prefix"
+fi
+
 # api-ms-win-appmodel-runtime-l1-1-1.dll: forwards the apiset to kernelbase plus the one function
 # Wine lacks. Resolved by name at load time, so it only has to exist in system32.
 AMR=${SHIM_DIR}/api-ms-win-appmodel-runtime-l1-1-1.dll
