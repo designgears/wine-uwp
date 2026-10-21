@@ -6,8 +6,10 @@
  *   wineuwp-install PACKAGE [DATADIR] --info [--windows TREE] [--icon OUT]
  *   wineuwp-install APPINSTALLER --latest
  *
- * PACKAGE is a file or an http(s) URL; paths may be Unix paths. Progress goes to stdout as lines: "PID <pid>",
- * "STAGE <what>", "PROGRESS <done> <total>", other messages as they are, and "INSTALLED <stage>" last on success.
+ * PACKAGE is a file, an http(s) URL, or an installed package's directory (Program Files\WindowsApps\<full name> of a
+ * Windows installation, as stage-app.sh staged them); paths may be Unix paths. Progress goes to stdout as lines:
+ * "PID <pid>", "STAGE <what>", "PROGRESS <done> <total>", other messages as they are, and "INSTALLED <stage>" last on
+ * success.
  * Exit status 0 on success, 1 on failure (the reason on stderr), 143 when cancelled.
  *
  * Copyright 2026 wine-uwp contributors

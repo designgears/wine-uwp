@@ -13143,3 +13143,16 @@ calls `wine wineuwp-setup --windows WIN11 --build WINE_BUILD --data REPO [--webv
   bring Calculator up on `prefix-test` with either version (Port-to-C, run.sh row).
 - **Not ported in this step:** `fasthive.py` itself stays (used by `gen-classes-reg.py` and `gen-interfaces-reg.py`,
   which `new-prefix.sh` runs, and by the investigation tools). Copies are `CopyFileW`, not reflinks.
+
+## 2026-10-21: Scripts to C - `stage-app.sh` -> appxinstall installs from a directory
+
+`stage-app.sh` copied an installed package from a mounted Windows partition's WindowsApps into a stage, added three
+frameworks' DLLs and wrote `identity.env`. appxinstall now takes such a directory as a package (`package.c`: the
+directory's files, in name order, are its members), so `wine wineuwp-install DIR uwp-bin --windows uwp-bin/win11`
+stages it the way it installs any package. Check: Calculator installed from `Calculator_0.365.1.0_x64.msix` and from
+that file unzipped; `diff -r` of the two stages differs only in the data directory `launch.env` names, and the
+directory install starts to its Standard page on `:97` (`docs/screenshots/calculator-from-installed-dir.png`).
+
+The first comparison differed in `.wine-uwp-icon.png`: `pick_logo` ranks (unplated, size, plain) and takes the first of
+equals, which in the zip's order was `targetsize-256_altform-unplated_contrast-white.png` - the high-contrast icon.
+It now passes over `contrast-` variants unless nothing else matches; both installs pick the plain unplated icon.

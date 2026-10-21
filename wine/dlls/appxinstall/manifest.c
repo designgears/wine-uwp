@@ -198,7 +198,7 @@ static unsigned int qualifier_size( const WCHAR *q )
 int pick_logo( const struct package *pkg, const WCHAR *logo )
 {
     WCHAR *base, *ext;
-    int best = -1, best_unplated = 0, best_plain = 0;
+    int best = -1, best_normal = 0, best_unplated = 0, best_plain = 0;
     unsigned int i, best_size = 0;
     size_t blen, elen;
 
@@ -213,7 +213,7 @@ int pick_logo( const struct package *pkg, const WCHAR *logo )
         WCHAR *low = strdupW( package_name( pkg, i ) ), *quals;
         size_t len;
         unsigned int size;
-        int unplated, plain;
+        int normal, unplated, plain;
 
         if (!low) continue;
         _wcslwr( low );
@@ -229,11 +229,14 @@ int pick_logo( const struct package *pkg, const WCHAR *logo )
         size = qualifier_size( quals );
         unplated = size >= 256 && wcsstr( quals, L"unplated" ) && !wcsstr( quals, L"lightunplated" );
         plain = !*quals;
-        /* the Python picked max((unplated, size, plain)) */
-        if (best < 0 || unplated > best_unplated || (unplated == best_unplated &&
-            (size > best_size || (size == best_size && plain > best_plain))))
+        /* high-contrast variants only when there is nothing else: the Python's max((unplated, size, plain)) took the
+         * first of equals in zip order, which for Calculator was the white-on-black contrast icon */
+        normal = !wcsstr( quals, L"contrast-" );
+        if (best < 0 || normal > best_normal || (normal == best_normal && (unplated > best_unplated ||
+            (unplated == best_unplated && (size > best_size || (size == best_size && plain > best_plain))))))
         {
             best = i;
+            best_normal = normal;
             best_unplated = unplated;
             best_size = size;
             best_plain = plain;

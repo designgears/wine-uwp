@@ -23,7 +23,8 @@ if [ -x "$WINE_BUILD/wine" ]; then export PATH="$WINE_BUILD:$PATH"; fi
 wineserver -k 2>/dev/null
 
 "$(dirname "$0")/install-overrides.sh" >/dev/null
-# UWP_STAGE names a directory under ${UWP_BIN}/stage (see stage-app.sh).
+# UWP_STAGE names a directory under ${UWP_BIN}/stage (an install by Wine's wineuwp-install, from a package file or an
+# installed package's directory).
 S=${UWP_BIN}/stage/${UWP_STAGE:-calculator}
 # Where an app that installs others (the Xbox app, through winegameplatform and appxinstall.dll) puts them, and the
 # Windows files the frameworks come from.

@@ -39,6 +39,9 @@ struct package
     struct eappx *eappx;        /* or an encrypted package's */
     WCHAR *temp;                /* a bundle's package extracted here, deleted on close */
     WCHAR **names;              /* member names, percent-decoded, '/'-separated */
+    WCHAR *dir;                 /* or an unpacked package: a directory with its AppxManifest.xml */
+    UINT64 *sizes;              /* the directory's files' sizes */
+    unsigned int count;         /* and their number */
 };
 
 /* package zips percent-encode names ("%20" for a space) over UTF-8; [Content_Types].xml is stored literally */
@@ -135,14 +138,123 @@ static HRESULT open_bundle_package( struct package *pkg, const WCHAR *temp_dir )
     }
 }
 
+static const struct package *sort_pkg;   /* qsort has no context argument */
+
+/* the files under dir, relative and '/'-separated, as package members */
+static BOOL list_dir( struct package *pkg, const WCHAR *dir, const WCHAR *rel )
+{
+    WIN32_FIND_DATAW fd;
+    WCHAR *pattern = path_join( dir, L"*" );
+    HANDLE find;
+    BOOL ok = TRUE;
+
+    if (!pattern) return FALSE;
+    find = FindFirstFileW( pattern, &fd );
+    free( pattern );
+    if (find == INVALID_HANDLE_VALUE) return TRUE;
+    do
+    {
+        WCHAR *name, *sub;
+        size_t len;
+
+        if (!wcscmp( fd.cFileName, L"." ) || !wcscmp( fd.cFileName, L".." )) continue;
+        len = (rel ? wcslen( rel ) + 1 : 0) + wcslen( fd.cFileName ) + 1;
+        if (!(name = malloc( len * sizeof(WCHAR) ))) { ok = FALSE; break; }
+        swprintf( name, len, L"%s%s%s", rel ? rel : L"", rel ? L"/" : L"", fd.cFileName );
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            ok = (sub = path_join( dir, fd.cFileName )) && list_dir( pkg, sub, name );
+            free( sub );
+            free( name );
+            if (!ok) break;
+            continue;
+        }
+        if (!(pkg->count % 256))
+        {
+            WCHAR **names = realloc( pkg->names, (pkg->count + 257) * sizeof(*names) );
+            UINT64 *sizes = realloc( pkg->sizes, (pkg->count + 257) * sizeof(*sizes) );
+            if (names) pkg->names = names;
+            if (sizes) pkg->sizes = sizes;
+            if (!names || !sizes) { free( name ); ok = FALSE; break; }
+        }
+        pkg->sizes[pkg->count] = ((UINT64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        pkg->names[pkg->count++] = name;
+        pkg->names[pkg->count] = NULL;
+    } while (FindNextFileW( find, &fd ));
+    FindClose( find );
+    return ok;
+}
+
+static int __cdecl compare_member( const void *a, const void *b )
+{
+    const struct package *pkg = sort_pkg;
+    unsigned int i = *(const unsigned int *)a, j = *(const unsigned int *)b;
+    return wcscmp( pkg->names[i], pkg->names[j] );
+}
+
+/* in name order, so that what is picked among equals (the logo) does not depend on the directory's order */
+static BOOL sort_members( struct package *pkg )
+{
+    unsigned int *order, i;
+    WCHAR **names;
+    UINT64 *sizes;
+
+    if (pkg->count < 2) return TRUE;
+    order = malloc( pkg->count * sizeof(*order) );
+    names = malloc( (pkg->count + 1) * sizeof(*names) );
+    sizes = malloc( pkg->count * sizeof(*sizes) );
+    if (!order || !names || !sizes) { free( order ); free( names ); free( sizes ); return FALSE; }
+    for (i = 0; i < pkg->count; i++) order[i] = i;
+    sort_pkg = pkg;
+    qsort( order, pkg->count, sizeof(*order), compare_member );
+    for (i = 0; i < pkg->count; i++)
+    {
+        names[i] = pkg->names[order[i]];
+        sizes[i] = pkg->sizes[order[i]];
+    }
+    names[pkg->count] = NULL;
+    free( pkg->names );
+    free( pkg->sizes );
+    pkg->names = names;
+    pkg->sizes = sizes;
+    free( order );
+    return TRUE;
+}
+
+/* an installed package's directory, as Windows unpacks it under WindowsApps */
+static HRESULT open_dir( const WCHAR *path, struct package *pkg )
+{
+    WCHAR *manifest = path_join( path, L"AppxManifest.xml" );
+    DWORD attrs = manifest ? GetFileAttributesW( manifest ) : INVALID_FILE_ATTRIBUTES;
+
+    free( manifest );
+    if (attrs == INVALID_FILE_ATTRIBUTES)
+    {
+        ERR( "%s has no AppxManifest.xml\n", debugstr_w(path) );
+        return HRESULT_FROM_WIN32( ERROR_BAD_FORMAT );
+    }
+    if (!(pkg->dir = strdupW( path ))) return E_OUTOFMEMORY;
+    if (!list_dir( pkg, path, NULL ) || !sort_members( pkg )) return E_OUTOFMEMORY;
+    TRACE( "%s: %u files\n", debugstr_w(path), pkg->count );
+    return S_OK;
+}
+
 HRESULT package_open( const WCHAR *path, const struct appx_install_params *params, const WCHAR *temp_dir,
                       struct package **out )
 {
     struct package *pkg;
     unsigned int i;
+    DWORD attrs;
     HRESULT hr;
 
     if (!(pkg = calloc( 1, sizeof(*pkg) ))) return E_OUTOFMEMORY;
+    if (!is_url( path ) && (attrs = GetFileAttributesW( path )) != INVALID_FILE_ATTRIBUTES &&
+        (attrs & FILE_ATTRIBUTE_DIRECTORY))
+    {
+        if (FAILED(hr = open_dir( path, pkg ))) goto fail;
+        *out = pkg;
+        return S_OK;
+    }
     if (FAILED(hr = source_open( path, params, &pkg->outer ))) goto fail;
     if (FAILED(hr = eappx_open( pkg->outer, params, &pkg->eappx ))) goto fail;
     if (hr == S_FALSE && FAILED(hr = xvd_open( pkg->outer, params, &pkg->xvd ))) goto fail;
@@ -185,18 +297,21 @@ struct xvd *package_xvd( const struct package *pkg )
 
 unsigned int package_count( const struct package *pkg )
 {
+    if (pkg->dir) return pkg->count;
     if (pkg->eappx) return eappx_count( pkg->eappx );
     return pkg->xvd ? xvd_count( pkg->xvd ) : zip_count( pkg->zip );
 }
 
 const WCHAR *package_name( const struct package *pkg, unsigned int index )
 {
+    if (pkg->dir) return pkg->names[index];
     if (pkg->eappx) return eappx_name( pkg->eappx, index );
     return pkg->xvd ? xvd_name( pkg->xvd, index ) : pkg->names[index];
 }
 
 UINT64 package_size( const struct package *pkg, unsigned int index )
 {
+    if (pkg->dir) return pkg->sizes[index];
     if (pkg->eappx) return eappx_size( pkg->eappx, index );
     return pkg->xvd ? xvd_size( pkg->xvd, index ) : zip_entry( pkg->zip, index )->size;
 }
@@ -216,9 +331,39 @@ int package_find( const struct package *pkg, const WCHAR *name )
     return -1;
 }
 
+static HRESULT extract_file( const struct package *pkg, unsigned int index,
+                             BOOL (*write)( void *context, const BYTE *data, ULONG size ), void *context )
+{
+    WCHAR *path = path_join( pkg->dir, pkg->names[index] ), *p;
+    static const ULONG chunk = 1 << 20;
+    HRESULT hr = S_OK;
+    HANDLE file;
+    BYTE *buf;
+    DWORD got;
+
+    if (!path || !(buf = malloc( chunk ))) { free( path ); return E_OUTOFMEMORY; }
+    for (p = path; *p; p++) if (*p == '/') *p = '\\';
+    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+    free( path );
+    if (file == INVALID_HANDLE_VALUE) hr = HRESULT_FROM_WIN32( GetLastError() );
+    else
+    {
+        while (SUCCEEDED(hr))
+        {
+            if (!ReadFile( file, buf, chunk, &got, NULL )) hr = HRESULT_FROM_WIN32( GetLastError() );
+            else if (!got) break;
+            else if (!write( context, buf, got )) hr = HRESULT_FROM_WIN32( ERROR_WRITE_FAULT );
+        }
+        CloseHandle( file );
+    }
+    free( buf );
+    return hr;
+}
+
 HRESULT package_extract( const struct package *pkg, unsigned int index,
                          BOOL (*write)( void *context, const BYTE *data, ULONG size ), void *context )
 {
+    if (pkg->dir) return extract_file( pkg, index, write, context );
     if (pkg->eappx) return eappx_extract( pkg->eappx, index, write, context );
     if (pkg->xvd) return xvd_extract( pkg->xvd, index, write, context );
     return zip_extract( pkg->zip, zip_entry( pkg->zip, index ), write, context );
@@ -240,7 +385,7 @@ HRESULT package_read( const struct package *pkg, unsigned int index, BYTE **data
     struct buffer b = { 0 };
     HRESULT hr;
 
-    if (!pkg->xvd && !pkg->eappx) return zip_read( pkg->zip, zip_entry( pkg->zip, index ), data, size );
+    if (!pkg->xvd && !pkg->eappx && !pkg->dir) return zip_read( pkg->zip, zip_entry( pkg->zip, index ), data, size );
     if (package_size( pkg, index ) > 64u << 20) return HRESULT_FROM_WIN32( ERROR_FILE_TOO_LARGE );
     b.capacity = package_size( pkg, index );
     if (!(b.data = malloc( b.capacity + 1 ))) return E_OUTOFMEMORY;
@@ -265,6 +410,8 @@ void package_close( struct package *pkg )
         for (i = 0; pkg->names[i]; i++) free( pkg->names[i] );
         free( pkg->names );
     }
+    free( pkg->dir );
+    free( pkg->sizes );
     xvd_close( pkg->xvd );
     eappx_close( pkg->eappx );
     if (pkg->zip != pkg->bundle) zip_close( pkg->zip );

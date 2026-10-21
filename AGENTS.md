@@ -17,7 +17,7 @@ environment:
 
 | Path | What |
 | --- | --- |
-| `run.sh`, `install-overrides.sh`, `stage-app.sh` | launching and prefix setup: thin host-side wrappers over Wine's `programs/wineuwp-launch` and `programs/wineuwp-setup` (`wine/programs/`) |
+| `run.sh`, `install-overrides.sh` | launching and prefix setup: thin host-side wrappers over Wine's `programs/wineuwp-launch` and `programs/wineuwp-setup` (`wine/programs/`). A package is staged with `wine wineuwp-install PACKAGE uwp-bin --windows uwp-bin/win11 [--stage NAME]`, where PACKAGE may be a file, a URL or an installed package's directory (`/mnt/win/Program Files/WindowsApps/<full name>`, which `stage-app.sh` used to copy) |
 | `shims/`, `probes/`, `CMakeLists.txt` | the WinRT stand-ins and the diagnostic probes |
 | `*.py` | the investigation toolkit (`xref.py`, `winmd.py`, `piid.py`, `fasthive.py`, ...) |
 | `wine/` | **our Wine source**, vendored in full by `sync-wine.sh` - 196 files, +49k lines vs upstream |
@@ -194,7 +194,7 @@ silently break if it moves again. All of these bit me during the move out of the
   until the rebuild finishes.
 - **`identity.env` in a stage directory must not contain `WINE_UWP_PACKAGE_PATH`.** `wineuwp-launch` (formerly
   `run.sh`) reads that file, so a stale value there would win over the computed one. The launcher always computes
-  it from the stage directory and `stage-app.sh` does not write it.
+  it from the stage directory and the installer does not write it.
 
 **`info[0]=0x8007007B` in an exception record is `ERROR_INVALID_NAME`** - "the filename, directory
 name, or volume label syntax is incorrect". It means a path is *malformed*, not missing, which is a
