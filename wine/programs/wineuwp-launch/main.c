@@ -19,26 +19,35 @@
  */
 
 /*
- * The way any Wine launcher (a desktop entry, Lutris) runs a Windows program. run.sh does the same from the host side,
- * but a launcher that only knows "run this exe in this prefix" cannot run a shell script first, so the steps that make
- * a package start happen here, from the stage directory this program sits in (the installer copies it there):
+ * The way any Wine launcher (a desktop entry, Lutris) runs a Windows program, and the way run.sh starts a staged app
+ * for testing. The steps that make a package start happen here, from the stage directory this program sits in (the
+ * installer copies it there) or the one named by --stage:
  *
  *   1. the package identity: identity.env, "export NAME=VALUE" lines, becomes the environment. Wine reads
  *      WINE_UWP_PACKAGE_FULL_NAME and friends from it, and a child's Unix environment follows its Windows block.
- *   2. launch.env, same format: the rest of what run.sh exports (DLL overrides, the framework search path, renderer).
- *      WINE_UWP_PACKAGE_PATH is this directory. Values are literal: nothing is expanded.
+ *   2. launch.env, same format: the rest of what an installed app needs (DLL overrides, the framework search path,
+ *      renderer). WINE_UWP_PACKAGE_PATH is the stage directory. Values are literal: nothing is expanded.
+ *      With --defaults FILE (run.sh) that file is read instead, where a variable already in the environment wins,
+ *      and the framework dependencies come from the frameworks directory beside the stage: a test run controls
+ *      its environment, as run.sh always let it.
  *   3. the per-package AppContainer storage key Windows.Globalization writes to (without it the first launch dies
  *      with 0x80070032).
  *   4. CoreMessagingRegistrar started and RUNNING: CoreMessaging.dll waits for it before the first CoreDispatcher.
- *   5. the app, from this directory, with this process's command line tail; its exit code is ours.
+ *   5. the app (UWP_EXE, or --exe), from the stage directory, with the rest of the command line; its exit code is
+ *      ours.
  *
- * Failures are shown in a message box: a launcher started from a menu has no console.
+ *   wineuwp-launch.exe [--stage DIR] [--defaults FILE] [--graphics DRIVER] [--exe EXE] [args...]
+ *
+ * --graphics sets HKCU\Software\Wine\Drivers\Graphics, which has no environment override; run.sh pins x11 so a
+ * test cannot land on the desktop compositor. Failures are shown in a message box (a launcher started from a menu
+ * has no console) and written to stderr.
  */
 
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wctype.h>
 
 #include "windef.h"
 #include "winbase.h"
@@ -48,6 +57,7 @@
 #include "winuser.h"
 
 static WCHAR dir[MAX_PATH];
+static BOOL quiet;   /* started by run.sh: report on stderr, no message box */
 
 static void fail( const WCHAR *format, ... )
 {
@@ -57,7 +67,8 @@ static void fail( const WCHAR *format, ... )
     va_start( args, format );
     vswprintf( text, ARRAY_SIZE(text), format, args );
     va_end( args );
-    MessageBoxW( NULL, text, L"wine-uwp", MB_OK | MB_ICONERROR );
+    fprintf( stderr, "wineuwp-launch: %ls\n", text );
+    if (!quiet) MessageBoxW( NULL, text, L"wine-uwp", MB_OK | MB_ICONERROR );
 }
 
 static WCHAR *widen( const char *s, int len )
@@ -72,16 +83,15 @@ static WCHAR *widen( const char *s, int len )
     return w;
 }
 
-/* "export NAME=VALUE" / "NAME=VALUE" lines; single or double quotes around VALUE are removed; # starts a comment */
-static BOOL load_env_file( const WCHAR *name, BOOL required )
+/* "export NAME=VALUE" / "NAME=VALUE" lines; single or double quotes around VALUE are removed; # starts a comment.
+ * With keep, a variable already set is left alone. */
+static BOOL load_env_path( const WCHAR *path, BOOL required, BOOL keep )
 {
-    WCHAR path[MAX_PATH];
     char *data, *line, *next;
     LARGE_INTEGER size;
     DWORD got = 0;
     HANDLE file;
 
-    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", dir, name );
     file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
     if (file == INVALID_HANDLE_VALUE)
     {
@@ -119,12 +129,127 @@ static BOOL load_env_file( const WCHAR *name, BOOL required )
         }
         wname = widen( line, -1 );
         wvalue = widen( value, -1 );
-        if (wname && wvalue) SetEnvironmentVariableW( wname, wvalue );
+        if (wname && wvalue && !(keep && GetEnvironmentVariableW( wname, NULL, 0 ))) SetEnvironmentVariableW( wname, wvalue );
         free( wname );
         free( wvalue );
     }
     free( data );
     return TRUE;
+}
+
+static BOOL load_env_file( const WCHAR *name, BOOL required )
+{
+    WCHAR path[MAX_PATH];
+
+    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", dir, name );
+    return load_env_path( path, required, FALSE );
+}
+
+static WCHAR *env( const WCHAR *name )
+{
+    DWORD n = GetEnvironmentVariableW( name, NULL, 0 );
+    WCHAR *value;
+
+    if (!n || !(value = malloc( n * sizeof(WCHAR) ))) return NULL;
+    GetEnvironmentVariableW( name, value, n );
+    return value;
+}
+
+static BOOL file_exists( const WCHAR *name )
+{
+    WCHAR path[MAX_PATH];
+
+    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", dir, name );
+    return GetFileAttributesW( path ) != INVALID_FILE_ATTRIBUTES;
+}
+
+static void append( WCHAR **str, const WCHAR *part )
+{
+    size_t len = *str ? wcslen( *str ) : 0;
+    WCHAR *grown = realloc( *str, (len + wcslen( part ) + 1) * sizeof(WCHAR) );
+
+    if (!grown) return;
+    wcscpy( grown + len, part );
+    *str = grown;
+}
+
+/* The order a host glob lists them in (glibc's collation): letters and digits first, ignoring case and
+ * punctuation, so Microsoft.VCLibs.140.00_14.0... comes before Microsoft.VCLibs.140.00.UWPDesktop_14.0.... */
+static int __cdecl compare_names( const void *a, const void *b )
+{
+    const WCHAR *x = *(const WCHAR **)a, *y = *(const WCHAR **)b;
+
+    for (;;)
+    {
+        while (*x && !iswalnum( *x )) x++;
+        while (*y && !iswalnum( *y )) y++;
+        if (!*x || !*y || towlower( *x ) != towlower( *y )) break;
+        x++;
+        y++;
+    }
+    if (*x || *y) return (int)towlower( *x ) - (int)towlower( *y );
+    return wcscmp( *(const WCHAR **)a, *(const WCHAR **)b );
+}
+
+/* What the installer writes into launch.env for an installed app, for a stage beside a frameworks directory:
+ * WINE_UWP_PACKAGE_DEPENDENCIES ("fullname|family|path;" each, which GetCurrentPackageInfo returns after the main
+ * package) unless set, and every framework root appended to WINEPATH, as Windows adds the package graph to the
+ * search path. In the order of the host's sorted directory listing, as run.sh's glob gave them. */
+static void add_frameworks(void)
+{
+    WCHAR pattern[MAX_PATH], root[MAX_PATH], item[1024], *deps = NULL, *path, *slash, **names = NULL, **grown;
+    WIN32_FIND_DATAW data;
+    const WCHAR *name, *publisher;
+    BOOL have_deps = GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_DEPENDENCIES", NULL, 0 ) > 0;
+    unsigned int count = 0, i;
+    HANDLE find;
+
+    wcscpy( root, dir );
+    if (!(slash = wcsrchr( root, '\\' ))) return;
+    wcscpy( slash + 1, L"frameworks" );
+    swprintf( pattern, ARRAY_SIZE(pattern), L"%s\\*", root );
+    if ((find = FindFirstFileW( pattern, &data )) == INVALID_HANDLE_VALUE) return;
+    do
+    {
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || data.cFileName[0] == '.') continue;
+        if (!(grown = realloc( names, (count + 1) * sizeof(*names) ))) break;
+        names = grown;
+        names[count++] = wcsdup( data.cFileName );
+    } while (FindNextFileW( find, &data ));
+    FindClose( find );
+    qsort( names, count, sizeof(*names), compare_names );
+
+    path = env( L"WINEPATH" );
+    for (i = 0; i < count; i++)
+    {
+        name = names[i];
+        publisher = wcsstr( name, L"__" );
+        swprintf( item, ARRAY_SIZE(item), L"%s|%.*s_%s|%s\\%s;", name, (int)wcscspn( name, L"_" ), name,
+                  publisher ? publisher + 2 : L"", root, name );
+        append( &deps, item );
+        /* WINEPATH is a host list, as run.sh exported it: Z:\a\b is /a/b */
+        swprintf( item, ARRAY_SIZE(item), L"%s%s\\%s", path && *path ? L":" : L"", root, name );
+        for (slash = item; *slash; slash++) if (*slash == '\\') *slash = '/';
+        if ((slash = wcsstr( item, L"Z:/" )) || (slash = wcsstr( item, L"z:/" )))
+            memmove( slash, slash + 2, (wcslen( slash + 2 ) + 1) * sizeof(WCHAR) );
+        append( &path, item );
+        free( names[i] );
+    }
+    free( names );
+    if (deps && !have_deps) SetEnvironmentVariableW( L"WINE_UWP_PACKAGE_DEPENDENCIES", deps );
+    if (path) SetEnvironmentVariableW( L"WINEPATH", path );
+    free( deps );
+    free( path );
+}
+
+static void set_graphics_driver( const WCHAR *driver )
+{
+    HKEY key;
+
+    if (RegCreateKeyExW( HKEY_CURRENT_USER, L"Software\\Wine\\Drivers", 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL ))
+        return;
+    RegSetValueExW( key, L"Graphics", 0, REG_SZ, (const BYTE *)driver, (wcslen( driver ) + 1) * sizeof(WCHAR) );
+    RegCloseKey( key );
 }
 
 static void ensure_appcontainer_key( const WCHAR *family )
@@ -158,48 +283,89 @@ static void start_coremessaging(void)
     CloseServiceHandle( scm );
 }
 
-/* the command line after our own executable name, to pass through to the app */
-static const WCHAR *args_tail(void)
+/* One argument from *p, unquoted, into out; *p moves past it and the blanks after it. */
+static BOOL next_arg( const WCHAR **p, WCHAR *out, size_t size )
 {
-    const WCHAR *p = GetCommandLineW();
+    const WCHAR *s = *p;
+    size_t n = 0;
+    BOOL quoted = FALSE;
 
-    if (*p == '"')
+    if (!*s) return FALSE;
+    while (*s && (quoted || (*s != ' ' && *s != '\t')))
     {
-        p = wcschr( p + 1, '"' );
-        p = p ? p + 1 : L"";
+        if (*s == '"') quoted = !quoted;
+        else if (n + 1 < size) out[n++] = *s;
+        s++;
     }
-    else while (*p && *p != ' ' && *p != '\t') p++;
-    while (*p == ' ' || *p == '\t') p++;
-    return p;
+    out[n] = 0;
+    while (*s == ' ' || *s == '\t') s++;
+    *p = s;
+    return TRUE;
 }
 
-static WCHAR *env( const WCHAR *name )
+/* A Unix path (/a/b) as the Windows one Wine maps it to (Z:\a\b); a Windows path as it is. */
+static void to_windows_path( WCHAR *path, size_t size )
 {
-    DWORD n = GetEnvironmentVariableW( name, NULL, 0 );
-    WCHAR *value;
+    WCHAR *p;
 
-    if (!n || !(value = malloc( n * sizeof(WCHAR) ))) return NULL;
-    GetEnvironmentVariableW( name, value, n );
-    return value;
+    if (path[0] == '/' && wcslen( path ) + 3 < size)
+    {
+        memmove( path + 2, path, (wcslen( path ) + 1) * sizeof(WCHAR) );
+        path[0] = 'Z';
+        path[1] = ':';
+    }
+    for (p = path; *p; p++) if (*p == '/') *p = '\\';
 }
 
 int WINAPI wWinMain( HINSTANCE instance, HINSTANCE prev, WCHAR *cmdline, int show )
 {
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi;
+    WCHAR arg[MAX_PATH], defaults[MAX_PATH] = L"", graphics[64] = L"", exe_arg[MAX_PATH] = L"";
     WCHAR *exe, *family, *path, *command, *p, *slash;
-    const WCHAR *tail;
+    const WCHAR *tail = GetCommandLineW(), *rest;
+    BOOL staged = FALSE;
     DWORD code = 0;
     size_t len;
 
     GetModuleFileNameW( NULL, dir, ARRAY_SIZE(dir) );
     if ((slash = wcsrchr( dir, '\\' ))) *slash = 0;
 
-    if (!load_env_file( L"identity.env", TRUE )) return 1;
-    load_env_file( L"launch.env", FALSE );
-    SetEnvironmentVariableW( L"WINE_UWP_PACKAGE_PATH", dir );
+    next_arg( &tail, arg, ARRAY_SIZE(arg) );   /* our own name */
+    for (rest = tail; next_arg( &rest, arg, ARRAY_SIZE(arg) ); tail = rest)
+    {
+        WCHAR *value = NULL;
+        size_t size = MAX_PATH;
 
-    if (!(exe = env( L"UWP_EXE" )) || !*exe)
+        if (!wcscmp( arg, L"--stage" )) value = dir;
+        else if (!wcscmp( arg, L"--defaults" )) value = defaults;
+        else if (!wcscmp( arg, L"--graphics" )) { value = graphics; size = ARRAY_SIZE(graphics); }
+        else if (!wcscmp( arg, L"--exe" )) value = exe_arg;
+        else break;
+        if (!next_arg( &rest, value, size ))
+        {
+            fail( L"%s needs a value", arg );
+            return 1;
+        }
+        if (value != graphics) to_windows_path( value, size );
+        if (value == dir) staged = quiet = TRUE;
+    }
+
+    /* a stage of stage-app.sh's may have no identity.env when the defaults are the whole identity */
+    if (!load_env_file( L"identity.env", !staged )) return 1;
+    if (!*defaults) load_env_file( L"launch.env", FALSE );
+    else
+    {
+        load_env_path( defaults, TRUE, TRUE );
+        add_frameworks();
+    }
+    SetEnvironmentVariableW( L"WINE_UWP_PACKAGE_PATH", dir );
+    /* EOS's Linux bootstrapper issues native Linux syscalls from its high-address helper */
+    if (file_exists( L"EasyAntiCheat\\Settings.json" ) && !GetEnvironmentVariableW( L"WINE_HACK_NATIVE_SYSCALLS", NULL, 0 ))
+        SetEnvironmentVariableW( L"WINE_HACK_NATIVE_SYSCALLS", L"1" );
+
+    exe = *exe_arg ? wcsdup( exe_arg ) : env( L"UWP_EXE" );
+    if (!exe || !*exe)
     {
         fail( L"identity.env names no UWP_EXE" );
         return 1;
@@ -208,14 +374,15 @@ int WINAPI wWinMain( HINSTANCE instance, HINSTANCE prev, WCHAR *cmdline, int sho
     family = env( L"WINE_UWP_PACKAGE_FAMILY_NAME" );
     ensure_appcontainer_key( family );
     free( family );
+    if (*graphics) set_graphics_driver( graphics );
     start_coremessaging();
 
-    tail = args_tail();
     len = wcslen( dir ) + wcslen( exe ) + 2;
     path = malloc( len * sizeof(WCHAR) );
     command = malloc( (len + wcslen( tail ) + 4) * sizeof(WCHAR) );
     if (!path || !command) return 1;
-    swprintf( path, len, L"%s\\%s", dir, exe );
+    if (exe[0] == '\\' || (exe[0] && exe[1] == ':')) wcscpy( path, exe );
+    else swprintf( path, len, L"%s\\%s", dir, exe );
     swprintf( command, len + wcslen( tail ) + 4, *tail ? L"\"%s\" %s" : L"\"%s\"", path, tail );
 
     if (!CreateProcessW( path, command, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, dir, &si, &pi ))
