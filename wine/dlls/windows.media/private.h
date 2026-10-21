@@ -96,6 +96,23 @@ extern IActivationFactory *media_transcoder_factory;
 extern IActivationFactory *media_source_factory;
 extern IActivationFactory *playback_item_factory;
 extern IActivationFactory *media_binder_factory;
+extern IActivationFactory *timed_text_source_factory;
+
+extern HRESULT timed_text_source_vector_create( IInspectable **out );
+extern void timed_text_source_vector_resolve( IInspectable *vector );
+extern HRESULT timed_text_track_list_create( HSTRING language, IInspectable **out );
+
+/* A TypedEventHandler<A*, B*> is a delegate: three IUnknown slots and Invoke. We only ever call
+ * the pointer the app registered, never ask anyone for this interface, so it needs no IID. */
+typedef struct IWineEventHandler IWineEventHandler;
+struct IWineEventHandlerVtbl
+{
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)( IWineEventHandler *, REFIID, void ** );
+    ULONG (STDMETHODCALLTYPE *AddRef)( IWineEventHandler * );
+    ULONG (STDMETHODCALLTYPE *Release)( IWineEventHandler * );
+    HRESULT (STDMETHODCALLTYPE *Invoke)( IWineEventHandler *, void *sender, void *args );
+};
+struct IWineEventHandler { const struct IWineEventHandlerVtbl *lpVtbl; };
 
 /* windows.media.core.idl does not define this name, and MediaSource is activated by it. */
 static const WCHAR RuntimeClass_Windows_Media_Core_MediaSource[] = L"Windows.Media.Core.MediaSource";

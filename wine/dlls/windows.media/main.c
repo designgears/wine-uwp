@@ -55,6 +55,9 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **fac
     if (!wcscmp( buffer, RuntimeClass_Windows_Media_Transcoding_MediaTranscoder ))
         IActivationFactory_QueryInterface( media_transcoder_factory, &IID_IActivationFactory, (void **)factory );
 
+    if (!wcscmp( buffer, L"Windows.Media.Core.TimedTextSource" ))
+        IActivationFactory_QueryInterface( timed_text_source_factory, &IID_IActivationFactory, (void **)factory );
+
     if (*factory) return S_OK;
     return CLASS_E_CLASSNOTAVAILABLE;
 }

@@ -79,6 +79,19 @@ static const struct track_list_kind metadata_kind =
     2 /* MediaTrackKind_TimedMetadata */, FALSE, FALSE,
 };
 
+/* What a TimedTextSource's Resolved hands back in its args: a plain IVectorView over the one
+ * TimedMetadataTrack parsed from the file. Shapr3D labels Tracks[0] in its Resolved handler, so
+ * the view cannot be empty. */
+static const struct track_list_kind timed_text_kind =
+{
+    L"Windows.Foundation.Collections.IVectorView`1<Windows.Media.Core.TimedMetadataTrack>",
+    L"Windows.Media.Core.TimedMetadataTrack",
+    {0x9fd7f588,0x6a85,0x516f,{0xbd,0xcb,0xdc,0xb2,0xca,0xc1,0x1f,0x2e}},
+    {0x74d8d19e,0x63e3,0x53e1,{0x9b,0x4f,0x83,0x93,0xeb,0xaf,0x75,0x7e}},
+    {0x1bce7131,0x4d00,0x5fa5,{0xac,0x6b,0x51,0x2d,0xce,0xdc,0x37,0x39}},
+    2 /* MediaTrackKind_TimedMetadata */, FALSE, TRUE,
+};
+
 /* ---------------------------------------------------------------- AudioTrack */
 
 struct audio_track
@@ -87,6 +100,7 @@ struct audio_track
     IAudioTrackInternal IAudioTrackInternal_iface;
     LONG ref;
     HSTRING label;
+    HSTRING language;
     const struct track_list_kind *kind;
     /* The item owns the list which owns the track, so this is deliberately not a reference. */
     IInspectable *item;
@@ -114,7 +128,7 @@ static HRESULT WINAPI audio_track_QueryInterface( IMediaTrackInternal *iface, RE
         return S_OK;
     }
 
-    if (IsEqualGUID( iid, &IID_IAudioTrackInternal ))
+    if (IsEqualGUID( iid, &IID_IAudioTrackInternal ) && impl->kind->track_kind == 0 /* Audio */)
     {
         IInspectable_AddRef( (*out = (IInspectable *)&impl->IAudioTrackInternal_iface) );
         return S_OK;
@@ -138,6 +152,7 @@ static ULONG WINAPI audio_track_Release( IMediaTrackInternal *iface )
     if (!ref)
     {
         WindowsDeleteString( impl->label );
+        WindowsDeleteString( impl->language );
         free( impl );
     }
     return ref;
@@ -169,14 +184,14 @@ static HRESULT WINAPI audio_track_get_Id( IMediaTrackInternal *iface, HSTRING *v
     return WindowsCreateString( L"0", 1, value );
 }
 
-/* Nothing is demuxed, so the language is genuinely unknown. An empty string is what a track with
- * no language tag reports, which is a case every player already handles. */
+/* Nothing is demuxed, so a media track's language is genuinely unknown. An empty string is what a
+ * track with no language tag reports, which is a case every player already handles. A timed text
+ * track has the language its TimedTextSource was created with. */
 static HRESULT WINAPI audio_track_get_Language( IMediaTrackInternal *iface, HSTRING *value )
 {
     TRACE( "iface %p, value %p.\n", iface, value );
     if (!value) return E_POINTER;
-    *value = NULL;
-    return S_OK;
+    return WindowsDuplicateString( impl_from_IMediaTrackInternal( iface )->language, value );
 }
 
 static HRESULT WINAPI audio_track_get_TrackKind( IMediaTrackInternal *iface, INT32 *value )
@@ -311,7 +326,7 @@ static HRESULT audio_track_create( IInspectable *item, const struct track_list_k
     impl->ref = 1;
     impl->item = item;
     impl->kind = kind;
-    if (FAILED(hr = WindowsCreateString( L"Audio", 5, &impl->label )))
+    if (kind->track_kind == 0 && FAILED(hr = WindowsCreateString( L"Audio", 5, &impl->label )))
     {
         free( impl );
         return hr;
@@ -690,4 +705,19 @@ HRESULT video_track_list_create( IInspectable *item, IInspectable **out )
 HRESULT metadata_track_list_create( IInspectable *item, IInspectable **out )
 {
     return track_list_create( item, &metadata_kind, out );
+}
+
+HRESULT timed_text_track_list_create( HSTRING language, IInspectable **out )
+{
+    struct audio_track_list *impl;
+    HRESULT hr;
+
+    if (FAILED(hr = track_list_create( NULL, &timed_text_kind, out ))) return hr;
+    impl = impl_from_track_list( *out );
+    if (FAILED(hr = WindowsDuplicateString( language, &impl->track->language )))
+    {
+        IInspectable_Release( *out );
+        *out = NULL;
+    }
+    return hr;
 }

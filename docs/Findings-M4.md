@@ -13169,3 +13169,58 @@ cache name, timestamps). Calculator on the new prefix: AE 3924.73, as on `prefix
 (`docs/screenshots/calculator-new-prefix-wine-setup.png`). A fresh prefix's first verify finds AppInstallManager and
 AppUpdateOptions not yet registered - the same as the shell, where those two were only ever written by the verify
 loop - and the second passes; the verify is silent now unless its last attempt fails (`--report`).
+
+## Shapr3D tutorials: video in XAML's MediaPlayerElement (2026-10-19)
+
+Shapr3D's in-app tutorials ("Model a Bracket Mount" was the test) are an MP4 with an SRT subtitle file in a
+`MediaPlayerElement` with XAML's own transport controls. They crashed, froze, deadlocked or showed a blank area, in
+that order, one fix at a time. The video now plays, and pause, resume, +30 s and full screen
+work. Subtitles are not drawn: cues are not parsed yet. Tested on Wine 11.17 with this branch's builtins, with
+the app offline (`unshare -n`). `regress.sh` was run A/B against `main` on a prefix built from the 25H2
+evaluation ISO. calc, kb and mp were identical, and mp registers the player's events at startup. fh and sol
+fail the same way on `main`: the ISO's inbox versions of those apps are older than the ones the suite expects.
+
+What it took, in the order the app hit it:
+
+- **`TimedTextSource` did not exist** (0x80040111 out of activation) and `MediaSource.ExternalTimedTextSources` was
+  E_NOTIMPL. Either one threw out of the tutorial's setup. `windows.media/timedtext.c`.
+- **`MediaSource` and `MediaPlaybackItem` were not `IMediaPlaybackSource`**, so the app's cast assigned null to
+  `MediaPlayer.Source`.
+- **ms-appx URIs**: Media Foundation has no scheme handler for them (MF_E_UNSUPPORTED_SCHEME); the engine resolves them to
+  the package's files.
+- **The freeze**: MediaOpened was raised inline in `put_Source`, on the UI thread that assigned the source, and
+  Shapr3D's handler waits for its UI dispatcher. It now always comes from the open worker, as on Windows.
+- **The deadlock**: Shapr3D's MediaOpened handler blocks on a `CountdownEvent` that its `TimedTextSource.Resolved`
+  handlers signal, then labels `Tracks[0]`. Resolved is raised before MediaOpened, through a private
+  `Wine.Internal.IWineMediaOpened` on the source, with one (empty) track.
+- **No video**: XAML's `MediaPlayerPresenter` needs three private things from the player. They were found with
+  `windows.ui.xaml.pdb` and breakpoints on the presenter. The presenter:
+  - reads the session's `NaturalVideoHeight`/`Width` (slots 38 and 39; `HasVideo` is both > 0);
+  - casts the player to `IMediaPlayer4` {80035db0} (`UpdateVideoStream`; on failure it zeroes the natural size);
+  - asks `IMediaPlayerPrivate` {9d47a108} slot 13, `get_VideoSwapchainHandle`, for a composition surface handle.
+
+  Windows binds that handle with `IDXGIFactoryMedia`, which Wine's dxgi lacks; dcomp has a private
+  `wine_dcomp_bind_surface_handle` instead.
+- **`CopySurface` called with garbage**: dcomp's `SetContent` asked a surface of ours for `IDXGISwapChain`. Generic
+  dcomp objects answer every QI, so the surface was taken for a swap chain.
+- **Dead transport buttons**: XAML's `MediaTransportControls` in player mode send play/pause/seek through
+  `ISystemMediaTransportControlsInternal` {74570402} slot 6 -> `IMediaPlaybackDataSource` {c4f66b80}. They do this only
+  while the command manager is enabled, and enable buttons from its behaviours. The slot names came from
+  `Windows.Media.MediaControl.pdb`'s `MediaTransportControlsServerPriv` vtable.
+- **Full screen was stretched**: the media engine, not XAML, letterboxes. XAML hands over the element's size through
+  `IMediaPlayer4::SetSurfaceSize`, and the compositor shows the swap chain one to one.
+
+Traps:
+
+- **`llvm-pdbutil` refuses `windows.ui.xaml.pdb`** (and other large PDBs). Reading the MSF stream directory and the
+  `S_PUB32` records directly is about 45 lines of Python, and worked for every PDB here.
+- **.NET Native calls WinRT through `$NEAT$` import cells**, so a breakpoint on a Shapr3D call site needs the cell's
+  target, not the import name.
+- **The source reader's RGB32 stride for a 1440-wide frame was 1440, not 5760.** The engine treats a stride under four
+  bytes a pixel as `width * 4`. This is not traced in winegstreamer yet.
+- Opening is once per *file*, not per source: a playlist keeps one source and changes the file under it.
+
+Not done: playback rate is accepted but not applied; seeking while paused does not redraw the frame. The track
+lists answer `IIterable` with the vector-view vtable (upstream's code, hidden behind a cast exception Shapr3D catches).
+`IDXGIFactoryMedia` in dxgi would retire the dcomp export. The video upload has no `ID3D10Multithread` protection, and
+scaling runs on the CPU.

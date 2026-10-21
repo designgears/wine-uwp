@@ -1,5 +1,5 @@
 MODULE  = windows.media.playback.mediaplayer.dll
-IMPORTS = combase user32 mfplat mfreadwrite mfuuid winmm ole32
+IMPORTS = combase user32 mfplat mfreadwrite mfuuid winmm ole32 d3d11 dxgi dxguid
 
 SOURCES = \
 	classes.idl \

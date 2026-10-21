@@ -18,6 +18,7 @@
 @ stdcall DCompositionCreateDevice3(ptr ptr ptr)
 @ stdcall DCompositionCreateDevice(ptr ptr ptr)
 @ stdcall DCompositionCreateSurfaceHandle(long ptr ptr)
+@ stdcall wine_dcomp_bind_surface_handle(ptr ptr)
 @ stub DeserializeEffectDescription
 @ stdcall -private DllCanUnloadNow()
 @ stdcall -private DllGetActivationFactory(ptr ptr)
