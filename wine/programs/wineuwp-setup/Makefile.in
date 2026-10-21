@@ -1,0 +1,7 @@
+MODULE    = wineuwp-setup.exe
+IMPORTS   = advapi32 bcrypt
+
+EXTRADLLFLAGS = -mconsole -municode
+
+SOURCES = \
+	main.c

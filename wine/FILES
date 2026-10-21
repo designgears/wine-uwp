@@ -374,6 +374,8 @@ dlls/windows.ui.notifications/main.c
 dlls/windows.ui.notifications/windows.ui.notifications.spec
 programs/wineuwp-launch/Makefile.in
 programs/wineuwp-launch/main.c
+programs/wineuwp-setup/Makefile.in
+programs/wineuwp-setup/main.c
 include/windows.system.idl
 dlls/windows.system.memorymanager/Makefile.in
 dlls/windows.system.memorymanager/classes.idl

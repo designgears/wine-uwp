@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     4a90cd3f60a95c2ffab79dd7566468d1437be1b8
-                 winexboxauth: Add the Xbox sign-in, the Microsoft account WebAccount and the Store's account.
+  wine HEAD:     775082d921d16faa4c9582f45394bb91954b4d38
+                 wineuwp-setup: Put the Windows pieces UWP apps need into a prefix.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-21T08:01:18Z
+  captured:      2026-10-21T08:17:38Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

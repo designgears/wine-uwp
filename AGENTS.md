@@ -17,7 +17,7 @@ environment:
 
 | Path | What |
 | --- | --- |
-| `run.sh`, `install-overrides.sh`, `stage-app.sh` | launching and prefix setup |
+| `run.sh`, `install-overrides.sh`, `stage-app.sh` | launching and prefix setup: thin host-side wrappers over Wine's `programs/wineuwp-launch` and `programs/wineuwp-setup` (`wine/programs/`) |
 | `shims/`, `probes/`, `CMakeLists.txt` | the WinRT stand-ins and the diagnostic probes |
 | `*.py` | the investigation toolkit (`xref.py`, `winmd.py`, `piid.py`, `fasthive.py`, ...) |
 | `wine/` | **our Wine source**, vendored in full by `sync-wine.sh` - 196 files, +49k lines vs upstream |
@@ -70,7 +70,7 @@ that were ours; the Calculator tree is no longer involved.
 - **A wrapper that sets `WINEPREFIX` on its `wineserver -k` only runs `run.sh` on the dev prefix**, because `env.sh` defaults it: `/tmp/xbox-test.sh` did that on 10-15 and killed the dev prefix's wineserver three times. Export it for the whole script, and check `/proc/$(pgrep -x wineserver)/environ` when in doubt.
 - **A separate prefix does not isolate you from the user's app: the Wine build tree is shared.** Every prefix loads its builtins from `~/src/wine-build`, so an experimental `make dlls/ntdll/all` there goes straight into the user's next launch. On 10-15 an agent's heap instrumentation made the user's Xbox app abort in ReactNative. Build experiments in a reflinked copy (`cp -a --reflink=auto ~/src/wine-build uwp-bin/wine-build-<name>`, then point `WINE_BUILD` and `PATH` at it), and rebuild the shared tree only with a finished, regression-tested change.
 - **Xbox install data needs its own override too.** `run.sh` defaults `WINE_UWP_GAMES_DATA` to `uwp-bin/xbox-games` even with a separate prefix. Export an existing isolated data directory for installation/add-on tests; `uwp-bin/xbox-addons-ui-test` contains a small Halo installed-state fixture for the Manage UI. Reuse the existing test prefix/build/data instead of making more copies, and stop trace instances after capture.
-- **`run.sh` stops the app after `UWP_TIMEOUT` seconds (60 by default).** Launching an app for the user to use needs `UWP_TIMEOUT=86400`, or it vanishes after a minute.
+- **`run.sh` stops the app after `UWP_TIMEOUT` seconds (60 by default).** Launching an app for the user to use needs `UWP_TIMEOUT=86400`, or it vanishes after a minute. Since 10-21 `run.sh` only picks the Wine, prefix, overrides, timeout and log; `wineuwp-launch --stage DIR --defaults launch-defaults.env` does the rest (identity, framework search path, AppContainer key, CoreMessagingRegistrar), and the app is its child, so a timeout ends the prefix with `wineserver -k`. **A stage needs an `identity.env` naming `UWP_EXE`** (Calculator's defaults used to live in `run.sh`), and with `--defaults` a stage's own `launch.env` is ignored, as `run.sh` always ignored it.
 - **Run on Xvfb `:98`, never the user's `:0`.** `DISPLAY=:98 ./run.sh`. **Check that `:98` is yours before
   trusting a capture**: another program took it over on 09-24 with a full-screen window, and every
   Shapr3D capture came back black (1 colour) while the app was fine. `xdotool search --onlyvisible
@@ -192,9 +192,9 @@ silently break if it moves again. All of these bit me during the move out of the
   uwp-bin/build-probes/CMakeCache.txt && rm -rf uwp-bin/build-probes/CMakeFiles` then `./build.sh`.
   Back up `uwp-bin/build-probes/*.exe` first if you are mid-investigation - they are the only copies
   until the rebuild finishes.
-- **`identity.env` in a stage directory must not contain `WINE_UWP_PACKAGE_PATH`.** `run.sh` sources
-  that file, so a stale value there wins over the computed one. `run.sh` now always computes it from
-  the stage directory and `stage-app.sh` no longer writes it.
+- **`identity.env` in a stage directory must not contain `WINE_UWP_PACKAGE_PATH`.** `wineuwp-launch` (formerly
+  `run.sh`) reads that file, so a stale value there would win over the computed one. The launcher always computes
+  it from the stage directory and `stage-app.sh` does not write it.
 
 **`info[0]=0x8007007B` in an exception record is `ERROR_INVALID_NAME`** - "the filename, directory
 name, or volume label syntax is incorrect". It means a path is *malformed*, not missing, which is a
@@ -1009,6 +1009,14 @@ It "fixed itself" on the next run only because the verify loop sets the caller's
 right class before calling. Certificate, FileSavePicker and FolderPicker each lost a run to it.
 Never refer to a variable declared in the same `local`/`export` statement.
 
+**Since 10-21 the writes and the check are Wine's `wineuwp-setup`** (`programs/wineuwp-setup`), which reads the live
+registry from inside the prefix, so neither trap above applies; `install-overrides.sh` waits with `wineserver -w` and
+runs `wineuwp-setup --verify` (exit 1 while a class was wrong, after writing it again) up to four times. Its output is
+checked against the shell version's: on two reflinks of `prefix-test`, `system.reg`/`user.reg` identical apart from
+device `ContainerId`s, the same files, and the generated `wine-uwp-clsid.reg` / `wine-uwp-single-module.reg` byte
+for byte (Findings-M4 2026-10-21). A path built from `GetSystemDirectory` + `\..` is `C:\windows`, not `C:\`: the first
+port put the WebView2 runtime in `C:\windows\Program Files (x86)`; only the file-list diff caught it.
+
 **`pkill -x wineserver` kills every prefix's wineserver, not yours.** On 10-15 it took down the user's running Xbox app's server on `:0` while looking for my own test prefix: their `XboxPcAppFT.exe` survived as an orphan with no server. Stop a test's server with `wineserver -k` under that prefix's `WINEPREFIX` (or by its pid, checked against `/proc/<pid>/environ`), never by name.
 
 **Do not force `wineboot -u` to settle the prefix.** It starts a fresh `services.exe`/`explorer.exe`
@@ -1037,7 +1045,7 @@ only `IMAGE_DIRECTORY_ENTRY_IMPORT` finds nothing and looks broken.
 **`wineuwp.dll` gets a stale copy in the prefix like any other builtin**, and it shadows the build
 tree - so a correct fix looks like it did nothing. This is already documented below for Wine DLLs
 generally and I walked into it anyway, because I checked the *timestamp* rather than `cmp`.
-`install-overrides.sh` now refreshes it and says `refreshed: stale wineuwp.dll in the prefix`.
+`wineuwp-setup` (via `install-overrides.sh`) refreshes it and says `refreshed: stale wineuwp.dll in the prefix`.
 
 **A guessed signature for a private export can silently drop work.** `SHTaskPoolQueueTask` had
 been implemented as `(flags, proc, context, cancel)` with a comment explaining why a small "proc"

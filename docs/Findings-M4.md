@@ -13116,3 +13116,30 @@ The Add-ons tab still opens with "Requires 67.77 GB disk space (+67.77 GB)" and 
 changes. 67.77 GB is the figure the C++ gameplatform shim showed there on 10-16 (the "Follow-up virtual repro" entry
 above: Campaign moves it from 67.77 GB to 74.31 GB), so the size is not from either port. Whether that shim also drew
 Apply enabled before a change was not recorded and was not re-run: its source left the tree with 43f964e.
+
+## 2026-10-21: Scripts to C - `install-overrides.sh` -> `programs/wineuwp-setup`
+
+The prefix setup runs inside the prefix now. `install-overrides.sh` keeps the host half (which Wine and prefix, the
+EAC runtime script, a `wineboot -u` when the prefix predates the program, `wineserver -w` and the `--verify` loop) and
+calls `wine wineuwp-setup --windows WIN11 --build WINE_BUILD --data REPO [--webview2 DIR] [--force] [LIST]`.
+
+- **What moved:** the Windows DLL copies (with the case-variant removal), resource-only and native-only modules,
+  fonts, MUI files of genuine copies, winmd, native DllOverrides, the .reg imports (`reg.exe import`), the CLSID and
+  single-module generators with the regf reader they used (`fasthive.py`'s walk, in C), `wineuwp.reg`'s
+  `@WIN11_WINPATH@`, every class Wine serves instead of Windows (StateRepository, AppCapability, pickers, Launcher,
+  certificates, Gaming Services with its stand-in packages and services, Xbox sign-in, ...), the Wine modules a
+  prefix update does not refresh (`wineuwp`, `appxinstall`, `xgameruntime`), the WebView2 runtime and the ICU data.
+- **Compared with the shell version** on two reflinks of `prefix-test` (`wine-build-wow64`), both updated first, then
+  forced: `system.reg`, `user.reg` and `userdef.reg` identical once key timestamps are dropped, apart from six device
+  `ContainerId`s Wine derives from the time; the same files under `drive_c` (a wineboot temp file name aside); and
+  `wine-uwp-clsid.reg` (782 classes registered, 5852 skipped) and `wine-uwp-single-module.reg` (288 classes, 9
+  modules) byte-identical to the Python's.
+- **One bug found by that comparison:** the WebView2 destination was `GetSystemDirectory` + `\..\Program Files (x86)`,
+  which is `C:\windows\Program Files (x86)`. The registry was right, so only the file list showed it.
+- **Speed:** a forced run took 34 s as shell (about 150 `wine reg` processes) and 6 s now; an unchanged prefix 5-7 s,
+  mostly Wine starting (the shell's stamp check ran without Wine in ~3 s).
+- **Apps on the new prefix (`:97`):** calc AE 3924.73, mp 236 colours, the same as before on this prefix and build;
+  the Xbox app reaches Home signed in (`docs/screenshots/xbox-home-wine-setup.png`). `kb` was not run: it does not
+  bring Calculator up on `prefix-test` with either version (Port-to-C, run.sh row).
+- **Not ported in this step:** `fasthive.py` itself stays (used by `gen-classes-reg.py` and `gen-interfaces-reg.py`,
+  which `new-prefix.sh` runs, and by the investigation tools). Copies are `CopyFileW`, not reflinks.

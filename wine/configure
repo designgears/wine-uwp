@@ -1601,8 +1601,8 @@ enable_wineusb_sys
 enable_wineuwp
 enable_winevulkan
 enable_winewayland_drv
-enable_winexboxauth
 enable_winex11_drv
+enable_winexboxauth
 enable_winexinput_sys
 enable_wing32
 enable_winhttp
@@ -1843,6 +1843,7 @@ enable_winetest
 enable_wineuwp_gamingservice
 enable_wineuwp_install
 enable_wineuwp_launch
+enable_wineuwp_setup
 enable_winevdm
 enable_winhlp32
 enable_winmgmt
@@ -23007,8 +23008,8 @@ wine_fn_config_makefile dlls/wineusb.sys enable_wineusb_sys
 wine_fn_config_makefile dlls/wineuwp enable_wineuwp
 wine_fn_config_makefile dlls/winevulkan enable_winevulkan
 wine_fn_config_makefile dlls/winewayland.drv enable_winewayland_drv
-wine_fn_config_makefile dlls/winexboxauth enable_winexboxauth
 wine_fn_config_makefile dlls/winex11.drv enable_winex11_drv
+wine_fn_config_makefile dlls/winexboxauth enable_winexboxauth
 wine_fn_config_makefile dlls/winexinput.sys enable_winexinput_sys
 wine_fn_config_makefile dlls/wing.dll16 enable_win16
 wine_fn_config_makefile dlls/wing32 enable_wing32
@@ -23297,6 +23298,7 @@ wine_fn_config_makefile programs/winetest enable_winetest
 wine_fn_config_makefile programs/wineuwp-gamingservice enable_wineuwp_gamingservice
 wine_fn_config_makefile programs/wineuwp-install enable_wineuwp_install
 wine_fn_config_makefile programs/wineuwp-launch enable_wineuwp_launch
+wine_fn_config_makefile programs/wineuwp-setup enable_wineuwp_setup
 wine_fn_config_makefile programs/winevdm enable_winevdm
 wine_fn_config_makefile programs/winhelp.exe16 enable_win16
 wine_fn_config_makefile programs/winhlp32 enable_winhlp32

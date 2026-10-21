@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Assemble an installable wine-uwp tree from this checkout: our Wine build, installed, plus the shims and the
+# Assemble an installable wine-uwp tree from this checkout: our Wine build, installed, plus the
 # scripts that set up and run apps. A product built on wine-uwp adds its own setup UI to it (bin/wine-uwp-installer;
 # shapr3d-linux does), and `wine-uwp setup` runs that UI when there is one.
 #
@@ -9,7 +9,6 @@
 # OUT/bin                   wine, wineserver, ... and the wine-uwp launcher
 # OUT/lib/wine              Wine's modules
 # OUT/share/wine-uwp        run.sh, install-overrides.sh, the .reg files, the registry generators, packaging/
-# OUT/share/wine-uwp/shims  our WinRT stand-ins (built by build.sh with clang-cl against the Windows SDK)
 #
 # Nothing Microsoft's goes in: the Windows files are harvested on the user's machine by the setup.
 set -euo pipefail
@@ -43,13 +42,11 @@ fi
 
 echo "STAGE Installing wine-uwp"
 share=$out/share/wine-uwp
-mkdir -p "$share/shims" "$share/packaging"
+mkdir -p "$share/packaging"
 cp "$here"/{env.sh,run.sh,install-overrides.sh,launch-defaults.env,globalization.reg,wineuwp.reg,mrt-single-module.reg} "$share"/
-cp "$here"/{gen-classes-reg.py,gen-clsid-reg.py,gen-interfaces-reg.py,gen-single-module-reg.py,fasthive.py,uwppaths.py} "$share"/
+cp "$here"/{gen-classes-reg.py,gen-interfaces-reg.py,fasthive.py,uwppaths.py} "$share"/
 cp -r "$here"/packaging/{harvest,new-prefix.sh,install-app.py,install-eac-runtime.sh,install-d3d-runtime.sh} "$share/packaging"/
 find "$share" -name __pycache__ -prune -exec rm -rf {} +
-shims=$(grep -ohE '\$\{SHIM_DIR\}/[A-Za-z0-9_.-]+\.dll' "$here/install-overrides.sh" | sed 's|${SHIM_DIR}/||' | sort -u)
-for s in $shims; do cp "$UWP_BIN/build-probes/$s" "$share/shims/"; done
 install -m755 "$here/packaging/wine-uwp" "$out/bin/wine-uwp"
 git -C "$here" rev-parse --short HEAD > "$share/VERSION"
 echo "STAGE Done: $out ($(du -sh "$out" | cut -f1))"
