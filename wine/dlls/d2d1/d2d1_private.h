@@ -823,10 +823,6 @@ struct d2d_render_info
 
     unsigned int mask;
     GUID pixel_shader;
-    BYTE *ps_constants;
-    UINT32 ps_constants_size;
-    D2D1_BUFFER_PRECISION output_precision;
-    D2D1_CHANNEL_DEPTH output_depth;
 };
 
 struct d2d_transform_node

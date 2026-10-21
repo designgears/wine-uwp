@@ -915,7 +915,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
     ret = NtWaitForAlertByThreadId( NULL, timeout );
 
     /* We may have already been removed by a call to RtlWakeAddressSingle() or RtlWakeAddressAll(). */
-    if (ReadPointerAcquire( (void *const *)&entry.addr ))
+    if (ReadPointerAcquire( (void * volatile *)&entry.addr ))
     {
         spin_lock( &queue->lock );
         if (entry.addr)
@@ -938,6 +938,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
     struct futex_entry *entry, *next;
     unsigned int count = 0;
     HANDLE tids[256];
+    DWORD tid;
 
     TRACE("%p\n", addr);
 
@@ -952,15 +953,15 @@ void WINAPI RtlWakeAddressAll( const void *addr )
     {
         if (entry->addr == addr)
         {
+            tid = entry->tid;
+            list_remove( &entry->entry );
+            WritePointerRelease( (void * volatile *)&entry->addr, NULL );
             if (count == ARRAY_SIZE(tids))
             {
                 NtAlertMultipleThreadByThreadId( tids, count, NULL, NULL );
                 count = 0;
             }
-            tids[count++] = (HANDLE)(ULONG_PTR)entry->tid;
-            list_remove( &entry->entry );
-            /* last: the waiter may return and reuse its stack as soon as it sees this */
-            InterlockedExchangePointer( (void **)&entry->addr, NULL );
+            tids[count++] = (HANDLE)(ULONG_PTR)tid;
         }
     }
 
@@ -999,15 +1000,9 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
 
             /* Remove this entry from the queue, so that a simultaneous call to
              * RtlWakeAddressSingle() will not also wake it—two simultaneous
-             * calls must wake at least two waiters if they exist.
-             *
-             * Clear addr only after the unlink: the waiter tests it without the lock once its wait
-             * times out or is woken spuriously, and returns - reusing the stack the entry lives on -
-             * as soon as it reads NULL. Clearing it first let list_remove() read the entry's links
-             * back out of a reused frame and write through them; in Shapr3D that put a stack pointer
-             * into this very lock word, and every thread contending for the process heap spun on it. */
+             * calls must wake at least two waiters if they exist. */
             list_remove( &entry->entry );
-            InterlockedExchangePointer( (void **)&entry->addr, NULL );
+            WritePointerRelease( (void * volatile *)&entry->addr, NULL );
             break;
         }
     }

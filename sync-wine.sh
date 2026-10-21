@@ -19,6 +19,18 @@ set -euo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
 VENDOR=$REPO/wine
 LIST=$VENDOR/FILES
+
+# The upstream release the tree is based on: the newest wine-* release tag merged into it. The tree is
+# a shallow clone, so origin/master is not there for merge-base; before any release was merged in, its
+# single root commit was the release it was cut from (11.17), and that is the fallback.
+upstream_base() {
+  local tag
+  if tag=$(git -C "$WINE_SRC" describe --tags --abbrev=0 --match 'wine-[0-9]*' HEAD 2>/dev/null); then
+    git -C "$WINE_SRC" rev-parse "$tag^{commit}"
+  else
+    git -C "$WINE_SRC" rev-list --max-parents=0 HEAD | head -1
+  fi
+}
 MODE=${1:---check}
 
 [ -f "$LIST" ] || { echo "no $LIST"; exit 2; }
@@ -57,9 +69,7 @@ if [ "$MODE" = --from-tree ]; then
     echo
     echo "  wine HEAD:     $(git -C "$WINE_SRC" rev-parse HEAD)"
     echo "                 $(git -C "$WINE_SRC" log -1 --format=%s)"
-    # The shared tree is a *shallow* clone, so origin/master is not fetched and merge-base fails.
-    # Its single root commit is the upstream release it was cut from.
-    base=$(git -C "$WINE_SRC" rev-list --max-parents=0 HEAD | head -1)
+    base=$(upstream_base)
     echo "  upstream base: $base"
     echo "                 $(git -C "$WINE_SRC" log -1 --format='%s (%ad)' --date=short "$base")"
     echo "  captured:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -75,7 +85,7 @@ fi
 # the upstream base - committed, uncommitted and untracked changes alike.
 unlisted=0
 if [ "$MODE" = --check ]; then
-  base=$(git -C "$WINE_SRC" rev-list --max-parents=0 HEAD | head -1)
+  base=$(upstream_base)
   while read -r f; do
     case $f in configure|autom4te.cache/*|*~|*.orig|*.rej) continue ;; esac
     printf '%s\n' "${FILES[@]}" | grep -xF "$f" >/dev/null && continue   # not -q: an early exit SIGPIPEs printf, and pipefail then made random files "unlisted"

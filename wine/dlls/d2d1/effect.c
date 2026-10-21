@@ -1287,45 +1287,6 @@ static HRESULT __stdcall crop_factory(IUnknown **effect)
     return d2d_effect_create_impl(effect, &properties, sizeof(properties));
 }
 
-static const WCHAR border_description[] =
-L"<?xml version='1.0'?>                                                   \
-  <Effect>                                                                \
-    <Property name='DisplayName' type='string' value='Border'/>           \
-    <Property name='Author'      type='string' value='The Wine Project'/> \
-    <Property name='Category'    type='string' value='Stub'/>             \
-    <Property name='Description' type='string' value='Border'/>           \
-    <Inputs >                                                             \
-      <Input name='Source'/>                                              \
-    </Inputs>                                                             \
-    <Property name='EdgeModeX' type='enum' />                             \
-    <Property name='EdgeModeY' type='enum' />                             \
-  </Effect>";
-
-struct border_properties
-{
-    D2D1_BORDER_EDGE_MODE edge_mode_x;
-    D2D1_BORDER_EDGE_MODE edge_mode_y;
-};
-
-EFFECT_PROPERTY_RW(border, edge_mode_x, ENUM)
-EFFECT_PROPERTY_RW(border, edge_mode_y, ENUM)
-
-static const D2D1_PROPERTY_BINDING border_bindings[] =
-{
-    { L"EdgeModeX", BINDING_RW(border, edge_mode_x) },
-    { L"EdgeModeY", BINDING_RW(border, edge_mode_y) },
-};
-
-static HRESULT __stdcall border_factory(IUnknown **effect)
-{
-    static const struct border_properties properties =
-    {
-        .edge_mode_x = D2D1_BORDER_EDGE_MODE_CLAMP,
-        .edge_mode_y = D2D1_BORDER_EDGE_MODE_CLAMP,
-    };
-    return d2d_effect_create_impl(effect, &properties, sizeof(properties));
-}
-
 static const WCHAR shadow_description[] =
 L"<?xml version='1.0'?>                                                   \
   <Effect>                                                                \
@@ -1383,40 +1344,6 @@ L"<?xml version='1.0'?>                                                   \
   </Effect>";
 
 static HRESULT __stdcall grayscale_factory(IUnknown **effect)
-{
-    return d2d_effect_create_impl(effect, NULL, 0);
-}
-
-static const WCHAR premultiply_description[] =
-L"<?xml version='1.0'?>                                                   \
-  <Effect>                                                                \
-    <Property name='DisplayName' type='string' value='Premultiply'/>      \
-    <Property name='Author'      type='string' value='The Wine Project'/> \
-    <Property name='Category'    type='string' value='Stub'/>             \
-    <Property name='Description' type='string' value='Premultiply'/>      \
-    <Inputs >                                                             \
-      <Input name='Source'/>                                              \
-    </Inputs>                                                             \
-  </Effect>";
-
-static HRESULT __stdcall premultiply_factory(IUnknown **effect)
-{
-    return d2d_effect_create_impl(effect, NULL, 0);
-}
-
-static const WCHAR unpremultiply_description[] =
-L"<?xml version='1.0'?>                                                   \
-  <Effect>                                                                \
-    <Property name='DisplayName' type='string' value='UnPremultiply'/>      \
-    <Property name='Author'      type='string' value='The Wine Project'/> \
-    <Property name='Category'    type='string' value='Stub'/>             \
-    <Property name='Description' type='string' value='UnPremultiply'/>      \
-    <Inputs >                                                             \
-      <Input name='Source'/>                                              \
-    </Inputs>                                                             \
-  </Effect>";
-
-static HRESULT __stdcall unpremultiply_factory(IUnknown **effect)
 {
     return d2d_effect_create_impl(effect, NULL, 0);
 }
@@ -1913,6 +1840,120 @@ static HRESULT __stdcall scale_factory(IUnknown **effect)
     return d2d_effect_create_impl(effect, &properties, sizeof(properties));
 }
 
+static const WCHAR premultiply_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Premultiply'/>      \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Premultiply'/>      \
+    <Inputs >                                                             \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+  </Effect>";
+
+static HRESULT __stdcall premultiply_factory(IUnknown **effect)
+{
+    return d2d_effect_create_impl(effect, NULL, 0);
+}
+
+static const WCHAR _3d_transform_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='3D Transform'/>     \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='3D Transform'/>     \
+    <Inputs>                                                              \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+    <Property name='InterpolationMode' type='enum' />                     \
+    <Property name='BorderMode' type='enum' />                            \
+    <Property name='TransformMatrix' type='matrix4x4' />                  \
+  </Effect>";
+
+struct _3d_transform_properties
+{
+    D2D1_3DTRANSFORM_INTERPOLATION_MODE interpolation_mode;
+    D2D1_BORDER_MODE border_mode;
+    D2D_MATRIX_4X4_F transform_matrix;
+};
+
+EFFECT_PROPERTY_RW(_3d_transform, interpolation_mode, ENUM)
+EFFECT_PROPERTY_RW(_3d_transform, border_mode, ENUM)
+EFFECT_PROPERTY_RW(_3d_transform, transform_matrix, MATRIX_4X4)
+
+static const D2D1_PROPERTY_BINDING _3d_transform_bindings[] =
+{
+    { L"InterpolationMode", BINDING_RW(_3d_transform, interpolation_mode) },
+    { L"BorderMode", BINDING_RW(_3d_transform, border_mode) },
+    { L"TransformMatrix", BINDING_RW(_3d_transform, transform_matrix) },
+};
+
+static HRESULT __stdcall _3d_transform_factory(IUnknown **effect)
+{
+    static const struct _3d_transform_properties properties =
+    {
+        .interpolation_mode = D2D1_3DTRANSFORM_INTERPOLATION_MODE_LINEAR,
+        .border_mode = D2D1_BORDER_MODE_SOFT,
+        .transform_matrix = { ._11 = 1.0f, ._22 = 1.0f, ._33 = 1.0f, ._44 = 1.0f },
+    };
+    return d2d_effect_create_impl(effect, &properties, sizeof(properties));
+}
+
+static const WCHAR color_management_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Color Management'/> \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Color Management'/> \
+    <Inputs>                                                              \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+    <Property name='SourceColorContext' type='iunknown' />                \
+    <Property name='SourceRenderingIntent' type='enum' />                 \
+    <Property name='DestinationColorContext' type='iunknown' />           \
+    <Property name='DestinationRenderingIntent' type='enum' />            \
+    <Property name='AlphaMode' type='enum' />                             \
+    <Property name='Quality' type='enum' />                               \
+  </Effect>";
+
+struct color_management_properties
+{
+    ID2D1ColorContext *source_color_context;
+    D2D1_COLORMANAGEMENT_RENDERING_INTENT source_rendering_intent;
+    ID2D1ColorContext *destination_color_context;
+    D2D1_COLORMANAGEMENT_RENDERING_INTENT destination_rendering_intent;
+    D2D1_COLORMANAGEMENT_ALPHA_MODE alpha_mode;
+    D2D1_COLORMANAGEMENT_QUALITY quality;
+};
+
+EFFECT_PROPERTY_RW(color_management, source_rendering_intent, ENUM)
+EFFECT_PROPERTY_RW(color_management, destination_rendering_intent, ENUM)
+EFFECT_PROPERTY_RW(color_management, alpha_mode, ENUM)
+EFFECT_PROPERTY_RW(color_management, quality, ENUM)
+
+static const D2D1_PROPERTY_BINDING color_management_bindings[] =
+{
+    { L"SourceRenderingIntent", BINDING_RW(color_management, source_rendering_intent) },
+    { L"DestinationRenderingIntent", BINDING_RW(color_management, destination_rendering_intent) },
+    { L"AlphaMode", BINDING_RW(color_management, alpha_mode) },
+    { L"Quality", BINDING_RW(color_management, quality) },
+};
+
+static HRESULT __stdcall color_management_factory(IUnknown **effect)
+{
+    static const struct color_management_properties properties =
+    {
+        .source_rendering_intent = D2D1_COLORMANAGEMENT_RENDERING_INTENT_PERCEPTUAL,
+        .destination_rendering_intent = D2D1_COLORMANAGEMENT_RENDERING_INTENT_PERCEPTUAL,
+        .alpha_mode = D2D1_COLORMANAGEMENT_ALPHA_MODE_PREMULTIPLIED,
+        .quality = D2D1_COLORMANAGEMENT_QUALITY_NORMAL,
+    };
+    return d2d_effect_create_impl(effect, &properties, sizeof(properties));
+}
+
 void d2d_effects_init_builtins(struct d2d_factory *factory)
 {
     static const struct builtin_description
@@ -1931,11 +1972,8 @@ void d2d_effects_init_builtins(struct d2d_factory *factory)
         { &CLSID_D2D13DPerspectiveTransform, X2(_3d_perspective_transform) },
         { &CLSID_D2D1Composite, X2(composite) },
         { &CLSID_D2D1Crop, X2(crop) },
-        { &CLSID_D2D1Border, X2(border) },
         { &CLSID_D2D1Shadow, X2(shadow) },
         { &CLSID_D2D1Grayscale, X(grayscale) },
-        { &CLSID_D2D1Premultiply, X(premultiply) },
-        { &CLSID_D2D1UnPremultiply, X(unpremultiply) },
         { &CLSID_D2D1ColorMatrix, X2(color_matrix) },
         { &CLSID_D2D1Flood, X2(flood) },
         { &CLSID_D2D1GaussianBlur, X2(gaussian_blur) },
@@ -1948,6 +1986,9 @@ void d2d_effects_init_builtins(struct d2d_factory *factory)
         { &CLSID_D2D1Saturation, X2(saturation) },
         { &CLSID_D2D1Opacity, X2(opacity) },
         { &CLSID_D2D1Scale, X2(scale) },
+        { &CLSID_D2D1Premultiply, X(premultiply) },
+        { &CLSID_D2D13DTransform, X2(_3d_transform) },
+        { &CLSID_D2D1ColorManagement, X2(color_management) },
 #undef X2
 #undef X
     };
@@ -3362,10 +3403,7 @@ static ULONG STDMETHODCALLTYPE d2d_draw_info_Release(ID2D1DrawInfo *iface)
     TRACE("iface %p refcount %lu.\n", iface, refcount);
 
     if (!refcount)
-    {
-        free(render_info->ps_constants);
         free(render_info);
-    }
 
     return refcount;
 }
@@ -3373,24 +3411,17 @@ static ULONG STDMETHODCALLTYPE d2d_draw_info_Release(ID2D1DrawInfo *iface)
 static HRESULT STDMETHODCALLTYPE d2d_draw_info_SetInputDescription(ID2D1DrawInfo *iface,
         UINT32 index, D2D1_INPUT_DESCRIPTION description)
 {
-    /* Recorded nothing to act on yet: custom draw transforms are not rendered. Refusing made Win2D's
-     * PixelShaderEffect fail to be created ("Call failed" in the Microsoft Store). */
-    TRACE("iface %p, index %u, filter %#x, level of detail %u.\n", iface, index, description.filter,
-            description.levelOfDetailCount);
+    FIXME("iface %p, index %u stub.\n", iface, index);
 
-    return S_OK;
+    return E_NOTIMPL;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_draw_info_SetOutputBuffer(ID2D1DrawInfo *iface,
         D2D1_BUFFER_PRECISION precision, D2D1_CHANNEL_DEPTH depth)
 {
-    struct d2d_render_info *render_info = impl_from_ID2D1DrawInfo(iface);
+    FIXME("iface %p, precision %u, depth %u stub.\n", iface, precision, depth);
 
-    TRACE("iface %p, precision %u, depth %u.\n", iface, precision, depth);
-
-    render_info->output_precision = precision;
-    render_info->output_depth = depth;
-    return S_OK;
+    return E_NOTIMPL;
 }
 
 static void STDMETHODCALLTYPE d2d_draw_info_SetCached(ID2D1DrawInfo *iface, BOOL is_cached)
@@ -3407,21 +3438,9 @@ static void STDMETHODCALLTYPE d2d_draw_info_SetInstructionCountHint(ID2D1DrawInf
 static HRESULT STDMETHODCALLTYPE d2d_draw_info_SetPixelShaderConstantBuffer(ID2D1DrawInfo *iface,
         const BYTE *buffer, UINT32 size)
 {
-    struct d2d_render_info *render_info = impl_from_ID2D1DrawInfo(iface);
-    BYTE *copy = NULL;
+    FIXME("iface %p, buffer %p, size %u stub.\n", iface, buffer, size);
 
-    TRACE("iface %p, buffer %p, size %u.\n", iface, buffer, size);
-
-    if (size && !buffer)
-        return E_INVALIDARG;
-    if (size && !(copy = malloc(size)))
-        return E_OUTOFMEMORY;
-    if (size)
-        memcpy(copy, buffer, size);
-    free(render_info->ps_constants);
-    render_info->ps_constants = copy;
-    render_info->ps_constants_size = size;
-    return S_OK;
+    return E_NOTIMPL;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_draw_info_SetResourceTexture(ID2D1DrawInfo *iface,

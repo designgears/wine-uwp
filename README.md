@@ -39,7 +39,7 @@ closed-source Store apps install and run, with no source and no symbols for any 
 ## How it works
 
 - **Wine, extended.** Our changes to Wine live in full in [`wine/`](wine/): about 49,000 lines over 196 files,
-  on top of Wine 11.17. The largest pieces are new: a DirectComposition implementation
+  on top of Wine 11.20. The largest pieces are new: a DirectComposition implementation
   (`dlls/dcomp`), composition swap chains (`dlls/dxgi`), and `wineuwp`, which hosts a package's app model:
   identity, activation, the CoreWindow, protocol activation.
 - **Microsoft's own frameworks, not reimplementations.** XAML, CoreMessaging and the app-model DLLs are taken
@@ -67,7 +67,7 @@ Data lives in `$WINE_UWP_DATA`, by default `~/.local/share/wine-uwp`. See
 
 ## Building
 
-1. **Wine.** Unpack the [Wine 11.17](https://dl.winehq.org/wine/source/11.x/wine-11.17.tar.xz) source, copy
+1. **Wine.** Unpack the [Wine 11.20](https://dl.winehq.org/wine/source/11.x/wine-11.20.tar.xz) source, copy
    `wine/` over it (whole files, not patches; leave out its `FILES` and `BASE.txt`), then `autoreconf -f`, `./configure --enable-archs=x86_64`
    and `make`. Point `WINE_BIN_DIR` at the build directory.
 2. **Shims.** `./build.sh` builds them with clang-cl and lld-link against the Windows SDK headers from

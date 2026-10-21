@@ -21,7 +21,7 @@
 172 stub @
 243 stub @
 244 stub @
-245 stub SHTestTokenMembership
+245 stdcall SHTestTokenMembership(ptr long) shell32.SHTestTokenMembership
 264 stub @
 644 stdcall SHChangeNotification_Lock(long long ptr ptr)
 645 stdcall SHChangeNotification_Unlock(long)
@@ -67,7 +67,7 @@
 915 stub @
 916 stub @
 923 stub @
-925 stub CreateStorageItemFromShellItem_FullTrustCaller_ForPackage
+925 stdcall CreateStorageItemFromShellItem_FullTrustCaller_ForPackage(ptr ptr long ptr ptr) shell32.CreateStorageItemFromShellItem_FullTrustCaller_ForPackage
 928 stub @
 938 stub GetCachedFileUpdateInformation
 942 stub CreateStorageItemFromShellItem

@@ -246,17 +246,17 @@ struct startup_info_data
     unsigned int flags;
     unsigned int show;
     process_id_t process_group_id;
+    data_size_t  imagepath_len;
     data_size_t  curdir_len;
     data_size_t  dllpath_len;
-    data_size_t  imagepath_len;
     data_size_t  cmdline_len;
     data_size_t  title_len;
     data_size_t  desktop_len;
     data_size_t  shellinfo_len;
     data_size_t  runtime_len;
+    /* VARARG(imagepath,unicode_str,imagepath_len); */
     /* VARARG(curdir,unicode_str,curdir_len); */
     /* VARARG(dllpath,unicode_str,dllpath_len); */
-    /* VARARG(imagepath,unicode_str,imagepath_len); */
     /* VARARG(cmdline,unicode_str,cmdline_len); */
     /* VARARG(title,unicode_str,title_len); */
     /* VARARG(desktop,unicode_str,desktop_len); */
@@ -1351,20 +1351,22 @@ typedef volatile struct
     int          priority;     /* current thread priority */
     int          base_priority;/* base priority level (relative to process base priority class) */
     affinity_t   affinity;     /* affinity mask */
+    affinity_t   system_affinity; /* process system affinity mask */
     client_ptr_t entry_point;  /* thread entry point */
     obj_handle_t token;        /* impersonation token */
     int          disable_boost;/* disable thread priority boost */
     unsigned int mask;         /* setting mask (see below) */
     VARARG(desc,unicode_str);  /* description string */
 @END
-#define SET_THREAD_INFO_PRIORITY        0x01
-#define SET_THREAD_INFO_BASE_PRIORITY   0x02
-#define SET_THREAD_INFO_AFFINITY        0x04
-#define SET_THREAD_INFO_TOKEN           0x08
-#define SET_THREAD_INFO_ENTRYPOINT      0x10
-#define SET_THREAD_INFO_DESCRIPTION     0x20
-#define SET_THREAD_INFO_DBG_HIDDEN      0x40
-#define SET_THREAD_INFO_DISABLE_BOOST   0x80
+#define SET_THREAD_INFO_PRIORITY        0x001
+#define SET_THREAD_INFO_BASE_PRIORITY   0x002
+#define SET_THREAD_INFO_AFFINITY        0x004
+#define SET_THREAD_INFO_GROUP_AFFINITY  0x008
+#define SET_THREAD_INFO_TOKEN           0x010
+#define SET_THREAD_INFO_ENTRYPOINT      0x020
+#define SET_THREAD_INFO_DESCRIPTION     0x040
+#define SET_THREAD_INFO_DBG_HIDDEN      0x080
+#define SET_THREAD_INFO_DISABLE_BOOST   0x100
 
 
 /* Suspend a thread */
@@ -1648,9 +1650,11 @@ enum event_op { PULSE_EVENT, SET_EVENT, RESET_EVENT };
     obj_handle_t rootdir;       /* root directory */
     unsigned int sharing;       /* sharing flags */
     unsigned int options;       /* file options */
+    client_ptr_t async_user;    /* async user ptr, same as async_data.user */
     VARARG(filename,unicode_str); /* file name */
 @REPLY
     obj_handle_t handle;        /* handle to the file */
+    obj_handle_t wait;          /* handle to wait on for blocking create */
 @END
 
 
@@ -1831,6 +1835,12 @@ enum server_fd_type
     obj_handle_t handle;
 @REPLY
     VARARG(events,filesystem_event);  /* collected filesystem events */
+@END
+
+
+/* close all files on a device to allow unmounting it */
+@REQ(unmount_device)
+    int          dev;           /* device number from fstat */
 @END
 
 

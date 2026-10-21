@@ -13224,3 +13224,50 @@ Not done: playback rate is accepted but not applied; seeking while paused does n
 lists answer `IIterable` with the vector-view vtable (upstream's code, hidden behind a cast exception Shapr3D catches).
 `IDXGIFactoryMedia` in dxgi would retire the dcomp export. The video upload has no `ID3D10Multithread` protection, and
 scaling runs on the CPU.
+
+## 2026-10-21: Wine 11.20
+
+Our Wine (`wine-uwp`, 307 commits on 11.17) merged with `wine-11.20` (1076 upstream commits) as one merge commit,
+`74c71bbd`, on branch `wine-uwp-11.20` in a worktree (`uwp-bin/wine-src-1120`); `~/src/wine`'s checkout and the shared
+`~/src/wine-build` are untouched until the switch. 61 files changed on both sides; eight conflicted.
+
+| File | Resolution |
+| --- | --- |
+| `dlls/ntdll/sync.c` | Upstream fixed the same `RtlWakeAddress*` race we had (unlink the wait entry, then clear its address with release semantics). Theirs, all four hunks. |
+| `dlls/ntdll/unix/virtual.c` | Upstream replaced the reserved-area list with an array and the alignment retry loop with `unmap_extra_space`. Ours kept on top of theirs: bottom-up allocations try the low 2^43 first, then `map_free_area` before an unconstrained mmap (Halo's 43-bit pointers). |
+| `dlls/kernelbase/version.c` | Both added functions; both kept. Upstream's new `PackageFullNameFromId` duplicated ours and is dropped: with a NULL `resourceId` it writes `x64_<publisher>` where Windows writes `x64__<publisher>`. |
+| `include/appmodel.h` | Both declarations. |
+| `msvcrt.spec`, `ucrtbase.spec` | Upstream's arm64ec split of `__C_specific_handler`, plus our `_noexcept` alias. |
+| `ntsyscalls.h`, `configure` | Regenerated (`make_specfiles`, `autoreconf`). That also brought `msvcp_win`, `vcruntime140` and `windows.storage` forwards up to date with exports we had added; those two specs are now vendored. |
+
+**One build break after a clean merge.** 11.20 moved per-architecture enables out of configure into each module's
+makefile (`ENABLE_ARCHS`, upstream `886f2eaa`), so `--enable-wineuwp=x86_64` was silently ignored and `wineuwp`'s
+x64-only diagnostics failed to compile for i386. `dlls/wineuwp/Makefile.in` now says `ENABLE_ARCHS = x86_64`
+(`07568d29`).
+
+**Upstream now covers one of our files**: `include/windows.storage.streams.idl` is identical to 11.20's and left the
+vendored list. `sync-wine.sh` takes the newest merged `wine-*` tag as the upstream base; the clone is shallow and its
+only root is still 11.17, which would have counted all of 11.18-11.20 as ours.
+
+**Upstream changes we lean on:** "Reserve the entire low 8G on 64-bit" (`f8da67d3`) and the top-down area changes
+move where allocations land; Halo was the test for them.
+
+Tests, each on a reflinked copy of the prefix with `wineboot -u`, Xvfb `:92`, against the same suite on 11.17 on an
+identical copy:
+
+| | 11.17 | 11.20 |
+| --- | --- | --- |
+| `regress.sh calc` | AE 3924.73 | AE 3924.73 |
+| `mp` | 236 colours | 236 colours |
+| `fh`, `sol`, `kb` | fail (this prefix's baseline) | identical failures |
+
+- Xbox app: Home signed in, Halo's page, Manage > Add-ons with Base game and Campaign
+  (`docs/screenshots/xbox-home-wine-11.20.png`, `xbox-manage-addons-wine-11.20.png`).
+- Halo from the real stage: title, online main menu, Campaign, New Game, the opening cutscene; no crash report
+  (`halo-main-menu-wine-11.20.png`, `halo-campaign-cutscene-wine-11.20.png`). Its `assertion failure exception` lines
+  also appear in the 11.17 campaign logs.
+- Shapr3D: Recents, signed in (`shapr3d-recents-wine-11.20.png`).
+- `probe-xboxauth`: sigtest 3/3; device/authenticate signed 200, unsigned 400, damaged 403.
+
+Trap on the way: on Xvfb without a window manager, X focus stays on the root window. Halo took the first Enter and
+then ignored keys and clicks on its menu until `xdotool windowfocus`; that is the test setup, not 11.20.

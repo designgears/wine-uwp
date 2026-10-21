@@ -341,6 +341,7 @@ registry:
     }
 
     *out = buf;
+    RegCloseKey(hkey_class);
     return S_OK;
 
 done:

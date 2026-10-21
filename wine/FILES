@@ -99,6 +99,7 @@ dlls/msvcp140_app/Makefile.in
 dlls/msvcp140_app/msvcp140_app.spec
 dlls/msvcp140/msvcp140.spec
 dlls/msvcp90/misc.c
+dlls/msvcp_win/msvcp_win.spec
 dlls/msvcrt/exit.c
 dlls/msvcrt/mbcs.c
 dlls/msvcrt/msvcrt.spec
@@ -166,6 +167,7 @@ dlls/userenv/userenv_main.c
 dlls/userenv/userenv.spec
 dlls/uxtheme/system.c
 dlls/uxtheme/uxtheme.spec
+dlls/vcruntime140/vcruntime140.spec
 dlls/win32u/defwnd.c
 dlls/win32u/font.c
 dlls/win32u/input.c
@@ -299,7 +301,6 @@ include/windows.media.playback.idl
 include/windows.networking.connectivity.idl
 include/windows.networking.sockets.idl
 include/windows.storage.idl
-include/windows.storage.streams.idl
 include/windows.ui.text.core.idl
 include/wine/server_protocol.h
 include/wininet.h

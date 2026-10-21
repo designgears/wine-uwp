@@ -2873,3 +2873,4 @@ BOOL WINAPI GetSystemAppDataKey( HANDLE handle, DWORD flags, HKEY *key )
     SetLastError( ERROR_NOT_SUPPORTED );
     return FALSE;
 }
+

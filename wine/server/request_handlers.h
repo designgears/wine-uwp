@@ -70,6 +70,7 @@ DECL_HANDLER(socket_get_icmp_id);
 DECL_HANDLER(get_next_console_request);
 DECL_HANDLER(read_directory_changes);
 DECL_HANDLER(read_change);
+DECL_HANDLER(unmount_device);
 DECL_HANDLER(create_mapping);
 DECL_HANDLER(open_mapping);
 DECL_HANDLER(get_mapping_info);
@@ -390,6 +391,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_get_next_console_request,
     (req_handler)req_read_directory_changes,
     (req_handler)req_read_change,
+    (req_handler)req_unmount_device,
     (req_handler)req_create_mapping,
     (req_handler)req_open_mapping,
     (req_handler)req_get_mapping_info,
@@ -840,11 +842,12 @@ C_ASSERT( offsetof(struct set_thread_info_request, handle) == 12 );
 C_ASSERT( offsetof(struct set_thread_info_request, priority) == 16 );
 C_ASSERT( offsetof(struct set_thread_info_request, base_priority) == 20 );
 C_ASSERT( offsetof(struct set_thread_info_request, affinity) == 24 );
-C_ASSERT( offsetof(struct set_thread_info_request, entry_point) == 32 );
-C_ASSERT( offsetof(struct set_thread_info_request, token) == 40 );
-C_ASSERT( offsetof(struct set_thread_info_request, disable_boost) == 44 );
-C_ASSERT( offsetof(struct set_thread_info_request, mask) == 48 );
-C_ASSERT( sizeof(struct set_thread_info_request) == 56 );
+C_ASSERT( offsetof(struct set_thread_info_request, system_affinity) == 32 );
+C_ASSERT( offsetof(struct set_thread_info_request, entry_point) == 40 );
+C_ASSERT( offsetof(struct set_thread_info_request, token) == 48 );
+C_ASSERT( offsetof(struct set_thread_info_request, disable_boost) == 52 );
+C_ASSERT( offsetof(struct set_thread_info_request, mask) == 56 );
+C_ASSERT( sizeof(struct set_thread_info_request) == 64 );
 C_ASSERT( offsetof(struct suspend_thread_request, handle) == 12 );
 C_ASSERT( sizeof(struct suspend_thread_request) == 16 );
 C_ASSERT( offsetof(struct suspend_thread_reply, count) == 8 );
@@ -999,8 +1002,10 @@ C_ASSERT( offsetof(struct open_file_object_request, attributes) == 16 );
 C_ASSERT( offsetof(struct open_file_object_request, rootdir) == 20 );
 C_ASSERT( offsetof(struct open_file_object_request, sharing) == 24 );
 C_ASSERT( offsetof(struct open_file_object_request, options) == 28 );
-C_ASSERT( sizeof(struct open_file_object_request) == 32 );
+C_ASSERT( offsetof(struct open_file_object_request, async_user) == 32 );
+C_ASSERT( sizeof(struct open_file_object_request) == 40 );
 C_ASSERT( offsetof(struct open_file_object_reply, handle) == 8 );
+C_ASSERT( offsetof(struct open_file_object_reply, wait) == 12 );
 C_ASSERT( sizeof(struct open_file_object_reply) == 16 );
 C_ASSERT( offsetof(struct alloc_file_handle_request, access) == 12 );
 C_ASSERT( offsetof(struct alloc_file_handle_request, attributes) == 16 );
@@ -1097,6 +1102,8 @@ C_ASSERT( sizeof(struct read_directory_changes_request) == 64 );
 C_ASSERT( offsetof(struct read_change_request, handle) == 12 );
 C_ASSERT( sizeof(struct read_change_request) == 16 );
 C_ASSERT( sizeof(struct read_change_reply) == 8 );
+C_ASSERT( offsetof(struct unmount_device_request, dev) == 12 );
+C_ASSERT( sizeof(struct unmount_device_request) == 16 );
 C_ASSERT( offsetof(struct create_mapping_request, access) == 12 );
 C_ASSERT( offsetof(struct create_mapping_request, flags) == 16 );
 C_ASSERT( offsetof(struct create_mapping_request, file_access) == 20 );

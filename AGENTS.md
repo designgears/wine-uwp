@@ -1432,8 +1432,9 @@ callsite correlation” (10-16).
 `WINEPREFIX=... packaging/install-eac-runtime.sh --download` installs/links the Proton runtime without
 restarting Wine. env.sh supplies both PROTON_EAC_RUNTIME and WINEDLLPATH: our Wine does not interpret
 the former itself. Keep its PE DLLs with their Unix .so partners. The original shared build is x64-only;
-`uwp-bin/wine-build-wow64` now builds both architectures from our source (use --enable-archs=i386,x86_64
---enable-wineuwp=x86_64; the UWP host itself uses x64 diagnostics). The desktop prefix-test was updated
+`uwp-bin/wine-build-wow64` now builds both architectures from our source (use --enable-archs=i386,x86_64; the UWP
+host itself uses x64 diagnostics, so `dlls/wineuwp/Makefile.in` says `ENABLE_ARCHS = x86_64`. Before 11.20 that was
+`--enable-wineuwp=x86_64` on the configure line, which 11.20 silently ignores). The desktop prefix-test was updated
 with that build's wineboot -u. Halo's bundled 32-bit EOS installer then exited 0 and registered
 EasyAntiCheat_EOS with its executable under Program Files (x86). Protected-game compatibility is still
 not established. The later Halo launch investigation fixed EAC module mapping (below). Never mix
