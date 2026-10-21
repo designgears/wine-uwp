@@ -4474,9 +4474,10 @@ extern "C" __declspec(dllexport) int WINAPI XboxAuthSelfTest(const char *what, c
                 EnterCriticalSection(&account.cs);
                 account.xsts["http://xboxlive.com"] = x;
                 std::string header = "XBL3.0 x=" + account.uhs + ";" + x.token;
+                std::string xid = account.xid;
                 LeaveCriticalSection(&account.cs);
                 std::string pbody = "{\"id\":\"2043073184\",\"placement\":\"full\",\"state\":\"active\"}";
-                std::string purl = "https://userpresence.xboxlive.com/users/xuid(2533274829256434)/devices/current/titles/current";
+                std::string purl = "https://userpresence.xboxlive.com/users/xuid(" + xid + ")/devices/current/titles/current";
                 SigningPolicy policy; find_policy(purl, policy);
                 std::string sig = sign_request(policy.version, policy.max_body_bytes, "POST", split_url(purl).path_and_query, header, pbody);
                 std::vector<std::string> h = {"Authorization: "+header,"x-xbl-contract-version: 3","Content-Type: application/json","Accept: application/json"};
