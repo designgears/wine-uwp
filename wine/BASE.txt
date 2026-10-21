@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     e9995a04270dde3d5eaad865ea0d82b411c559c5
-                 winegameplatform: Add the Microsoft.GamePlatform.Services classes.
+  wine HEAD:     f336599e952ae49a403461641a07672deb0200d8
+                 xgameruntime: Add the GDK game runtime.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-21T06:06:59Z
+  captured:      2026-10-21T07:09:29Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

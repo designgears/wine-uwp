@@ -1,0 +1,9 @@
+MODULE    = xgameruntime.dll
+IMPORTS   = uuid crypt32
+
+SOURCES = \
+	async.c \
+	main.c \
+	services.c \
+	store.c \
+	user.c

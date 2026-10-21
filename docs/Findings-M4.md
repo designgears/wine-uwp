@@ -12998,3 +12998,27 @@ Two Gaming Services calls still answer 0x87E00196 in that session, as with the s
 (slot 26, 23 calls) and `Customization.QueryUserProps` (slot 10, once). Neither stopped a screen. The Add-ons tab
 opens with Apply enabled and "+67.77 GB" before anything is changed (the fixture's marker records no features); not
 compared against the shim.
+
+## 2026-10-21: Shims to C - the GDK runtime (`gameruntime` -> `dlls/xgameruntime`)
+
+- Named `xgameruntime`, the DLL GdkSupport loads. Windows has none, so a builtin takes nothing over. Prefixes from
+  before the port have the stand-in in system32 with `xgameruntime=native`; `install-overrides.sh` replaces it with the
+  builtin and drops the override.
+- **Stage copies win.** Halo's stage had the stand-in beside `HaloInfinite.exe`, in `game/` and in
+  `subgames/CampaignS1/` (`.bak-xasync` backups too); an app-directory DLL loads before system32's builtin. The test used
+  a reflinked copy of the stage without them (`uwp-bin/xbox-games/stage/halo-gdktest`). **The real stage
+  `254428597cfe2` still has them, so Halo there still runs the old stand-in** until they are moved aside.
+- First run: Halo crashed on Enter at the title, in `async_new`, writing `0x27`. A heap critical section was named
+  through `cs.DebugInfo->Spare[0]`, and Wine's `InitializeCriticalSection` leaves `DebugInfo` as -1. SRW lock now.
+- Then: title -> sign-in as the Xbox app's account (XUserAddAsync, title-storage and halowaypoint tokens signed through
+  `wineuwp_xboxauth.dll`) -> the Store-user notice (as before) -> online main menu with live challenges -> Campaign ->
+  confirm -> the campaign subgame's GDK init (package identifier `513710F5AB8E4D7C9ED5D0BA94DCFB33` for a 33-byte
+  buffer, HD1 and CampaignS1 features queried, HD1 Installable) -> Slot 1 New Game -> the opening cutscene. No crash
+  report. The only FIXMEs are `XPackageCreateInstallationMonitor`, E_NOTIMPL as in the shim.
+- Bad Magpie reaches its menu. It has no `.wine-uwp-chunks.json`, so `QueryApiImpl` fails as it did with the shim, and
+  the game copes.
+- `hd_softskip.cpp` (patched Halo campaign code at run time; opt-in, off by default, recorded above as hiding the real
+  fault) is not ported.
+- `probe-gdkchunks` passes against the builtin (Launch Ready, HD1 Installable, chunk 1200 Installable, chunk 1000
+  Ready). Its first run loaded the old stand-in still sitting in `build-probes/`; that copy is now
+  `xgameruntime.dll.old-shim`.

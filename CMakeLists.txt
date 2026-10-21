@@ -68,9 +68,6 @@ target_link_libraries(probe-memorymanager PRIVATE runtimeobject.lib)
 
 # Windows.Services.Store.StoreContext - a traced stand-in used to find out which Store methods
 # the app actually calls, before implementing any of them.
-add_library(gameruntime SHARED shims/gameruntime/gameruntime.cpp shims/gameruntime/xuser_xstore.cpp shims/gameruntime/hd_softskip.cpp)
-set_target_properties(gameruntime PROPERTIES PREFIX "" OUTPUT_NAME "xgameruntime" CXX_STANDARD 17)
-target_link_libraries(gameruntime PRIVATE ole32.lib crypt32.lib)
 add_executable(probe-gdkchunks probes/probe-gdkchunks.cpp)
 set_target_properties(probe-gdkchunks PROPERTIES CXX_STANDARD 17)
 target_link_libraries(probe-gdkchunks PRIVATE ole32.lib)

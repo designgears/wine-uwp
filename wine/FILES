@@ -454,3 +454,11 @@ dlls/winegameplatform/objects.c
 dlls/winegameplatform/private.h
 dlls/winegameplatform/slots.h
 dlls/winegameplatform/winegameplatform.spec
+dlls/xgameruntime/Makefile.in
+dlls/xgameruntime/async.c
+dlls/xgameruntime/main.c
+dlls/xgameruntime/private.h
+dlls/xgameruntime/services.c
+dlls/xgameruntime/store.c
+dlls/xgameruntime/user.c
+dlls/xgameruntime/xgameruntime.spec

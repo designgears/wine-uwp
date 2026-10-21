@@ -3,7 +3,7 @@
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
-#include "../shims/gameruntime/package_abi.h"
+#include "xpackage_abi.h"
 
 typedef HRESULT (WINAPI *InitializeApiImpl_t)(ULONG, ULONG);
 typedef HRESULT (WINAPI *QueryApiImpl_t)(REFCLSID, REFIID, void **);

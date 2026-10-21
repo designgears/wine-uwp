@@ -33,7 +33,7 @@ STAMP=$WINEPREFIX/.install-overrides.stamp
 # The shim DLLs have to be in the stamp: without them, rebuilding a shim leaves the stamp
 # unchanged, the installer skips itself, and the prefix keeps running the previous build - which
 # looks exactly like the code change having no effect.
-stamp=$( { find "$SRC" "$(dirname "$SRC")/Globalization" "$(dirname "$SRC")/Fonts" -printf '%p %s %T@\n' 2>/dev/null; stat -c '%Y' "$SYS32" "$(wine_pe ntdll)" "$(wine_pe wineuwp)" "$0" "$(dirname "$0")/globalization.reg" 2>/dev/null; stat -c '%n %s %Y' ${SHIM_DIR}/wineuwp_*.dll ${SHIM_DIR}/xgameruntime.dll 2>/dev/null; echo "${1:-}"; } | md5sum | cut -d' ' -f1 )
+stamp=$( { find "$SRC" "$(dirname "$SRC")/Globalization" "$(dirname "$SRC")/Fonts" -printf '%p %s %T@\n' 2>/dev/null; stat -c '%Y' "$SYS32" "$(wine_pe ntdll)" "$(wine_pe wineuwp)" "$0" "$(dirname "$0")/globalization.reg" 2>/dev/null; stat -c '%n %s %Y' ${SHIM_DIR}/wineuwp_*.dll 2>/dev/null; echo "${1:-}"; } | md5sum | cut -d' ' -f1 )
 if [ -z "${WINE_UWP_FORCE_OVERRIDES:-}" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$stamp" ]; then
   echo "overrides unchanged"
   exit 0
@@ -318,14 +318,15 @@ if [ -f "$SYS32/windows.services.store.dll" ]; then
 fi
 
 
-# GDK titles LoadLibrary xgameruntime.dll through GdkSupport. Our stand-in answers
-# XPackageFindChunkAvailability from the stage's .wine-uwp-chunks.json.
-GR_SHIM=${SHIM_DIR}/xgameruntime.dll
-if [ -f "$GR_SHIM" ]; then
-  GR_DST=$SYS32/xgameruntime.dll
-  if ! cmp -s "$GR_SHIM" "$GR_DST"; then cp -f --reflink=auto "$GR_SHIM" "$GR_DST"; fi
-  "${WINE_BIN}wine" reg add 'HKCU\Software\Wine\DllOverrides' /v xgameruntime /t REG_SZ /d native /f >/dev/null 2>&1
-  echo "installed: xgameruntime (GDK package availability)"
+# GDK titles LoadLibrary xgameruntime.dll through GdkSupport: Wine's dlls/xgameruntime, which answers
+# XPackageFindChunkAvailability from the stage's .wine-uwp-chunks.json. Prefixes set up before the port have the old
+# stand-in in system32 under a native override; once the build has the builtin, both go.
+if [ -f "$(wine_pe xgameruntime)" ]; then
+  if [ -f "$SYS32/xgameruntime.dll" ] && ! LC_ALL=C grep -aq "Wine builtin DLL" "$SYS32/xgameruntime.dll"; then
+    rm -f "$SYS32/xgameruntime.dll"
+    cp -f --reflink=auto "$(wine_pe xgameruntime)" "$SYS32/xgameruntime.dll"
+  fi
+  "${WINE_BIN}wine" reg delete 'HKCU\Software\Wine\DllOverrides' /v xgameruntime /f >/dev/null 2>&1
 fi
 
 # Microsoft.GamePlatform.Services.*: the Gaming Services client classes, Wine's winegameplatform. They replace the

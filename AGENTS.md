@@ -720,6 +720,14 @@ the Xbox app (passing three) had in its own frame. The app then released a clobb
 right after `add_ApiStatusChanged`. Declare only the register arguments (four, `this` included) for a thunk that
 stands for slots of unknown arity, and check the disassembly for a `jmp` that writes `[rsp+0x28]` first.
 
+**`InitializeCriticalSection` in Wine leaves `DebugInfo` as `(void *)-1`.** Naming a heap critical section with
+`cs.DebugInfo->Spare[0] = ...` (the pattern for *static* ones, which carry their own `CRITICAL_SECTION_DEBUG`) writes to
+`0x27`: the first `xgameruntime` port crashed Halo in `XUserAddAsync` that way. Use an SRW lock for per-object state.
+
+**A DLL beside a game's exe beats Wine's builtin of the same name.** The old `xgameruntime.dll` stand-in had been
+copied into Halo's stage, `game/` and `subgames/CampaignS1/`, and those copies load before `system32`'s builtin
+(`build-probes/` had one beside `probe-gdkchunks.exe` too). Check `+loaddll` says `builtin` before testing a port.
+
 **Wine does not show a child window that belongs to another process.** A cross-process `WS_CHILD` (WebView2's Chromium
 window parented to the app) paints nothing on screen (`probes/probe-xchild.cpp`); `shims/webview2` shows the browser
 through `CapturePreview` frames in a popup instead.
