@@ -73,10 +73,7 @@ set_target_properties(probe-gdkchunks PROPERTIES CXX_STANDARD 17)
 target_link_libraries(probe-gdkchunks PRIVATE ole32.lib)
 set_target_properties(probe-gdkchunks PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
 
-# Microsoft.GamePlatform.Services.Identity: Xbox sign-in (MSA device code + Xbox Live tokens) for the Xbox app.
-add_library(xboxauth SHARED shims/xboxauth/xboxauth.cpp)
-set_target_properties(xboxauth PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_xboxauth")
-target_link_libraries(xboxauth PRIVATE runtimeobject.lib winhttp.lib crypt32.lib bcrypt.lib shell32.lib ole32.lib)
+# Xbox sign-in self-tests: drives Wine's winexboxauth.dll without the Xbox app.
 add_executable(probe-xboxauth probes/probe-xboxauth.cpp)
 set_target_properties(probe-xboxauth PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
 

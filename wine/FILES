@@ -454,6 +454,16 @@ dlls/winegameplatform/objects.c
 dlls/winegameplatform/private.h
 dlls/winegameplatform/slots.h
 dlls/winegameplatform/winegameplatform.spec
+dlls/winexboxauth/Makefile.in
+dlls/winexboxauth/auth.c
+dlls/winexboxauth/identity.c
+dlls/winexboxauth/main.c
+dlls/winexboxauth/private.h
+dlls/winexboxauth/storeconfig.c
+dlls/winexboxauth/util.c
+dlls/winexboxauth/webaccount.c
+dlls/winexboxauth/windevice.c
+dlls/winexboxauth/winexboxauth.spec
 dlls/xgameruntime/Makefile.in
 dlls/xgameruntime/async.c
 dlls/xgameruntime/main.c

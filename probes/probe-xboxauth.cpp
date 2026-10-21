@@ -1,12 +1,12 @@
-// probe-xboxauth <what> [arg]: drives wineuwp_xboxauth.dll's XboxAuthSelfTest without the Xbox app.
+// probe-xboxauth <what> [arg]: drives winexboxauth.dll's XboxAuthSelfTest without the Xbox app.
 //   endpoints <url> | xbl [rps] | devicecode | silent [url] | sigtest | devicetoken [Win32|Android|...] | sisu | policy <url>
-//   (see shims/xboxauth/xboxauth.cpp)
+//   (see dlls/winexboxauth in Wine)
 #include <windows.h>
 #include <cstdio>
 int main(int argc, char **argv)
 {
     if (argc < 2) { printf("usage: probe-xboxauth endpoints URL | xbl [RPS] | devicecode | silent [URL] | sigtest | devicetoken [TYPE] | sisu | policy URL\n"); return 2; }
-    HMODULE m = LoadLibraryA("wineuwp_xboxauth.dll");
+    HMODULE m = LoadLibraryA("winexboxauth.dll");
     if (!m) { printf("LoadLibrary failed %lu\n", GetLastError()); return 3; }
     typedef int (WINAPI *fn)(const char *, const char *);
     fn f = (fn)GetProcAddress(m, "XboxAuthSelfTest");

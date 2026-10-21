@@ -386,16 +386,15 @@ if [ -f "$SYS32/winegameplatform.dll" ]; then
   echo "installed: GamePlatform (Gaming Services client): Wine's winegameplatform"
 fi
 
-# Microsoft.GamePlatform.Services.Identity: Xbox sign-in (see shims/xboxauth). On Windows it is Gaming Services'
+# Microsoft.GamePlatform.Services.Identity: Xbox sign-in, Wine's winexboxauth. On Windows it is Gaming Services'
 # token broker; this one signs in with a Microsoft account device code in the user's browser and talks to Xbox
 # Live itself. The sign-in is kept, DPAPI-protected, in %LOCALAPPDATA%\wineuwp\xboxauth.bin.
-XA_SHIM=${SHIM_DIR}/wineuwp_xboxauth.dll
-if [ -f "$XA_SHIM" ]; then
-  XA_DST=$SYS32/wineuwp_xboxauth.dll
-  if ! cmp -s "$XA_SHIM" "$XA_DST"; then cp -f --reflink=auto "$XA_SHIM" "$XA_DST"; fi
+if [ -f "$SYS32/winexboxauth.dll" ]; then
+  # prefixes set up before the port used a stand-in DLL
+  rm -f "$SYS32/wineuwp_xboxauth.dll"
   for cls in XboxAuthManager XboxAuthInitializationArgs; do
     K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Microsoft.GamePlatform.Services.Identity.$cls"
-    "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_xboxauth.dll' /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\winexboxauth.dll' /f >/dev/null 2>&1
     "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
     "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 0 /f >/dev/null 2>&1
     "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -405,17 +404,17 @@ if [ -f "$XA_SHIM" ]; then
   # "consumers") and its WebAccount are the account the Xbox sign-in holds, which is what the Store account is on
   # Windows. Other providers are not found. (It replaced shims/webauthcore, which found no provider at all.)
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_xboxauth.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\winexboxauth.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 0 /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
   # StoreConfiguration likewise: which WebAccount is the Store's. Windows' own needs StoreConfigurationServer.
   K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.ApplicationModel.Store.Preview.StoreConfiguration"
-  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_xboxauth.dll' /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\winexboxauth.dll' /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 0 /f >/dev/null 2>&1
   "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
-  echo "installed: Xbox sign-in (XboxAuthManager, WebAuthenticationCoreManager, StoreConfiguration) stand-in"
+  echo "installed: Xbox sign-in (XboxAuthManager, WebAuthenticationCoreManager, StoreConfiguration): Wine's winexboxauth"
 fi
 
 # dmprocessxmlfiltered.dll (the Microsoft Store's MDM policy query) and the advertising-ID apiset are Wine's own now:
@@ -541,8 +540,8 @@ for c in AppInstallManager AppUpdateOptions; do
 done
 [ -f "$SYS32/windows.ui.shell.taskbarmanager.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.UI.Shell.TaskbarManager:windows.ui.shell.taskbarmanager.dll"
 [ -f "$SYS32/windows.services.store.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Services.Store.StoreContext:windows.services.store.dll"
-[ -f "$SYS32/wineuwp_xboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager:wineuwp_xboxauth.dll"
-[ -f "$SYS32/wineuwp_xboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.StoreConfiguration:wineuwp_xboxauth.dll"
+[ -f "$SYS32/winexboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager:winexboxauth.dll"
+[ -f "$SYS32/winexboxauth.dll" ]          && SHIM_CLASSES="$SHIM_CLASSES Windows.ApplicationModel.Store.Preview.StoreConfiguration:winexboxauth.dll"
 [ -f "$SYS32/windows.media.devices.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioDeviceConfiguration:windows.media.devices.dll"
 [ -f "$SYS32/windows.media.devices.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Media.Audio.SpatialAudioFormatSubtype:windows.media.devices.dll"
 [ -f "$SYS32/windows.networking.connectivity.dll" ] && SHIM_CLASSES="$SHIM_CLASSES Windows.Networking.Connectivity.NetworkInformation:windows.networking.connectivity.dll"

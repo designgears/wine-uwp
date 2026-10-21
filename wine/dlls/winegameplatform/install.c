@@ -24,7 +24,7 @@
  * Gaming Services installs a game the user owns from the Store's delivery service; so does this:
  *   1. the product's Windows Update category, from the public display catalogue;
  *   2. the package's download address from the Store's delivery service (appxinstall's appx_store_*), or for a
- *      GDK title its .msixvc from the Xbox CDN (packagespc.xboxlive.com, signed by wineuwp_xboxauth.dll);
+ *      GDK title its .msixvc from the Xbox CDN (packagespc.xboxlive.com, signed by winexboxauth.dll);
  *   3. appxinstall streams the package from there into a stage directory, with its frameworks from the Windows
  *      files, decrypting it with the licence's content keys when it is encrypted, and reports progress;
  *   4. the queue reports it as Gaming Services would (ItemAdded, InstallationChanged with progress,
@@ -511,19 +511,19 @@ static void guid_text( const GUID *id, char *buf )
              id->Data4[1], id->Data4[2], id->Data4[3], id->Data4[4], id->Data4[5], id->Data4[6], id->Data4[7] );
 }
 
-/* An encrypted package's content keys, from the Store licence (wineuwp_xboxauth.dll), as the installer takes them:
+/* An encrypted package's content keys, from the Store licence (winexboxauth.dll), as the installer takes them:
  * "keyid:key;..." in hex. They go to it in memory, never into a file or a log. */
 static HRESULT encrypted_package_keys( const GUID *content_id, char *keys, size_t size )
 {
     typedef HRESULT (WINAPI *content_keys_fn)( const char *, const char *, char *, UINT32 );
-    HMODULE auth = LoadLibraryW( L"wineuwp_xboxauth.dll" );
+    HMODULE auth = LoadLibraryW( L"winexboxauth.dll" );
     content_keys_fn fn = auth ? (void *)GetProcAddress( auth, "XboxAuthContentKeys" ) : NULL;
     char id[40];
     HRESULT hr;
 
     if (!fn)
     {
-        WARN( "install: no wineuwp_xboxauth.dll with XboxAuthContentKeys\n" );
+        WARN( "install: no winexboxauth.dll with XboxAuthContentKeys\n" );
         return HRESULT_FROM_WIN32( ERROR_NOT_SUPPORTED );
     }
     guid_text( content_id, id );
@@ -538,7 +538,7 @@ static HRESULT encrypted_package_keys( const GUID *content_id, char *keys, size_
 HRESULT msixvc_url( const GUID *content_id, char **url )
 {
     typedef HRESULT (WINAPI *get_fn)( const char *, const char *, const char *, unsigned char **, UINT32 *, DWORD * );
-    HMODULE xboxauth = LoadLibraryW( L"wineuwp_xboxauth.dll" );
+    HMODULE xboxauth = LoadLibraryW( L"winexboxauth.dll" );
     get_fn get = xboxauth ? (void *)GetProcAddress( xboxauth, "XboxAuthHttpGet" ) : NULL;
     const struct json *files, *file;
     unsigned char *body = NULL;

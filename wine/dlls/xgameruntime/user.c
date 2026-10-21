@@ -1,5 +1,5 @@
 /*
- * XUser, from the Xbox sign-in kept by wineuwp_xboxauth.dll
+ * XUser, from the Xbox sign-in kept by winexboxauth.dll
  *
  * Copyright 2026 wine-uwp contributors
  *
@@ -29,7 +29,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(gdk);
 
 /*
- * The user is the one signed in to the Xbox app. wineuwp_xboxauth.dll keeps that sign-in in
+ * The user is the one signed in to the Xbox app. winexboxauth.dll keeps that sign-in in
  * %LOCALAPPDATA%\wineuwp\xboxauth.bin (DPAPI-protected "key=value" lines; WINE_UWP_XBOXAUTH_STORE overrides the path)
  * and signs the title's requests for it.
  */
@@ -314,11 +314,11 @@ static INIT_ONCE xboxauth_once = INIT_ONCE_STATIC_INIT;
 
 static BOOL CALLBACK load_xboxauth( INIT_ONCE *once, void *param, void **context )
 {
-    HMODULE module = LoadLibraryW( L"wineuwp_xboxauth.dll" );
+    HMODULE module = LoadLibraryW( L"winexboxauth.dll" );
 
     if (!module)
     {
-        ERR( "wineuwp_xboxauth.dll not loaded, error %lu\n", GetLastError() );
+        ERR( "winexboxauth.dll not loaded, error %lu\n", GetLastError() );
         return TRUE;
     }
     if (!(get_token = (get_token_fn)GetProcAddress( module, "XboxAuthGetTokenAndSignature" )))

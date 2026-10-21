@@ -1,0 +1,8 @@
+@ stdcall -private DllCanUnloadNow()
+@ stdcall -private DllGetActivationFactory(ptr ptr)
+@ stdcall XboxAuthContentKeys(str str ptr long)
+@ stdcall XboxAuthGetTokenAndSignature(str str long ptr long ptr long ptr ptr long ptr)
+@ stdcall XboxAuthHttpGet(str str str ptr ptr ptr)
+@ stdcall XboxAuthOwnsProduct(str)
+@ stdcall XboxAuthSelfTest(str str)
+@ stdcall XboxAuthSetTitleContext(str long)

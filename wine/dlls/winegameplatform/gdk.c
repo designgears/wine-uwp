@@ -659,7 +659,7 @@ static const struct gdk_package *gdk_package( const WCHAR *store_id )
 static BOOL entitled_to( const char *store_id )
 {
     typedef HRESULT (WINAPI *owns_fn)( const char * );
-    HMODULE xboxauth = LoadLibraryW( L"wineuwp_xboxauth.dll" );
+    HMODULE xboxauth = LoadLibraryW( L"winexboxauth.dll" );
     owns_fn owns = xboxauth ? (void *)GetProcAddress( xboxauth, "XboxAuthOwnsProduct" ) : NULL;
     char needle[256];
     size_t len = strlen( store_id );

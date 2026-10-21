@@ -13057,3 +13057,43 @@ its "Looks like you're stranded" page.
 Also fixed on the way: `install-overrides.sh` exited under `set -e` at the xgameruntime step whenever the
 `xgameruntime` override was already gone (`reg delete` of a missing value returns 1), so nothing after it ran - the
 WebView2 runtime install included.
+
+## 2026-10-21: Shims to C - the Xbox sign-in (`xboxauth` -> `dlls/winexboxauth`)
+
+The last shim. `dlls/winexboxauth` holds what `shims/xboxauth/xboxauth.cpp` and `windevice.inc` did: the device and
+user tokens, XSTS and SISU (`auth.c`), XboxAuthManager (`identity.c`), WebAuthenticationCoreManager and the Microsoft
+account WebAccount (`webaccount.c`), StoreConfiguration (`storeconfig.c`), the per-prefix Windows device licence and
+content keys (`windevice.c`) and the exports (`main.c`: `XboxAuthHttpGet`, `XboxAuthGetTokenAndSignature`,
+`XboxAuthSetTitleContext`, `XboxAuthOwnsProduct`, `XboxAuthContentKeys`, `XboxAuthSelfTest`). winegameplatform and
+xgameruntime load it as `winexboxauth.dll`. `xboxauth.bin` is read and written in the shim's format, so the test
+prefixes stayed signed in and kept their device: `probe-xboxauth windev` with `+xboxauth` logs only the
+www.microsoft.com ticket, no `deviceaddcredential` (no new slot in the account's device group). With xboxauth gone,
+`shims/common/json.h` had no user left, and `shims/` is empty.
+
+`XboxAuthSelfTest` keeps the shim's checks except the exploratory `halotitle` and `titleauth` (title-auth experiments
+from 10-17; `halodevice` stays). Nothing it prints is a token or a key.
+
+One port bug, found on the first Xbox start: the four factories called `InitOnceBeginInitialize( &once, 0, NULL,
+NULL )`. kernelbase writes the result through `pending`, so the first activation (XboxAuthInitializationArgs) faulted
+at address 0 in kernelbase before the module logged anything. `+loaddll` gave the bases (kernelbase at
+`0x6FFFFF2C0000`, fault at +0x3a8da, `InitOnceBeginInitialize`). Fixed with a real `pending`, and only initialising
+when it is set (AGENTS.md).
+
+Tests, `wine-build-wow64`, Xvfb `:91`:
+- `probe-xboxauth sigtest`: the xal-rs prehash vector matches, the xal-rs device/authenticate signature verifies, and
+  our own proof key round-trips. `devicetoken Win32`: a token; device/authenticate signed 200, no Signature 400, a
+  damaged one 403 (XSTS with the device token alone still accepts a damaged signature, as recorded on 10-15).
+  `silent`: signed in, token for profile.xboxlive.com. `license` for the Taiko demo and Resident Evil 7 content ids:
+  one 32-byte key each, with the package names.
+- Xbox app on `prefix-test`, `WINE_UWP_GAMES_DATA=uwp-bin/xbox-addons-ui-test`: Home signed in
+  (`docs/screenshots/xbox-home-wine-xboxauth.png`); Settings > Account shows the gamertag and picture with no
+  Store-account mismatch notice (`xbox-settings-account-wine-xboxauth.png`); Halo > Manage > Add-ons names Base game
+  and Campaign (`xbox-manage-addons-wine-xboxauth.png`).
+- Halo from `uwp-bin/xbox-games/stage/254428597cfe2` (its old `xgameruntime.dll` copies renamed `.old-shim`, so
+  Wine's builtin runs) on `prefix-gdk-test`: title -> Enter -> the online main menu with the live challenges
+  (`halo-main-menu-wine-xboxauth.png`); 13 GDK token requests signed through `XboxAuthGetTokenAndSignature`.
+
+The Add-ons tab still opens with "Requires 67.77 GB disk space (+67.77 GB)" and Apply drawn enabled before anything
+changes. 67.77 GB is the figure the C++ gameplatform shim showed there on 10-16 (the "Follow-up virtual repro" entry
+above: Campaign moves it from 67.77 GB to 74.31 GB), so the size is not from either port. Whether that shim also drew
+Apply enabled before a change was not recorded and was not re-run: its source left the tree with 43f964e.

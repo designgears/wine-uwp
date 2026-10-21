@@ -817,7 +817,7 @@ HRESULT WINAPI store_EnumerateMigrationBlockedProducts( struct factory *f, IInsp
 
 /* ---- ContentAccess.GetRawContentAccessDataAsync: which games the user may play (owned, Game Pass) ----
  * Gaming Services fetches it from the Content Access Service; so does this, with the user's Xbox Live token from
- * wineuwp_xboxauth.dll: contentaccess.exp.xboxservices.com/all/v1, the endpoint the app itself uses when it does not
+ * winexboxauth.dll: contentaccess.exp.xboxservices.com/all/v1, the endpoint the app itself uses when it does not
  * use Gaming Services as its source. The data is handed over as it arrives. */
 
 static const GUID IID_IRawContentAccessDataResult = {0xd84407df,0xb7e6,0x58a2,{0xa1,0xe8,0x2d,0xb3,0x66,0xc4,0xff,0x11}};
@@ -875,7 +875,7 @@ BOOL content_access_has( const char *needle, size_t len )
 static HRESULT content_access_work( void *ctx, IUnknown **result )
 {
     static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    HMODULE xboxauth = LoadLibraryW( L"wineuwp_xboxauth.dll" );
+    HMODULE xboxauth = LoadLibraryW( L"winexboxauth.dll" );
     xboxauth_get_fn get = xboxauth ? (void *)GetProcAddress( xboxauth, "XboxAuthHttpGet" ) : NULL;
     char market[8], url[256], cv[64], extra[96];
     struct content_access *r;
@@ -888,7 +888,7 @@ static HRESULT content_access_work( void *ctx, IUnknown **result )
 
     if (!get)
     {
-        WARN( "ContentAccess: no wineuwp_xboxauth.dll\n" );
+        WARN( "ContentAccess: no winexboxauth.dll\n" );
         return GP_E_NO_SERVICE;
     }
     user_market( wmarket, ARRAY_SIZE(wmarket) );
