@@ -13054,6 +13054,25 @@ window since. Next: find why a window whose own contents are right shows black (
 redirection for owned popups of a XAML window), with a smaller trace than `trace+x11drv`, which slowed the Xbox app into
 its "Looks like you're stranded" page.
 
+**Correction, same day: the dialog is on screen. The black came from `xwd -root`.** Reproduced on a reflink of
+`prefix-test` on Xvfb `:93`: Buy -> a 456x560 popup at +416+139, and `xwd -root` black there (one colour). Then:
+- the popup's X window is mapped, on top (a red window stacked just below it is hidden in the capture), unshaped, not
+  composite-redirected (`XCompositeNameWindowPixmap` gives BadMatch, and a manual redirect of it succeeds; a window
+  redirected as a control gives neither), no backing store, no child X windows;
+- one `XGetImage` of the root - the whole screen, a part, or one pixel - has the dialog (20856 colours in its
+  rectangle, the Buy button's `#008746` where `xwd` has `#000000`), every time, alternating with `xwd -root` four times;
+  outside the popup's rectangle the two captures are identical (AE 0);
+- `xwd` 1.0.10's source: when windows use a colormap other than the root's (Wine's are `0xa00001`, the root's `0x20`),
+  `GetMultiVisualRegions` returns true, and `make_region_list` makes one region per visual and colormap whose source is
+  the *first* window found (`new_reg->win = base_src->win`). The popup's area is read from the main window under it,
+  where it is obscured: black. A popup of my own with the default colormap shows in `xwd -root` as it should.
+- clicking the dialog's close button closed it (`host_place popup hidden`, `ctrl_Close`) and the app showed its own
+  "why did you not continue" prompt, so input reaches the browser too. Nothing was bought.
+
+So there is no Wine fault, and the three host changes above were rightly reverted. `probes/xcap.c` captures the screen
+with one `XGetImage`; AGENTS.md has the trap. Screenshot: `docs/screenshots/xbox-purchase-dialog-on-screen.png`
+(raw capture, the payment rows blacked out).
+
 Also fixed on the way: `install-overrides.sh` exited under `set -e` at the xgameruntime step whenever the
 `xgameruntime` override was already gone (`reg delete` of a missing value returns 1), so nothing after it ran - the
 WebView2 runtime install included.
