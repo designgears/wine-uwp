@@ -32,6 +32,6 @@ WINEDEBUG=${WINEDEBUG:--all} "${WINE_BIN}wine" wineuwp-setup "${SETUP[@]}" ${1:+
 # set behind on every launch, which breaks the activation race.
 for attempt in 1 2 3 4; do
   "${WINE_BIN}wineserver" -w 2>/dev/null || true
-  WINEDEBUG=${WINEDEBUG:--all} "${WINE_BIN}wine" wineuwp-setup --verify "${SETUP[@]}" 2> >(quiet) && exit 0
+  report=; [ $attempt = 4 ] && report=--report   # the last check names what is still wrong
+  WINEDEBUG=${WINEDEBUG:--all} "${WINE_BIN}wine" wineuwp-setup --verify $report "${SETUP[@]}" 2> >(quiet) && exit 0
 done
-echo "WARNING: shim registration did not stick" >&2

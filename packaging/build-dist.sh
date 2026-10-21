@@ -8,7 +8,7 @@
 #
 # OUT/bin                   wine, wineserver, ... and the wine-uwp launcher
 # OUT/lib/wine              Wine's modules
-# OUT/share/wine-uwp        run.sh, install-overrides.sh, the .reg files, the registry generators, packaging/
+# OUT/share/wine-uwp        run.sh, install-overrides.sh, the .reg files, packaging/
 #
 # Nothing Microsoft's goes in: the Windows files are harvested on the user's machine by the setup.
 set -euo pipefail
@@ -44,7 +44,6 @@ echo "STAGE Installing wine-uwp"
 share=$out/share/wine-uwp
 mkdir -p "$share/packaging"
 cp "$here"/{env.sh,run.sh,install-overrides.sh,launch-defaults.env,globalization.reg,wineuwp.reg,mrt-single-module.reg} "$share"/
-cp "$here"/{gen-classes-reg.py,gen-interfaces-reg.py,fasthive.py,uwppaths.py} "$share"/
 cp -r "$here"/packaging/{harvest,new-prefix.sh,install-app.py,install-eac-runtime.sh,install-d3d-runtime.sh} "$share/packaging"/
 find "$share" -name __pycache__ -prune -exec rm -rf {} +
 install -m755 "$here/packaging/wine-uwp" "$out/bin/wine-uwp"

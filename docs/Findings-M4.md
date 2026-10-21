@@ -13156,3 +13156,16 @@ directory install starts to its Standard page on `:97` (`docs/screenshots/calcul
 The first comparison differed in `.wine-uwp-icon.png`: `pick_logo` ranks (unplated, size, plain) and takes the first of
 equals, which in the zip's order was `targetsize-256_altform-unplated_contrast-white.png` - the high-contrast icon.
 It now passes over `contrast-` variants unless nothing else matches; both installs pick the plain unplated icon.
+
+## 2026-10-21: Scripts to C - `packaging/new-prefix.sh`'s registrations -> `wineuwp-setup --new-prefix`
+
+The CoreMessagingRegistrar service and its svchost group, the x11 graphics key, and the WinRT class and COM
+interface registrations generated from the tree's SOFTWARE hive are `wine wineuwp-setup --new-prefix` now (the hive
+reader from the install-overrides port; `gen-classes-reg.py` and `gen-interfaces-reg.py` in C). Compared by building
+two prefixes from reflinks of `uwp-bin/win11-iso` with the old and the new script: the three generated `.reg` files
+identical once the tree's directory name is normalised (3998 classes; 25410 interfaces, 174 proxy DLLs; 842 CLSIDs),
+the registries identical apart from wineboot's own per-run values (MachineGuid/MachineId, HID device order, an MSI
+cache name, timestamps). Calculator on the new prefix: AE 3924.73, as on `prefix-test`
+(`docs/screenshots/calculator-new-prefix-wine-setup.png`). A fresh prefix's first verify finds AppInstallManager and
+AppUpdateOptions not yet registered - the same as the shell, where those two were only ever written by the verify
+loop - and the second passes; the verify is silent now unless its last attempt fails (`--report`).

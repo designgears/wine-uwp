@@ -249,8 +249,8 @@ These all exist and work. Prefer them over reading code and guessing.
 **Run the Python tools with `$UWP_BIN/venv/bin/python`, not `python3`.** Five of them import `pefile`,
 which is installed only in that venv: `disas.py`, `import-audit.py`, `ordinal-audit.py`, `pdbsyms.py` and
 `xrefs.py`. Under a bare `python3` they die with `ModuleNotFoundError` and look broken. The prefix
-builders (`gen-*-reg.py`, `packaging/`) need nothing but the standard library. `gen-classes-reg.py` used
-`regipy` until 09-29; on `fasthive` it writes the same `.reg` byte for byte, in 0.15 s instead of 3 minutes. This file previously asserted that `pefile` was
+builders are C now (Wine's `wineuwp-setup` generates every `.reg` from the hive; the `gen-*-reg.py` scripts are gone,
+10-21), and `packaging/` needs nothing but the standard library. This file previously asserted that `pefile` was
 "not installed", advising you to hand-parse PE headers instead - that was wrong, and it cost a
 session exactly that detour. `requirements.txt` records the dependencies; the venv lives inside
 gitignored `uwp-bin`, so a fresh clone has to recreate it.

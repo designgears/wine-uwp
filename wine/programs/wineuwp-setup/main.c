@@ -36,10 +36,16 @@
  *
  *   wineuwp-setup.exe --windows DIR --build DIR --data DIR [--webview2 DIR] [--force] [LIST]
  *   wineuwp-setup.exe --verify --windows DIR ...
+ *   wineuwp-setup.exe --new-prefix --windows DIR ...
+ *
+ * --new-prefix does a new prefix's registrations first (what packaging/new-prefix.sh did with wine reg and two Python
+ * generators): the CoreMessagingRegistrar service, the x11 graphics driver, and the tree's WinRT classes and COM
+ * interfaces generated from its SOFTWARE hive into the tree (wine-uwp-classes.reg, wine-uwp-interfaces.reg) and
+ * imported.
  *
  * Directories are host paths. A prefix update that lands after the writes can rewrite the DllPath of a class Wine
  * also registers; --verify checks each class and writes it again, exiting 1 while any was wrong. The caller waits
- * for the prefix to settle (wineserver -w) and runs it until it passes.
+ * for the prefix to settle (wineserver -w) and runs it until it passes; with --report the last one names them.
  *
  * Nothing is done when the tree, the build, the data files, system32 and the list are as they were on the last run
  * (the stamp in the prefix); --force skips that check.
@@ -830,6 +836,35 @@ static WCHAR *hive_string( const struct hive *h, DWORD p, const WCHAR *want )
     return ret;
 }
 
+/* a REG_DWORD value, def when absent */
+static DWORD hive_dword( const struct hive *h, DWORD p, const WCHAR *want, DWORD def )
+{
+    DWORD count = hive_u32( h, p + 0x24 ), list = hive_u32( h, p + 0x28 ), q, i, ret = def;
+
+    if (!count || list == 0xffffffff) return def;
+    q = 0x1000 + list + 4;
+    for (i = 0; i < count; i++)
+    {
+        DWORD v = 0x1000 + hive_u32( h, q + 4 * i ) + 4, dlen, doff, type;
+        WORD nlen, flags;
+        BOOL match = TRUE;
+        unsigned k;
+
+        if (v + 0x14 > h->size || memcmp( h->d + v, "vk", 2 )) continue;
+        nlen = hive_u16( h, v + 2 );
+        dlen = hive_u32( h, v + 4 );
+        doff = hive_u32( h, v + 8 );
+        type = hive_u32( h, v + 12 );
+        flags = hive_u16( h, v + 16 );
+        if (!(flags & 1) || nlen != wcslen( want ) || v + 0x14 + nlen > h->size) continue;
+        for (k = 0; k < nlen && match; k++) if (h->d[v + 0x14 + k] != want[k]) match = FALSE;
+        if (!match || type != REG_DWORD || (dlen & 0x7fffffff) < 4) continue;
+        if (dlen & 0x80000000) ret = doff;
+        else ret = hive_u32( h, 0x1000 + doff + 4 );
+    }
+    return ret;
+}
+
 /* ---- .reg text, UTF-16 with a BOM and CRLF between lines (no final one), as the Python generators wrote ---- */
 
 struct text
@@ -1032,6 +1067,297 @@ static void generate_clsid_reg( const WCHAR *hive_path, const WCHAR *out )
     free_listing( &present );
     free( h.d );
     printf( "registered %u in-process CLSIDs, skipped %u (builtin or DLL not extracted)\n", nreg, nskip );
+}
+
+/* the last path component of a DLL path, lowercase */
+static WCHAR *dll_base( const WCHAR *dll )
+{
+    const WCHAR *slash = dll, *p;
+    for (p = dll; *p; p++) if (*p == '\\' || *p == '/') slash = p + 1;
+    return lower( slash );
+}
+
+/* ---- the tree's WinRT classes (was gen-classes-reg.py) ---- */
+
+/* Every in-process class whose DLL the tree has, by the prefix copy's path when the prefix has the DLL (one copy per
+ * process), else by the tree's. Server-activated classes are skipped: there is no RuntimeBroker in Wine. */
+static void generate_classes_reg( const WCHAR *hive_path, const WCHAR *out )
+{
+    struct hive h;
+    struct key_list classes;
+    struct listing present, in_prefix;
+    struct text t = {0};
+    unsigned i, nreg = 0, nskip_server = 0, nskip_missing = 0;
+    DWORD map;
+
+    if (!hive_open( hive_path, &h ) || !(map = hive_key( &h, L"Microsoft\\WindowsRuntime\\ActivatableClassId" )))
+    {
+        fprintf( stderr, "wineuwp-setup: cannot read %ls\n", hive_path );
+        return;
+    }
+    list_dir( src, &present );
+    list_dir( sys32, &in_prefix );
+    text_lines = 0;
+    text_line( &t, L"Windows Registry Editor Version 5.00" );
+    text_line( &t, L"" );
+    hive_subkeys( &h, map, &classes );
+    for (i = 0; i < classes.count; i++)
+    {
+        WCHAR *name = hive_name( &h, classes.keys[i] ), *dll = hive_string( &h, classes.keys[i], L"DllPath" );
+        WCHAR *base, *found, *target, *e, *line;
+
+        if (!dll || !*dll)
+        {
+            nskip_server++;
+            free( dll );
+            free( name );
+            continue;
+        }
+        base = dll_base( dll );
+        if (!(found = find_any_case( &present, base )))
+        {
+            nskip_missing++;
+            free( base );
+            free( dll );
+            free( name );
+            continue;
+        }
+        line = strfw( L"[HKEY_LOCAL_MACHINE\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\%s]", name );
+        text_line( &t, line );
+        free( line );
+        if (find_any_case( &in_prefix, base )) target = strfw( L"C:\\windows\\system32\\%s", base );
+        else target = strfw( L"%s\\%s", src, found );
+        e = reg_escape( target );
+        line = strfw( L"\"DllPath\"=\"%s\"", e );
+        text_line( &t, line );
+        free( line );
+        line = strfw( L"\"ActivationType\"=dword:%08x", hive_dword( &h, classes.keys[i], L"ActivationType", 0 ) );
+        text_line( &t, line );
+        free( line );
+        line = strfw( L"\"Threading\"=dword:%08x", hive_dword( &h, classes.keys[i], L"Threading", 0 ) );
+        text_line( &t, line );
+        free( line );
+        line = strfw( L"\"TrustLevel\"=dword:%08x", hive_dword( &h, classes.keys[i], L"TrustLevel", 0 ) );
+        text_line( &t, line );
+        free( line );
+        text_line( &t, L"" );
+        nreg++;
+        free( e );
+        free( target );
+        free( base );
+        free( dll );
+        free( name );
+    }
+    free( classes.keys );
+    text_write( &t, out );
+    free( t.p );
+    free_listing( &in_prefix );
+    free_listing( &present );
+    free( h.d );
+    printf( "registered %u classes, skipped %u server-activated, %u with DLLs not extracted\n", nreg, nskip_server,
+            nskip_missing );
+}
+
+/* ---- COM interfaces and their proxy/stub DLLs (was gen-interfaces-reg.py) ---- */
+
+/* Every interface with a ProxyStubClsid32, and every proxy CLSID whose DLL the tree has, pointing at the tree's
+ * copy, so that Wine's combase marshals through Microsoft's own NDR proxies. */
+static void generate_interfaces_reg( const WCHAR *hive_path, const WCHAR *out )
+{
+    static const WCHAR *keep[] = { L"ole32.dll", L"combase.dll", L"oleaut32.dll", L"rpcrt4.dll", L"actxprxy.dll",
+                                   L"shell32.dll", L"propsys.dll", L"shcore.dll", L"windows.storage.dll" };
+    struct hive h;
+    struct key_list ifaces, classes;
+    struct listing present;
+    struct text t = {0};
+    WCHAR **proxies = NULL;
+    unsigned nproxies = 0, i, j, n_if = 0, n_px = 0, n_skip = 0;
+    DWORD iface_key, clsid_key;
+
+    if (!hive_open( hive_path, &h ) || !(iface_key = hive_key( &h, L"Classes\\Interface" )) ||
+        !(clsid_key = hive_key( &h, L"Classes\\CLSID" )))
+    {
+        fprintf( stderr, "wineuwp-setup: cannot read %ls\n", hive_path );
+        return;
+    }
+    list_dir( src, &present );
+    text_lines = 0;
+    text_line( &t, L"Windows Registry Editor Version 5.00" );
+    text_line( &t, L"" );
+    hive_subkeys( &h, iface_key, &ifaces );
+    for (i = 0; i < ifaces.count; i++)
+    {
+        struct key_list subs;
+        WCHAR *ps = NULL, *iid, *name, *line;
+
+        hive_subkeys( &h, ifaces.keys[i], &subs );
+        for (j = 0; j < subs.count; j++)
+        {
+            WCHAR *sname = hive_name( &h, subs.keys[j] );
+            BOOL is_ps = !wcsicmp( sname, L"proxystubclsid32" );
+            free( sname );
+            if (is_ps)
+            {
+                ps = hive_string( &h, subs.keys[j], NULL );
+                break;
+            }
+        }
+        free( subs.keys );
+        if (!ps || !*ps)
+        {
+            free( ps );
+            continue;
+        }
+        iid = hive_name( &h, ifaces.keys[i] );
+        name = hive_string( &h, ifaces.keys[i], NULL );
+        line = strfw( L"[HKEY_LOCAL_MACHINE\\Software\\Classes\\Interface\\%s]", iid );
+        text_line( &t, line );
+        free( line );
+        if (name && *name)
+        {
+            WCHAR *e = reg_escape( name );
+            line = strfw( L"@=\"%s\"", e );
+            text_line( &t, line );
+            free( line );
+            free( e );
+        }
+        line = strfw( L"[HKEY_LOCAL_MACHINE\\Software\\Classes\\Interface\\%s\\ProxyStubClsid32]", iid );
+        text_line( &t, line );
+        free( line );
+        line = strfw( L"@=\"%s\"", ps );
+        text_line( &t, line );
+        free( line );
+        text_line( &t, L"" );
+        for (j = 0; j < nproxies; j++) if (!wcsicmp( proxies[j], ps )) break;
+        if (j == nproxies)
+        {
+            proxies = realloc( proxies, (nproxies + 1) * sizeof(*proxies) );
+            proxies[nproxies++] = _wcsdup( ps );
+        }
+        n_if++;
+        free( name );
+        free( iid );
+        free( ps );
+    }
+    free( ifaces.keys );
+
+    hive_subkeys( &h, clsid_key, &classes );
+    for (i = 0; i < classes.count; i++)
+    {
+        WCHAR *cname = hive_name( &h, classes.keys[i] ), *dll = NULL, *threading = NULL, *base, *found, *target, *e, *line;
+        struct key_list subs;
+        DWORD inproc = 0;
+        BOOL keep_it = FALSE;
+
+        for (j = 0; j < nproxies; j++) if (!wcsicmp( proxies[j], cname )) break;
+        if (j == nproxies)
+        {
+            free( cname );
+            continue;
+        }
+        hive_subkeys( &h, classes.keys[i], &subs );
+        for (j = 0; j < subs.count && !inproc; j++)
+        {
+            WCHAR *sname = hive_name( &h, subs.keys[j] );
+            if (!wcsicmp( sname, L"inprocserver32" )) inproc = subs.keys[j];
+            free( sname );
+        }
+        free( subs.keys );
+        if (!inproc || !(dll = hive_string( &h, inproc, NULL )) || !*dll)
+        {
+            n_skip++;
+            free( dll );
+            free( cname );
+            continue;
+        }
+        base = dll_base( dll );
+        for (j = 0; j < ARRAY_SIZE(keep); j++) if (!wcscmp( base, keep[j] )) keep_it = TRUE;
+        if (keep_it || !(found = find_any_case( &present, base )))
+        {
+            if (!keep_it) n_skip++;
+            free( base );
+            free( dll );
+            free( cname );
+            continue;
+        }
+        threading = hive_string( &h, inproc, L"ThreadingModel" );
+        line = strfw( L"[HKEY_LOCAL_MACHINE\\Software\\Classes\\CLSID\\%s\\InprocServer32]", cname );
+        text_line( &t, line );
+        free( line );
+        if (!wcscmp( base, L"mrmcorer.dll" )) target = _wcsdup( L"C:\\windows\\system32\\mrmcorer.dll" );
+        else target = strfw( L"%s\\%s", src, found );
+        e = reg_escape( target );
+        line = strfw( L"@=\"%s\"", e );
+        text_line( &t, line );
+        free( line );
+        line = strfw( L"\"ThreadingModel\"=\"%s\"", threading ? threading : L"Both" );
+        text_line( &t, line );
+        free( line );
+        text_line( &t, L"" );
+        n_px++;
+        free( e );
+        free( target );
+        free( threading );
+        free( base );
+        free( dll );
+        free( cname );
+    }
+    free( classes.keys );
+    text_write( &t, out );
+    free( t.p );
+    while (nproxies) free( proxies[--nproxies] );
+    free( proxies );
+    free_listing( &present );
+    free( h.d );
+    printf( "%u interfaces, %u proxy DLL registrations, %u proxies skipped (DLL not extracted)\n", n_if, n_px, n_skip );
+}
+
+/* ---- a new prefix's registrations (was the first half of packaging/new-prefix.sh) ---- */
+
+static void set_expand_sz( HKEY root, const WCHAR *path, const WCHAR *name, const WCHAR *value )
+{
+    HKEY key;
+    if (RegCreateKeyExW( root, path, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL )) return;
+    RegSetValueExW( key, name, 0, REG_EXPAND_SZ, (const BYTE *)value, (wcslen( value ) + 1) * sizeof(WCHAR) );
+    RegCloseKey( key );
+}
+
+static void new_prefix_registrations(void)
+{
+    static const WCHAR svc[] = L"System\\CurrentControlSet\\Services\\CoreMessagingRegistrar";
+    static const WCHAR group[] = L"CoreMessagingRegistrar\0";
+    WCHAR *hive = strfw( L"%s\\config\\SOFTWARE", src ), *out;
+    HKEY key;
+
+    /* Every CoreMessaging endpoint registers with this service: Windows' own CoreMessaging.dll hosted by Wine's
+     * svchost. Without it CoreMessaging fail-fasts with ERROR_SERVICE_DOES_NOT_EXIST as the first view starts. */
+    set_sz( HKEY_LOCAL_MACHINE, svc, L"DisplayName", L"CoreMessaging" );
+    set_dword( HKEY_LOCAL_MACHINE, svc, L"ErrorControl", 1 );
+    set_expand_sz( HKEY_LOCAL_MACHINE, svc, L"ImagePath", L"%SystemRoot%\\system32\\svchost.exe -k LocalServiceNoNetwork" );
+    set_sz( HKEY_LOCAL_MACHINE, svc, L"ObjectName", L"LocalSystem" );
+    set_dword( HKEY_LOCAL_MACHINE, svc, L"Start", 3 );
+    set_dword( HKEY_LOCAL_MACHINE, svc, L"Type", 32 );
+    if (!RegCreateKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Svchost", 0, NULL, 0,
+                          KEY_SET_VALUE, NULL, &key, NULL ))
+    {
+        RegSetValueExW( key, L"LocalServiceNoNetwork", 0, REG_MULTI_SZ, (const BYTE *)group, sizeof(group) );
+        RegCloseKey( key );
+    }
+    out = strfw( L"%s\\Parameters", svc );
+    set_expand_sz( HKEY_LOCAL_MACHINE, out, L"ServiceDll", L"%SystemRoot%\\system32\\CoreMessaging.dll" );
+    free( out );
+    /* Wine picks its graphics driver from this key only: X11 (Xwayland on a Wayland desktop), as run.sh pins it */
+    set_sz( HKEY_CURRENT_USER, L"Software\\Wine\\Drivers", L"Graphics", L"x11" );
+
+    out = strfw( L"%s\\wine-uwp-classes.reg", win11 );
+    generate_classes_reg( hive, out );
+    reg_import( out );
+    free( out );
+    out = strfw( L"%s\\wine-uwp-interfaces.reg", win11 );
+    generate_interfaces_reg( hive, out );
+    reg_import( out );
+    free( out );
+    free( hive );
 }
 
 /* ---- activatable classes pinned to the prefix copy of their DLL (was gen-single-module-reg.py) ---- */
@@ -1661,14 +1987,14 @@ static int verify_classes(void)
 
 static void usage(void)
 {
-    fprintf( stderr, "usage: wineuwp-setup --windows DIR --build DIR --data DIR [--webview2 DIR] [--force] [--verify] [LIST]\n" );
+    fprintf( stderr, "usage: wineuwp-setup --windows DIR --build DIR --data DIR [--webview2 DIR] [--force] [--verify [--report]|--new-prefix] [LIST]\n" );
     exit( 2 );
 }
 
 int __cdecl wmain( int argc, WCHAR **argv )
 {
     WCHAR *list = NULL, *stamp_path, *stamp = NULL, *p, *q;
-    BOOL force = FALSE, verify = FALSE;
+    BOOL force = FALSE, verify = FALSE, registrations = FALSE;
     int i;
 
     for (i = 1; i < argc; i++)
@@ -1678,6 +2004,8 @@ int __cdecl wmain( int argc, WCHAR **argv )
 
         if (!wcscmp( argv[i], L"--force" )) force = TRUE;
         else if (!wcscmp( argv[i], L"--verify" )) verify = TRUE;
+        else if (!wcscmp( argv[i], L"--new-prefix" )) registrations = TRUE;
+        else if (!wcscmp( argv[i], L"--report" )) verbose_fail = TRUE;
         else if (argv[i][0] == '-' && argv[i][1] == '-' && i + 1 < argc)
         {
             len = WideCharToMultiByte( CP_UNIXCP, 0, argv[i + 1], -1, NULL, 0, NULL, NULL );
@@ -1707,16 +2035,22 @@ int __cdecl wmain( int argc, WCHAR **argv )
         free( a );
     }
 
+    if (registrations)
+    {
+        new_prefix_registrations();
+        return 0;
+    }
     if (verify)
     {
-        verbose_fail = TRUE;
         collect_checked_classes( FALSE );
+        if (verbose_fail) fprintf( stderr, "WARNING: shim registration did not stick for:" );
         if (!verify_classes())
         {
+            if (verbose_fail) fprintf( stderr, " (none now)\n" );
             printf( "verified: shim ActivatableClassId registrations\n" );
             return 0;
         }
-        fprintf( stderr, "\n" );
+        if (verbose_fail) fprintf( stderr, "\n" );
         return 1;
     }
 
