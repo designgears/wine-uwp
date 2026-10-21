@@ -95,7 +95,7 @@ if ! grep -qF "[$APPC\\\\$WINE_UWP_PACKAGE_FAMILY_NAME\\\\ResourcesConfig]" "$WI
       -u WINE_UWP_PACKAGE_PATH -u WINE_UWP_AUMID -u WINE_UWP_PACKAGE_DEPENDENCIES wine reg add "HKCU\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Storage\\$WINE_UWP_PACKAGE_FAMILY_NAME\\ResourcesConfig" /f >/dev/null 2>&1) ||
     echo "run.sh: could not create the AppContainer storage key for $WINE_UWP_PACKAGE_FAMILY_NAME" >&2
 fi
-# Where an app that installs others (the Xbox app, through shims/gameplatform and appxinstall.dll) puts them: a
+# Where an app that installs others (the Xbox app, through Wine's winegameplatform and appxinstall.dll) puts them: a
 # data directory of its own (stage/, as the installer lays it out) and the Windows files the frameworks come from.
 export WINE_UWP_GAMES_DATA=${WINE_UWP_GAMES_DATA:-${UWP_BIN}/xbox-games}
 export WINE_UWP_WINDOWS_TREE=${WINE_UWP_WINDOWS_TREE:-${WIN11:-${UWP_BIN}/win11}}

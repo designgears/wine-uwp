@@ -76,11 +76,6 @@ set_target_properties(probe-gdkchunks PROPERTIES CXX_STANDARD 17)
 target_link_libraries(probe-gdkchunks PRIVATE ole32.lib)
 set_target_properties(probe-gdkchunks PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
 
-add_library(gameplatform SHARED shims/gameplatform/gameplatform.cpp)
-set_target_properties(gameplatform PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_gameplatform")
-target_link_libraries(gameplatform PRIVATE runtimeobject.lib advapi32.lib winhttp.lib ole32.lib)
-# appxinstall.dll's API, from our Wine source (the header alone: the shims build against the Windows SDK)
-target_compile_definitions(gameplatform PRIVATE "APPXINSTALL_H=\"$ENV{WINE_SRC}/include/wine/appxinstall.h\"")
 # Microsoft.GamePlatform.Services.Identity: Xbox sign-in (MSA device code + Xbox Live tokens) for the Xbox app.
 add_library(xboxauth SHARED shims/xboxauth/xboxauth.cpp)
 set_target_properties(xboxauth PROPERTIES PREFIX "" OUTPUT_NAME "wineuwp_xboxauth")

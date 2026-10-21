@@ -318,9 +318,6 @@ if [ -f "$SYS32/windows.services.store.dll" ]; then
 fi
 
 
-# Microsoft.GamePlatform.Services.*: the Gaming Services client classes (see shims/gameplatform). They
-# replace the package's own Microsoft.GamePlatform.Services.dll (OverridesPackage=1, read by combase),
-# whose NT services cannot run under Wine.
 # GDK titles LoadLibrary xgameruntime.dll through GdkSupport. Our stand-in answers
 # XPackageFindChunkAvailability from the stage's .wine-uwp-chunks.json.
 GR_SHIM=${SHIM_DIR}/xgameruntime.dll
@@ -331,16 +328,18 @@ if [ -f "$GR_SHIM" ]; then
   echo "installed: xgameruntime (GDK package availability)"
 fi
 
-GP_SHIM=${SHIM_DIR}/wineuwp_gameplatform.dll
-if [ -f "$GP_SHIM" ]; then
-  GP_DST=$SYS32/wineuwp_gameplatform.dll
-  if ! cmp -s "$GP_SHIM" "$GP_DST"; then cp -f --reflink=auto "$GP_SHIM" "$GP_DST"; fi
-  # every class of the client that has statics (gen-gameplatform.py lists them in shims/gameplatform/slots.h)
+# Microsoft.GamePlatform.Services.*: the Gaming Services client classes, Wine's winegameplatform. They replace the
+# package's own Microsoft.GamePlatform.Services.dll (OverridesPackage=1, read by combase), whose NT services cannot run
+# under Wine.
+if [ -f "$SYS32/winegameplatform.dll" ]; then
+  # prefixes set up before the port used a stand-in DLL
+  rm -f "$SYS32/wineuwp_gameplatform.dll"
+  # every class of the client that has statics (gen-gameplatform.py lists them in dlls/winegameplatform/slots.h)
   for cls in PackageRequest Package PackagePreview PackageQueue PackageUpdate UploadQueue Storage GameFolder \
               GameProfile GameSave GameStreaming GameMetrics Licensing SupportedFeatures PlatformStatus \
               ProcessMonitor Store Customization ContentAccess BackgroundConsent; do
     K="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Microsoft.GamePlatform.Services.$cls"
-    "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\wineuwp_gameplatform.dll' /f >/dev/null 2>&1
+    "${WINE_BIN}wine" reg add "$K" /v DllPath /d 'C:\windows\system32\winegameplatform.dll' /f >/dev/null 2>&1
     "${WINE_BIN}wine" reg add "$K" /v ActivationType /t REG_DWORD /d 0 /f >/dev/null 2>&1
     "${WINE_BIN}wine" reg add "$K" /v Threading /t REG_DWORD /d 0 /f >/dev/null 2>&1
     "${WINE_BIN}wine" reg add "$K" /v TrustLevel /t REG_DWORD /d 0 /f >/dev/null 2>&1
@@ -383,7 +382,7 @@ if [ -f "$GP_SHIM" ]; then
       "${WINE_BIN}wine" reg add "$K" /v DisplayName /d "$svc" /f >/dev/null 2>&1
     done
   fi
-  echo "installed: GamePlatform (Gaming Services client) stand-in"
+  echo "installed: GamePlatform (Gaming Services client): Wine's winegameplatform"
 fi
 
 # Microsoft.GamePlatform.Services.Identity: Xbox sign-in (see shims/xboxauth). On Windows it is Gaming Services'

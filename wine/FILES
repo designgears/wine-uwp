@@ -446,3 +446,11 @@ dlls/windows.applicationmodel.store.preview.installcontrol/classes.idl
 dlls/windows.applicationmodel.store.preview.installcontrol/main.c
 dlls/windows.applicationmodel.store.preview.installcontrol/private.h
 dlls/windows.applicationmodel.store.preview.installcontrol/windows.applicationmodel.store.preview.installcontrol.spec
+dlls/winegameplatform/Makefile.in
+dlls/winegameplatform/gdk.c
+dlls/winegameplatform/install.c
+dlls/winegameplatform/main.c
+dlls/winegameplatform/objects.c
+dlls/winegameplatform/private.h
+dlls/winegameplatform/slots.h
+dlls/winegameplatform/winegameplatform.spec

@@ -12978,3 +12978,23 @@ once before judging it.
 Two bugs in the shims came out in the port: `LaunchUriForUserAsync` handed back a bool operation where the interface
 returns `IAsyncOperation<LaunchUriStatus>` (its "true" read as AppUnavailable), and the save picker's FileTypeChoices
 was a PropertySet, which does not keep the app's order; the dialog's type list follows it.
+
+## 2026-10-21: Shims to C - Gaming Services (`gameplatform`)
+
+`shims/gameplatform` is Wine's `dlls/winegameplatform` now (details and the screenshots in `docs/Port-to-C.md`). The
+Xbox app on `prefix-test` with the `xbox-addons-ui-test` fixture reaches Home, Halo's page with Play, Manage (General,
+Files "Installed to: Z:", Add-ons), queues Campaign at 74.3 GB, pauses and cancels; a Game Pass title shows Install
+and Buy. The traces moved from the shim's `[gameplatform]` stderr lines to `WINEDEBUG=+gameplatform`.
+
+**The first run crashed, and the port was the cause.** Thread after thread faulted in `XboxPcApp.exe+0x20710`
+(`mov rax,[rax+0x10]` on 0xffff...: a `com_ptr` release) right after `PlatformStatus.add_ApiStatusChanged`
+registered. The generic thunks were declared `(f, a1, a2, a3, a4, a5)` and called `generic_slot(f, n, a1, a2, ret)`;
+gcc turned that into a sibling call that stores `ret` at `[rsp+0x28]`, the fifth argument's slot, which belongs to
+the callee by declaration but was the app's own local (it passed three arguments). The local was the factory pointer
+it released next. The C++ shim had the same declaration and ran without this fault; its compiler's code was not checked. The thunks now
+declare only the register arguments, and `generic_slot` takes four (AGENTS.md has the rule).
+
+Two Gaming Services calls still answer 0x87E00196 in that session, as with the shim: `PackageInstance.QueryMigration`
+(slot 26, 23 calls) and `Customization.QueryUserProps` (slot 10, once). Neither stopped a screen. The Add-ons tab
+opens with Apply enabled and "+67.77 GB" before anything is changed (the fixture's marker records no features); not
+compared against the shim.

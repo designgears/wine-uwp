@@ -1,0 +1,8 @@
+MODULE    = winegameplatform.dll
+IMPORTS   = uuid combase advapi32 winhttp appxinstall
+
+SOURCES = \
+	gdk.c \
+	install.c \
+	main.c \
+	objects.c
