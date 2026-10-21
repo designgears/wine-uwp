@@ -326,7 +326,7 @@ if [ -f "$(wine_pe xgameruntime)" ]; then
     rm -f "$SYS32/xgameruntime.dll"
     cp -f --reflink=auto "$(wine_pe xgameruntime)" "$SYS32/xgameruntime.dll"
   fi
-  "${WINE_BIN}wine" reg delete 'HKCU\Software\Wine\DllOverrides' /v xgameruntime /f >/dev/null 2>&1
+  "${WINE_BIN}wine" reg delete 'HKCU\Software\Wine\DllOverrides' /v xgameruntime /f >/dev/null 2>&1 || true
 fi
 
 # Microsoft.GamePlatform.Services.*: the Gaming Services client classes, Wine's winegameplatform. They replace the
@@ -422,12 +422,12 @@ fi
 # dlls/dmprocessxmlfiltered, and kernelbase through the apiset schema.
 
 # The WebView2 runtime (Edge's EBWebView, from a Windows ISO's install.wim: Program Files (x86)/Microsoft/EdgeWebView),
-# with shims/webview2 in front of its EmbeddedBrowserWebView.dll. The Xbox app's purchase dialog and other React
-# Native WebViews need it; without a runtime the app crashes on Get. The host turns composition-hosted WebViews
-# into a windowed browser in a popup (Wine does not show another process's child windows). Optional: only when
-# the harvested runtime is there.
+# with Wine's webview2host installed as its EmbeddedBrowserWebView.dll (the runtime's own renamed .real.dll). The Xbox
+# app's purchase dialog and other React Native WebViews need it; without a runtime the app crashes on Get. The host
+# turns composition-hosted WebViews into a windowed browser in a popup (Wine does not show another process's child
+# windows). Optional: only when the harvested runtime is there.
 WV2_ROOT=${WEBVIEW2_RUNTIME:-${UWP_BIN}/webview2/rt/Program Files (x86)/Microsoft/EdgeWebView}
-WV2_HOST=${SHIM_DIR}/EmbeddedBrowserWebView.dll
+WV2_HOST=$(wine_pe webview2host)
 WV2_APP=$(ls -d "$WV2_ROOT"/Application/[0-9]*.[0-9]*.[0-9]*.[0-9]* 2>/dev/null | tail -1)
 if [ -n "$WV2_APP" ] && [ -f "$WV2_HOST" ]; then
   WV2_VER=$(basename "$WV2_APP")

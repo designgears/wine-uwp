@@ -13022,3 +13022,38 @@ compared against the shim.
 - `probe-gdkchunks` passes against the builtin (Launch Ready, HD1 Installable, chunk 1200 Installable, chunk 1000
   Ready). Its first run loaded the old stand-in still sitting in `build-probes/`; that copy is now
   `xgameruntime.dll.old-shim`.
+
+## 2026-10-21: Shims to C - WebView2 host (`webview2` -> `dlls/webview2host`), and a black purchase dialog
+
+`shims/webview2` is Wine's `dlls/webview2host`. It is copied into the WebView2 runtime as `EmbeddedBrowserWebView.dll`
+in front of the runtime's own `.real.dll`, as the shim was. It is written without Microsoft's `WebView2.h`: the runtime's
+objects are reached by vtable slot, the composition controller (20 slots) and the completion handlers are written out,
+and the environment and the windowed controller are wrapped by forwarding thunks that swap `this` for the runtime's
+object and jump to the same slot, so only the overridden methods exist in C.
+
+Tested on `uwp-bin/prefix-wv2` (a reflink of `prefix-test`; `prefix-test` and `:97` were in use by another test run,
+whose `wineserver -k` ended my first Xbox run) on Xvfb `:93`, `wine-build-wow64`, `WINE_UWP_GAMES_DATA=xbox-addons-ui-test`:
+Home signed in, Beyond These Stars' page, Buy -> environment wrapped, composition controller answered with a windowed
+controller on a popup, popup placed at the dialog's bounds, CapturePreview frames 456x560. The purchase dialog was not
+used (nothing bought).
+
+**The popup is black on screen, and the old shim does the same now.** Evidence, all on the same prefix and build:
+- the runtime renders the dialog: `WINE_UWP_WEBVIEW2_DUMP=1` wrote the frame, which is the full purchase dialog (it holds
+  the account's payment details: deleted, never kept);
+- the popup paints (a traced `WM_PAINT` 231 times with the frame bitmap), and `xwd -id` of the popup's X window returns
+  the dialog (20856 colours), while `xwd -root` at the same place is one colour, black; moved with `xdotool windowmove`
+  over other content it is still black, and `windowraise` changes nothing. So its pixels do not reach the screen,
+  rather than being covered;
+- swapping the old C++ `EmbeddedBrowserWebView.dll` back in (with the HEAD installer, so nothing re-copied the new one)
+  gives the identical black rectangle;
+- three host-side changes did not help, and were reverted to keep the shim's behaviour: forcing the frame's alpha to
+  0xff (the capture PNG has alpha 0 everywhere), moving the browser's window out of the popup into an off-screen
+  window of its own, and making the popup a layered window at alpha 255.
+AGENTS.md's 10-15 row says this dialog showed then, so something between Wine and the X server changed for this kind of
+window since. Next: find why a window whose own contents are right shows black (x11drv window surface / composite
+redirection for owned popups of a XAML window), with a smaller trace than `trace+x11drv`, which slowed the Xbox app into
+its "Looks like you're stranded" page.
+
+Also fixed on the way: `install-overrides.sh` exited under `set -e` at the xgameruntime step whenever the
+`xgameruntime` override was already gone (`reg delete` of a missing value returns 1), so nothing after it ran - the
+WebView2 runtime install included.

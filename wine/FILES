@@ -462,3 +462,6 @@ dlls/xgameruntime/services.c
 dlls/xgameruntime/store.c
 dlls/xgameruntime/user.c
 dlls/xgameruntime/xgameruntime.spec
+dlls/webview2host/Makefile.in
+dlls/webview2host/main.c
+dlls/webview2host/webview2host.spec

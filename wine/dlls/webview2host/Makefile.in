@@ -1,0 +1,5 @@
+MODULE    = webview2host.dll
+IMPORTS   = uuid ole32 user32 gdi32 windowscodecs
+
+SOURCES = \
+	main.c

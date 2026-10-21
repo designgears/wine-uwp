@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     f336599e952ae49a403461641a07672deb0200d8
-                 xgameruntime: Add the GDK game runtime.
+  wine HEAD:     3736d54a39827ba4c35fb3027d7caa58ccd62e85
+                 webview2host: Add the WebView2 runtime host.
   upstream base: 36b6a2cf679fb395f668a917b76537190e212d9c
                  Release 11.17. (2026-09-04)
-  captured:      2026-10-21T07:09:29Z
+  captured:      2026-10-21T07:55:32Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
