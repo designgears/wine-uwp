@@ -1,5 +1,5 @@
 MODULE    = xgameruntime.dll
-IMPORTS   = uuid crypt32
+IMPORTS   = uuid crypt32 combase
 
 SOURCES = \
 	async.c \

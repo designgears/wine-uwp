@@ -218,6 +218,7 @@ static struct user *get_default_user(void)
 typedef HRESULT (WINAPI *get_token_fn)( const char *method, const char *url, int force, const void *body,
                                         UINT32 body_size, char *token, UINT32 token_cap, UINT32 *token_len,
                                         char *signature, UINT32 sig_cap, UINT32 *sig_len );
+typedef HRESULT (WINAPI *gamer_picture_fn)( int size, unsigned char **png, UINT32 *len );
 typedef HRESULT (WINAPI *set_title_context_fn)( const char *msa_app_id, UINT32 title_id );
 
 static BOOL xml_tag_value( const char *xml, const char *tag, char *value, size_t size )
@@ -310,6 +311,7 @@ void load_title_identity( struct title_identity *id )
 
 static get_token_fn get_token;
 static set_title_context_fn set_title_context;
+static gamer_picture_fn gamer_picture;
 static INIT_ONCE xboxauth_once = INIT_ONCE_STATIC_INIT;
 
 static BOOL CALLBACK load_xboxauth( INIT_ONCE *once, void *param, void **context )
@@ -325,6 +327,8 @@ static BOOL CALLBACK load_xboxauth( INIT_ONCE *once, void *param, void **context
         ERR( "no XboxAuthGetTokenAndSignature\n" );
     if (!(set_title_context = (set_title_context_fn)GetProcAddress( module, "XboxAuthSetTitleContext" )))
         ERR( "no XboxAuthSetTitleContext\n" );
+    if (!(gamer_picture = (gamer_picture_fn)GetProcAddress( module, "XboxAuthGamerPicture" )))
+        ERR( "no XboxAuthGamerPicture\n" );
     return TRUE;
 }
 
@@ -640,23 +644,81 @@ static HRESULT WINAPI user_notimpl( gdk_object *iface )
     return E_NOTIMPL;
 }
 
+/* --- XUserGetGamerPictureAsync --- */
+
+static const char picture_identity[] = "XUserGetGamerPictureAsync";
+
+struct picture_context
+{
+    int size;
+    unsigned char *png;
+    UINT32 len;
+    XAsyncBlock *async;
+};
+
+static DWORD WINAPI picture_work( void *param )
+{
+    struct picture_context *ctx = param;
+    HRESULT hr = E_NOTIMPL;
+
+    init_xboxauth();
+    if (gamer_picture) hr = gamer_picture( ctx->size, &ctx->png, &ctx->len );
+    TRACE( "gamer picture %dpx: hr %#lx, %u bytes\n", ctx->size, hr, ctx->len );
+    async_complete( ctx->async, hr, SUCCEEDED(hr) ? ctx->len : 0 );
+    return 0;
+}
+
+static HRESULT WINAPI picture_provider( UINT32 op, const XAsyncProviderData *data )
+{
+    struct picture_context *ctx = data->context;
+
+    switch (op)
+    {
+    case XAsyncOp_DoWork:
+        /* two HTTP requests: not on the title's thread */
+        ctx->async = data->async;
+        if (!QueueUserWorkItem( picture_work, ctx, WT_EXECUTELONGFUNCTION ))
+        {
+            picture_work( ctx );
+            return S_OK;
+        }
+        return E_PENDING;
+    case XAsyncOp_GetResult:
+        if (!data->buffer || data->bufferSize < ctx->len) return E_INVALIDARG;
+        memcpy( data->buffer, ctx->png, ctx->len );
+        return S_OK;
+    case XAsyncOp_Cleanup:
+        CoTaskMemFree( ctx->png );
+        free( ctx );
+        return S_OK;
+    }
+    return S_OK;
+}
+
 static HRESULT WINAPI user_GetGamerPictureAsync( gdk_object *iface, struct user *user, UINT32 size, XAsyncBlock *block )
 {
-    return async_begin_empty( block, "XUserGetGamerPictureAsync" );
+    /* XUserGamerPictureSize: Small, Medium, Large, ExtraLarge */
+    static const int pixels[] = { 64, 208, 424, 1080 };
+    struct picture_context *ctx;
+    HRESULT hr;
+
+    if (!user || !block) return E_INVALIDARG;
+    if (size >= ARRAY_SIZE(pixels)) return E_INVALIDARG;
+    if (!(ctx = calloc( 1, sizeof(*ctx) ))) return E_OUTOFMEMORY;
+    ctx->size = pixels[size];
+    if (FAILED(hr = async_begin( block, ctx, picture_identity, picture_identity, picture_provider ))) free( ctx );
+    return hr;
 }
 
 static HRESULT WINAPI user_GetGamerPictureResultSize( gdk_object *iface, XAsyncBlock *block, SIZE_T *size )
 {
-    if (!size) return E_POINTER;
-    *size = 0;
-    return S_OK;
+    return async_get_result_size( block, size );
 }
 
 static HRESULT WINAPI user_GetGamerPictureResult( gdk_object *iface, XAsyncBlock *block, SIZE_T size, void *buffer,
                                                   SIZE_T *used )
 {
-    if (used) *used = 0;
-    return S_OK;
+    return async_get_result( block, picture_identity, size, buffer, used );
 }
 
 static HRESULT WINAPI user_GetAgeGroup( gdk_object *iface, struct user *user, UINT32 *age )

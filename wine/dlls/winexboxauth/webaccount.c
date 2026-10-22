@@ -697,6 +697,27 @@ static BOOL gamer_picture( int size, struct buf *png )
     return FALSE;
 }
 
+/* The gamer picture for the GDK's XUserGetGamerPictureAsync (xgameruntime): *png is CoTaskMemAlloc'ed. */
+HRESULT WINAPI XboxAuthGamerPicture( int size, unsigned char **png, UINT32 *len )
+{
+    struct buf pic = {0};
+
+    if (!png || !len) return E_POINTER;
+    *png = NULL;
+    *len = 0;
+    account_init();
+    if (!gamer_picture( size, &pic )) return XA_E_NETWORK;
+    if (!(*png = CoTaskMemAlloc( pic.n ? pic.n : 1 )))
+    {
+        buf_free( &pic );
+        return E_OUTOFMEMORY;
+    }
+    memcpy( *png, pic.p, pic.n );
+    *len = pic.n;
+    buf_free( &pic );
+    return S_OK;
+}
+
 static HRESULT picture_work( struct async *op, void *ctx )
 {
     /* if the picture cannot be fetched, a 1x1 transparent PNG stands in */

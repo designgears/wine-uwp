@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     07568d2928f0ed93d5c09f83513ce6beb8cad2ae
-                 wineuwp: Build for x86_64 only, through ENABLE_ARCHS.
+  wine HEAD:     07cd0fdeb68708dbf185630ec9bec8ca8952ca0e
+                 xgameruntime: Implement XUserGetGamerPictureAsync.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-10-21T09:11:44Z
+  captured:      2026-10-22T11:50:11Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
