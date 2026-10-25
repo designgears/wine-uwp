@@ -13368,3 +13368,20 @@ which looks fainter than before.
   a visual's `Size`, `Lerp`, and `this.Target` for the clip and for a property set's own values.
 
 Regression on `prefix-test`: calc AE 3924.73, mp 236.
+
+### Microsoft Store: the Apps page (2026-10-25, open)
+
+Apps navigates (the rail's Home and Apps icons swap states) but stays on its loading skeletons: unlike 10-19, the
+content never comes, and after the click the app makes no catalog request at all (`trace+wininet` with the click
+time: one asset zip and telemetry), with its UI thread idle. Breakpoints on the runtime's ThrowExceptionForHR
+(`WinStore.App.dll+0xc46a10`, HRESULT in ecx) and on each failing call site's `call *` (target in rax, resolved
+against `probe-threads` maps) found: `StoreConfiguration.FilterUnsupportedSystemFeaturesAsync` refused by
+`winexboxauth` (now an empty `IVectorView<StoreSystemFeature>`, completed; not enough on its own), E_BOUNDS x58 from
+`wintypes.dll`, E_FAIL x8 from Win2D (`Microsoft.Graphics.Canvas.dll+0x82440`), and one E_NOTIMPL from WinUI's
+folded C++/WinRT forwarder `+0xb310` (`IXamlType::get_FullName` / `IXamlMember::get_Name`). Not yet known which of
+these, if any, the page waits on.
+
+**`piid.py` gets nested generics wrong**: `IAsyncOperation<IVectorView<X>>` printed `2f9f38c6`, the real IID is
+`b1713163` (`--signature 'pinterface({9fc2b0bb...};pinterface({bbe1fa4c...};enum(...;i4)))'`, checked against widl's
+`IAsyncOperation<IVectorView<StorageFile>>` = `03362e33`). Use `--signature` for anything nested. **Builtins with a
+copy in the prefix shadow the build**: `winexboxauth.dll` in `prefix-store` was 10-21's; copy it after rebuilding.

@@ -142,11 +142,27 @@ static HRESULT WINAPI sc_get_HardwareManufacturerInfo( void *iface, void **v )
     *v = &obj->vtbl[0];
     return S_OK;
 }
+/* IAsyncOperation<IVectorView<StoreSystemFeature>> and the view's interfaces; StoreSystemFeature is an enum
+ * (enum(...;i4)), so these are derived from explicit signatures: piid.py's nested form gives a wrong IID */
+static const GUID IID_AsyncOp_VectorView_StoreSystemFeature = {0xb1713163,0xee1b,0x5290,{0x83,0x16,0xf7,0xeb,0xb9,0xd5,0x31,0x63}};
+static const GUID IID_IVectorView_StoreSystemFeature = {0xc8f90757,0xebcf,0x5f2c,{0xb9,0x18,0x64,0x87,0x10,0x5b,0x0c,0xa1}};
+static const GUID IID_IIterable_StoreSystemFeature = {0x98a8577a,0xb128,0x5400,{0x8d,0x3d,0x58,0x65,0x4e,0xaa,0xf9,0x57}};
+static const GUID IID_IIterator_StoreSystemFeature = {0xd0455b2d,0xd8aa,0x557e,{0x89,0xa3,0x63,0xc3,0x3e,0x8c,0xee,0x99}};
+
+/* The features of the list this machine lacks: none (an x64 desktop; the Store only offers what passes). Refusing
+ * the call left the Microsoft Store's Apps page on its loading skeletons for good. */
 static HRESULT WINAPI sc_FilterUnsupportedSystemFeaturesAsync( void *iface, IInspectable *features, void **v )
 {
-    TRACE( "StoreConfiguration.FilterUnsupportedSystemFeaturesAsync -> E_NOTIMPL\n" );
-    if (v) *v = NULL;
-    return E_NOTIMPL;
+    struct vector_view *view;
+
+    TRACE( "StoreConfiguration.FilterUnsupportedSystemFeaturesAsync -> none unsupported\n" );
+    if (!v) return E_POINTER;
+    if (!(view = vector_view_create( &IID_IVectorView_StoreSystemFeature, &IID_IIterable_StoreSystemFeature,
+            &IID_IIterator_StoreSystemFeature,
+            L"Windows.Foundation.Collections.IVectorView`1<Windows.ApplicationModel.Store.Preview.StoreSystemFeature>" )))
+        return E_OUTOFMEMORY;
+    return completed_iface( &IID_AsyncOp_VectorView_StoreSystemFeature, "FilterUnsupportedSystemFeaturesAsync",
+                            (IUnknown *)&view->obj.vtbl[0], v );
 }
 
 /* null is the documented "no policy set" */
