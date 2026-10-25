@@ -13472,3 +13472,21 @@ source's child at `0,48` with offset and transform 0. `visual_surface_render` cl
 first container in the source took the island's part and its dcomp children were moved down by the title bar row
 (`xaml_content_dy`). A visual surface now renders with an island that is no visual. It also subtracts its source's
 expression-bound translation (`dcv_own_translation`), which did not matter here. Regression: calc AE 3924.73, mp 236.
+
+### Microsoft Store: Gaming's box art is missing (2026-10-25, open)
+
+Scrolled down, Gaming's "Best selling games" and "Most popular Game Pass games" tiles show their titles and prices
+on a grey tile with no box art (Raid's small badge is drawn), and the second MosaicHeroRegion below the chips stays a
+skeleton. What is known:
+
+- Each tile is a mask brush (rounded corners), 131x248, whose source surface is readable but at content generation 0
+  (`+dcompops`: `mask brush ...: 131x248 composed, ... surface ... gen 0`): the poster surface never receives pixels.
+- XAML reports no image failure: breakpoints on `CImageSource::FireImageFailed` (`windows.ui.xaml.dll+f3860`) never
+  hit, `CImageSource::FireImageOpened` (`+189360`) hit 24 times after the click. The posters are not downloaded
+  through urlmon either (`trace+urlmon`: only the chip icons, side cards and four store-images URLs).
+- They come from the Store's own image cache: `trace+storage` shows 98 files of `LocalCache/perUserCache_{Global}`
+  (JPEGs) opened through our `windows.storage` file stream after the click, 174 ReadAsync, 34 cache files written.
+  What reads those streams (BitmapImage.SetSourceAsync, LoadedImageSurface.StartLoadFromStream, or the app's own
+  decoder) and where the pixels are lost is not yet known. The Xbox app's library art (AGENTS.md) has the same shape.
+- `CloudXaml-ModulePackageProvider`'s "Data request returned with null data" for the GameCategorization zip is not
+  this: it appears on Apps too, where the module (the category chips) draws.
