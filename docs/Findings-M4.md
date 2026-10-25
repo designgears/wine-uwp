@@ -13369,7 +13369,7 @@ which looks fainter than before.
 
 Regression on `prefix-test`: calc AE 3924.73, mp 236.
 
-### Microsoft Store: the Apps page (2026-10-25, open)
+### Microsoft Store: the Apps page (2026-10-25, solved below)
 
 Apps navigates (the rail's Home and Apps icons swap states) but stays on its loading skeletons: unlike 10-19, the
 content never comes, and after the click the app makes no catalog request at all (`trace+wininet` with the click
@@ -13379,9 +13379,59 @@ against `probe-threads` maps) found: `StoreConfiguration.FilterUnsupportedSystem
 `winexboxauth` (now an empty `IVectorView<StoreSystemFeature>`, completed; not enough on its own), E_BOUNDS x58 from
 `wintypes.dll`, E_FAIL x8 from Win2D (`Microsoft.Graphics.Canvas.dll+0x82440`), and one E_NOTIMPL from WinUI's
 folded C++/WinRT forwarder `+0xb310` (`IXamlType::get_FullName` / `IXamlMember::get_Name`). Not yet known which of
-these, if any, the page waits on.
+these, if any, the page waits on. **Wrong, see the next section: the request was made and the UI thread was not
+idle.** "No catalog request" was a misread trace, and "idle" came from one look at a thread that was in fact spinning.
 
 **`piid.py` gets nested generics wrong**: `IAsyncOperation<IVectorView<X>>` printed `2f9f38c6`, the real IID is
 `b1713163` (`--signature 'pinterface({9fc2b0bb...};pinterface({bbe1fa4c...};enum(...;i4)))'`, checked against widl's
 `IAsyncOperation<IVectorView<StorageFile>>` = `03362e33`). Use `--signature` for anything nested. **Builtins with a
 copy in the prefix shadow the build**: `winexboxauth.dll` in `prefix-store` was 10-21's; copy it after rebuilding.
+
+### Microsoft Store: Apps, Gaming and AI Hub load - xmllite read UTF-16 input twice (2026-10-25)
+
+`docs/screenshots/msstore-22608-apps-page.png`, `-gaming-page.png`, `-aihub-page.png`: after the click each page draws
+its side cards, category chips and rows, and the rail answers further clicks. Before, the Store looked hung after
+Apps: Gaming and AI Hub clicks changed nothing, and the rail still showed Apps selected.
+
+How it was found, in order:
+
+- `WINE_UWP_BP=winstore.app.dll+108c4c0@rcx+0:160` (the helper that throws the data layer's `InvalidOperation`,
+  rcx = the message string) printed `Data request returned with null data: https://cdn.storeedgefd.../GameCategorization-844ef226.zip`;
+  a breakpoint on the JsonException formatter (`+0xbae020`, rdx = the exception) through one pointer,
+  `@rdx+8>0:200` (new: `>` follows a pointer), gave `ExpectedStartOfValueNotFound, P LineNumber: 0` - a zip (`PK`)
+  given to the JSON reader. The zip was intact (cached copy `cmp`-identical to a fresh download, valid
+  `config.json` inside) and the page JSON (`pages/ProductivityHome`) was in the Store's own cache: **the data had
+  come.** These turned out to be a side issue; I have not found whether Windows takes the same path.
+- `probe-threads` three times on the hung app: the UI thread at three different rips, in ntdll's heap and XAML's
+  `xstring_ptr` copy. **Busy, not idle.**
+- `WINE_UWP_PROFILE` dumps at the click and 25 s later, `profdiff.py` and `profsym.py`: every busy sample of the UI
+  thread in `XamlReader.Load` -> `CParser::LoadXamlCore` -> `XamlScanner` -> Wine's **xmllite**. A breakpoint on
+  `ParseXamlWithEventRoot` (`windows.ui.xaml.dll+26d764@rdx+0:4`) showed one parse after the click, of 0x15d6a
+  bytes: the CloudXaml module's `Main.xaml` (35 KB of UTF-8, as UTF-16).
+- `probes/probe-xmllite.cpp` (new) reads a file through xmllite as UTF-16 and as raw bytes: `Main.xaml` read 622
+  nodes as UTF-8 and stopped after 150 with `0xc00cee61` as UTF-16.
+
+Three xmllite bugs, all at the boundary where the reader fetches the next chunk of input (0x2000 bytes at first):
+
+1. **UTF-16 input was never removed from the raw buffer after it was copied** (`reader_more`: only the multibyte
+   branch called `readerinput_shrinkraw`). Each later chunk was appended behind the data already converted, and the
+   whole lot copied again, so the reader saw the document repeated from a chunk boundary. XAML hands xmllite the
+   text of `XamlReader.Load` as UTF-16, so every string over a chunk went wrong; on this page XAML then kept the UI
+   thread for good.
+2. **`-->` and `]]>` were looked for without reading on**: `--` at the end of the buffer was `WC_E_COMMENT`, and a
+   `-` there let the end marker go by. `reader_get_ptr_n` fetches enough input for the lookahead.
+3. **UTF-8: a character split between chunks was mangled**. `readerinput_get_utf8_convlen` stopped at the first byte
+   with a high bit set, a continuation byte, so a complete 3-byte character at the end was cut after its first
+   byte; and `readerinput_shrinkraw` kept the leftover bytes from the wrong offset.
+
+`probe-xmllite.exe` on a 720 KB document with CRLFs, CDATA, comments and multibyte text (`big.xml`, generated):
+before, UTF-16 stopped at 10010 nodes and UTF-8 at 12600 (both `WC_E_COMMENT`); after, both read 35840 nodes and
+6001 elements, the count the file has. This build tree has Wine's tests disabled, so `dlls/xmllite/tests` has not
+been run.
+
+Regression on `prefix-test` with `wine-build-store`: calc AE 3924.73, mp 236, as before; fh 1 colour with 16
+fail-fasts, identical on the control `wine-build-wow64` (the known Feedback Hub failure).
+
+Still open on these pages: the large hero carousel on the left is empty on all three (Home draws its own), Gaming's
+lower panel is still a skeleton 40 s after the click, and AI Hub's lower banner is drawn with a notch cut from its
+top-left corner and a green sliver above it.

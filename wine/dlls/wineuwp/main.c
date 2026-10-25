@@ -5183,6 +5183,9 @@ struct code_bp
     char dump_reg[8];
     LONG_PTR dump_off;
     unsigned int dump_count;
+    /* "@reg+off>off2:count": dump at [reg+off]+off2 instead, through one pointer (a field of an object) */
+    BOOL dump_deref;
+    LONG_PTR dump_off2;
 };
 static struct code_bp code_bps[32];
 static unsigned int code_bp_count;
@@ -5268,6 +5271,13 @@ static void code_bp_dump( const struct code_bp *bp, const CONTEXT *ctx )
     for (i = 0; i < ARRAY_SIZE(regs); i++) if (!strcmp( regs[i].name, bp->dump_reg )) break;
     if (i == ARRAY_SIZE(regs)) return;
     mem = (const DWORD *)(*(const ULONG_PTR *)((const BYTE *)ctx + regs[i].offset) + bp->dump_off);
+    if (bp->dump_deref)
+    {
+        __TRY { mem = (const DWORD *)(*(const ULONG_PTR *)mem + bp->dump_off2); }
+        __EXCEPT_ALL { mem = NULL; }
+        __ENDTRY
+        if (!mem) { ERR( "BP %s+%#Ix  [%s%+Id]: <fault>\n", bp->module, bp->rva, bp->dump_reg, bp->dump_off ); return; }
+    }
     /* short dumps as hex and float; long ones (a stack) as hex only, eight dwords a line: one debug line holds
      * about 1 KiB, and overflowing it aborts the process */
     for (start = 0; start < bp->dump_count; start += 8)
@@ -5475,7 +5485,16 @@ static void maybe_start_code_bps(void)
             if (colon) { *colon = 0; bp->dump_count = min( atoi( colon + 1 ), 1024 ); }
             else bp->dump_count = 4;
             off = strpbrk( at, "+-" );
-            if (off) bp->dump_off = strtoll( off, NULL, 16 );
+            if (off)
+            {
+                char *end;
+                bp->dump_off = strtoll( off, &end, 16 );
+                if (*end == '>')
+                {
+                    bp->dump_deref = TRUE;
+                    bp->dump_off2 = strtoll( end + 1, NULL, 16 );
+                }
+            }
             lstrcpynA( bp->dump_reg, at, off ? min( off - at + 1, sizeof(bp->dump_reg) ) : sizeof(bp->dump_reg) );
         }
         plus = strrchr( item, '+' );
