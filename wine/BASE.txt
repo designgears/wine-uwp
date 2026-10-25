@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     4d310c66cf2ccae9a500346993a5310c7a805730
-                 wineuwp: Do not start the first view from inside the app's own code.
+  wine HEAD:     fe6884a2d568806ec3b83f24c50b908136275e0a
+                 dcomp: Effect-brush sprites, clip edge expressions and ICompositionAnimation4.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-10-25T12:19:57Z
+  captured:      2026-10-25T12:44:54Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

@@ -13347,3 +13347,24 @@ Traps on the way: **the prefix's `wineuwp.dll` is refreshed only when a run star
 against the build right after a rebuild says "differs" and means nothing; and **a stack logged on one line overflowed
 Wine's debug buffer and aborted the app** (74-colour "failures" that were my own trace). Earlier today
 `WINE_UWP_DUMP_STACKS` + `probe-threads` maps showed only which threads waited; the stack *at the APC* was the evidence.
+
+### Microsoft Store: the selected Home icon and the hero picture (2026-10-25)
+
+`docs/screenshots/msstore-22608-home-complete.png`: Home as Windows draws it, but for the hero's "See details" pill,
+which looks fainter than before.
+
+- **The selected Home icon** is a Lottie track matte: a sprite whose brush is `Composite(destination, source)` over
+  two CompositionVisualSurfaces. `paint_effect_sprite` draws such sprites when every node of the graph renders here
+  (strict: XAML's acrylic, with blur and backdrop, stays undrawn as before rather than becoming a tint over the
+  window). The matte's surfaces are 48 px under a sprite drawn at 24: a surface brush with no layout of its own now
+  stretches to fill, as its default Stretch says, instead of being copied 1:1 (it drew a quarter of the house).
+- **The hero picture** was in the tree and painted, at its place, with an empty clip. Its pages are clipped by
+  RectangleClips whose edges are expressions (`Left = (visual.Size.X - Min(visual.Size.X, rootProperties.ActualWidth))
+  / 2`, `Right = this.Target.Left + Min(...)`, `Bottom = visual.Size.Y`), with `rootProperties.ActualWidth` itself an
+  expression on a property set (`Lerp(visual.Size.X, this.Target.CollapsedWidth, Abs(this.Target.CollapsedLerp))`).
+  Needed, each found by the warning `clip %p: cannot evaluate` with its references listed: clip edge bindings,
+  `ICompositionAnimation4::SetExpressionReferenceParameter` (the references arrive as `IAnimationObject`s, and the
+  recording table dropped them: `ref_count` 0), a property set behind an IAnimationObject view, `.X`/`.Y` of a vector,
+  a visual's `Size`, `Lerp`, and `this.Target` for the clip and for a property set's own values.
+
+Regression on `prefix-test`: calc AE 3924.73, mp 236.

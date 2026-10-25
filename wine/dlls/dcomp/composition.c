@@ -276,6 +276,7 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
 static BOOL brush_solid_color( ICompositionBrush *brush, Color *color );
 static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int width, int height, float opacity );
 static BOOL paint_gradient_sprite( HDC hdc, void *brush_iface, int x, int y, int width, int height, float opacity );
+static BOOL paint_effect_sprite( HDC hdc, void *brush_iface, int x, int y, int width, int height );
 struct drawing_surface;
 static BOOL paint_mapped_surface( HDC hdc, void *brush_iface, struct drawing_surface *surface, int x, int y,
                                   int width, int height, float opacity );
@@ -11722,6 +11723,11 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
             TRACE( "painted public sprite %p with gradient brush at %d,%d.\n", impl, px, py );
             goto children;
         }
+        if (paint_effect_sprite( hdc, impl->brush, px, py, pw, ph ))
+        {
+            TRACE( "painted public sprite %p with effect brush at %d,%d.\n", impl, px, py );
+            goto children;
+        }
         matched = brush_solid_color( impl->brush, &c );
         /* Colour brushes carry alpha: a transparent (A=0) fill is XAML's default for unset
          * backgrounds and hover/pressed overlays and must not cover what is below. Brushes we
@@ -14647,6 +14653,7 @@ struct comp_clip
     float rotation;
     Matrix3x2 transform;
     struct expr_animation *transform_expr;   /* TransformMatrix bound to an expression */
+    struct expr_animation *edge_expr[4];     /* Left/Top/Right/Bottom (or their insets) bound to expressions */
 };
 static void *inset_clip_vtbl[COMP_OBJECT_SLOTS], *rect_clip_vtbl[COMP_OBJECT_SLOTS];
 static LONG inset_clip_vtbl_ready, rect_clip_vtbl_ready;
@@ -14856,8 +14863,43 @@ static const void *clip2_vtbl[] =
 /* A clip's rectangle in its visual's space (an inset clip's from the visual's size), through the clip's
  * transform: scale about the centre point, the static or expression-bound TransformMatrix, the offset. A
  * rotation is taken by its bounding box. */
+/* A clip edge bound to an expression - XAML's carousels centre their pages with
+ * "Left = (visual.Size.X - Min(visual.Size.X, rootProperties.ActualWidth)) / 2" and
+ * "Right = this.Target.Left + Min(...)": unevaluated, the clip stayed 0,0,0,0 and hid the page (the Microsoft Store's
+ * big hero picture). Evaluated in edge order, so "this.Target.Left" sees the new Left. */
+static struct comp_clip *expr_this_clip;
+static BOOL expr_evaluate_scalar_full( struct expr_animation *expr, float *out );
+static void clip_eval_edges( struct comp_clip *clip )
+{
+    float *edges[4] = { &clip->left, &clip->top, &clip->right, &clip->bottom }, value;
+    struct comp_clip *saved = expr_this_clip;
+    unsigned int i;
+
+    expr_this_clip = clip;
+    for (i = 0; i < 4; i++)
+        if (clip->edge_expr[i])
+        {
+            if (expr_evaluate_scalar_full( clip->edge_expr[i], &value ))
+            {
+                if (*edges[i] != value)
+                    TRACE_(dcompops)( "clip %p edge %u = %g (%s)\n", clip, i, value, debugstr_w( clip->edge_expr[i]->expression ) );
+                *edges[i] = value;
+            }
+            else if (!clip->edge_expr[i]->warned_eval)
+            {
+                clip->edge_expr[i]->warned_eval = TRUE;
+                unsigned int k;
+                WARN( "clip %p: cannot evaluate %s\n", clip, debugstr_w( clip->edge_expr[i]->expression ) );
+                for (k = 0; k < clip->edge_expr[i]->ref_count; k++)
+                    WARN( "  ref %s = %p (vtbl %p)\n", debugstr_w( clip->edge_expr[i]->ref_names[k] ), clip->edge_expr[i]->refs[k],
+                          clip->edge_expr[i]->refs[k] ? *(void **)clip->edge_expr[i]->refs[k] : NULL );
+            }
+        }
+    expr_this_clip = saved;
+}
 static void clip_bounds( struct comp_clip *clip, float width, float height, float *l, float *t, float *r, float *b )
 {
+    clip_eval_edges( clip );
     D2D_MATRIX_3X2_F m = { { { clip->transform.M11, clip->transform.M12, clip->transform.M21, clip->transform.M22,
                                clip->transform.M31, clip->transform.M32 } } };
     float x0 = clip->left, y0 = clip->top;
@@ -15654,6 +15696,68 @@ static struct expr_animation *expr_from_anim_view( void *iface )
 {
     return CONTAINING_RECORD( iface, struct expr_animation, anim_vtbl );
 }
+/* ICompositionAnimation4 {770137be}: 6 SetExpressionReferenceParameter(key, IAnimationObject) - a visual referenced
+ * through its IAnimationObject (Windows 10 1809). Answered by the recording table, the reference was dropped: the
+ * Microsoft Store's hero carousel binds its pages' clips to "visual.Size.X" that way, and every page was clipped away. */
+static const GUID IID_ICompositionAnimation4_local = { 0x770137be, 0x76bc, 0x4e23, { 0xbf, 0xed, 0xfe, 0x9c, 0xc2, 0x0f, 0x6e, 0xc9 } };
+struct expr_anim4_view
+{
+    const void **vtbl;
+    LONG ref;
+    struct expr_animation *owner;
+};
+static HRESULT WINAPI expr_animation_QueryInterface( void *iface, REFIID iid, void **out );
+static HRESULT WINAPI expr_view_SetReferenceParameter( void *iface, HSTRING key, IUnknown *object );
+static HRESULT WINAPI expr_anim4_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct expr_anim4_view *view = iface;
+    return expr_animation_QueryInterface( &view->owner->vtbl, iid, out );
+}
+static ULONG WINAPI expr_anim4_AddRef( void *iface )
+{
+    return InterlockedIncrement( &((struct expr_anim4_view *)iface)->ref );
+}
+static ULONG WINAPI expr_anim4_Release( void *iface )
+{
+    struct expr_anim4_view *view = iface;
+    ULONG ref = InterlockedDecrement( &view->ref );
+    if (!ref)
+    {
+        IUnknown_Release( (IUnknown *)&view->owner->vtbl );
+        (free)( view );
+    }
+    return ref;
+}
+static HRESULT WINAPI expr_anim4_GetIids( void *iface, ULONG *count, IID **iids ) { *count = 0; *iids = NULL; return S_OK; }
+static HRESULT WINAPI expr_anim4_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.UI.Composition.ExpressionAnimation";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI expr_anim4_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
+static HRESULT WINAPI expr_anim4_SetExpressionReferenceParameter( void *iface, HSTRING key, IUnknown *object )
+{
+    struct expr_anim4_view *view = iface;
+    TRACE( "%p, %s, %p.\n", view->owner, debugstr_w( WindowsGetStringRawBuffer( key, NULL ) ), object );
+    return expr_view_SetReferenceParameter( &view->owner->anim_vtbl, key, object );
+}
+static const void *expr_anim4_vtbl[] =
+{
+    expr_anim4_QueryInterface, expr_anim4_AddRef, expr_anim4_Release,
+    expr_anim4_GetIids, expr_anim4_GetRuntimeClassName, expr_anim4_GetTrustLevel,
+    expr_anim4_SetExpressionReferenceParameter,
+};
+static HRESULT expr_anim4_create( struct expr_animation *owner, void **out )
+{
+    struct expr_anim4_view *view;
+    if (!(view = calloc( 1, sizeof(*view) ))) return E_OUTOFMEMORY;
+    view->vtbl = expr_anim4_vtbl;
+    view->ref = 1;
+    IUnknown_AddRef( (IUnknown *)&owner->vtbl );
+    view->owner = owner;
+    *out = view;
+    return S_OK;
+}
 static HRESULT WINAPI expr_animation_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
@@ -15672,6 +15776,7 @@ static HRESULT WINAPI expr_animation_QueryInterface( void *iface, REFIID iid, vo
      * slot 7 then wrote an object into get_Target's HSTRING (React Native's animation driver aborted on it) */
     if (IsEqualGUID( iid, &IID_ICompositionAnimation2_early ))
         return expr_anim2_create( (IUnknown *)&impl->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionAnimation4_local )) return expr_anim4_create( impl, out );
     if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
         return create_object4_view( (IUnknown *)&impl->vtbl, out );
     /* A real ICompositionObject view: WinUI calls get_Compositor on it, which on this table would be
@@ -16048,6 +16153,13 @@ static BOOL expr_visual_vector( struct expr_ctx *c, const WCHAR *ref, const WCHA
         *x = *y = 0.0f;
         ret = TRUE;
     }
+    else if (!wcsicmp( prop, L"Size" ))
+    {
+        struct dcomp_visual *dcv = dcv_from_any( interop );
+        struct visual *pub = dcv ? NULL : visual_from_interop( interop );
+        if (dcv) { *x = dcv->width; *y = dcv->height; ret = TRUE; }
+        else if (pub) { *x = pub->size.X; *y = pub->size.Y; ret = TRUE; }
+    }
     IUnknown_Release( (IUnknown *)interop );
     return ret;
 }
@@ -16132,7 +16244,7 @@ static BOOL expr_scalar_factor( struct expr_ctx *c, float *out )
     static const struct { const WCHAR *name; unsigned int args; } funcs[] =
     {
         { L"cos(", 1 }, { L"sin(", 1 }, { L"tan(", 1 }, { L"abs(", 1 }, { L"sqrt(", 1 },
-        { L"min(", 2 }, { L"max(", 2 }, { L"clamp(", 3 },
+        { L"min(", 2 }, { L"max(", 2 }, { L"clamp(", 3 }, { L"lerp(", 3 },
     };
     WCHAR ref[48], prop[48];
     struct propset_value *v;
@@ -16183,7 +16295,8 @@ static BOOL expr_scalar_factor( struct expr_ctx *c, float *out )
         case 4: *out = sqrtf( arg[0] ); break;
         case 5: *out = min( arg[0], arg[1] ); break;
         case 6: *out = max( arg[0], arg[1] ); break;
-        default: *out = min( max( arg[0], arg[1] ), arg[2] ); break;
+        case 7: *out = min( max( arg[0], arg[1] ), arg[2] ); break;
+        default: *out = arg[0] + (arg[1] - arg[0]) * arg[2]; break;   /* Lerp */
         }
         return TRUE;
     }
@@ -16193,7 +16306,40 @@ static BOOL expr_scalar_factor( struct expr_ctx *c, float *out )
         *out = 3.14159265358979f;
         return TRUE;
     }
+    if (expr_this_clip && !wcsnicmp( c->p, L"this.Target.", 12 ))
+    {
+        static const WCHAR *const names[4] = { L"Left", L"Top", L"Right", L"Bottom" };
+        const float values[4] = { expr_this_clip->left, expr_this_clip->top, expr_this_clip->right, expr_this_clip->bottom };
+        c->p += 12;
+        if (!expr_ident( c, prop, ARRAY_SIZE(prop) )) return FALSE;
+        for (i = 0; i < 4; i++)
+            if (!wcsnicmp( prop, names[i], wcslen( names[i] ) )) { *out = values[i]; return TRUE; }
+        return FALSE;
+    }
+    /* "this.Target.CollapsedWidth" in an expression bound on a property set: that set's own property */
+    if (c->local && !wcsnicmp( c->p, L"this.Target.", 12 ))
+    {
+        c->p += 12;
+        if (!expr_ident( c, prop, ARRAY_SIZE(prop) )) return FALSE;
+        if (expr_bound_scalar( c, L"LOCAL", prop, out )) return TRUE;
+        v = expr_property( c, L"LOCAL", prop );
+        if (!v || v->type != PROP_SCALAR) return FALSE;
+        *out = v->u.scalar;
+        return TRUE;
+    }
     if (!expr_name( c, ref, ARRAY_SIZE(ref), prop, ARRAY_SIZE(prop) )) return FALSE;
+    /* "visual.Size.X": one component of a vector */
+    if (*c->p == '.' && (towupper( c->p[1] ) == 'X' || towupper( c->p[1] ) == 'Y') && !iswalnum( c->p[2] ) && c->p[2] != '_')
+    {
+        BOOL y_comp = towupper( c->p[1] ) == 'Y';
+        float vx, vy;
+        c->p += 2;
+        if (expr_visual_vector( c, ref, prop, &vx, &vy )) { *out = y_comp ? vy : vx; return TRUE; }
+        v = expr_property( c, ref, prop );
+        if (v && v->type == PROP_VECTOR2) { *out = y_comp ? v->u.vector2.Y : v->u.vector2.X; return TRUE; }
+        if (v && v->type == PROP_VECTOR3) { *out = y_comp ? v->u.vector3.Y : v->u.vector3.X; return TRUE; }
+        return FALSE;
+    }
     if (expr_bound_scalar( c, ref, prop, out )) return TRUE;
     v = expr_property( c, ref, prop );
     if (!v || v->type != PROP_SCALAR) return FALSE;
@@ -16507,6 +16653,13 @@ static void notify_facade_listeners( void )
     LeaveCriticalSection( &listened_cs );
 }
 
+struct anim_object_view
+{
+    const void **vtbl;
+    LONG ref;
+    IUnknown *owner;
+};
+static const void *anim_object_view_vtbl[];
 static struct property_set *propset_from_object( IUnknown *object )
 {
     void **vtbl = object ? *(void ***)object : NULL;
@@ -16520,6 +16673,8 @@ static struct property_set *propset_from_object( IUnknown *object )
         vtbl == (void **)expr_animation_vtbl || vtbl == (void **)expr_anim_view_vtbl || vtbl == (void **)kf_animation_vtbl)
         return NULL;
     if (vtbl == (void **)object_view_vtbl) return propset_from_object( impl_from_object_view( object )->owner );
+    /* a reference set through its IAnimationObject (ICompositionAnimation4::SetExpressionReferenceParameter) */
+    if (vtbl == (void **)anim_object_view_vtbl) return propset_from_object( ((struct anim_object_view *)object)->owner );
     /* "_.Progress": an expression referencing a visual reads that visual's Properties */
     if (SUCCEEDED( IUnknown_QueryInterface( object, &IID_IInteropVisual_private, &interop ) ))
     {
@@ -17706,6 +17861,12 @@ struct effect_brush
     IUnknown *sources[EFFECT_BRUSH_SOURCES];
     IGraphicsEffect *effect;    /* the factory's effect graph */
     ICompositionPropertySet *properties;   /* shared by every ICompositionObject view of the brush */
+    /* the graph rendered for a sprite (paint_effect_sprite), kept while its pixels stay the same */
+    HBITMAP cache_bmp;
+    BYTE *cache_bits;
+    unsigned int cache_w, cache_h;
+    ULONGLONG cache_hash;
+    ULONG cache_serial;
 };
 
 struct effect_factory
@@ -19701,6 +19862,7 @@ static const GUID CLSID_D2D1Composite_ = { 0x48fc9f51, 0xf6ac, 0x48f1, { 0x8b, 0
 static const GUID CLSID_D2D1Opacity_ = { 0x811d79a4, 0xde28, 0x4454, { 0x80, 0x94, 0xc6, 0x46, 0x85, 0xf8, 0xbd, 0x4c } };
 static BOOL brush_render_pixels( void *brush, unsigned int w, unsigned int h, float *out, int depth );
 static const char *debugstr_brush( void *brush );
+static BOOL effect_render_strict;
 static BOOL effect_property_uint( IGraphicsEffectD2D1Interop_ *interop, UINT index, UINT *value )
 {
     IPropertyValue *v = NULL;
@@ -19799,7 +19961,11 @@ static BOOL effect_node_render( struct effect_brush *eb, IUnknown *node, unsigne
             source = NULL;
             interop->lpVtbl->GetSource( interop, k, &source );
             if (!effect_node_render( eb, (IUnknown *)source, w, h, dst, depth + 1 ))
+            {
+                /* a mask's picture may simply not be decoded yet; a sprite's graph must be complete */
+                if (effect_render_strict) ret = FALSE;
                 memset( dst, 0, n * 4 * sizeof(float) );
+            }
             if (source) IGraphicsEffectSource_Release( source );
             if (!k) continue;
             for (i = 0; i < n; i++)
@@ -19912,17 +20078,16 @@ static BOOL brush_render_pixels( void *brush, unsigned int w, unsigned int h, fl
     }
     else
     {
+        /* no layout of its own: a surface brush's default, Stretch Fill (a Lottie matte's 48 px visual surfaces
+         * under a sprite drawn at 24) */
         unsigned int x, y;
         for (y = 0; y < h; y++)
             for (x = 0; x < w; x++)
             {
                 float *o = out + ((size_t)y * w + x) * 4;
-                if (x < desc.Width && y < desc.Height)
-                {
-                    const BYTE *px = pixels + ((size_t)y * desc.Width + x) * 4;
-                    o[0] = px[2] / 255.0f; o[1] = px[1] / 255.0f; o[2] = px[0] / 255.0f; o[3] = px[3] / 255.0f;
-                }
-                else o[0] = o[1] = o[2] = o[3] = 0.0f;
+                unsigned int sx = (unsigned int)(((x + 0.5f) * desc.Width) / w), sy = (unsigned int)(((y + 0.5f) * desc.Height) / h);
+                const BYTE *px = pixels + ((size_t)min( sy, desc.Height - 1 ) * desc.Width + min( sx, desc.Width - 1 )) * 4;
+                o[0] = px[2] / 255.0f; o[1] = px[1] / 255.0f; o[2] = px[0] / 255.0f; o[3] = px[3] / 255.0f;
             }
     }
     return TRUE;
@@ -19945,6 +20110,52 @@ static BYTE *effect_brush_render_bgra( void *brush, unsigned int w, unsigned int
         }
     free( f );
     return bgra;
+}
+static void retire_bitmap( HBITMAP bmp );
+/* A sprite painted with an effect brush whose whole graph renders here (Lottie track mattes: the Microsoft Store's
+ * selected Home icon). Graphs with anything else (XAML's acrylic, with its blur and backdrop) are left alone. */
+static BOOL paint_effect_sprite( HDC hdc, void *brush_iface, int x, int y, int width, int height )
+{
+    struct effect_brush *eb = effect_brush_from_any( brush_iface );
+    ULONGLONG hash = 1469598103934665603ull;
+    BITMAPINFO info = { { 0 } };
+    BYTE *bgra;
+    void *bits;
+
+    if (!eb || !eb->effect || width <= 0 || height <= 0 || width > 4096 || height > 4096) return FALSE;
+    effect_render_strict = TRUE;
+    bgra = effect_brush_render_bgra( brush_iface, width, height );
+    effect_render_strict = FALSE;
+    if (!bgra)
+    {
+        TRACE_(dcompops)( "effect sprite %dx%d at %d,%d: %s not rendered.\n", width, height, x, y, debugstr_brush( brush_iface ) );
+        return FALSE;
+    }
+    hash_bytes( &hash, bgra, (size_t)width * height * 4 );
+    if (!eb->cache_bmp || eb->cache_w != width || eb->cache_h != height || eb->cache_hash != hash)
+    {
+        retire_bitmap( eb->cache_bmp );
+        eb->cache_bmp = NULL;
+        info.bmiHeader.biSize = sizeof(info.bmiHeader);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        if (!(eb->cache_bmp = CreateDIBSection( NULL, &info, DIB_RGB_COLORS, &bits, NULL, 0 )))
+        {
+            free( bgra );
+            return FALSE;
+        }
+        memcpy( (eb->cache_bits = bits), bgra, (size_t)width * height * 4 );
+        eb->cache_w = width;
+        eb->cache_h = height;
+        eb->cache_hash = hash;
+        eb->cache_serial = InterlockedIncrement( &content_generation );
+        TRACE_(dcompops)( "effect sprite %dx%d at %d,%d rendered: %s.\n", width, height, x, y, debugstr_brush( brush_iface ) );
+    }
+    free( bgra );
+    return soft_blend( hdc, x, y, width, height, eb->cache_bits, width * 4, 255, eb, eb->cache_serial );
 }
 
 /* CompositionNineGridBrush. ICompositionNineGridBrush {f25154e4}, native Api vtable in dcomp.pdb: 6/7 BottomInset,
@@ -22460,6 +22671,20 @@ static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, voi
         struct comp_clip *rc = view->owner ? clip_from_any( view->owner ) : NULL;
         struct expr_animation *cexpr = expr_animation_from_any( animation );
         const WCHAR *cprop = WindowsGetStringRawBuffer( name, NULL );
+        if (rc && cexpr && cprop && wcsicmp( cprop, L"TransformMatrix" ))
+        {
+            static const WCHAR *const names[4][2] = { { L"Left", L"LeftInset" }, { L"Top", L"TopInset" },
+                                                     { L"Right", L"RightInset" }, { L"Bottom", L"BottomInset" } };
+            unsigned int e;
+            for (e = 0; e < 4; e++)
+                if (!wcsicmp( cprop, names[e][0] ) || !wcsicmp( cprop, names[e][1] ))
+                {
+                    IUnknown_AddRef( (IUnknown *)&cexpr->vtbl );
+                    if (rc->edge_expr[e]) IUnknown_Release( (IUnknown *)&rc->edge_expr[e]->vtbl );
+                    rc->edge_expr[e] = cexpr;
+                    TRACE_(dcomptree)( "%s %p %s <- %s\n", rc->kind, rc, debugstr_w( cprop ), debugstr_w( cexpr->expression ) );
+                }
+        }
         if (rc && cexpr && cprop && !wcsicmp( cprop, L"TransformMatrix" ))
         {
             IUnknown_AddRef( (IUnknown *)&cexpr->vtbl );
@@ -24387,12 +24612,6 @@ static HRESULT create_anim_prop_info( void **out )
 
 /* IAnimationObject {e7141e0a} view of one of our composition objects: 6 PopulatePropertyInfo(name, info). As
  * CompositionObject::PopulatePropertyInfo does, the object names itself and the property. */
-struct anim_object_view
-{
-    const void **vtbl;
-    LONG ref;
-    IUnknown *owner;
-};
 static HRESULT WINAPI anim_object_view_QueryInterface( void *iface, REFIID iid, void **out )
 {
     struct anim_object_view *impl = iface;
