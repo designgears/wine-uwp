@@ -13327,3 +13327,23 @@ complete with S_OK; "facade not decoded yet" came only from frames painted befor
 hero artwork on the left, the selected Home icon (a Lottie matte through an effect brush on a plain sprite, which
 the sprite painter does not render), and the blank-start flake (~1 in 3 runs today). Regression on `prefix-test`
 against `wine-build-wow64`: calc AE 3924.73, mp 236, unchanged.
+
+### Microsoft Store: the blank start (2026-10-25)
+
+About one Store start in five stayed blank for good: every thread idle, the UI thread in Windows.UI's dispatcher wait,
+one pool worker against ~20 in a good run, and input to the window did not revive it. The logs were identical to a
+good run's up to the view Activate, except that the good runs loaded the app's App.xaml resources (WinUI's
+`CBSPackageDetector`) *before* wineuwp drove the view startup, and the stuck ones after; the stuck runs also claimed
+the startup early ("after 1-3 tries" against ~5). A stack captured in `drive_view_startup` settled it: in a stuck run
+the startup APC ran inside `combase` `CoWaitForMultipleHandles` called from `WinStore.App.dll` (its runtime wait,
+`+31904b3`, or `+9ef4af`): an alertable wait in the app's own start-up code. Activating there re-entered a half-built
+app; Activated was "handled" and OnLaunched never ran. `drive_view_startup` now leaves the startup unclaimed while any
+frame on the stack is in a module loaded from the package directory (`in_app_code`), or while XAML has no
+`Application.Current` (at most 3 s); the activation thread re-queues it every 200 ms. 16/16 good starts with tracing
+on (which made the flake more frequent), the guard firing in 3 of them, each then claimed and painted. Calculator
+19/20 AE 3924.73 on `prefix-test` (one 175222, the one-off seen there on 10-19), mp 236 and sol as the control.
+
+Traps on the way: **the prefix's `wineuwp.dll` is refreshed only when a run starts** (`wineuwp-setup`), so `cmp`
+against the build right after a rebuild says "differs" and means nothing; and **a stack logged on one line overflowed
+Wine's debug buffer and aborted the app** (74-colour "failures" that were my own trace). Earlier today
+`WINE_UWP_DUMP_STACKS` + `probe-threads` maps showed only which threads waited; the stack *at the APC* was the evidence.

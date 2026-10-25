@@ -2024,6 +2024,75 @@ static BOOL drive_first_view( void )
     return GetEnvironmentVariableW( L"WINE_UWP_DRIVE_FIRST_VIEW", NULL, 0 ) != 0;
 }
 
+/* Whether the calling thread is inside the app's own code: any frame on its stack in a module loaded from the
+ * package directory. The view startup is queued as an APC, and an APC runs in any alertable wait - including one the
+ * app's start-up code makes (a COM wait under the App's construction, seen in the Microsoft Store). Activating there
+ * re-entered a half-built app: Activated reached it, "the app handled the activation", and OnLaunched never ran -
+ * a blank window with every thread idle, about one start in five. */
+static BOOL in_app_code( void )
+{
+    static WCHAR package_dir[MAX_PATH];
+    static DWORD package_len;
+    void *frames[64];
+    USHORT n = RtlCaptureStackBackTrace( 1, ARRAY_SIZE(frames), frames, NULL ), i;
+
+    if (!package_len)
+    {
+        WCHAR *slash;
+        if (!GetModuleFileNameW( NULL, package_dir, ARRAY_SIZE(package_dir) ) || !(slash = wcsrchr( package_dir, '\\' )))
+            return FALSE;
+        slash[1] = 0;
+        package_len = wcslen( package_dir );
+    }
+    for (i = 0; i < n; i++)
+    {
+        HMODULE mod = NULL;
+        WCHAR path[MAX_PATH];
+        if (!GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                 frames[i], &mod ) || mod == GetModuleHandleW( NULL ) ||
+            !GetModuleFileNameW( mod, path, ARRAY_SIZE(path) ))
+            continue;
+        if (!wcsnicmp( path, package_dir, package_len ))
+        {
+            ERR( "view startup reached through %s+%Ix (frame %u): the app is mid-way through its own code; later\n",
+                 debugstr_w( path + package_len ), (char *)frames[i] - (char *)mod, i );
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* whether the view's XAML Application exists yet (or XAML is not in this view, or we have waited long enough) */
+static BOOL xaml_application_ready( void )
+{
+    static DWORD first_asked;
+    struct slot_vtbl **statics = NULL, *app = NULL;
+    HSTRING_HEADER header;
+    HSTRING name;
+    HRESULT hr;
+
+    /* not xaml_dxaml_core_current(): this early the view thread has no DXamlCore yet either */
+    if (!GetModuleHandleW( L"Windows.UI.Xaml.dll" )) return TRUE;
+    if (!first_asked) first_asked = GetTickCount();
+    if (GetTickCount() - first_asked > 3000)
+    {
+        ERR( "no XAML Application on tid %lu after 3 s; starting the view anyway\n", GetCurrentThreadId() );
+        return TRUE;
+    }
+    if (FAILED( WindowsCreateStringReference( L"Windows.UI.Xaml.Application", 27, &header, &name ) ) ||
+        FAILED( RoGetActivationFactory( name, &IID_IApplicationStatics, (void **)&statics ) ))
+        return TRUE;
+    hr = (*statics)->slot[6]( statics, &app );   /* get_Current */
+    IUnknown_Release( (IUnknown *)statics );
+    if (SUCCEEDED( hr ) && app)
+    {
+        IUnknown_Release( (IUnknown *)app );
+        return TRUE;
+    }
+    ERR( "no XAML Application on tid %lu yet (hr %#lx); the view startup waits\n", GetCurrentThreadId(), hr );
+    return FALSE;
+}
+
 static HRESULT drive_view_startup( IInspectable *args )
 {
     struct slot_vtbl **view = NULL;
@@ -2054,6 +2123,17 @@ static HRESULT drive_view_startup( IInspectable *args )
         IUnknown_Release( (IUnknown *)view );
         if (own_args) IInspectable_Release( own_args );
         return E_NOINTERFACE;
+    }
+    /* Not before the XAML Application exists. FrameworkView::Initialize runs the app's Application.Start callback,
+     * which builds the App object and loads App.xaml, on this thread; the startup APC can land in an alertable wait
+     * before that. Activated then went to no application ("the app handled the activation", and nothing ever ran
+     * OnLaunched): the Microsoft Store stayed blank about one start in five, every thread idle. Left unclaimed, the
+     * next APC (activation_thread queues them every 200 ms) finds the App. Capped, for an app that never makes one. */
+    if (drive_first_view() && (in_app_code() || !xaml_application_ready()))
+    {
+        IUnknown_Release( (IUnknown *)view );
+        if (own_args) IInspectable_Release( own_args );
+        return E_PENDING;
     }
     if (InterlockedCompareExchange( &view_startup_done, 1, 0 ))
     {
