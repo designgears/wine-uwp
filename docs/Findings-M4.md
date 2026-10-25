@@ -13464,5 +13464,11 @@ hero on the left draws. Before, it was one flat colour on all three pages.
 Regression on `prefix-test` with `wine-build-store`: calc AE 3924.73, mp 236, sol 3/3 not reached (as on the control
 build).
 
-Still open: on Apps, Gaming and AI Hub the right-hand column of cards starts 48 px below the hero (Home lines them
-up), Gaming's lower panel, and AI Hub's lower banner.
+Still open: Gaming's lower panel, and AI Hub's lower banner.
+
+**The side cards' top 48 px** (Apps, Gaming, AI Hub: the large card began 48 px below the hero). The card is a
+CompositionVisualSurface (`visual surface ...: dcomp visual ... 443x249, 3 ops`), and inside it `+dcomptree` had the
+source's child at `0,48` with offset and transform 0. `visual_surface_render` cleared `xaml_island_container`, so the
+first container in the source took the island's part and its dcomp children were moved down by the title bar row
+(`xaml_content_dy`). A visual surface now renders with an island that is no visual. It also subtracts its source's
+expression-bound translation (`dcv_own_translation`), which did not matter here. Regression: calc AE 3924.73, mp 236.

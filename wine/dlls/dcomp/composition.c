@@ -270,6 +270,7 @@ static void present_dcomp_visuals( HDC hdc );
  * the window-sized visual they are hosted in (see branch_is_window_space_dcv). */
 static float xaml_content_dy;
 static struct visual *xaml_island_container;
+static const char no_island;  /* an xaml_island_container that is no visual: a subtree painted on its own */
 static struct dcomp_visual *xaml_content_branch, *paint_branch;
 static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float parent_width,
                                  float parent_height, float sx, float sy );
@@ -10832,6 +10833,27 @@ static HRESULT create_visual_surface( void **out )
     return S_OK;
 }
 /* paint the source subtree into the surface's cache; called inside a walk on its thread */
+/* Where paint_dcomp_visual puts a visual relative to the origin it is given: its offset, its transform and, while an
+ * expression is bound to its TransformMatrix, that matrix's translation instead of the static one's. A subtree
+ * painted on its own (a CompositionVisualSurface's source) starts at minus this. */
+static void dcv_own_translation( struct dcomp_visual *v, float *x, float *y )
+{
+    D2D_MATRIX_3X2_F em;
+
+    *x = v->offset_x + v->transform_x;
+    *y = v->offset_y + v->transform_y;
+    if (v->transform_expr && expr_evaluate_matrix( v->transform_expr, v->properties,
+                                                    v->manip && v->manip->has_matrix ? &v->manip->matrix : NULL, &em ))
+    {
+        *x += em._31;
+        *y += em._32;
+    }
+    else
+    {
+        *x += v->transform4.M41;
+        *y += v->transform4.M42;
+    }
+}
 static void visual_surface_render( struct visual_surface *impl )
 {
     struct dcomp_visual *dv = dcv_from_any( impl->source );
@@ -10897,11 +10919,17 @@ static void visual_surface_render( struct visual_surface *impl )
     paint_xf.quarter = 0; paint_xf.active = FALSE;
     paint_opacity = 1.0f;
     paint_content_sx = paint_content_sy = 1.0f;
-    xaml_island_container = NULL;
+    /* not the window's island: with none set, the first container in the source took the part, and its dcomp
+     * children were moved down by the title bar row (the Microsoft Store's side cards lost their top 48 px) */
+    xaml_island_container = (struct visual *)&no_island;
     paint_branch = NULL;
     EnterCriticalSection( &dcomp_visual_cs );
-    if (dv) paint_dcomp_visual( dc, dv, -(dv->offset_x + dv->transform_x + dv->transform4.M41) - impl->offset.X,
-                                -(dv->offset_y + dv->transform_y + dv->transform4.M42) - impl->offset.Y, 1.0f, 1.0f );
+    if (dv)
+    {
+        float tx, ty;
+        dcv_own_translation( dv, &tx, &ty );
+        paint_dcomp_visual( dc, dv, -tx - impl->offset.X, -ty - impl->offset.Y, 1.0f, 1.0f );
+    }
     else paint_public_visual( dc, &pv->interop_vtbl, -(pv->offset.X + pv->transform.M41) - impl->offset.X,
                               -(pv->offset.Y + pv->transform.M42) - impl->offset.Y, (float)w, (float)h, 1.0f, 1.0f );
     LeaveCriticalSection( &dcomp_visual_cs );
