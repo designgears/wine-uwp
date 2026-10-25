@@ -4120,6 +4120,7 @@ struct drawing_surface
      * surface's, then 8 Resize and 9 Trim, which collide with the internal interface's slots on
      * vtbl. Every other interface is answered by vtbl. */
     const void **virtual_vtbl;
+    BOOL cpu_only;              /* a CompositionVisualSurface's: the content is the cache, there is no texture */
 };
 
 static struct drawing_surface **swapchain_surfaces;
@@ -5005,6 +5006,7 @@ static struct drawing_surface *surface_from_iface( void *iface )
 /* ICompositionSurfaceFacade {e01622c8-2332-55c7-8868-a7312c5c229d}: slot 6 GetRealSurface. XAML's
  * LoadedImageSurface is a facade over the composition surface it decodes into; apps hand the facade
  * to CreateSurfaceBrush, and the real surface only exists once XAML has allocated it. */
+static struct drawing_surface *visual_surface_resolve( IUnknown *facade, BOOL *is_visual_surface );
 static struct drawing_surface *surface_from_facade( IUnknown *facade, BOOL *unknown )
 {
     static const GUID IID_ICompositionSurfaceFacade_ =
@@ -5024,6 +5026,11 @@ static struct drawing_surface *surface_from_facade( IUnknown *facade, BOOL *unkn
 
     if (unknown) *unknown = FALSE;
     if (!facade) return NULL;
+    {
+        BOOL is_visual_surface;
+        struct drawing_surface *rendered = visual_surface_resolve( facade, &is_visual_surface );
+        if (is_visual_surface) return rendered;
+    }
     if (SUCCEEDED(IUnknown_QueryInterface( facade, &IID_ILoadedImageSurface_, (void **)&iface )))
     {
         Size decoded = { 0 };
@@ -5530,9 +5537,9 @@ static struct drawing_surface *brush_surface( void *brush_iface )
         }
         else if (real) IUnknown_Release( (IUnknown *)&real->vtbl );
     }
-    if (brush->surface && !brush->surface->texture && !brush->surface->swapchain)
+    if (brush->surface && !brush->surface->texture && !brush->surface->swapchain && !brush->surface->cpu_only)
         TRACE_(dcompops)( "brush %p: surface %p has no texture yet.\n", brush, brush->surface );
-    return brush->surface && (brush->surface->texture || brush->surface->swapchain) ? brush->surface : NULL;
+    return brush->surface && (brush->surface->texture || brush->surface->swapchain || brush->surface->cpu_only) ? brush->surface : NULL;
 }
 
 /* Copy what XAML drew into a surface onto the window. The texture lives on the GPU and the
@@ -5727,6 +5734,15 @@ static const BYTE *surface_cached_pixels( struct drawing_surface *surface, D3D11
     ID3D11Device *device;
 
     if (surface) surface_sync_swapchain( surface );
+    if (surface && surface->cpu_only)
+    {
+        if (!surface->cache_valid || !surface->cache) return NULL;
+        memset( desc, 0, sizeof(*desc) );
+        desc->Width = surface->cache_w;
+        desc->Height = surface->cache_h;
+        desc->Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        return surface->cache;
+    }
     if (!surface || (!surface->texture && !surface->swapchain)) return NULL;
     if (surface->swapchain)
     {
@@ -10710,6 +10726,231 @@ static void capture_paint_public( HDC dc, struct visual *pv, int width, int heig
                        pv->collection.count, pv->brush, pv->parent );
     paint_public_visual( dc, &pv->interop_vtbl, -(pv->offset.X + pv->transform.M41), -(pv->offset.Y + pv->transform.M42),
                          (float)width, (float)height, 1.0f, 1.0f );
+}
+/* CompositionVisualSurface: ICompositionVisualSurface {b224d803} is 6/7 SourceVisual, 8/9 SourceOffset, 10/11 SourceSize.
+ * It renders the source visual's subtree, with the visual's own origin at -SourceOffset, into a surface a brush can
+ * use. The Microsoft Store masks every app icon with one (a MaskBrush over two visual surfaces: the picture and a
+ * rounded rectangle) and draws Lottie track mattes through them; as a recording object every such icon was empty.
+ * The subtree is painted when a brush asks for the surface during a frame's walk, nested in it (the same thread
+ * already holds the painter's locks), once per scene generation. */
+struct visual_surface
+{
+    const void **vtbl;          /* must match struct comp_object */
+    const char *kind;
+    LONG ref;
+    IUnknown *source;
+    Vector2 offset, size;
+    struct drawing_surface *surface;
+    LONG rendered_generation;
+    BOOL rendered;
+};
+static void *visual_surface_vtbl[COMP_OBJECT_SLOTS];
+static struct visual_surface *impl_from_visual_surface( void *iface ) { return CONTAINING_RECORD( iface, struct visual_surface, vtbl ); }
+static HRESULT WINAPI visual_surface_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_ICompositionObject )) return create_composition_object_view( iface, out );
+    return comp_object_QueryInterface( iface, iid, out );
+}
+static ULONG WINAPI visual_surface_Release( void *iface )
+{
+    struct visual_surface *impl = impl_from_visual_surface( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref)
+    {
+        comp_map_owner_gone( &impl->vtbl );
+        if (impl->source) IUnknown_Release( impl->source );
+        /* the painter may still hold the surface for this frame: it is a comp object of its own and refcounted */
+        if (impl->surface) IUnknown_Release( (IUnknown *)&impl->surface->vtbl );
+        free( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI visual_surface_get_SourceVisual( void *iface, IUnknown **value )
+{
+    struct visual_surface *impl = impl_from_visual_surface( iface );
+    if (!value) return E_POINTER;
+    if ((*value = impl->source)) IUnknown_AddRef( impl->source );
+    return S_OK;
+}
+static HRESULT WINAPI visual_surface_put_SourceVisual( void *iface, IUnknown *value )
+{
+    struct visual_surface *impl = impl_from_visual_surface( iface );
+    TRACE( "%p, %p.\n", impl, value );
+    scene_changed();
+    if (value) IUnknown_AddRef( value );
+    if (impl->source) IUnknown_Release( impl->source );
+    impl->source = value;
+    impl->rendered = FALSE;
+    return S_OK;
+}
+#define VISUAL_SURFACE_VECTOR2( name, field ) \
+    static HRESULT WINAPI visual_surface_get_##name( void *iface, Vector2 *value ) \
+    { if (!value) return E_POINTER; *value = impl_from_visual_surface( iface )->field; return S_OK; } \
+    static HRESULT WINAPI visual_surface_put_##name( void *iface, Vector2 value ) \
+    { \
+        struct visual_surface *impl = impl_from_visual_surface( iface ); \
+        TRACE( "%p, %g,%g.\n", impl, value.X, value.Y ); \
+        scene_changed(); \
+        impl->field = value; \
+        impl->rendered = FALSE; \
+        return S_OK; \
+    }
+VISUAL_SURFACE_VECTOR2( SourceOffset, offset )
+VISUAL_SURFACE_VECTOR2( SourceSize, size )
+#undef VISUAL_SURFACE_VECTOR2
+static HRESULT create_visual_surface( void **out )
+{
+    static LONG ready;
+    struct visual_surface *impl;
+
+    if (!out) return E_POINTER;
+    ensure_comp_object_vtbl();
+    if (!InterlockedCompareExchange( &ready, 1, 0 ))
+    {
+        memcpy( visual_surface_vtbl, comp_object_vtbl, sizeof(visual_surface_vtbl) );
+        visual_surface_vtbl[2] = visual_surface_Release;
+        visual_surface_vtbl[6] = visual_surface_get_SourceVisual;  visual_surface_vtbl[7] = visual_surface_put_SourceVisual;
+        visual_surface_vtbl[8] = visual_surface_get_SourceOffset;  visual_surface_vtbl[9] = visual_surface_put_SourceOffset;
+        visual_surface_vtbl[10] = visual_surface_get_SourceSize;   visual_surface_vtbl[11] = visual_surface_put_SourceSize;
+        visual_surface_vtbl[0] = visual_surface_QueryInterface;
+        InterlockedExchange( &ready, 2 );
+    }
+    while (ready != 2) Sleep( 0 );
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    comp_map_owner_gone( &impl->vtbl );
+    impl->vtbl = (const void **)visual_surface_vtbl;
+    impl->kind = "CompositionVisualSurface";
+    impl->ref = 1;
+    TRACE( "visual surface %p.\n", impl );
+    *out = &impl->vtbl;
+    return S_OK;
+}
+/* paint the source subtree into the surface's cache; called inside a walk on its thread */
+static void visual_surface_render( struct visual_surface *impl )
+{
+    struct dcomp_visual *dv = dcv_from_any( impl->source );
+    struct visual *pv = dv ? NULL : public_visual_from( (IInspectable *)impl->source );
+    RECT saved_clip, saved_rot_clip;
+    struct paint_xform saved_xf;
+    float saved_opacity, saved_csx = paint_content_sx, saved_csy = paint_content_sy;
+    unsigned int saved_current, saved_count, w, h;
+    struct visual *saved_island;
+    struct dcomp_visual *saved_branch;
+    BOOL saved_transparent = raster_transparent;
+    BITMAPINFO info = { { 0 } };
+    RECT area;
+    BYTE *bits = NULL;
+    HBITMAP dib = NULL, old = NULL;
+    HDC dc = NULL;
+    void *out;
+
+    if (!dv && !pv) return;
+    w = impl->size.X >= 0.5f ? (unsigned int)(impl->size.X + 0.5f) : pv ? (unsigned int)(pv->size.X + 0.5f) : (unsigned int)dv->width;
+    h = impl->size.Y >= 0.5f ? (unsigned int)(impl->size.Y + 0.5f) : pv ? (unsigned int)(pv->size.Y + 0.5f) : (unsigned int)dv->height;
+    if (!w || !h || w > 4096 || h > 4096) return;
+    if (impl->surface && (impl->surface->width != w || impl->surface->height != h))
+    {
+        IUnknown_Release( (IUnknown *)&impl->surface->vtbl );
+        impl->surface = NULL;
+    }
+    if (!impl->surface)
+    {
+        if (FAILED( create_drawing_surface( w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED, &out ) )) return;
+        impl->surface = CONTAINING_RECORD( out, struct drawing_surface, vtbl );
+        impl->surface->cpu_only = TRUE;
+    }
+    if (!surface_ensure_cache( impl->surface, w, h, 4 )) return;
+
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = w;
+    info.bmiHeader.biHeight = -(LONG)h;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    if (!(dc = CreateCompatibleDC( NULL )) || !(dib = CreateDIBSection( dc, &info, DIB_RGB_COLORS, (void **)&bits, NULL, 0 )))
+    {
+        if (dc) DeleteDC( dc );
+        return;
+    }
+    old = SelectObject( dc, dib );
+    SetRect( &area, 0, 0, w, h );
+
+    saved_current = paint_current;
+    saved_count = paint_lists[2].count;
+    saved_clip = paint_clip;
+    saved_rot_clip = paint_rot_clip;
+    saved_xf = paint_xf;
+    saved_opacity = paint_opacity;
+    saved_island = xaml_island_container;
+    saved_branch = paint_branch;
+
+    paint_current = 2;
+    paint_lists[2].count = 0;
+    paint_clip = area;
+    paint_xf.m11 = paint_xf.m22 = 1.0f; paint_xf.m12 = paint_xf.m21 = paint_xf.dx = paint_xf.dy = 0.0f;
+    paint_xf.quarter = 0; paint_xf.active = FALSE;
+    paint_opacity = 1.0f;
+    paint_content_sx = paint_content_sy = 1.0f;
+    xaml_island_container = NULL;
+    paint_branch = NULL;
+    EnterCriticalSection( &dcomp_visual_cs );
+    if (dv) paint_dcomp_visual( dc, dv, -(dv->offset_x + dv->transform_x + dv->transform4.M41) - impl->offset.X,
+                                -(dv->offset_y + dv->transform_y + dv->transform4.M42) - impl->offset.Y, 1.0f, 1.0f );
+    else paint_public_visual( dc, &pv->interop_vtbl, -(pv->offset.X + pv->transform.M41) - impl->offset.X,
+                              -(pv->offset.Y + pv->transform.M42) - impl->offset.Y, (float)w, (float)h, 1.0f, 1.0f );
+    LeaveCriticalSection( &dcomp_visual_cs );
+
+    raster_transparent = TRUE;
+    raster_ops( dc, bits, w, &paint_lists[2], &area );
+    raster_transparent = saved_transparent;
+    GdiFlush();
+    TRACE_(dcompops)( "visual surface %p: %s visual %p %ux%u at %g,%g, %u ops.\n", impl, dv ? "dcomp" : "public", impl->source,
+                      w, h, impl->offset.X, impl->offset.Y, paint_lists[2].count );
+
+    paint_lists[2].count = saved_count;
+    paint_current = saved_current;
+    paint_clip = saved_clip;
+    paint_rot_clip = saved_rot_clip;
+    paint_xf = saved_xf;
+    paint_opacity = saved_opacity;
+    paint_content_sx = saved_csx; paint_content_sy = saved_csy;
+    xaml_island_container = saved_island;
+    paint_branch = saved_branch;
+
+    if (!impl->surface->cache_valid || memcmp( impl->surface->cache, bits, (size_t)w * h * 4 ))
+    {
+        memcpy( impl->surface->cache, bits, (size_t)w * h * 4 );
+        impl->surface->generation = InterlockedIncrement( &content_generation );
+    }
+    impl->surface->cache_valid = TRUE;
+    impl->surface->opaque = FALSE;
+    SelectObject( dc, old );
+    DeleteDC( dc );
+    DeleteObject( dib );
+}
+/* the surface a CompositionVisualSurface shows now, with a reference, or NULL; *is_visual_surface says whether the
+ * facade is one */
+static struct drawing_surface *visual_surface_resolve( IUnknown *facade, BOOL *is_visual_surface )
+{
+    struct visual_surface *impl;
+    LONG generation = scene_generation;
+
+    *is_visual_surface = FALSE;
+    if (*(void ***)facade != (void **)visual_surface_vtbl) return NULL;
+    *is_visual_surface = TRUE;
+    impl = impl_from_visual_surface( facade );
+    if (!impl->source) return NULL;
+    /* only inside a frame's walk, and not inside a capture (which uses the third list) */
+    if (walk_owner == GetCurrentThreadId() && paint_current != 2 &&
+        (!impl->rendered || impl->rendered_generation != generation))
+    {
+        visual_surface_render( impl );
+        impl->rendered = TRUE;
+        impl->rendered_generation = generation;
+    }
+    if (!impl->surface || !impl->surface->cache_valid) return NULL;
+    IUnknown_AddRef( (IUnknown *)&impl->surface->vtbl );
+    return impl->surface;
 }
 static int collection_index_of( struct visual_collection *impl, IVisual *child )
 {
@@ -19291,6 +19532,34 @@ static BOOL flood_color_of( IUnknown *node, float rgba[4] )
     return ret;
 }
 
+/* an effect graph as "{clsid}(source, ...)", for traces */
+static const char *debugstr_effect_node( IUnknown *node, int depth )
+{
+    IGraphicsEffectD2D1Interop_ *interop;
+    IGraphicsEffectSource *source;
+    char buf[400];
+    UINT count = 0, i;
+    GUID id;
+    int n;
+
+    if (!node) return "-";
+    if (is_own_object( node )) return "brush-source";
+    if (depth > 3 || FAILED( IUnknown_QueryInterface( node, &IID_IGraphicsEffectD2D1Interop_, (void **)&interop ) ))
+        return "param";
+    interop->lpVtbl->GetEffectId( interop, &id );
+    interop->lpVtbl->GetSourceCount( interop, &count );
+    n = snprintf( buf, sizeof(buf), "%s(", wine_dbgstr_guid( &id ) );
+    for (i = 0; i < count && n < sizeof(buf) - 60; i++)
+    {
+        source = NULL;
+        interop->lpVtbl->GetSource( interop, i, &source );
+        n += snprintf( buf + n, sizeof(buf) - n, "%s%s", i ? "," : "", debugstr_effect_node( (IUnknown *)source, depth + 1 ) );
+        if (source) IGraphicsEffectSource_Release( source );
+    }
+    snprintf( buf + n, sizeof(buf) - n, ")" );
+    interop->lpVtbl->Release( interop );
+    return wine_dbg_sprintf( "%s", buf );
+}
 static struct effect_brush *effect_brush_from_any( void *brush_iface );
 static struct drawing_surface *effect_brush_source_surface( void *brush_iface );
 static BOOL effect_brush_blend( void *brush_iface, struct effect_blend *blend )
@@ -19423,6 +19692,260 @@ static struct drawing_surface *effect_brush_surface( void *brush_iface )
     return effect_brush_source_surface_( brush_iface, FALSE );
 }
 
+
+/* An effect graph rendered on the CPU, for the effects composition brushes are built of here: Composite (its modes over
+ * premultiplied colour), Opacity, Flood and Blend, over the brush's named sources (colours, surface brushes, nested
+ * effect brushes). The Microsoft Store draws every app icon as Composite(background colour, Opacity(picture)) under a
+ * rounded mask; only Blend-with-a-flood was understood, so the icons were empty. */
+static const GUID CLSID_D2D1Composite_ = { 0x48fc9f51, 0xf6ac, 0x48f1, { 0x8b, 0x58, 0x3b, 0x28, 0xac, 0x46, 0xf7, 0x6d } };
+static const GUID CLSID_D2D1Opacity_ = { 0x811d79a4, 0xde28, 0x4454, { 0x80, 0x94, 0xc6, 0x46, 0x85, 0xf8, 0xbd, 0x4c } };
+static BOOL brush_render_pixels( void *brush, unsigned int w, unsigned int h, float *out, int depth );
+static const char *debugstr_brush( void *brush );
+static BOOL effect_property_uint( IGraphicsEffectD2D1Interop_ *interop, UINT index, UINT *value )
+{
+    IPropertyValue *v = NULL;
+    BOOL ret = FALSE;
+    if (SUCCEEDED( interop->lpVtbl->GetProperty( interop, index, &v ) ) && v)
+    {
+        INT32 i;
+        if (SUCCEEDED( IPropertyValue_GetUInt32( v, value ) )) ret = TRUE;
+        else if (SUCCEEDED( IPropertyValue_GetInt32( v, &i ) )) { *value = i; ret = TRUE; }
+        IPropertyValue_Release( v );
+    }
+    return ret;
+}
+static BOOL effect_property_float( IGraphicsEffectD2D1Interop_ *interop, UINT index, float *value )
+{
+    IPropertyValue *v = NULL;
+    BOOL ret = FALSE;
+    if (SUCCEEDED( interop->lpVtbl->GetProperty( interop, index, &v ) ) && v)
+    {
+        ret = SUCCEEDED( IPropertyValue_GetSingle( v, value ) );
+        IPropertyValue_Release( v );
+    }
+    return ret;
+}
+/* The brush's live value of "<effect name>.<property>": the Store fades its icons in by animating "<name>.Opacity"
+ * through the brush's properties once the picture has loaded, from the 0 the effect is built with. */
+static const GUID IID_IGraphicsEffect_local = { 0xcb51c0ce, 0x8fe6, 0x4636, { 0xb2, 0x02, 0x86, 0x1f, 0xaa, 0x07, 0xd8, 0xf3 } };
+static void effect_live_scalar( struct effect_brush *eb, IUnknown *node, const WCHAR *prop, float *value )
+{
+    IInspectable *effect;
+    HSTRING name = NULL;
+    WCHAR full[96];
+    struct property_set *set;
+    unsigned int i;
+
+    if (!eb->properties || FAILED( IUnknown_QueryInterface( node, &IID_IGraphicsEffect_local, (void **)&effect ) )) return;
+    /* IGraphicsEffect: 6 get_Name */
+    ((HRESULT (WINAPI *)( IInspectable *, HSTRING * ))(*(void ***)effect)[6])( effect, &name );
+    IInspectable_Release( effect );
+    if (!name) return;
+    swprintf( full, ARRAY_SIZE(full), L"%s.%s", WindowsGetStringRawBuffer( name, NULL ), prop );
+    WindowsDeleteString( name );
+    set = CONTAINING_RECORD( eb->properties, struct property_set, ICompositionPropertySet_iface );
+    for (i = 0; i < set->value_count; i++)
+        if (set->values[i].type == PROP_SCALAR && !wcsicmp( set->values[i].name, full ))
+        {
+            *value = set->values[i].u.scalar;
+            return;
+        }
+}
+/* premultiplied RGBA floats, w * h * 4 */
+static BOOL effect_node_render( struct effect_brush *eb, IUnknown *node, unsigned int w, unsigned int h, float *out, int depth )
+{
+    IGraphicsEffectD2D1Interop_ *interop;
+    size_t i, n = (size_t)w * h;
+    UINT count = 0, k, mode = 0;
+    BOOL ret = FALSE;
+    GUID id;
+
+    if (!node || depth > 6) return FALSE;
+    if (*(void ***)node == (void **)esp_source_vtbl || *(void ***)node == (void **)esp_parameter_vtbl)
+    {
+        struct effect_source_parameter *param = *(void ***)node == (void **)esp_source_vtbl
+                ? effect_source_parameter_from_source( node ) : effect_source_parameter_from_parameter( node );
+        const WCHAR *name = WindowsGetStringRawBuffer( param->name, NULL );
+        for (k = 0; k < eb->source_count; k++)
+            if (!wcsicmp( WindowsGetStringRawBuffer( eb->source_names[k], NULL ), name ))
+                return brush_render_pixels( eb->sources[k], w, h, out, depth + 1 );
+        TRACE_(dcompops)( "effect brush %p: no source %s.\n", eb, debugstr_w( name ) );
+        return FALSE;
+    }
+    if (is_own_object( node )) return brush_render_pixels( node, w, h, out, depth + 1 );
+    if (FAILED( IUnknown_QueryInterface( node, &IID_IGraphicsEffectD2D1Interop_, (void **)&interop ) )) return FALSE;
+    interop->lpVtbl->GetEffectId( interop, &id );
+    interop->lpVtbl->GetSourceCount( interop, &count );
+    if (IsEqualGUID( &id, &CLSID_D2D1Flood_ ))
+    {
+        float c[4];
+        if ((ret = flood_color_of( node, c )))
+            for (i = 0; i < n; i++)
+            {
+                out[i * 4] = c[0] * c[3]; out[i * 4 + 1] = c[1] * c[3]; out[i * 4 + 2] = c[2] * c[3]; out[i * 4 + 3] = c[3];
+            }
+    }
+    else if ((IsEqualGUID( &id, &CLSID_D2D1Composite_ ) || IsEqualGUID( &id, &CLSID_D2D1Blend_ )) && count >= 1)
+    {
+        BOOL blend = IsEqualGUID( &id, &CLSID_D2D1Blend_ );
+        float *src = malloc( n * 4 * sizeof(float) );
+        IGraphicsEffectSource *source;
+
+        effect_property_uint( interop, 0, &mode );
+        ret = src != NULL;
+        for (k = 0; ret && k < count; k++)
+        {
+            float *dst = k ? src : out;
+            source = NULL;
+            interop->lpVtbl->GetSource( interop, k, &source );
+            if (!effect_node_render( eb, (IUnknown *)source, w, h, dst, depth + 1 ))
+                memset( dst, 0, n * 4 * sizeof(float) );
+            if (source) IGraphicsEffectSource_Release( source );
+            if (!k) continue;
+            for (i = 0; i < n; i++)
+            {
+                float *d = out + i * 4, *s = src + i * 4, da = d[3], sa = s[3], fs, fd;
+                unsigned int c;
+                if (blend)
+                {
+                    /* input 0 is the backdrop, input 1 the source */
+                    float o[3];
+                    for (c = 0; c < 3; c++)
+                    {
+                        float cb = da > 0 ? d[c] / da : 0, cs = sa > 0 ? s[c] / sa : 0;
+                        o[c] = s[c] * (1 - da) + d[c] * (1 - sa) + sa * da * blend_channel( mode, cb, cs );
+                    }
+                    d[0] = o[0]; d[1] = o[1]; d[2] = o[2]; d[3] = sa + da - sa * da;
+                    continue;
+                }
+                switch (mode)   /* D2D1_COMPOSITE_MODE: Porter-Duff factors of source and destination */
+                {
+                case 1:  fs = 1 - da; fd = 1;      break;   /* destination over */
+                case 2:  fs = da;     fd = 0;      break;   /* source in */
+                case 3:  fs = 0;      fd = sa;     break;   /* destination in */
+                case 4:  fs = 1 - da; fd = 0;      break;   /* source out */
+                case 5:  fs = 0;      fd = 1 - sa; break;   /* destination out */
+                case 6:  fs = da;     fd = 1 - sa; break;   /* source atop */
+                case 7:  fs = 1 - da; fd = sa;     break;   /* destination atop */
+                case 8:  fs = 1 - da; fd = 1 - sa; break;   /* xor */
+                case 9:  fs = 1;      fd = 1;      break;   /* plus */
+                case 10: case 11: fs = 1; fd = 0;  break;   /* source copy */
+                default: fs = 1;      fd = 1 - sa; break;   /* source over */
+                }
+                for (c = 0; c < 4; c++) d[c] = min( s[c] * fs + d[c] * fd, 1.0f );
+            }
+        }
+        free( src );
+    }
+    else if (IsEqualGUID( &id, &CLSID_D2D1Opacity_ ) && count >= 1)
+    {
+        IGraphicsEffectSource *source = NULL;
+        float opacity = 1.0f;
+        effect_property_float( interop, 0, &opacity );
+        effect_live_scalar( eb, node, L"Opacity", &opacity );
+        interop->lpVtbl->GetSource( interop, 0, &source );
+        if ((ret = effect_node_render( eb, (IUnknown *)source, w, h, out, depth + 1 )))
+            for (i = 0; i < n * 4; i++) out[i] *= opacity;
+        if (source) IGraphicsEffectSource_Release( source );
+    }
+    else TRACE_(dcompops)( "effect brush %p: effect %s not rendered.\n", eb, debugstr_guid( &id ) );
+    interop->lpVtbl->Release( interop );
+    return ret;
+}
+/* a brush's pixels over a w x h area, premultiplied RGBA floats */
+static BOOL brush_render_pixels( void *brush, unsigned int w, unsigned int h, float *out, int depth )
+{
+    struct effect_brush *eb = effect_brush_from_any( brush );
+    struct drawing_surface *surface;
+    D3D11_TEXTURE2D_DESC desc;
+    const BYTE *pixels;
+    size_t i, n = (size_t)w * h;
+    float m[6];
+    Color c;
+
+    if (!brush) return FALSE;
+    if (eb) return eb->effect && effect_node_render( eb, (IUnknown *)eb->effect, w, h, out, depth );
+    if (brush_solid_color( (ICompositionBrush *)brush, &c ))
+    {
+        float a = c.A / 255.0f;
+        for (i = 0; i < n; i++)
+        {
+            out[i * 4] = c.R / 255.0f * a; out[i * 4 + 1] = c.G / 255.0f * a; out[i * 4 + 2] = c.B / 255.0f * a; out[i * 4 + 3] = a;
+        }
+        return TRUE;
+    }
+    if (!(surface = brush_surface( brush )) || !(pixels = surface_cached_pixels( surface, &desc )) ||
+        desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM)
+    {
+        D3D11_TEXTURE2D_DESC td = { 0 };
+        if (surface && surface->texture) ID3D11Texture2D_GetDesc( surface->texture, &td );
+        TRACE_(dcompops)( "effect source %s: no pixels (surface %p, %ux%u format %u, cache %d).\n", debugstr_brush( brush ),
+                          surface, td.Width, td.Height, td.Format, surface ? surface->cache_valid : -1 );
+        return FALSE;
+    }
+    if (TRACE_ON(dcompops))
+    {
+        static const void *last_surface;
+        static ULONG last_gen;
+        if (last_surface != surface || last_gen != surface->generation)
+        {
+            size_t k, visible = 0;
+            for (k = 0; k < (size_t)desc.Width * desc.Height; k++) visible += pixels[k * 4 + 3] != 0;
+            TRACE_(dcompops)( "effect source surface %p gen %lu %ux%u: %Iu pixels visible, into %ux%u.\n", surface,
+                              surface->generation, desc.Width, desc.Height, visible, w, h );
+            last_surface = surface;
+            last_gen = surface->generation;
+        }
+    }
+    if (surface_brush_mapping( brush, w, h, desc.Width, desc.Height, m ))
+    {
+        int interpolation = *(void ***)brush == (void **)surface_brush_vtbl ? surface_brush_from( brush )->interpolation : 1;
+        unsigned int x, y;
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++)
+            {
+                BYTE px[4];
+                float *o = out + ((size_t)y * w + x) * 4;
+                surface_sample( pixels, desc.Width, desc.Height, m, x, y, interpolation, px );
+                o[0] = px[2] / 255.0f; o[1] = px[1] / 255.0f; o[2] = px[0] / 255.0f; o[3] = px[3] / 255.0f;
+            }
+    }
+    else
+    {
+        unsigned int x, y;
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++)
+            {
+                float *o = out + ((size_t)y * w + x) * 4;
+                if (x < desc.Width && y < desc.Height)
+                {
+                    const BYTE *px = pixels + ((size_t)y * desc.Width + x) * 4;
+                    o[0] = px[2] / 255.0f; o[1] = px[1] / 255.0f; o[2] = px[0] / 255.0f; o[3] = px[3] / 255.0f;
+                }
+                else o[0] = o[1] = o[2] = o[3] = 0.0f;
+            }
+    }
+    return TRUE;
+}
+/* an effect brush as premultiplied BGRA bytes (malloc'd), or NULL */
+static BYTE *effect_brush_render_bgra( void *brush, unsigned int w, unsigned int h )
+{
+    size_t i, n = (size_t)w * h;
+    float *f;
+    BYTE *bgra = NULL;
+
+    if (!w || !h || w > 4096 || h > 4096 || !(f = malloc( n * 4 * sizeof(float) ))) return NULL;
+    if (brush_render_pixels( brush, w, h, f, 0 ) && (bgra = malloc( n * 4 )))
+        for (i = 0; i < n; i++)
+        {
+            bgra[i * 4]     = (BYTE)(min( f[i * 4 + 2], 1.0f ) * 255.0f + 0.5f);
+            bgra[i * 4 + 1] = (BYTE)(min( f[i * 4 + 1], 1.0f ) * 255.0f + 0.5f);
+            bgra[i * 4 + 2] = (BYTE)(min( f[i * 4], 1.0f ) * 255.0f + 0.5f);
+            bgra[i * 4 + 3] = (BYTE)(min( f[i * 4 + 3], 1.0f ) * 255.0f + 0.5f);
+        }
+    free( f );
+    return bgra;
+}
 
 /* CompositionNineGridBrush. ICompositionNineGridBrush {f25154e4}, native Api vtable in dcomp.pdb: 6/7 BottomInset,
  * 8/9 BottomInsetScale, 10/11 IsCenterHollow, 12/13 LeftInset, 14/15 LeftInsetScale, 16/17 RightInset,
@@ -20793,6 +21316,41 @@ static BOOL paint_mapped_surface( HDC hdc, void *brush_iface, struct drawing_sur
 
 /* Composite a mask brush onto the DC: the mask's alpha (A8, or the alpha channel of a BGRA surface)
  * scales the source, which is a colour brush or a surface. */
+/* what a brush is, for traces */
+static struct effect_brush *effect_brush_from_any( void *brush_iface );
+static const char *debugstr_effect_node( IUnknown *node, int depth );
+static const char *debugstr_brush( void *brush )
+{
+    struct effect_brush *eb;
+
+    if (!brush) return "(null)";
+    if ((eb = effect_brush_from_any( brush )))
+    {
+        char buf[600];
+        unsigned int i;
+        int n = snprintf( buf, sizeof(buf), "effect brush, graph %s, sources", debugstr_effect_node( (IUnknown *)eb->effect, 0 ) );
+        for (i = 0; i < eb->source_count && n < sizeof(buf) - 80; i++)
+        {
+            void *src = eb->sources[i];
+            n += snprintf( buf + n, sizeof(buf) - n, " %s=%s", debugstr_w( WindowsGetStringRawBuffer( eb->source_names[i], NULL ) ),
+                           !src ? "-" : *(void ***)src == (void **)surface_brush_vtbl ?
+                           (surface_brush_from( src )->facade ? (*(void ***)surface_brush_from( src )->facade == (void **)comp_object_vtbl ?
+                            "surface(recording facade)" : "surface(facade)") : "surface") : ((struct comp_object *)src)->kind );
+        }
+        return wine_dbg_sprintf( "%s", buf );
+    }
+    if (*(void ***)brush == (void **)surface_brush_vtbl)
+    {
+        struct surface_brush *sb = surface_brush_from( brush );
+        return wine_dbg_sprintf( "surface brush, surface %p%s, facade %p (vtbl %p%s%s)", sb->surface,
+                                 sb->surface && !sb->surface->texture ? " without texture" : "", sb->facade,
+                                 sb->facade ? *(void **)sb->facade : NULL,
+                                 sb->facade && *(void ***)sb->facade == (void **)comp_object_vtbl ? ", recording " : "",
+                                 sb->facade && *(void ***)sb->facade == (void **)comp_object_vtbl ? ((struct comp_object *)sb->facade)->kind : "" );
+    }
+    if (*(void ***)brush == (void **)comp_object_vtbl) return wine_dbg_sprintf( "recording %s", ((struct comp_object *)brush)->kind );
+    return wine_dbg_sprintf( "%s (vtbl %p)", debugstr_a( ((struct comp_object *)brush)->kind ), *(void **)brush );
+}
 static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int width, int height, float opacity )
 {
     struct mask_brush *brush = mask_brush_from( brush_iface );
@@ -20825,8 +21383,8 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
     grid = nine_grid_from( brush->mask );
     if (!(mask_surface = brush_surface( grid ? grid->source : brush->mask )))
     {
-        TRACE_(dcompops)( "mask brush %p: mask %p is not a surface brush with a texture (vtbl %p).\n", brush, brush->mask,
-               *(void **)brush->mask );
+        TRACE_(dcompops)( "mask brush %p: mask %p is not a surface brush with a texture: %s.\n", brush, brush->mask,
+                          debugstr_brush( grid ? grid->source : brush->mask ) );
         return FALSE;
     }
     {
@@ -20843,10 +21401,10 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
         if (!have_color && !source_surface && src) source_surface = brush_surface( src );
         if (!have_color && !source_surface) gradient = gradient_brush_from( src );
     }
-    if (!have_color && !source_surface && !gradient)
+    if (!have_color && !source_surface && !gradient && !effect_brush_from_any( src ))
     {
-        TRACE_(dcompops)( "mask brush %p: source %p is neither a colour nor a surface brush (vtbl %p).\n", brush,
-               brush->source, brush->source ? *(void **)brush->source : NULL );
+        TRACE_(dcompops)( "mask brush %p: source %p is neither a colour nor a surface brush: %s.\n", brush,
+                          brush->source, debugstr_brush( src ) );
         return FALSE;
     }
 
@@ -20868,6 +21426,21 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
         source_desc.Width = w;
         source_desc.Height = h;
         layout = gradient_generation;
+    }
+    else if (!have_color && !source_surface)
+    {
+        /* an effect graph (effect_node_render), over the mask's area too; its pixels stand for its layout */
+        ULONGLONG hash = 1469598103934665603ull;
+        if (!(gradient_bits = effect_brush_render_bgra( src, w, h )))
+        {
+            TRACE_(dcompops)( "mask brush %p: source %s not rendered.\n", brush, debugstr_brush( src ) );
+            return FALSE;
+        }
+        source = gradient_bits;
+        source_desc.Width = w;
+        source_desc.Height = h;
+        hash_bytes( &hash, gradient_bits, (size_t)w * h * 4 );
+        layout = (ULONG)(hash ^ (hash >> 32)) | 1;
     }
     if (source_surface)
     {
@@ -20950,14 +21523,14 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
                 else memset( out, 0, 4 );
             }
         }
-        if (TRACE_ON(dcomp))
+        if (TRACE_ON(dcomp) || TRACE_ON(dcompops))
         {
             unsigned int n = 0, i;
             for (i = 0; i < w * h; i++) if (((const BYTE *)brush->cache_bits)[i * 4 + 3]) n++;
             unsigned int m = 0;
             for (i = 0; i < mask_desc.Width * mask_desc.Height; i++)
                 if (mask_desc.Format == DXGI_FORMAT_A8_UNORM ? mask[i] : mask[i * 4 + 3]) m++;
-            TRACE( "mask brush %p: %ux%u composed, %u of %u pixels visible (mask gen %u, %u mask pixels, blend %d colour %d "
+            TRACE_(dcompops)( "mask brush %p: %ux%u composed, %u of %u pixels visible (mask gen %u, %u mask pixels, blend %d colour %d "
                    "surface %p gen %u flood %.2f %.2f %.2f %.2f).\n", brush, w, h, n, w * h, mask_surface->generation, m,
                    have_blend, have_color, source_surface, source_surface ? source_surface->generation : 0,
                    effect_blend.flood[0], effect_blend.flood[1], effect_blend.flood[2], effect_blend.flood[3] );
@@ -21822,6 +22395,28 @@ static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, voi
             anim_bind( pg->bindings, &pg->binding_count, prop, kf );
             TRACE( "geometry %p: %s bound to %p.\n", pg, debugstr_w( prop ), kf );
         }
+        else if (!shape && !ctrl && kf && prop && kf->has_value && kf->value_kind == KF_SCALAR &&
+                 effect_brush_from_any( view->owner ))
+        {
+            /* an effect brush's animated scalar ("<effect>.Opacity", the Microsoft Store's icon fade-in): settles at
+             * the last key frame too, read by effect_live_scalar */
+            struct effect_brush *eb = effect_brush_from_any( view->owner );
+            ICompositionPropertySet *set = eb->properties;
+            HSTRING hname;
+
+            if (!set && SUCCEEDED( create_property_set( &set ) ) &&
+                InterlockedCompareExchangePointer( (void **)&eb->properties, set, NULL ))
+            {
+                ICompositionPropertySet_Release( set );
+                set = eb->properties;
+            }
+            if (set && SUCCEEDED( WindowsCreateString( prop, wcslen( prop ), &hname ) ))
+            {
+                ICompositionPropertySet_InsertScalar( set, hname, kf->scalar );
+                WindowsDeleteString( hname );
+                TRACE_(dcompops)( "effect brush %p: %s settles at %g.\n", eb, debugstr_w( prop ), kf->scalar );
+            }
+        }
         else if (!shape && !ctrl && kf && prop && kf->has_value && kf->value_kind == KF_COLOR &&
                  effect_brush_from_any( view->owner ))
         {
@@ -22159,7 +22754,7 @@ static const void *compositor_radial_vtbl[] =
 };
 
 /* ICompositorWithVisualSurface ({cfa1658b-...}): 6 CreateVisualSurface. A CompositionVisualSurface renders a visual
- * subtree into a brush (XAML draws its drop shadows' masks with one); it is a recorded object, not drawn. */
+ * subtree into a brush (XAML draws its drop shadows' masks with one); see create_visual_surface. */
 static struct compositor *impl_from_compositor_visual_surface( void *iface )
 {
     return CONTAINING_RECORD( iface, struct compositor, visual_surface_vtbl );
@@ -22176,11 +22771,11 @@ static ULONG WINAPI compositor_visual_surface_Release( void *iface )
 {
     return compositor_Release( &impl_from_compositor_visual_surface( iface )->ICompositor_iface );
 }
+static HRESULT create_visual_surface( void **out );
 static HRESULT WINAPI compositor_visual_surface_CreateVisualSurface( void *iface, void **result )
 {
     TRACE( "iface %p.\n", iface );
-    if (!result) return E_POINTER;
-    return create_comp_object( "CompositionVisualSurface", result );
+    return create_visual_surface( result );
 }
 static const void *compositor_visual_surface_vtbl[] =
 {

@@ -13301,3 +13301,29 @@ identical. The Store's start-up still sometimes stays blank for the whole run (2
 
 Two traps on the way: `pgrep -f WinStore.App` inside an `until` loop matches the loop's own command line and never
 ends (build the pattern from pieces); and a wait loop started before `run.sh` has launched the app exits at once.
+
+### Microsoft Store: app icons and hero cards (2026-10-25)
+
+Every app tile was an empty rounded square, and the hero's side cards had no artwork. `trace+dcompshape` (sprites that
+draw nothing, with their brush kind) put a `MaskBrush` on each tile; `trace+dcompops` (now naming brush kinds and
+effect graphs) gave the rest:
+
+- **CompositionVisualSurface was a recording object.** Both the tiles' masks and the hero cards draw through visual
+  surfaces (a subtree rendered into a surface). It now paints its source visual's subtree, nested in the frame's walk
+  on the painter's own thread (the third paint list, the painter state saved and restored as `capture_visual_pixels`
+  does), into a CPU-only drawing surface (`cpu_only`: no texture, the cache is the content), once per scene
+  generation. The hero side cards appeared with this alone (`docs/screenshots/msstore-22608-home-app-icons.png`).
+- **The tile's picture is an effect brush**: `Composite(_backgroundBrush, Opacity(_imageSurfaceBrush))`
+  (CLSIDs `48fc9f51`, `811d79a4`), under the rounded mask. Effect brushes were understood only as Blend-with-a-flood.
+  `effect_node_render` now renders Composite (Porter-Duff modes), Opacity, Flood and Blend over colour, surface and
+  nested effect sources.
+- **The picture fades in**: `OpacityEffect.Opacity` is animated 0 -> 1 through the brush once the LoadedImageSurface
+  has loaded; only colour animations on effect brushes were settled into their properties. Scalars are now, and the
+  Opacity node reads its live value (`effect_live_scalar`, the effect's `IGraphicsEffect` name).
+
+A dead end worth recording: the LoadedImageSurfaces themselves were fine. Breakpoints on `CLoadedImageSurface`
+(`InitFromUri` `+35dcd0`, `StartFinalSizeDecoding` `+196e4c`, `FireLoadCompleted(hr)` `+6062ac`) showed all 17 loads
+complete with S_OK; "facade not decoded yet" came only from frames painted before that. Still open on Home: the big
+hero artwork on the left, the selected Home icon (a Lottie matte through an effect brush on a plain sprite, which
+the sprite painter does not render), and the blank-start flake (~1 in 3 runs today). Regression on `prefix-test`
+against `wine-build-wow64`: calc AE 3924.73, mp 236, unchanged.
