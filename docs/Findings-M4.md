@@ -13432,6 +13432,37 @@ been run.
 Regression on `prefix-test` with `wine-build-store`: calc AE 3924.73, mp 236, as before; fh 1 colour with 16
 fail-fasts, identical on the control `wine-build-wow64` (the known Feedback Hub failure).
 
-Still open on these pages: the large hero carousel on the left is empty on all three (Home draws its own), Gaming's
-lower panel is still a skeleton 40 s after the click, and AI Hub's lower banner is drawn with a notch cut from its
-top-left corner and a green sliver above it.
+Still open on these pages: Gaming's lower panel is still a skeleton 40 s after the click, and AI Hub's lower banner is
+drawn with a notch cut from its top-left corner and a green sliver above it. The hero carousel: next section.
+
+### Microsoft Store: the hero carousels on Apps, Gaming and AI Hub (2026-10-25)
+
+`docs/screenshots/msstore-22608-apps-page.png` (WhatsApp), `-gaming-page.png`, `-aihub-page.png` (Claude): the big
+hero on the left draws. Before, it was one flat colour on all three pages.
+
+- `+dcompops`: the three pages' pictures were emitted with clip `(0,0)-(0,0)` and dropped. Their RectangleClip's
+  Left and Right both came to 339.765 (`(visual.Size.X - Min(visual.Size.X, rootProperties.ActualWidth)) / 2`), so
+  `rootProperties.ActualWidth` read 0.
+- New `trace+dcompanim` lines from `expr_bound_scalar` (each property-set expression's value, or where it stopped,
+  with its references): `ActualWidth = Lerp(visual.Size.X, this.Target.CollapsedWidth, Abs(...))` stopped after
+  `this.Target.CollapsedWidth`, although the set had `CollapsedWidth = 322` (`trace+dcompshape` shows the inserts).
+  **The clip's own `this.Target` handling was still active inside the set's expression**: evaluated from a clip edge,
+  `this.Target.` took the clip branch, which knows only Left/Top/Right/Bottom. Nested bindings now run without the
+  clip.
+- `_interactionTracker.Position.X` did not evaluate either: `propset_from_object` knew no InteractionTracker, so the
+  tracker's property set (Position, MinPosition, MaxPosition, Scale, and the app's own ScrollableWidth...) was
+  unreachable; its fallback QI for `IDCompositionVisualPartnerWinRTInterop` `{fe93b735}` is where 37,000
+  `InteractionTracker: no interface` lines a run came from. Trackers now answer with their set, which also gains
+  NaturalRestingPosition (the position: no inertia here).
+- The carousel's page turn is `TryUpdatePositionWithAnimation` with a Vector3 key-frame animation whose only key is
+  `this.TargetValue`, and the Store puts TargetValue in the animation's own `Properties`
+  (`WinStore.App.dll+0x1529480`: `InsertVector3("TargetValue", (x, 0, 0))`). A key-frame animation's Properties were a
+  new set per `ICompositionObject` view, so the value was lost, and the tracker retried 70 times. The animation now
+  keeps one set, remembers its last expression key's text, and the tracker lands at `this.<name>` from it:
+  679.53, 1359.06, 2038.59 ..., a page at a time.
+
+Regression on `prefix-test` with `wine-build-store`: calc AE 3924.73, mp 236, sol 3/3 not reached (as on the control
+build).
+
+Still open: on Apps, Gaming and AI Hub the right-hand column of cards starts 48 px below the hero (Home lines them
+up), Gaming's lower panel, and AI Hub's lower banner.

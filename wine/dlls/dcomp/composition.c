@@ -2282,6 +2282,8 @@ struct kf_animation
     INT32 iteration_behavior, stop_behavior, direction, delay_behavior;
     INT32 iterations;
     void *timeline;             /* XAML's clock for it (an anim_instance, SetCustomTimeline), or NULL */
+    ICompositionPropertySet *properties; /* CompositionObject.Properties, kept: expression keys read "this.<name>" from it */
+    WCHAR last_expr[64];        /* the text of the last expression key inserted */
 };
 static struct kf_animation *kf_animation_from( void *animation );
 static BOOL kf_sample( struct kf_animation *kf, float progress, struct kf_key *out );
@@ -3338,6 +3340,9 @@ static HRESULT comp_object_slot_call( unsigned slot, void *iface, void *a, void 
 
     TRACE( "%s %p slot %u a %p b %p from %p: ignored.\n", object->kind, object, slot, a, b,
            __builtin_return_address( 0 ) );
+    if (object->vtbl == (const void **)kf_animation_vtbl && slot >= 7 && slot <= 16)
+        FIXME( "key frame animation %p: ICompositionAnimation slot %u, key %s, ignored.\n", object, slot,
+               debugstr_hstring( a ) );
     /* Fill the out-pointer with a recording object. Preserve a typed object's method layout across
      * private-interface getters: XAML asks an ExpressionAnimation for an internal animation object
      * before it calls ICompositionAnimationBase::CreateAnimatorPartner (slot 3) on that child. */
@@ -14281,7 +14286,7 @@ static HRESULT WINAPI kfa_InsertExpressionKeyFrame( void *iface, float key, HSTR
     BOOL starting = text && !wcsicmp( text, L"this.StartingValue" );
 
     if (!starting)
-        FIXME( "key %f, expression %s: expression key frames are not evaluated.\n", key, debugstr_hstring( expression ) );
+        FIXME( "%p key %f, expression %s: expression key frames are not evaluated.\n", impl, key, debugstr_hstring( expression ) );
     impl->key_count++;
     if (impl->key_count <= KF_KEYS)
     {
@@ -14290,6 +14295,7 @@ static HRESULT WINAPI kfa_InsertExpressionKeyFrame( void *iface, float key, HSTR
         k->key = key;
         k->expr = starting ? KF_EXPR_STARTING : KF_EXPR_OTHER;
     }
+    lstrcpynW( impl->last_expr, text ? text : L"", ARRAY_SIZE(impl->last_expr) );
     return S_OK;
 }
 static HRESULT WINAPI kfa_InsertExpressionKeyFrameWithEasingFunction( void *iface, float key, HSTRING expression,
@@ -14575,7 +14581,9 @@ static void kf_release_paths( struct comp_object *object )
     struct kf_animation *kf = CONTAINING_RECORD( object, struct kf_animation, vtbl );
     unsigned int i;
 
-    if (object->vtbl != (const void **)kf_animation_vtbl || kf->value_kind != KF_PATH) return;
+    if (object->vtbl != (const void **)kf_animation_vtbl) return;
+    if (kf->properties) ICompositionPropertySet_Release( kf->properties );
+    if (kf->value_kind != KF_PATH) return;
     for (i = 0; i < min( kf->key_count, KF_KEYS ); i++)
         if (kf->keys[i].u.path) IUnknown_Release( kf->keys[i].u.path );
 }
@@ -16037,6 +16045,7 @@ static struct matrix_transform *manip_matrix_from_animation( void *animation )
     return manip_matrix_from_object( (IUnknown *)animation, 0 );
 }
 static struct property_set *propset_from_object( IUnknown *object );
+static struct property_set *tracker_property_set( IUnknown *object );
 static struct expr_animation *expr_animation_from_any( void *animation )
 {
     void **vtbl = animation ? *(void ***)animation : NULL;
@@ -16212,6 +16221,8 @@ static BOOL expr_scalar_sum( struct expr_ctx *c, float *out );
  * "ValuePropSet.v + ValuePropSet.o" and animates v; the static value is only where the property started. */
 static BOOL expr_bound_scalar( struct expr_ctx *c, const WCHAR *ref, const WCHAR *prop, float *out )
 {
+    struct comp_clip *saved_clip;
+    BOOL ok;
     struct property_set *set = NULL;
     unsigned int i;
 
@@ -16233,8 +16244,29 @@ static BOOL expr_bound_scalar( struct expr_ctx *c, const WCHAR *ref, const WCHAR
         sub.dmanip = NULL;
         sub.p = bound->expression;
         sub.depth = c->depth + 1;
-        if (!expr_scalar( &sub, out )) return FALSE;
+        /* a clip's edge reading "rootProperties.ActualWidth": the set's own expression knows no clip, and its
+         * "this.Target" is the set (the Microsoft Store's Apps hero: "Lerp(visual.Size.X, this.Target.CollapsedWidth,
+         * ...)" failed on the clip's Left/Top/Right/Bottom, and the page got a zero-width clip) */
+        saved_clip = expr_this_clip;
+        expr_this_clip = NULL;
+        ok = expr_scalar( &sub, out );
+        expr_this_clip = saved_clip;
+        if (!ok)
+        {
+            TRACE_(dcompanim)( "set %p %s: %s not evaluated, stopped at %s\n", set, debugstr_w( prop ),
+                               debugstr_w( bound->expression ), debugstr_w( sub.p ) );
+            if (TRACE_ON(dcompanim))
+            {
+                unsigned int k;
+                for (k = 0; k < bound->ref_count; k++)
+                    TRACE_(dcompanim)( "  ref %s = %p (vtbl %p)\n", debugstr_w( bound->ref_names[k] ), bound->refs[k],
+                                       bound->refs[k] ? *(void **)bound->refs[k] : NULL );
+            }
+            return FALSE;
+        }
         expr_skip_space( &sub );
+        TRACE_(dcompanim)( "set %p %s = %g (%s)%s\n", set, debugstr_w( prop ), *out, debugstr_w( bound->expression ),
+                           *sub.p ? " trailing" : "" );
         return !*sub.p;
     }
     return FALSE;
@@ -16675,6 +16707,8 @@ static struct property_set *propset_from_object( IUnknown *object )
     if (vtbl == (void **)object_view_vtbl) return propset_from_object( impl_from_object_view( object )->owner );
     /* a reference set through its IAnimationObject (ICompositionAnimation4::SetExpressionReferenceParameter) */
     if (vtbl == (void **)anim_object_view_vtbl) return propset_from_object( ((struct anim_object_view *)object)->owner );
+    /* "_interactionTracker.Position.X": a tracker's values and the app's own properties are in its property set */
+    if ((set = tracker_property_set( object ))) return set;
     /* "_.Progress": an expression referencing a visual reads that visual's Properties */
     if (SUCCEEDED( IUnknown_QueryInterface( object, &IID_IInteropVisual_private, &interop ) ))
     {
@@ -22570,6 +22604,20 @@ static HRESULT WINAPI object_view_get_Properties( void *iface, ICompositionPrope
         ICompositionPropertySet_AddRef( (*value = expr->properties) );
         return S_OK;
     }
+    /* a key-frame animation's too: the Microsoft Store's hero carousel inserts TargetValue there and animates its
+     * tracker to "this.TargetValue" */
+    if (view->owner && *(void ***)view->owner == (void **)kf_animation_vtbl)
+    {
+        struct kf_animation *kf = CONTAINING_RECORD( view->owner, struct kf_animation, vtbl );
+        if (!kf->properties)
+        {
+            if (FAILED(hr = create_property_set( &set ))) return hr;
+            if (InterlockedCompareExchangePointer( (void **)&kf->properties, set, NULL ))
+                ICompositionPropertySet_Release( set );
+        }
+        ICompositionPropertySet_AddRef( (*value = kf->properties) );
+        return S_OK;
+    }
     if (!view->properties)
     {
         if (FAILED(hr = create_property_set( &set ))) return hr;
@@ -23570,7 +23618,7 @@ static HRESULT WINAPI interactions_QueryInterface( void *iface, REFIID iid, void
      * ResponsiveItemsRepeaterList casts its tracker to one */
     if (IsEqualGUID( iid, &IID_IAnimationObject_local ))
         return create_anim_object_view( (IUnknown *)&object->vtbl, out );
-    FIXME( "%s: no interface %s.\n", object->kind, debugstr_guid( iid ) );
+    FIXME( "%s: no interface %s (caller %p).\n", object->kind, debugstr_guid( iid ), __builtin_return_address( 0 ) );
     *out = NULL;
     return E_NOINTERFACE;
 }
@@ -23714,8 +23762,14 @@ static const void *sources_vtbl[] =
 static void tracker_sync_properties( struct interactions_object *tracker )
 {
     static const WCHAR positionW[] = L"Position", scaleW[] = L"Scale", minW[] = L"MinPosition", maxW[] = L"MaxPosition";
+    static const WCHAR restingW[] = L"NaturalRestingPosition";
     HSTRING str;
     if (!tracker->properties) return;
+    if (SUCCEEDED( WindowsCreateString( restingW, ARRAY_SIZE(restingW) - 1, &str ) ))
+    {
+        ICompositionPropertySet_InsertVector3( tracker->properties, str, tracker->natural_position );
+        WindowsDeleteString( str );
+    }
     if (SUCCEEDED( WindowsCreateString( positionW, ARRAY_SIZE(positionW) - 1, &str ) ))
     {
         ICompositionPropertySet_InsertVector3( tracker->properties, str, tracker->position );
@@ -23858,6 +23912,8 @@ static void tracker_set_position( struct interactions_object *tracker, Vector3 v
     tracker->position.X = clampf( value.X, tracker->min_position.X, tracker->max_position.X );
     tracker->position.Y = clampf( value.Y, tracker->min_position.Y, tracker->max_position.Y );
     tracker->position.Z = clampf( value.Z, tracker->min_position.Z, tracker->max_position.Z );
+    /* no inertia here: where it is is where it comes to rest */
+    tracker->natural_position = tracker->position;
 }
 
 static HRESULT WINAPI tracker_get_InteractionSources( void *iface, void **value )
@@ -23931,6 +23987,27 @@ static HRESULT WINAPI tracker_TryUpdatePositionBy( void *iface, Vector3 amount, 
     Vector3 value = { tracker->position.X + amount.X, tracker->position.Y + amount.Y, tracker->position.Z + amount.Z };
     return tracker_TryUpdatePosition( iface, value, request );
 }
+/* The last key of a key-frame animation is the expression "this.<name>", and its own Properties hold a Vector3
+ * of that name: where the animation ends. */
+static BOOL kf_vector3_from_this( struct kf_animation *kf, Vector3 *out )
+{
+    struct property_set *set;
+    const WCHAR *name;
+    unsigned int i;
+
+    if (!kf->key_count || kf->keys[min( kf->key_count, KF_KEYS ) - 1].expr != KF_EXPR_OTHER) return FALSE;
+    if (wcsnicmp( kf->last_expr, L"this.", 5 ) || !kf->properties) return FALSE;
+    name = kf->last_expr + 5;
+    if (!*name || wcspbrk( name, L". +-*/()" )) return FALSE;
+    set = CONTAINING_RECORD( kf->properties, struct property_set, ICompositionPropertySet_iface );
+    for (i = 0; i < set->value_count; i++)
+        if (!wcsicmp( set->values[i].name, name ) && set->values[i].type == PROP_VECTOR3)
+        {
+            *out = set->values[i].u.vector3;
+            return TRUE;
+        }
+    return FALSE;
+}
 static HRESULT WINAPI tracker_TryUpdatePositionWithAnimation( void *iface, void *animation, INT32 *request )
 {
     struct interactions_object *tracker = interactions_from( iface );
@@ -23952,6 +24029,12 @@ static HRESULT WINAPI tracker_TryUpdatePositionWithAnimation( void *iface, void 
         !kf->keys[min( kf->key_count, KF_KEYS ) - 1].expr)
     {
         TRACE( "%p animation %p: lands at %g,%g,%g.\n", tracker, animation, key.u.vector3.X, key.u.vector3.Y, key.u.vector3.Z );
+        tracker_set_position( tracker, key.u.vector3 );
+    }
+    else if (kf && kf->value_kind == KF_VECTOR3 && kf_vector3_from_this( kf, &key.u.vector3 ))
+    {
+        TRACE( "%p animation %p: lands at %s = %g,%g,%g.\n", tracker, animation, debugstr_w( kf->last_expr ),
+               key.u.vector3.X, key.u.vector3.Y, key.u.vector3.Z );
         tracker_set_position( tracker, key.u.vector3 );
     }
     else
@@ -24016,6 +24099,16 @@ static const void *tracker_vtbl[] =
     tracker_TryUpdateScaleWithAdditionalVelocity,
 };
 
+/* An InteractionTracker's property set: its own values (tracker_sync_properties) and whatever the app inserted */
+static struct property_set *tracker_property_set( IUnknown *object )
+{
+    struct interactions_object *tracker;
+
+    if (!object || *(const void ***)object != (const void **)tracker_vtbl) return NULL;
+    tracker = interactions_from( object );
+    if (!tracker->properties || *(void ***)tracker->properties != (void **)&propset_vtbl) return NULL;
+    return CONTAINING_RECORD( tracker->properties, struct property_set, ICompositionPropertySet_iface );
+}
 static HRESULT create_interaction_tracker( IUnknown *owner, void **out )
 {
     struct interactions_object *tracker;
