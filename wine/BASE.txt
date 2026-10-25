@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     07cd0fdeb68708dbf185630ec9bec8ca8952ca0e
-                 xgameruntime: Implement XUserGetGamerPictureAsync.
+  wine HEAD:     e70656478ed0c53ce659683c48fb6c9c9fa2fd6a
+                 dcomp: Draw Lottie animated icons as Windows does.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-10-22T11:50:11Z
+  captured:      2026-10-25T10:19:47Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

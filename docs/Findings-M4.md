@@ -13271,3 +13271,33 @@ identical copy:
 
 Trap on the way: on Xvfb without a window manager, X focus stays on the root window. Halo took the first Enter and
 then ignored keys and clicks on its menu until `xdotool windowfocus`; that is the test setup, not 11.20.
+
+### Microsoft Store: the nav rail's animated icons (2026-10-25)
+
+The rail's Home, Apps, Gaming, AI Hub and Library icons are Lottie `AnimatedIcon`s (ShapeVisuals of
+composition shapes); they were drawn as oversized blobs, a grey diamond and nothing. Five dcomp gaps, in the order
+the traces showed them (`trace+dcompshape`, new: every painted ShapeVisual and sprite shape with its world matrix,
+geometry bounds and fill, every animation sample, and sprites that draw nothing with their brush kind):
+
+- **TransformMatrix's scale was ignored.** AnimatedIcon fits its 48 px Lottie root into the 24 px slot with
+  `TransformMatrix` = 0.5; `paint_public_visual` took only the matrix's translation. Axis-aligned scale now applies.
+  `./dcomptree.py` on the ShapeVisual showed it: the parent's `m 0.5 0 0 0.5` and `scale 1,1`.
+- **StepEasingFunction ran linear** and kept none of its properties. Lottie shows and hides layers with "hold then
+  step" (`IsFinalStepSingleFrame`) and "step then hold". It is a typed object now and steps as on Windows.
+- **Every controller sampled progress 0.** AnimatedIcon binds the Lottie root's `Progress` to `_.Progress` of its own
+  set and writes that one (`InsertScalar`, 0.0245 and 0.3276 here); the simple evaluator read the root's stored 0.
+  The full evaluator, which follows bound expressions, now goes first.
+- **Ellipse, rectangle, rounded-rectangle and line geometries were recording objects** (values lost, never drawn).
+- **PathKeyFrameAnimation was a recording object**: Lottie's path morphs only reach the geometry through it, so
+  Gaming's path was NULL. Keys hold their path (no morphing between keys).
+
+Result (`docs/screenshots/msstore-22608-navrail-icons.png`): Apps, Gaming, AI Hub, Themes, What's New, Downloads and
+Library at their size and in their rest state. **Still open: the selected Home icon is empty.** Its visible Lottie
+root draws through sprites with an `EffectBrush` (a track matte: a composite effect over CompositionVisualSurface
+brushes); visual surfaces are recording objects and the painter skips effect brushes it does not know. Regression
+on `prefix-test`, this build against `wine-build-wow64` as control: calc AE 3924.73, mp 236, sol 3/3 not reached,
+identical. The Store's start-up still sometimes stays blank for the whole run (2 in ~10 here): same log up to
+`no Window.Activate()`, and the app's ApplicationData work never begins; not looked at yet.
+
+Two traps on the way: `pgrep -f WinStore.App` inside an `until` loop matches the loop's own command line and never
+ends (build the pattern from pieces); and a wait loop started before `run.sh` has launched the app exits at once.

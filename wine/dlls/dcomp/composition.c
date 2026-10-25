@@ -72,6 +72,7 @@ WINE_DECLARE_DEBUG_CHANNEL(dcompperf);
 WINE_DECLARE_DEBUG_CHANNEL(dcompanim);
 WINE_DECLARE_DEBUG_CHANNEL(dcompops);
 WINE_DECLARE_DEBUG_CHANNEL(dcomptree);
+WINE_DECLARE_DEBUG_CHANNEL(dcompshape);
 WINE_DECLARE_DEBUG_CHANNEL(dcompgate);
 
 /* The painter walks visuals, collections, brushes and expressions by raw pointer, and since swap chain frames
@@ -1807,6 +1808,8 @@ enum ease_type { EASE_LINEAR, EASE_BEZIER, EASE_POWER, EASE_EXPONENTIAL, EASE_SI
 struct kf_ease { enum ease_type type; int mode; float a, b, c, d; };
 static void easing_register( void *object, enum ease_type type, int mode, float a, float b );
 static void easing_lookup( void *function, struct kf_ease *ease );
+static BOOL step_easing_lookup( void *function, struct kf_ease *ease );
+static float step_ease_apply( const struct kf_ease *ease, float t );
 static float ease_apply( const struct kf_ease *ease, float t );
 
 /* ICompositorPrivate5 {509eab63} is CompositorCommon::DCPrivate (dcomp.pdb), an IUnknown-based
@@ -2122,6 +2125,8 @@ static struct anim_binding *anim_find( struct anim_binding *bindings, unsigned i
 static HRESULT create_anim_controller( void **out );
 struct comp_shape;
 static struct comp_shape *comp_shape_from_any( IInspectable *object );
+struct path_geometry;
+static struct path_geometry *path_geometry_from_any( IUnknown *object );
 static void anim_binding_set_controller( struct anim_binding *binding, void *controller );
 #define SHAPE_CHILDREN 64
 struct comp_shape
@@ -2148,6 +2153,11 @@ struct path_geometry
     const void **geometry_vtbl; /* ICompositionGeometry view */
     IUnknown *path;
     float trim_start, trim_end, trim_offset;
+    /* the other geometry kinds share this object, with their own main table (geometry_kind_vtbls) */
+    enum { GEOMETRY_PATH, GEOMETRY_ELLIPSE, GEOMETRY_RECTANGLE, GEOMETRY_ROUNDED_RECTANGLE, GEOMETRY_LINE } shape_kind;
+    Vector2 a, b, c;            /* ellipse: center, radius; rectangle: offset, size; rounded: corner, offset, size; line: start, end */
+    struct anim_binding bindings[ANIM_BINDINGS]; /* "Path" bound to a PathKeyFrameAnimation (Lottie's morphs) */
+    unsigned int binding_count;
 };
 struct composition_path
 {
@@ -2157,7 +2167,7 @@ struct composition_path
 };
 static const void *path_vtbl[];
 static void paint_shape_visual( HDC hdc, struct visual *impl, float x, float y, float dest_w, float dest_h );
-enum kf_kind { KF_COLOR, KF_SCALAR, KF_BOOLEAN, KF_VECTOR2, KF_VECTOR3 };
+enum kf_kind { KF_COLOR, KF_SCALAR, KF_BOOLEAN, KF_VECTOR2, KF_VECTOR3, KF_PATH };
 enum { KF_EXPR_NONE, KF_EXPR_STARTING, KF_EXPR_OTHER };
 #define KF_KEYS 96
 /* A DirectManipulation-driven position reaches a visual as an ExpressionAnimation on "TransformMatrix"
@@ -2258,7 +2268,7 @@ struct kf_animation
     float last_sampled;
     BOOL sampled_once;
     /* every key frame, for sampling at a controller's progress */
-    struct kf_key { float key; union { Color color; float scalar; boolean flag; Vector2 vector2; Vector3 vector3; } u;
+    struct kf_key { float key; union { Color color; float scalar; boolean flag; Vector2 vector2; Vector3 vector3; IUnknown *path; } u;
                     struct kf_ease ease;    /* the segment from the previous key to this one */
                     unsigned char expr;     /* an expression key: KF_EXPR_STARTING ("this.StartingValue"), KF_EXPR_OTHER */
                   } keys[KF_KEYS];
@@ -2921,6 +2931,7 @@ static ULONG WINAPI comp_object_AddRef( void *iface )
 }
 
 static void comp_map_owner_gone( void *owner );
+static void kf_release_paths( struct comp_object *object );
 static ULONG WINAPI comp_object_Release( void *iface )
 {
     struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
@@ -2930,6 +2941,7 @@ static ULONG WINAPI comp_object_Release( void *iface )
     {
         comp_map_owner_gone( &object->vtbl );
         expr_anim_target_gone( &object->vtbl );
+        kf_release_paths( object );
         free( object );
     }
     return ref;
@@ -11233,8 +11245,24 @@ static void visual_apply_controlled( struct visual *impl )
         struct anim_binding *b = &impl->bindings[i];
         struct kf_key v;
         float progress;
-        if (!b->kf || !b->kf->key_count || !anim_controller_progress( b->controller, &progress )) continue;
+        if (!b->kf || !b->kf->key_count || !anim_controller_progress( b->controller, &progress ))
+        {
+            TRACE_(dcompshape)( "visual %p %s: kf %p keys %u controller %p, not sampled.\n", impl, debugstr_w( b->prop ),
+                                b->kf, b->kf ? b->kf->key_count : 0, b->controller );
+            continue;
+        }
         if (!kf_sample( b->kf, progress, &v )) continue;
+        TRACE_(dcompshape)( "visual %p %s kind %d at %g -> %g / %g,%g.\n", impl, debugstr_w( b->prop ), b->kf->value_kind,
+                            progress, v.u.scalar, v.u.vector2.X, v.u.vector2.Y );
+        if (TRACE_ON(dcompshape) && !b->kf->sampled_once)
+        {
+            unsigned int k;
+            b->kf->sampled_once = TRUE;
+            for (k = 0; k < min( b->kf->key_count, KF_KEYS ); k++)
+                TRACE_(dcompshape)( "  key %u at %g: %g ease %d %g %g %g %g\n", k, b->kf->keys[k].key, b->kf->keys[k].u.scalar,
+                                    b->kf->keys[k].ease.type, b->kf->keys[k].ease.a, b->kf->keys[k].ease.b,
+                                    b->kf->keys[k].ease.c, b->kf->keys[k].ease.d );
+        }
         if (b->kf->value_kind == KF_BOOLEAN && !wcsicmp( b->prop, L"IsVisible" )) impl->visible = v.u.flag;
         else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Opacity" )) impl->opacity = v.u.scalar;
         else if (b->kf->value_kind == KF_VECTOR3 && !wcsicmp( b->prop, L"Offset" )) impl->offset = v.u.vector3;
@@ -11256,8 +11284,15 @@ static void shape_apply_controlled( struct comp_shape *shape )
         struct kf_key v;
         float progress;
         /* an animation whose key frames were expressions (inserted on the generic view) has none to sample */
-        if (!b->kf || !b->kf->key_count || !anim_controller_progress( b->controller, &progress )) continue;
+        if (!b->kf || !b->kf->key_count || !anim_controller_progress( b->controller, &progress ))
+        {
+            TRACE_(dcompshape)( "shape %p %s: kf %p keys %u controller %p, not sampled.\n", shape, debugstr_w( b->prop ),
+                                b->kf, b->kf ? b->kf->key_count : 0, b->controller );
+            continue;
+        }
         if (!kf_sample( b->kf, progress, &v )) continue;
+        TRACE_(dcompshape)( "shape %p %s kind %d at %g -> %g / %g,%g.\n", shape, debugstr_w( b->prop ), b->kf->value_kind,
+                            progress, v.u.scalar, v.u.vector2.X, v.u.vector2.Y );
         if (b->kf->last_sampled != progress || !b->kf->sampled_once)
         {
             b->kf->sampled_once = TRUE;
@@ -11337,12 +11372,21 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
     struct visual *impl = impl_from_visual_interop( iface );
     RECT clip, rect;
     float csx, csy;
+    float mx = 1.0f, my = 1.0f;
     visual_apply_controlled( impl );
-    csx = sx * impl->scale.X; csy = sy * impl->scale.Y;
+    /* TransformMatrix applies after Scale about CenterPoint and before Offset. Its translation was always taken; its
+     * scale too now, when it is axis aligned: AnimatedIcon fits its 48 px Lottie visual into a 24 px slot with a 0.5
+     * matrix, and the Microsoft Store's nav rail drew every animated icon at twice its size. */
+    if (!impl->transform.M12 && !impl->transform.M21 && impl->transform.M11 > 0.0f && impl->transform.M22 > 0.0f)
+    {
+        mx = impl->transform.M11;
+        my = impl->transform.M22;
+    }
+    csx = sx * impl->scale.X * mx; csy = sy * impl->scale.Y * my;
     float x = ox + (impl->offset.X + impl->transform.M41) * sx + impl->relative_offset.X * parent_width
-              + impl->center.X * sx * (1.0f - impl->scale.X);
+              + impl->center.X * sx * (1.0f - impl->scale.X) * mx;
     float y = oy + (impl->offset.Y + impl->transform.M42) * sy + impl->relative_offset.Y * parent_height
-              + impl->center.Y * sy * (1.0f - impl->scale.Y);
+              + impl->center.Y * sy * (1.0f - impl->scale.Y) * my;
     float width = impl->size.X * csx + impl->relative_size.X * parent_width;
     float height = impl->size.Y * csy + impl->relative_size.Y * parent_height;
     unsigned int i;
@@ -11446,6 +11490,9 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
         {
             TRACE( "skipped public sprite %p %gx%g at %d,%d matched %d alpha %u.\n", impl, width, height,
                    px, py, matched, matched ? c.A : 0 );
+            TRACE_(dcompshape)( "sprite %p %gx%g at %d,%d: brush %p (%s) not drawn, matched %d alpha %u.\n", impl, width,
+                                height, px, py, impl->brush, debugstr_a( ((struct comp_object *)impl->brush)->kind ),
+                                matched, matched ? c.A : 0 );
             if (matched && !c.A && width > 0 && height > 0)
             {
                 /* XAML's Transparent background: invisible, but it takes the pointer */
@@ -11464,6 +11511,10 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
                impl, width, height, px, py, c.A, c.R, c.G, c.B );
     }
     if (impl->shape_vtbl && impl->shape_count) paint_shape_visual( hdc, impl, x, y, width, height );
+    else if (impl->kind == VISUAL_SPRITE && !impl->brush)
+        TRACE_(dcompshape)( "sprite %p %gx%g at %g,%g has no brush.\n", impl, width, height, x, y );
+    else if (impl->shape_vtbl)
+        TRACE_(dcompshape)( "shape visual %p %gx%g at %g,%g has no shapes.\n", impl, width, height, x, y );
 children:
     paint_content_sx = paint_content_sy = 1.0f;
     for (i = 0; i < impl->collection.count; i++)
@@ -12247,7 +12298,9 @@ static HRESULT anim_controller_for( IUnknown *owner, const WCHAR *prop, void **o
     HRESULT hr;
 
     if (!out) return E_POINTER;
+    struct path_geometry *pg = !shape && owner ? path_geometry_from_any( owner ) : NULL;
     if (shape && prop) binding = anim_find( shape->bindings, shape->binding_count, prop );
+    else if (pg && prop) binding = anim_find( pg->bindings, pg->binding_count, prop );
     else if (owner && prop && SUCCEEDED( IUnknown_QueryInterface( owner, &IID_IInteropVisual_private, &interop ) ))
     {
         struct visual *impl = visual_from_interop( interop );
@@ -13163,6 +13216,7 @@ static HRESULT WINAPI propset_InsertScalar( ICompositionPropertySet *iface, HSTR
     struct property_set *set = CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface );
     struct propset_value *v = propset_find( set, name, TRUE );
     TRACE( "set %p %s = %g\n", set, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ), value );
+    TRACE_(dcompshape)( "set %p %s = %g\n", set, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ), value );
     if (!v) return E_OUTOFMEMORY;
     if (live_anim_count) live_anim_cancel( set, v->name );
     v->type = PROP_SCALAR; v->u.scalar = value;
@@ -13769,11 +13823,13 @@ static const GUID IID_IBooleanKeyFrameAnimation_ =
     { 0x95e23a08, 0xd1f4, 0x4972, { 0x97, 0x70, 0x3e, 0xfe, 0x68, 0xd8, 0x2e, 0x14 } };
 static void *kf_animation_vtbl[COMP_OBJECT_SLOTS];
 static LONG kf_animation_vtbl_ready;
-static const void *kf_color_vtbl[], *kf_scalar_vtbl[], *kf_boolean_vtbl[], *kf_vector2_vtbl[], *kf_vector3_vtbl[];
+static const void *kf_color_vtbl[], *kf_scalar_vtbl[], *kf_boolean_vtbl[], *kf_vector2_vtbl[], *kf_vector3_vtbl[], *kf_path_vtbl[];
 static const GUID IID_IVector2KeyFrameAnimation_ =
     { 0xdf414515, 0x4e29, 0x4f11, { 0xb5, 0x5e, 0xbf, 0x2a, 0x6e, 0xb3, 0x62, 0x94 } };
 static const GUID IID_IVector3KeyFrameAnimation_ =
     { 0xc8039daa, 0xa281, 0x43c2, { 0xa7, 0x3d, 0xb6, 0x8e, 0x3c, 0x53, 0x3c, 0x40 } };
+static const GUID IID_IPathKeyFrameAnimation_ =
+    { 0x9d0d18c9, 0x1576, 0x4b3f, { 0xbe, 0x60, 0x1d, 0x50, 0x31, 0xf5, 0xe7, 0x1b } };
 
 /*
  * ICompositionAnimation2 {369b603e-a80f-4948-93e3-ed23fb38c6cb}: SetBooleanParameter, get_Target,
@@ -14058,7 +14114,8 @@ static HRESULT WINAPI kf_animation_QueryInterface( void *iface, REFIID iid, void
         (impl->value_kind == KF_SCALAR && IsEqualGUID( iid, &IID_IScalarKeyFrameAnimation_ )) ||
         (impl->value_kind == KF_BOOLEAN && IsEqualGUID( iid, &IID_IBooleanKeyFrameAnimation_ )) ||
         (impl->value_kind == KF_VECTOR2 && IsEqualGUID( iid, &IID_IVector2KeyFrameAnimation_ )) ||
-        (impl->value_kind == KF_VECTOR3 && IsEqualGUID( iid, &IID_IVector3KeyFrameAnimation_ )))
+        (impl->value_kind == KF_VECTOR3 && IsEqualGUID( iid, &IID_IVector3KeyFrameAnimation_ )) ||
+        (impl->value_kind == KF_PATH && IsEqualGUID( iid, &IID_IPathKeyFrameAnimation_ )))
         *out = &impl->typed_vtbl;
     else
         *out = &impl->vtbl;
@@ -14091,8 +14148,12 @@ static HRESULT WINAPI kf_typed_GetRuntimeClassName( void *iface, HSTRING *name )
     static const WCHAR color[] = L"Windows.UI.Composition.ColorKeyFrameAnimation";
     static const WCHAR scalar[] = L"Windows.UI.Composition.ScalarKeyFrameAnimation";
     static const WCHAR flag[] = L"Windows.UI.Composition.BooleanKeyFrameAnimation";
+    static const WCHAR vector2[] = L"Windows.UI.Composition.Vector2KeyFrameAnimation";
+    static const WCHAR vector3[] = L"Windows.UI.Composition.Vector3KeyFrameAnimation";
+    static const WCHAR path[] = L"Windows.UI.Composition.PathKeyFrameAnimation";
     enum kf_kind kind = kf_from_typed( iface )->value_kind;
-    const WCHAR *n = kind == KF_COLOR ? color : kind == KF_SCALAR ? scalar : flag;
+    const WCHAR *n = kind == KF_COLOR ? color : kind == KF_SCALAR ? scalar : kind == KF_VECTOR2 ? vector2 :
+                     kind == KF_VECTOR3 ? vector3 : kind == KF_PATH ? path : flag;
     return WindowsCreateString( n, wcslen( n ), name );
 }
 static HRESULT WINAPI kf_typed_GetTrustLevel( void *iface, TrustLevel *level )
@@ -14213,6 +14274,33 @@ static const void *kf_vector2_vtbl[] =
     kf_typed_GetIids, kf_typed_GetRuntimeClassName, kf_typed_GetTrustLevel,
     kf_vector2_InsertKeyFrame, kf_vector2_InsertKeyFrameWithEasingFunction,
 };
+/* PathKeyFrameAnimation: 6 InsertKeyFrame(key, CompositionPath), 7 with an easing. The paths are held for the
+ * animation's lifetime (released with it: kf_release_paths). */
+static HRESULT WINAPI kf_path_InsertKeyFrame( void *iface, FLOAT key, IUnknown *path )
+{
+    struct kf_animation *impl = kf_from_typed( iface );
+    scene_changed();
+    TRACE( "%p, key %f, path %p.\n", impl, key, path );
+    kf_take_key( impl, key );
+    if (impl->key_count <= KF_KEYS)
+    {
+        if (path) IUnknown_AddRef( path );
+        impl->keys[impl->key_count - 1].u.path = path;
+    }
+    return S_OK;
+}
+static HRESULT WINAPI kf_path_InsertKeyFrameWithEasingFunction( void *iface, FLOAT key, IUnknown *path, void *function )
+{
+    HRESULT hr = kf_path_InsertKeyFrame( iface, key, path );
+    kf_set_easing( kf_from_typed( iface ), function );
+    return hr;
+}
+static const void *kf_path_vtbl[] =
+{
+    kf_typed_QueryInterface, kf_typed_AddRef, kf_typed_Release,
+    kf_typed_GetIids, kf_typed_GetRuntimeClassName, kf_typed_GetTrustLevel,
+    kf_path_InsertKeyFrame, kf_path_InsertKeyFrameWithEasingFunction,
+};
 static HRESULT WINAPI kf_vector3_InsertKeyFrame( void *iface, FLOAT key, Vector3 value )
 {
     scene_changed();
@@ -14235,6 +14323,15 @@ static const void *kf_vector3_vtbl[] =
     kf_vector3_InsertKeyFrame, kf_vector3_InsertKeyFrameWithEasingFunction,
 };
 
+static void kf_release_paths( struct comp_object *object )
+{
+    struct kf_animation *kf = CONTAINING_RECORD( object, struct kf_animation, vtbl );
+    unsigned int i;
+
+    if (object->vtbl != (const void **)kf_animation_vtbl || kf->value_kind != KF_PATH) return;
+    for (i = 0; i < min( kf->key_count, KF_KEYS ); i++)
+        if (kf->keys[i].u.path) IUnknown_Release( kf->keys[i].u.path );
+}
 static HRESULT create_kf_animation( enum kf_kind kind, void **out )
 {
     struct kf_animation *impl;
@@ -14255,11 +14352,12 @@ static HRESULT create_kf_animation( enum kf_kind kind, void **out )
     impl->vtbl = (const void **)kf_animation_vtbl;
     impl->kind = kind == KF_COLOR ? "ColorKeyFrameAnimation" : kind == KF_SCALAR ? "ScalarKeyFrameAnimation" :
                  kind == KF_BOOLEAN ? "BooleanKeyFrameAnimation" : kind == KF_VECTOR2 ? "Vector2KeyFrameAnimation" :
-                 "Vector3KeyFrameAnimation";
+                 kind == KF_PATH ? "PathKeyFrameAnimation" : "Vector3KeyFrameAnimation";
     impl->ref = 1;
     impl->value_kind = kind;
     impl->typed_vtbl = kind == KF_COLOR ? kf_color_vtbl : kind == KF_SCALAR ? kf_scalar_vtbl :
-                       kind == KF_BOOLEAN ? kf_boolean_vtbl : kind == KF_VECTOR2 ? kf_vector2_vtbl : kf_vector3_vtbl;
+                       kind == KF_BOOLEAN ? kf_boolean_vtbl : kind == KF_VECTOR2 ? kf_vector2_vtbl :
+                       kind == KF_PATH ? kf_path_vtbl : kf_vector3_vtbl;
     impl->anim2_vtbl = kf_anim2_vtbl;
     impl->partner_vtbl = kf_partner_vtbl;
     impl->iteration_count = 1.0f;
@@ -14937,7 +15035,9 @@ static BOOL kf_sample( struct kf_animation *kf, float progress, struct kf_key *o
     }
     /* before the first key the property keeps its static value (Lottie layers start hidden that way) */
     if (lo == ~0u) return FALSE;
-    if (hi == ~0u || kf->value_kind == KF_BOOLEAN || kf->value_kind == KF_COLOR) { *out = kf->keys[lo]; return TRUE; }
+    /* paths are not morphed: each holds until the next key */
+    if (hi == ~0u || kf->value_kind == KF_BOOLEAN || kf->value_kind == KF_COLOR || kf->value_kind == KF_PATH)
+    { *out = kf->keys[lo]; return TRUE; }
     t = ease_apply( &kf->keys[hi].ease, (progress - kf->keys[lo].key) / (kf->keys[hi].key - kf->keys[lo].key) );
     *out = kf->keys[lo];
     switch (kf->value_kind)
@@ -15122,10 +15222,21 @@ static BOOL expr_evaluate_scalar_simple( struct expr_animation *expr, float *out
     }
     return FALSE;
 }
+static BOOL expr_evaluate_scalar_full( struct expr_animation *expr, float *out );
 static BOOL anim_controller_progress( struct anim_controller *ctrl, float *progress )
 {
     if (!ctrl) return FALSE;
+    /* The full evaluator follows an expression bound on the property it reads: AnimatedIcon binds the Lottie root's
+     * "Progress" to "_.Progress" of its own set and moves that one, so reading the stored value (Lottie's initial 0)
+     * drew every animated icon at its first frame. It also takes Lottie's remapped progress, "(_.Progress - 0.4) * 2.5". */
+    if (ctrl->progress_expr && expr_evaluate_scalar_full( ctrl->progress_expr, progress ))
+    {
+        *progress = min( max( *progress, 0.0f ), 1.0f );
+        return TRUE;
+    }
     if (ctrl->progress_expr && expr_evaluate_scalar_simple( ctrl->progress_expr, progress )) return TRUE;
+    if (ctrl->progress_expr)
+        TRACE_(dcompshape)( "controller %p: cannot evaluate %s.\n", ctrl, debugstr_w( ctrl->progress_expr->expression ) );
     if (ctrl->has_progress) { *progress = ctrl->progress; return TRUE; }
     return FALSE;
 }
@@ -15936,6 +16047,15 @@ static BOOL expr_scalar( struct expr_ctx *c, float *out )
     *out = *out != 0.0f ? a : b;
     return TRUE;
 }
+static BOOL expr_evaluate_scalar_full( struct expr_animation *expr, float *out )
+{
+    struct expr_ctx c;
+
+    c.expr = expr; c.local = NULL; c.dmanip = NULL; c.p = expr->expression; c.depth = 1;
+    if (!expr_scalar( &c, out )) return FALSE;
+    expr_skip_space( &c );
+    return !*c.p;
+}
 static BOOL expr_matrix_product( struct expr_ctx *c, D2D_MATRIX_3X2_F *out );
 static BOOL expr_matrix_term( struct expr_ctx *c, D2D_MATRIX_3X2_F *out )
 {
@@ -16355,13 +16475,20 @@ static struct comp_shape *comp_shape_from_any( IInspectable *object )
     }
     return shape;
 }
+static void *ellipse_geometry_vtbl[COMP_OBJECT_SLOTS], *rectangle_geometry_vtbl[COMP_OBJECT_SLOTS];
+static void *rounded_rectangle_geometry_vtbl[COMP_OBJECT_SLOTS], *line_geometry_vtbl[COMP_OBJECT_SLOTS];
+static BOOL is_simple_geometry_vtbl( const void **vtbl )
+{
+    return vtbl == (const void **)ellipse_geometry_vtbl || vtbl == (const void **)rectangle_geometry_vtbl ||
+           vtbl == (const void **)rounded_rectangle_geometry_vtbl || vtbl == (const void **)line_geometry_vtbl;
+}
 static struct path_geometry *path_geometry_from_any( IUnknown *object )
 {
     struct path_geometry *geometry = NULL;
 
     if (!object || FAILED( IUnknown_QueryInterface( object, &IID_path_geometry_private, (void **)&geometry ) )) return NULL;
     IUnknown_Release( (IUnknown *)geometry );
-    if (geometry->vtbl != (const void **)path_geometry_vtbl)
+    if (geometry->vtbl != (const void **)path_geometry_vtbl && !is_simple_geometry_vtbl( geometry->vtbl ))
     {
         TRACE( "%p is not a path geometry.\n", geometry );
         return NULL;
@@ -16661,8 +16788,34 @@ static ULONG WINAPI geometry_view_AddRef( void *iface ) { return comp_object_Add
 static ULONG WINAPI geometry_view_Release( void *iface ) { return path_geometry_Release( &geometry_from_view( iface )->vtbl ); }
 static HRESULT WINAPI geometry_view_GetRuntimeClassName( void *iface, HSTRING *name )
 {
-    static const WCHAR class_name[] = L"Windows.UI.Composition.CompositionPathGeometry";
-    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+    WCHAR class_name[96];
+    swprintf( class_name, ARRAY_SIZE(class_name), L"Windows.UI.Composition.%hs", geometry_from_view( iface )->kind );
+    return WindowsCreateString( class_name, wcslen( class_name ), name );
+}
+/* Ellipse (6/7 Center, 8/9 Radius), rectangle (6/7 Offset, 8/9 Size), rounded rectangle (6/7 CornerRadius, 8/9 Offset,
+ * 10/11 Size) and line (6/7 Start, 8/9 End) geometries. They were recording objects that kept nothing, and the
+ * painter drew only paths: the Microsoft Store's Lottie nav icons (the Apps grid, Gaming) came out empty. */
+#define GEOMETRY_VECTOR2( name, field ) \
+    static HRESULT WINAPI geometry_get_##name( void *iface, Vector2 *value ) \
+    { if (!value) return E_POINTER; *value = CONTAINING_RECORD( iface, struct path_geometry, vtbl )->field; return S_OK; } \
+    static HRESULT WINAPI geometry_put_##name( void *iface, Vector2 value ) \
+    { \
+        struct path_geometry *geometry = CONTAINING_RECORD( iface, struct path_geometry, vtbl ); \
+        scene_changed(); \
+        TRACE( "%s %p %g,%g\n", geometry->kind, geometry, value.X, value.Y ); \
+        geometry->field = value; \
+        return S_OK; \
+    }
+GEOMETRY_VECTOR2( A, a )
+GEOMETRY_VECTOR2( B, b )
+GEOMETRY_VECTOR2( C, c )
+#undef GEOMETRY_VECTOR2
+static void init_simple_geometry_vtbl( void **vtbl, BOOL three )
+{
+    memcpy( vtbl, path_geometry_vtbl, sizeof(path_geometry_vtbl) );
+    vtbl[6] = geometry_get_A; vtbl[7] = geometry_put_A;
+    vtbl[8] = geometry_get_B; vtbl[9] = geometry_put_B;
+    if (three) { vtbl[10] = geometry_get_C; vtbl[11] = geometry_put_C; }
 }
 #define GEOMETRY_FLOAT( name, field ) \
     static HRESULT WINAPI geometry_view_get_##name( void *iface, FLOAT *value ) \
@@ -16702,6 +16855,10 @@ static void init_shape_vtbls( void )
     path_geometry_vtbl[0] = path_geometry_QueryInterface;
     path_geometry_vtbl[2] = path_geometry_Release;
     path_geometry_vtbl[6] = path_geometry_get_Path;     path_geometry_vtbl[7] = path_geometry_put_Path;
+    init_simple_geometry_vtbl( ellipse_geometry_vtbl, FALSE );
+    init_simple_geometry_vtbl( rectangle_geometry_vtbl, FALSE );
+    init_simple_geometry_vtbl( rounded_rectangle_geometry_vtbl, TRUE );
+    init_simple_geometry_vtbl( line_geometry_vtbl, FALSE );
     InterlockedExchange( &shape_vtbls_ready, 1 );
 }
 static HRESULT create_comp_shape( BOOL container, IUnknown *geometry, void **out )
@@ -16738,17 +16895,103 @@ static HRESULT create_path_geometry( IUnknown *path, void **out )
     return S_OK;
 }
 
+static HRESULT create_simple_geometry( int shape_kind, void **out )
+{
+    static const char *const kinds[] = { NULL, "CompositionEllipseGeometry", "CompositionRectangleGeometry",
+                                         "CompositionRoundedRectangleGeometry", "CompositionLineGeometry" };
+    void **vtbls[] = { NULL, ellipse_geometry_vtbl, rectangle_geometry_vtbl, rounded_rectangle_geometry_vtbl, line_geometry_vtbl };
+    struct path_geometry *geometry;
+    HRESULT hr;
+
+    if (FAILED( hr = create_path_geometry( NULL, out ) )) return hr;
+    geometry = CONTAINING_RECORD( *out, struct path_geometry, vtbl );
+    geometry->vtbl = (const void **)vtbls[shape_kind];
+    geometry->kind = kinds[shape_kind];
+    geometry->shape_kind = shape_kind;
+    TRACE( "created %s %p.\n", geometry->kind, geometry );
+    return S_OK;
+}
+
 /* Painting: rasterise the shapes with Direct2D into a texture of the visual's size, then blend it in. */
-static ID2D1Geometry *shape_d2d_geometry( struct comp_shape *shape )
+static ID2D1Geometry *simple_d2d_geometry( ID2D1RenderTarget *target, struct path_geometry *geometry )
+{
+    ID2D1Factory *factory = NULL;
+    ID2D1Geometry *result = NULL;
+    HRESULT hr = E_FAIL;
+    const Vector2 *a = &geometry->a, *b = &geometry->b, *c = &geometry->c;
+
+    ID2D1RenderTarget_GetFactory( target, &factory );
+    if (!factory) return NULL;
+    switch (geometry->shape_kind)
+    {
+    case GEOMETRY_ELLIPSE:
+    {
+        D2D1_ELLIPSE e = { { a->X, a->Y }, b->X, b->Y };
+        hr = ID2D1Factory_CreateEllipseGeometry( factory, &e, (ID2D1EllipseGeometry **)&result );
+        break;
+    }
+    case GEOMETRY_RECTANGLE:
+    {
+        D2D1_RECT_F r = { a->X, a->Y, a->X + b->X, a->Y + b->Y };
+        hr = ID2D1Factory_CreateRectangleGeometry( factory, &r, (ID2D1RectangleGeometry **)&result );
+        break;
+    }
+    case GEOMETRY_ROUNDED_RECTANGLE:
+    {
+        D2D1_ROUNDED_RECT r = { { b->X, b->Y, b->X + c->X, b->Y + c->Y }, a->X, a->Y };
+        hr = ID2D1Factory_CreateRoundedRectangleGeometry( factory, &r, (ID2D1RoundedRectangleGeometry **)&result );
+        break;
+    }
+    case GEOMETRY_LINE:
+    {
+        ID2D1PathGeometry *path;
+        ID2D1GeometrySink *sink;
+        D2D1_POINT_2F start = { a->X, a->Y }, end = { b->X, b->Y };
+        if (FAILED( hr = ID2D1Factory_CreatePathGeometry( factory, &path ) )) break;
+        if (SUCCEEDED( hr = ID2D1PathGeometry_Open( path, &sink ) ))
+        {
+            ID2D1GeometrySink_BeginFigure( sink, start, D2D1_FIGURE_BEGIN_HOLLOW );
+            ID2D1GeometrySink_AddLine( sink, end );
+            ID2D1GeometrySink_EndFigure( sink, D2D1_FIGURE_END_OPEN );
+            hr = ID2D1GeometrySink_Close( sink );
+            ID2D1GeometrySink_Release( sink );
+        }
+        if (SUCCEEDED( hr )) result = (ID2D1Geometry *)path;
+        else ID2D1PathGeometry_Release( path );
+        break;
+    }
+    default:
+        break;
+    }
+    ID2D1Factory_Release( factory );
+    return SUCCEEDED( hr ) ? result : NULL;
+}
+/* the path a geometry shows now: a bound PathKeyFrameAnimation's key at its controller's progress, else Path */
+static IUnknown *geometry_current_path( struct path_geometry *geometry )
+{
+    unsigned int i;
+    for (i = 0; i < geometry->binding_count; i++)
+    {
+        struct anim_binding *b = &geometry->bindings[i];
+        struct kf_key v;
+        float progress;
+        if (wcsicmp( b->prop, L"Path" ) || !b->kf || b->kf->value_kind != KF_PATH) continue;
+        if (!anim_controller_progress( b->controller, &progress )) progress = 1.0f;   /* a free-running one rests at its end */
+        if (kf_sample( b->kf, progress, &v ) && v.u.path) return v.u.path;
+    }
+    return geometry->path;
+}
+static ID2D1Geometry *shape_d2d_geometry( ID2D1RenderTarget *target, struct comp_shape *shape )
 {
     struct path_geometry *geometry = path_geometry_from_any( shape->geometry );
     struct composition_path *path;
-    IUnknown *interop = NULL;
+    IUnknown *interop = NULL, *current;
     ID2D1Geometry *result = NULL;
 
-    if (!geometry || !geometry->path) return NULL;
-    if (*(void ***)geometry->path != (void **)path_vtbl) return NULL;
-    path = CONTAINING_RECORD( geometry->path, struct composition_path, vtbl );
+    if (geometry && geometry->shape_kind != GEOMETRY_PATH) return simple_d2d_geometry( target, geometry );
+    if (!geometry || !(current = geometry_current_path( geometry ))) return NULL;
+    if (*(void ***)current != (void **)path_vtbl) return NULL;
+    path = CONTAINING_RECORD( current, struct composition_path, vtbl );
     if (!path->source || FAILED( IUnknown_QueryInterface( path->source, &IID_IGeometrySource2DInterop_, (void **)&interop ) )) return NULL;
     /* IGeometrySource2DInterop: 3 GetGeometry(ID2D1Geometry **) */
     ((HRESULT (WINAPI *)( IUnknown *, ID2D1Geometry ** ))(*(void ***)interop)[3])( interop, &result );
@@ -16817,11 +17060,18 @@ static void shape_signature( struct comp_shape *shape, const D2D1_MATRIX_3X2_F *
     hash_bytes( hash, &opacity, sizeof(opacity) );
     geometry = path_geometry_from_any( shape->geometry );
     hash_bytes( hash, &geometry, sizeof(geometry) );
-    if (geometry)
+    if (geometry && geometry->shape_kind != GEOMETRY_PATH)
     {
-        hash_bytes( hash, &geometry->path, sizeof(geometry->path) );
-        if (geometry->path && *(void ***)geometry->path == (void **)path_vtbl)
-            hash_bytes( hash, &CONTAINING_RECORD( geometry->path, struct composition_path, vtbl )->source, sizeof(IUnknown *) );
+        hash_bytes( hash, &geometry->a, sizeof(geometry->a) );
+        hash_bytes( hash, &geometry->b, sizeof(geometry->b) );
+        hash_bytes( hash, &geometry->c, sizeof(geometry->c) );
+    }
+    else if (geometry)
+    {
+        IUnknown *current = geometry_current_path( geometry );
+        hash_bytes( hash, &current, sizeof(current) );
+        if (current && *(void ***)current == (void **)path_vtbl)
+            hash_bytes( hash, &CONTAINING_RECORD( current, struct composition_path, vtbl )->source, sizeof(IUnknown *) );
     }
     have = shape->fill && brush_solid_color( (ICompositionBrush *)shape->fill, &color );
     hash_bytes( hash, &have, sizeof(have) );
@@ -16851,13 +17101,24 @@ static void paint_shape( ID2D1RenderTarget *target, struct comp_shape *shape, co
         return;
     }
     {
-        ID2D1Geometry *geometry = shape_d2d_geometry( shape );
+        ID2D1Geometry *geometry = shape_d2d_geometry( target, shape );
         ID2D1SolidColorBrush *brush;
         Color color;
         D2D1_COLOR_F c;
 
         TRACE( "sprite %p geometry %p fill %p stroke %p thickness %g at %g,%g\n", shape, geometry, shape->fill, shape->stroke,
                shape->stroke_thickness, world._31, world._32 );
+        if (TRACE_ON(dcompshape))
+        {
+            D2D1_RECT_F bounds = { 0 };
+            Color fc = { 0 };
+            if (geometry) ID2D1Geometry_GetBounds( geometry, &world, &bounds );
+            if (shape->fill) brush_solid_color( (ICompositionBrush *)shape->fill, &fc );
+            TRACE_(dcompshape)( "sprite %p geometry %p (%s) world %g,%g,%g,%g,%g,%g bounds %g,%g-%g,%g fill %p %02x%02x%02x%02x stroke %p\n",
+                                shape, shape->geometry, shape->geometry ? ((struct comp_object *)shape->geometry)->kind : "-",
+                                world._11, world._12, world._21, world._22, world._31, world._32,
+                                bounds.left, bounds.top, bounds.right, bounds.bottom, shape->fill, fc.A, fc.R, fc.G, fc.B, shape->stroke );
+        }
         if (!geometry) return;
         ID2D1RenderTarget_SetTransform( target, &world );
         if (shape->fill && brush_solid_color( (ICompositionBrush *)shape->fill, &color ) && color.A)
@@ -16943,6 +17204,7 @@ static void paint_shape_visual( HDC hdc, struct visual *impl, float x, float y, 
     hr = ID2D1DeviceContext_EndDraw( surface->context, NULL, NULL );
     surface_invalidate_cache( surface );
     TRACE( "shape visual %p: %u shapes into %ux%u at %g,%g, hr %#lx.\n", impl, impl->shape_count, w, h, x, y, hr );
+    TRACE_(dcompshape)( "shape visual %p: %u shapes into %ux%u at %g,%g dest %gx%g.\n", impl, impl->shape_count, w, h, x, y, dest_w, dest_h );
     blit_surface_rect( hdc, surface, (int)x, (int)y, dest_w > 0.5f ? (int)(dest_w + 0.5f) : w, dest_h > 0.5f ? (int)(dest_h + 0.5f) : h );
 }
 
@@ -17126,6 +17388,7 @@ static void easing_lookup( void *function, struct kf_ease *ease )
         ease->c = bz->point2.X; ease->d = bz->point2.Y;
         return;
     }
+    if (step_easing_lookup( function, ease )) return;
     AcquireSRWLockShared( &easing_lock );
     for (i = 0; i < EASINGS; i++)
         if (easings[i].object == function) { *ease = easings[i].ease; break; }
@@ -17159,12 +17422,12 @@ static float ease_apply( const struct kf_ease *ease, float t )
     float lo = 0.0f, hi = 1.0f, s = t;
     unsigned int i;
 
+    if (ease->type == EASE_STEP) return step_ease_apply( ease, t );
     if (t <= 0.0f) return 0.0f;
     if (t >= 1.0f) return 1.0f;
     switch (ease->type)
     {
     case EASE_LINEAR:
-    case EASE_STEP:
         return t;
     case EASE_BEZIER:
         /* the curve's x is monotonic in s for control points in 0..1: bisect for x(s) = t */
@@ -21139,11 +21402,102 @@ static HRESULT WINAPI compositor2_CreateNineGridBrush( void *iface, void **resul
 }
 COMPOSITOR2_RECORDING( CreatePointLight, "PointLight" )
 COMPOSITOR2_RECORDING( CreateSpotLight, "SpotLight" )
+/* StepEasingFunction: IStepEasingFunction {d0caa74b} is 6/7 FinalStep, 8/9 InitialStep, 10/11 IsFinalStepSingleFrame,
+ * 12/13 IsInitialStepSingleFrame, 14/15 StepCount. Lottie's generated icons (the Store's nav rail, AnimatedIcon) show
+ * and hide each layer with a Scale key frame eased "hold then step" (IsFinalStepSingleFrame) or "step then hold"
+ * (IsInitialStepSingleFrame). Run linear, every layer of every state was drawn part scaled on top of the others. */
+struct step_easing
+{
+    const void **vtbl;          /* must match struct comp_object */
+    const char *kind;
+    LONG ref;
+    INT32 count, initial, final;
+    BOOLEAN initial_single, final_single;
+};
+static void *step_easing_vtbl[COMP_OBJECT_SLOTS];
+static struct step_easing *impl_from_step( void *iface ) { return CONTAINING_RECORD( iface, struct step_easing, vtbl ); }
+static HRESULT WINAPI step_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    /* slots 6-10 here are not ICompositionObject's */
+    if (IsEqualGUID( iid, &IID_ICompositionObject )) return create_composition_object_view( iface, out );
+    return comp_object_QueryInterface( iface, iid, out );
+}
+static HRESULT WINAPI step_get_FinalStep( void *iface, INT32 *v ) { if (!v) return E_POINTER; *v = impl_from_step( iface )->final; return S_OK; }
+static HRESULT WINAPI step_put_FinalStep( void *iface, INT32 v ) { impl_from_step( iface )->final = v; return S_OK; }
+static HRESULT WINAPI step_get_InitialStep( void *iface, INT32 *v ) { if (!v) return E_POINTER; *v = impl_from_step( iface )->initial; return S_OK; }
+static HRESULT WINAPI step_put_InitialStep( void *iface, INT32 v ) { impl_from_step( iface )->initial = v; return S_OK; }
+static HRESULT WINAPI step_get_IsFinalStepSingleFrame( void *iface, BOOLEAN *v ) { if (!v) return E_POINTER; *v = impl_from_step( iface )->final_single; return S_OK; }
+static HRESULT WINAPI step_put_IsFinalStepSingleFrame( void *iface, BOOLEAN v ) { impl_from_step( iface )->final_single = v; return S_OK; }
+static HRESULT WINAPI step_get_IsInitialStepSingleFrame( void *iface, BOOLEAN *v ) { if (!v) return E_POINTER; *v = impl_from_step( iface )->initial_single; return S_OK; }
+static HRESULT WINAPI step_put_IsInitialStepSingleFrame( void *iface, BOOLEAN v ) { impl_from_step( iface )->initial_single = v; return S_OK; }
+static HRESULT WINAPI step_get_StepCount( void *iface, INT32 *v ) { if (!v) return E_POINTER; *v = impl_from_step( iface )->count; return S_OK; }
+static HRESULT WINAPI step_put_StepCount( void *iface, INT32 v )
+{
+    struct step_easing *impl = impl_from_step( iface );
+    /* as on Windows, the final step follows the count */
+    if (impl->final == impl->count) impl->final = v;
+    impl->count = v;
+    return S_OK;
+}
+static HRESULT create_step_easing( INT32 count, void **out )
+{
+    static LONG ready;
+    struct step_easing *impl;
+
+    if (!out) return E_POINTER;
+    ensure_comp_object_vtbl();
+    if (!InterlockedCompareExchange( &ready, 1, 0 ))
+    {
+        memcpy( step_easing_vtbl, comp_object_vtbl, sizeof(step_easing_vtbl) );
+        step_easing_vtbl[6] = step_get_FinalStep;               step_easing_vtbl[7] = step_put_FinalStep;
+        step_easing_vtbl[8] = step_get_InitialStep;             step_easing_vtbl[9] = step_put_InitialStep;
+        step_easing_vtbl[10] = step_get_IsFinalStepSingleFrame;  step_easing_vtbl[11] = step_put_IsFinalStepSingleFrame;
+        step_easing_vtbl[12] = step_get_IsInitialStepSingleFrame; step_easing_vtbl[13] = step_put_IsInitialStepSingleFrame;
+        step_easing_vtbl[14] = step_get_StepCount;              step_easing_vtbl[15] = step_put_StepCount;
+        step_easing_vtbl[0] = step_QueryInterface;
+        InterlockedExchange( &ready, 2 );
+    }
+    while (ready != 2) Sleep( 0 );
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    comp_map_owner_gone( &impl->vtbl );
+    impl->vtbl = (const void **)step_easing_vtbl;
+    impl->kind = "StepEasingFunction";
+    impl->ref = 1;
+    impl->count = impl->final = count;
+    TRACE( "step easing %p, %d steps.\n", impl, count );
+    *out = &impl->vtbl;
+    return S_OK;
+}
+static BOOL step_easing_lookup( void *function, struct kf_ease *ease )
+{
+    struct step_easing *impl;
+    if (*(void ***)function != (void **)step_easing_vtbl) return FALSE;
+    impl = impl_from_step( function );
+    ease->type = EASE_STEP;
+    ease->a = impl->count;
+    ease->b = impl->initial;
+    ease->c = impl->final;
+    ease->d = (impl->initial_single ? 1 : 0) | (impl->final_single ? 2 : 0);
+    return TRUE;
+}
+/* Steps InitialStep..FinalStep of 1/StepCount each share the duration evenly, except a single-frame first or last
+ * step, which shows only at t = 0 or t = 1. */
+static float step_ease_apply( const struct kf_ease *ease, float t )
+{
+    int count = max( (int)ease->a, 1 ), first = (int)ease->b, last = (int)ease->c, flags = (int)ease->d;
+    int lo = first + ((flags & 1) ? 1 : 0), hi = last - ((flags & 2) ? 1 : 0), k;
+
+    if (t <= 0.0f) return (float)first / count;
+    if (t >= 1.0f) return (float)last / count;
+    if (hi < lo) return (float)((flags & 2) ? first : last) / count;
+    k = lo + min( (int)(t * (hi - lo + 1)), hi - lo );
+    return (float)k / count;
+}
+
 static HRESULT WINAPI compositor2_CreateStepEasingFunction( void *iface, void **result )
 {
     TRACE( "iface %p.\n", iface );
-    if (!result) return E_POINTER;
-    return create_easing( "StepEasingFunction", 0, result );   /* runs linear */
+    return create_step_easing( 1, result );
 }
 
 static HRESULT WINAPI compositor2_CreateLayerVisual( void *iface, void **result )
@@ -21164,8 +21518,7 @@ static HRESULT WINAPI compositor2_CreateLayerVisual( void *iface, void **result 
 static HRESULT WINAPI compositor2_CreateStepEasingFunctionWithStepCount( void *iface, INT32 count, void **result )
 {
     TRACE( "iface %p, count %d.\n", iface, count );
-    if (!result) return E_POINTER;
-    return create_easing( "StepEasingFunction", 0, result );   /* runs linear */
+    return create_step_easing( count, result );
 }
 
 /* Windows.UI.Composition.CompositionEasingFunction statics {17a766b6} (Windows 11): the same easings the compositor
@@ -21458,10 +21811,16 @@ static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, voi
         struct kf_animation *kf = kf_animation_from( animation );
         struct expr_animation *expr = expr_animation_from_any( animation );
         const WCHAR *prop = WindowsGetStringRawBuffer( name, NULL );
+        struct path_geometry *pg = !shape && view->owner ? path_geometry_from_any( view->owner ) : NULL;
         if (shape && kf && prop)
         {
             anim_bind( shape->bindings, &shape->binding_count, prop, kf );
             TRACE( "shape %p: %s bound to %p.\n", shape, debugstr_w( prop ), kf );
+        }
+        else if (pg && kf && prop && kf->value_kind == KF_PATH)
+        {
+            anim_bind( pg->bindings, &pg->binding_count, prop, kf );
+            TRACE( "geometry %p: %s bound to %p.\n", pg, debugstr_w( prop ), kf );
         }
         else if (!shape && !ctrl && kf && prop && kf->has_value && kf->value_kind == KF_COLOR &&
                  effect_brush_from_any( view->owner ))
@@ -21526,6 +21885,9 @@ static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, voi
             HSTRING h;
             struct propset_value *pv;
             TRACE( "set %p %s settles at %g (%u keys).\n", set, debugstr_w( pprop ), pkf->scalar, pkf->key_count );
+            TRACE_(dcompshape)( "set %p %s settles at %g (%u keys, first %g, delay %s duration %s).\n", set, debugstr_w( pprop ),
+                                pkf->scalar, pkf->key_count, pkf->keys[0].u.scalar, wine_dbgstr_longlong( pkf->delay_time ),
+                                wine_dbgstr_longlong( pkf->duration ) );
             if (SUCCEEDED( WindowsCreateString( pprop, lstrlenW( pprop ), &h ) ))
             {
                 if ((pv = propset_find( set, h, TRUE ))) { pv->type = PROP_SCALAR; pv->u.scalar = pkf->scalar; }
@@ -22016,8 +22378,18 @@ static HRESULT WINAPI compositor5_CreateContainerShape( void *iface, void **resu
     TRACE( "iface %p.\n", iface );
     return create_comp_shape( TRUE, NULL, result );
 }
-COMPOSITOR5_RECORDING( CreateEllipseGeometry, "CompositionEllipseGeometry" )
-COMPOSITOR5_RECORDING( CreateLineGeometry, "CompositionLineGeometry" )
+static HRESULT WINAPI compositor5_CreateEllipseGeometry( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    init_shape_vtbls();
+    return create_simple_geometry( GEOMETRY_ELLIPSE, result );
+}
+static HRESULT WINAPI compositor5_CreateLineGeometry( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    init_shape_vtbls();
+    return create_simple_geometry( GEOMETRY_LINE, result );
+}
 static HRESULT WINAPI compositor5_CreatePathGeometry( void *iface, void **result )
 {
     TRACE( "iface %p.\n", iface );
@@ -22028,9 +22400,23 @@ static HRESULT WINAPI compositor5_CreatePathGeometryWithPath( void *iface, void 
     TRACE( "iface %p, path %p.\n", iface, path );
     return create_path_geometry( path, result );
 }
-COMPOSITOR5_RECORDING( CreatePathKeyFrameAnimation, "PathKeyFrameAnimation" )
-COMPOSITOR5_RECORDING( CreateRectangleGeometry, "CompositionRectangleGeometry" )
-COMPOSITOR5_RECORDING( CreateRoundedRectangleGeometry, "CompositionRoundedRectangleGeometry" )
+static HRESULT WINAPI compositor5_CreatePathKeyFrameAnimation( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    return create_kf_animation( KF_PATH, result );
+}
+static HRESULT WINAPI compositor5_CreateRectangleGeometry( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    init_shape_vtbls();
+    return create_simple_geometry( GEOMETRY_RECTANGLE, result );
+}
+static HRESULT WINAPI compositor5_CreateRoundedRectangleGeometry( void *iface, void **result )
+{
+    TRACE( "iface %p.\n", iface );
+    init_shape_vtbls();
+    return create_simple_geometry( GEOMETRY_ROUNDED_RECTANGLE, result );
+}
 static HRESULT WINAPI compositor5_CreateSpriteShape( void *iface, void **result )
 {
     TRACE( "iface %p.\n", iface );
