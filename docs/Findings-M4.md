@@ -13490,3 +13490,15 @@ skeleton. What is known:
   decoder) and where the pixels are lost is not yet known. The Xbox app's library art (AGENTS.md) has the same shape.
 - `CloudXaml-ModulePackageProvider`'s "Data request returned with null data" for the GameCategorization zip is not
   this: it appears on Apps too, where the module (the category chips) draws.
+
+## 2026-10-26: the Microsoft Store died on the first hover over Home - DropShadow's ICompositionObject
+
+On the user's desktop the Store fail-fasted (`System.Environment.FailFast`, "Access Violation") as soon as the pointer
+moved over Home. The managed stack runs through the function that builds the pointer-following tile shadow expressions
+(`WinStore.App.dll+0x23ce060`, strings `ShadowPointerAnimationTargetElement`, `_pointerPositionSet`), which reads
+`shadow.Properties`: `ICompositionObject` slot 8. A `WINE_UWP_BP` on that call (`+0x286b55@rax+0:2`, and the result at
+`+0x286b9b@rbp-40:2`) showed the out-pointer was `0xff` only for one vtable, which `llvm-symbolizer "DATA ..."` on our
+dcomp named `drop_shadow_vtbl`: the generic QI handed out the DropShadow's own table for `ICompositionObject`, so slot 8
+was `get_Color` and wrote the colour (alpha 255). DropShadow now answers it with an object view, like lights.
+Reproduced twice on `:97` with a pointer sweep over Home; after the fix the same sweep is clean. calc AE 3924.73,
+mp 236, as the control.

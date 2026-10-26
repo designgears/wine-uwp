@@ -2879,6 +2879,7 @@ static HRESULT create_closable_view( IUnknown *owner, void **out )
     return S_OK;
 }
 
+static void *drop_shadow_vtbl[];
 static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void **out )
 {
     struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
@@ -2898,9 +2899,12 @@ static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void 
      * Toolkit (ImplicitAnimationSet.GetImplicitAnimationCollection) builds each entry's group with
      * collection.Compositor.CreateAnimationGroup(); answered by this table, "Compositor" was a new recording object,
      * its CreateAnimationGroup another collection, and the cast to CompositionAnimationGroup threw (the Microsoft
-     * Store 22608 stopped on its splash screen). */
+     * Store 22608 stopped on its splash screen). And the drop shadow, whose own table is IDropShadow: the Store's
+     * pointer-following tile shadows read shadow.Properties through it, got get_Color's alpha (0xff) as the property
+     * set and died with an access violation on the first hover over Home. */
     if (IsEqualGUID( iid, &IID_ICompositionObject ) && object->kind &&
-        (strstr( object->kind, "Light" ) || !strcmp( object->kind, "ImplicitAnimationCollection" )))
+        (strstr( object->kind, "Light" ) || !strcmp( object->kind, "ImplicitAnimationCollection" ) ||
+         object->vtbl == (const void **)drop_shadow_vtbl))
         return create_composition_object_view( (IUnknown *)&object->vtbl, out );
     if (IsEqualGUID( iid, &IID_IMap_animations_local ))
         return comp_map_for_owner( (IUnknown *)&object->vtbl, out );
