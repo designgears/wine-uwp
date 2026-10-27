@@ -104,6 +104,10 @@ add_executable(probe-a8 probes/probe-a8.cpp)
 target_link_libraries(probe-a8 PRIVATE d3d11.lib d2d1.lib dxguid.lib)
 set_target_properties(probe-a8 PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
 
+add_executable(probe-fencerewind probes/probe-fencerewind.cpp)
+target_link_libraries(probe-fencerewind PRIVATE d3d12.lib)
+set_target_properties(probe-fencerewind PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")
+
 add_executable(probe-a8perf probes/probe-a8perf.cpp)
 target_link_libraries(probe-a8perf PRIVATE d3d11.lib dxguid.lib)
 set_target_properties(probe-a8perf PROPERTIES LINK_FLAGS "/SUBSYSTEM:CONSOLE")

@@ -487,3 +487,5 @@ dlls/windows.ui.popups/main.c
 dlls/windows.ui.popups/popups.rc
 dlls/windows.ui.popups/windows.ui.popups.manifest
 dlls/windows.ui.popups/windows.ui.popups.spec
+libs/vkd3d/libs/vkd3d/command.c
+libs/vkd3d/libs/vkd3d/vkd3d_private.h

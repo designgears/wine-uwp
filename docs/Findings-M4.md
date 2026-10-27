@@ -13605,3 +13605,34 @@ Later the same day:
   (`r8` of fn 0x144d6a7e0) and what it waits for.
 - `git checkout FILE` in the Wine tree to drop one experiment threw away the whole uncommitted licence work in that
   file. Commit finished work before experimenting on top of it.
+
+### 2026-10-27: Gears of War 4's title-screen stall is a vkd3d fence-rewind race
+
+**Found, from memory of the stalled process (no restart).** The UI thread's spin loop (fn 0x144d6a7e0) polls a
+condition functor `{0x143961ec0, arg}` that checks Unreal's frame-end fence (`FFrameEndSync`, a two-entry graph event
+array). The render thread (08b4) was blocked producing into a full 6-frame ring whose consumer (0620) sat in
+`ID3D12Fence::SetEventOnCompletion` + `WaitForSingleObject` on the frame fence (value 0xdfb, waiting for 0xdfc). Every
+later Signal sat in the direct queue's vkd3d op list (`d3d12_command_queue.op_queue`, +0xd0; ops are 0x50 bytes,
+opcode then fence/value). Its head was `WAIT fence 0xc6fe60 value 1`, and that fence had value 0, max_pending 0. It is
+one of seven `D3D12_FENCE_FLAG_SHARED` fences the game recycles: their values toggle 0 -> 1 -> 0 between samples
+(the CPU rewinds them with `ID3D12Fence::Signal(0)`). vkd3d only evaluates a queued Wait when the queue flushes up to
+it, so a fence signalled and then rewound before that point blocks the queue for good. dxgi's present worker then waits
+for the present fence's CPU signal behind it, so presents stop, and the main thread spins. On Windows a wait is
+satisfied by the signal itself.
+
+Reproduced deterministically by `probes/probe-fencerewind.cpp`: queue A `Wait(gate,1)`, `Wait(f,1)`, `Signal(done,1)`;
+queue B `Signal(f,1)`; CPU waits for f=1, rewinds it to 0, opens the gate. Old build: `FAIL: queue A still blocked`.
+Fixed build: `PASS: done 1`.
+
+**Fix (vkd3d, `libs/vkd3d/libs/vkd3d/command.c`).** A CPU signal below the current value counts as a rewind and
+records the peak (max pending) and the last submitted timeline value at that moment. A Wait remembers the rewind count
+when queued. At flush, a wait that is no longer reachable but was reached before a later rewind (or two rewinds have
+passed) waits on the pre-rewind timeline value instead of blocking the queue. The title screen keeps running
+(`docs/screenshots/gears4-title-after-fence-fix.png`). Calculator AE 3924.73, Media Player 236 (unchanged).
+
+The race never happened on Xvfb `:97`, in this run or in one with the window deactivated by a Notepad window. It hit
+on the user's `:0` (175 Hz NVIDIA). The fix is only proven by the probe until it runs there.
+
+**Method worth keeping.** `probe-peek` + `objcopy`/`llvm-objdump` on the decrypted exe named the wait. For vkd3d
+state, scan the heap for `d3d12_command_queue_vtbl` (wined3d.dll base + `llvm-nm` RVA; vkd3d lives inside wined3d.dll)
+and decode `op_queue`. Struct offsets come from `llvm-dwarfdump --name=<struct> -c` on the build's `.o`.
