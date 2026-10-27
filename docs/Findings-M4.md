@@ -13502,3 +13502,24 @@ dcomp named `drop_shadow_vtbl`: the generic QI handed out the DropShadow's own t
 was `get_Color` and wrote the colour (alpha 255). DropShadow now answers it with an object view, like lights.
 Reproduced twice on `:97` with a pointer sweep over Home; after the fix the same sweep is clean. calc AE 3924.73,
 mp 236, as the control.
+
+## 2026-10-26: the Microsoft Store's scrolling cost a third of what it did - caches that never hit
+
+Measured on `:97` (`/tmp/store-perf.sh` in the session: 20 wheel clicks over Home, UI thread `utime+stime` from
+`/proc`, profile with `WINE_UWP_PROFILE_MS=5`). The UI thread spent **6.4 s** on that scroll (two runs: 637, 641
+ticks) and 2.1 s on the switch to Apps. `profsym.py` names our builtin dcomp frames after the nearest export, which
+is wrong; `/tmp/dcsym.py` re-symbolizes the profile's dcomp frames with `llvm-symbolizer` against the build's DWARF.
+Three things re-rendered every frame although nothing in them moved, because each was keyed on a counter that
+moves when *anything* changes:
+
+- a mask brush over a gradient rendered the gradient and recomposed itself whenever `gradient_generation` moved
+  (any gradient anywhere); it is keyed on the gradient's own `gradient_signature` now;
+- a `CompositionVisualSurface` (the side cards) was rasterized on every `scene_generation`; it keeps its last op
+  list and rasterizes only a walk that differs (`paint_op_equal`, the damage rule);
+- a mask brush over an effect graph (the Store's tiles) rendered the graph per pixel, then hashed it, on every
+  paint: 40% of the UI thread after the first two fixes. `effect_brush_signature` folds the graph's inputs (source
+  surfaces' generation and mapping, colours, flood colours, composite/blend modes, opacities with their live
+  values) and the graph renders only when that changes; `paint_effect_sprite` uses it too.
+
+After: **1.1 s** for the same scroll (113, 111), 1.1 s for Apps. Home scrolled and Apps are pixel-identical to the old
+build (AE 0). calc AE 3924.73, mp 236, as the control.

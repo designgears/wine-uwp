@@ -10754,6 +10754,8 @@ struct visual_surface
     struct drawing_surface *surface;
     LONG rendered_generation;
     BOOL rendered;
+    struct paint_op *last_ops;  /* the walk that made the surface's pixels: the same walk again makes the same pixels */
+    unsigned int last_count;
 };
 static void *visual_surface_vtbl[COMP_OBJECT_SLOTS];
 static struct visual_surface *impl_from_visual_surface( void *iface ) { return CONTAINING_RECORD( iface, struct visual_surface, vtbl ); }
@@ -10772,6 +10774,7 @@ static ULONG WINAPI visual_surface_Release( void *iface )
         if (impl->source) IUnknown_Release( impl->source );
         /* the painter may still hold the surface for this frame: it is a comp object of its own and refcounted */
         if (impl->surface) IUnknown_Release( (IUnknown *)&impl->surface->vtbl );
+        free( impl->last_ops );
         free( impl );
     }
     return ref;
@@ -10875,6 +10878,8 @@ static void visual_surface_render( struct visual_surface *impl )
     HBITMAP dib = NULL, old = NULL;
     HDC dc = NULL;
     void *out;
+    BOOL same;
+    unsigned int i;
 
     if (!dv && !pv) return;
     w = impl->size.X >= 0.5f ? (unsigned int)(impl->size.X + 0.5f) : pv ? (unsigned int)(pv->size.X + 0.5f) : (unsigned int)dv->width;
@@ -10938,10 +10943,29 @@ static void visual_surface_render( struct visual_surface *impl )
                               -(pv->offset.Y + pv->transform.M42) - impl->offset.Y, (float)w, (float)h, 1.0f, 1.0f );
     LeaveCriticalSection( &dcomp_visual_cs );
 
-    raster_transparent = TRUE;
-    raster_ops( dc, bits, w, &paint_lists[2], &area );
-    raster_transparent = saved_transparent;
-    GdiFlush();
+    /* Any change anywhere moves scene_generation, and the Microsoft Store's side cards were rasterized again on
+     * every frame of a scroll that never touched them. The same operations compose the same pixels (see
+     * paint_op_equal), so only a walk that differs from the last one is rasterized. */
+    same = impl->surface->cache_valid && impl->last_ops && impl->last_count == paint_lists[2].count;
+    for (i = 0; same && i < paint_lists[2].count; i++)
+        same = paint_op_equal( &impl->last_ops[i], &paint_lists[2].ops[i] );
+    if (same) TRACE_(dcompops)( "visual surface %p: unchanged, %u ops.\n", impl, paint_lists[2].count );
+    else
+    {
+        if (impl->last_count < paint_lists[2].count || !impl->last_ops)
+        {
+            struct paint_op *ops = realloc( impl->last_ops, max( paint_lists[2].count, 1 ) * sizeof(*ops) );
+            if (ops) impl->last_ops = ops;
+            else { free( impl->last_ops ); impl->last_ops = NULL; }
+        }
+        if (impl->last_ops) memcpy( impl->last_ops, paint_lists[2].ops, paint_lists[2].count * sizeof(*impl->last_ops) );
+        impl->last_count = impl->last_ops ? paint_lists[2].count : 0;
+
+        raster_transparent = TRUE;
+        raster_ops( dc, bits, w, &paint_lists[2], &area );
+        raster_transparent = saved_transparent;
+        GdiFlush();
+    }
     TRACE_(dcompops)( "visual surface %p: %s visual %p %ux%u at %g,%g, %u ops.\n", impl, dv ? "dcomp" : "public", impl->source,
                       w, h, impl->offset.X, impl->offset.Y, paint_lists[2].count );
 
@@ -10955,7 +10979,7 @@ static void visual_surface_render( struct visual_surface *impl )
     xaml_island_container = saved_island;
     paint_branch = saved_branch;
 
-    if (!impl->surface->cache_valid || memcmp( impl->surface->cache, bits, (size_t)w * h * 4 ))
+    if (!same && (!impl->surface->cache_valid || memcmp( impl->surface->cache, bits, (size_t)w * h * 4 )))
     {
         memcpy( impl->surface->cache, bits, (size_t)w * h * 4 );
         impl->surface->generation = InterlockedIncrement( &content_generation );
@@ -17933,6 +17957,7 @@ struct effect_brush
     unsigned int cache_w, cache_h;
     ULONGLONG cache_hash;
     ULONG cache_serial;
+    UINT64 cache_sig;           /* effect_brush_signature() of the inputs the cached pixels came from */
 };
 
 struct effect_factory
@@ -20158,6 +20183,120 @@ static BOOL brush_render_pixels( void *brush, unsigned int w, unsigned int h, fl
     }
     return TRUE;
 }
+/* Everything effect_node_render() and brush_render_pixels() read, folded into *sig, so a graph whose inputs did not
+ * change is not rendered again: the Microsoft Store's tiles are masks over effect graphs, and rendering each one
+ * per pixel on every frame was 40% of its UI thread while scrolling Home. */
+#define SIG_MIX(v) do { *sig ^= (UINT64)(v); *sig *= 0x100000001b3ull; } while (0)
+static void sig_mix_bytes( UINT64 *sig, const void *data, size_t size )
+{
+    const BYTE *p = data;
+    while (size--) SIG_MIX( *p++ );
+}
+static void brush_pixels_signature( void *brush, unsigned int w, unsigned int h, UINT64 *sig, int depth );
+static void effect_node_signature( struct effect_brush *eb, IUnknown *node, unsigned int w, unsigned int h, UINT64 *sig, int depth )
+{
+    IGraphicsEffectD2D1Interop_ *interop;
+    UINT count = 0, k, mode = 0;
+    GUID id;
+
+    SIG_MIX( (UINT_PTR)node );
+    if (!node || depth > 6) return;
+    if (*(void ***)node == (void **)esp_source_vtbl || *(void ***)node == (void **)esp_parameter_vtbl)
+    {
+        struct effect_source_parameter *param = *(void ***)node == (void **)esp_source_vtbl
+                ? effect_source_parameter_from_source( node ) : effect_source_parameter_from_parameter( node );
+        const WCHAR *name = WindowsGetStringRawBuffer( param->name, NULL );
+        for (k = 0; k < eb->source_count; k++)
+            if (!wcsicmp( WindowsGetStringRawBuffer( eb->source_names[k], NULL ), name ))
+            {
+                brush_pixels_signature( eb->sources[k], w, h, sig, depth + 1 );
+                return;
+            }
+        return;
+    }
+    if (is_own_object( node ))
+    {
+        brush_pixels_signature( node, w, h, sig, depth + 1 );
+        return;
+    }
+    if (FAILED( IUnknown_QueryInterface( node, &IID_IGraphicsEffectD2D1Interop_, (void **)&interop ) )) return;
+    interop->lpVtbl->GetEffectId( interop, &id );
+    interop->lpVtbl->GetSourceCount( interop, &count );
+    sig_mix_bytes( sig, &id, sizeof(id) );
+    SIG_MIX( count );
+    if (IsEqualGUID( &id, &CLSID_D2D1Flood_ ))
+    {
+        float c[4] = { 0 };
+        SIG_MIX( flood_color_of( node, c ) );
+        sig_mix_bytes( sig, c, sizeof(c) );
+    }
+    else if (IsEqualGUID( &id, &CLSID_D2D1Composite_ ) || IsEqualGUID( &id, &CLSID_D2D1Blend_ ) ||
+             IsEqualGUID( &id, &CLSID_D2D1Opacity_ ))
+    {
+        float opacity = 1.0f;
+        if (IsEqualGUID( &id, &CLSID_D2D1Opacity_ ))
+        {
+            effect_property_float( interop, 0, &opacity );
+            effect_live_scalar( eb, node, L"Opacity", &opacity );
+            sig_mix_bytes( sig, &opacity, sizeof(opacity) );
+            count = min( count, 1 );
+        }
+        else
+        {
+            effect_property_uint( interop, 0, &mode );
+            SIG_MIX( mode );
+        }
+        for (k = 0; k < count; k++)
+        {
+            IGraphicsEffectSource *source = NULL;
+            interop->lpVtbl->GetSource( interop, k, &source );
+            effect_node_signature( eb, (IUnknown *)source, w, h, sig, depth + 1 );
+            if (source) IGraphicsEffectSource_Release( source );
+        }
+    }
+    interop->lpVtbl->Release( interop );
+}
+static void brush_pixels_signature( void *brush, unsigned int w, unsigned int h, UINT64 *sig, int depth )
+{
+    struct effect_brush *eb = effect_brush_from_any( brush );
+    struct drawing_surface *surface;
+    D3D11_TEXTURE2D_DESC desc;
+    float m[6];
+    Color c;
+
+    SIG_MIX( (UINT_PTR)brush );
+    if (!brush) return;
+    if (eb)
+    {
+        if (eb->effect) effect_node_signature( eb, (IUnknown *)eb->effect, w, h, sig, depth );
+        return;
+    }
+    if (brush_solid_color( (ICompositionBrush *)brush, &c ))
+    {
+        sig_mix_bytes( sig, &c, sizeof(c) );
+        return;
+    }
+    if (!(surface = brush_surface( brush )) || !surface_cached_pixels( surface, &desc ))
+    {
+        SIG_MIX( 0x6e6f6e65 );
+        return;
+    }
+    SIG_MIX( (UINT_PTR)surface ); SIG_MIX( surface->generation ); SIG_MIX( desc.Width ); SIG_MIX( desc.Height );
+    SIG_MIX( desc.Format );
+    if (surface_brush_mapping( brush, w, h, desc.Width, desc.Height, m ))
+    {
+        sig_mix_bytes( sig, m, sizeof(m) );
+        if (*(void ***)brush == (void **)surface_brush_vtbl) SIG_MIX( surface_brush_from( brush )->interpolation );
+    }
+}
+static UINT64 effect_brush_signature( void *brush, unsigned int w, unsigned int h )
+{
+    UINT64 value = 0xcbf29ce484222325ull, *sig = &value;
+    SIG_MIX( w ); SIG_MIX( h ); SIG_MIX( effect_render_strict );
+    brush_pixels_signature( brush, w, h, sig, 0 );
+    return value;
+}
+#undef SIG_MIX
 /* an effect brush as premultiplied BGRA bytes (malloc'd), or NULL */
 static BYTE *effect_brush_render_bgra( void *brush, unsigned int w, unsigned int h )
 {
@@ -20188,8 +20327,16 @@ static BOOL paint_effect_sprite( HDC hdc, void *brush_iface, int x, int y, int w
     BYTE *bgra;
     void *bits;
 
+    UINT64 sig;
+
     if (!eb || !eb->effect || width <= 0 || height <= 0 || width > 4096 || height > 4096) return FALSE;
     effect_render_strict = TRUE;
+    sig = effect_brush_signature( brush_iface, width, height );
+    if (eb->cache_bmp && eb->cache_w == width && eb->cache_h == height && eb->cache_sig == sig)
+    {
+        effect_render_strict = FALSE;
+        return soft_blend( hdc, x, y, width, height, eb->cache_bits, width * 4, 255, eb, eb->cache_serial );
+    }
     bgra = effect_brush_render_bgra( brush_iface, width, height );
     effect_render_strict = FALSE;
     if (!bgra)
@@ -20217,6 +20364,7 @@ static BOOL paint_effect_sprite( HDC hdc, void *brush_iface, int x, int y, int w
         eb->cache_w = width;
         eb->cache_h = height;
         eb->cache_hash = hash;
+        eb->cache_sig = sig;
         eb->cache_serial = InterlockedIncrement( &content_generation );
         TRACE_(dcompops)( "effect sprite %dx%d at %d,%d rendered: %s.\n", width, height, x, y, debugstr_brush( brush_iface ) );
     }
@@ -21647,6 +21795,7 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
     ULONG layout = 0;
     struct gradient_brush *gradient = NULL;
     BYTE *gradient_bits = NULL;
+    BOOL effect_source = FALSE;
     struct effect_blend effect_blend = { 0 };
     BOOL have_blend = FALSE;
     HDC mem;
@@ -21696,28 +21845,24 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
     h = grid && height > 0 ? (unsigned int)height : mask_desc.Height;
     if (gradient)
     {
-        /* the gradient spans the brush area, which is the mask's */
-        if (!(gradient_bits = malloc( (size_t)w * h * 4 ))) return FALSE;
-        gradient_render( gradient, gradient_bits, w, h );
-        source = gradient_bits;
+        /* the gradient spans the brush area, which is the mask's; it is rendered below only when the cache is
+         * stale. Keyed on its own signature, not gradient_generation: that moves when any gradient anywhere changes,
+         * and the Microsoft Store's shaded tiles then rendered every gradient and recomposed every mask on each
+         * frame of a scroll. */
+        UINT64 sig = gradient_signature( gradient, w, h );
         source_desc.Width = w;
         source_desc.Height = h;
-        layout = gradient_generation;
+        layout = (ULONG)(sig ^ (sig >> 32)) | 1;
     }
     else if (!have_color && !source_surface)
     {
-        /* an effect graph (effect_node_render), over the mask's area too; its pixels stand for its layout */
-        ULONGLONG hash = 1469598103934665603ull;
-        if (!(gradient_bits = effect_brush_render_bgra( src, w, h )))
-        {
-            TRACE_(dcompops)( "mask brush %p: source %s not rendered.\n", brush, debugstr_brush( src ) );
-            return FALSE;
-        }
-        source = gradient_bits;
+        /* an effect graph (effect_node_render), over the mask's area too; the signature of its inputs stands for its
+         * layout, and it is rendered below only when the cache is stale */
+        UINT64 sig = effect_brush_signature( src, w, h );
+        effect_source = TRUE;
         source_desc.Width = w;
         source_desc.Height = h;
-        hash_bytes( &hash, gradient_bits, (size_t)w * h * 4 );
-        layout = (ULONG)(hash ^ (hash >> 32)) | 1;
+        layout = (ULONG)(sig ^ (sig >> 32)) | 1;
     }
     if (source_surface)
     {
@@ -21736,6 +21881,21 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
            brush->cache_have_color == have_color && (!have_color || !memcmp( &brush->cache_color, &color, sizeof(color) )) &&
            !memcmp( brush->cache_blend, effect_blend.flood, sizeof(brush->cache_blend) ) &&
            !memcmp( brush->cache_grid, grid_key, sizeof(grid_key) ) && brush->cache_source_layout == layout;
+    if (!same && gradient)
+    {
+        if (!(gradient_bits = malloc( (size_t)w * h * 4 ))) return FALSE;
+        gradient_render( gradient, gradient_bits, w, h );
+        source = gradient_bits;
+    }
+    if (!same && effect_source)
+    {
+        if (!(gradient_bits = effect_brush_render_bgra( src, w, h )))
+        {
+            TRACE_(dcompops)( "mask brush %p: source %s not rendered.\n", brush, debugstr_brush( src ) );
+            return FALSE;
+        }
+        source = gradient_bits;
+    }
     if (!same)
     {
         BITMAPINFO info = { { 0 } };
