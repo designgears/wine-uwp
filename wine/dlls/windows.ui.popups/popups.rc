@@ -1,0 +1,5 @@
+/* comctl32 6, for TaskDialogIndirect */
+#include "winuser.h"
+
+/* @makedep: windows.ui.popups.manifest */
+ISOLATIONAWARE_MANIFEST_RESOURCE_ID RT_MANIFEST windows.ui.popups.manifest

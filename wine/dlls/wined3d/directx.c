@@ -1072,6 +1072,10 @@ HRESULT CDECL wined3d_adapter_get_video_memory_info(const struct wined3d_adapter
     query_memory_info.PhysicalAdapterIndex = node_idx;
     query_memory_info.MemorySegmentGroup = (D3DKMT_MEMORY_SEGMENT_GROUP)group;
     status = D3DKMTQueryVideoMemoryInfo(&query_memory_info);
+    /* win32u answers success with everything zero when it finds no Vulkan device for the adapter. A zero budget is
+     * "out of video memory" to a caller: Gears of War 4's D3D12 renderer stopped presenting after its intro. */
+    if (status == STATUS_SUCCESS && !query_memory_info.Budget)
+        status = STATUS_NOT_SUPPORTED;
     if (status == STATUS_SUCCESS)
     {
         info->budget = query_memory_info.Budget;

@@ -2,4 +2,5 @@ MODULE  = windows.services.store.dll
 IMPORTS = combase
 
 SOURCES = \
+	extexec.c \
 	main.c

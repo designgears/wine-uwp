@@ -2693,10 +2693,16 @@ static HRESULT WINAPI expr_anim2_get_Target( void *iface, HSTRING *value )
     if (!value) return E_POINTER;
     *value = NULL;  /* a NULL HSTRING is the empty string */
     EnterCriticalSection( &expr_targets_cs );
-    /* a clone made before the Target was set reads its origin's: React Native sets Target after UIElement.StartAnimation
-     * has already asked for the animation's ICompositionAnimationBase, and XAML refuses an animation with no Target */
-    if ((t = expr_target_find( impl->owner, FALSE )) && !t->target[0] && t->origin)
-        t = expr_target_find( t->origin, FALSE );
+    /* a clone is the same animation as its origin and reads the origin's Target, live: React Native sets Target after
+     * UIElement.StartAnimation has already asked for the animation's ICompositionAnimationBase, and XAML refuses an
+     * animation with no Target. A copy taken at clone time also went stale when React Native re-targeted the origin
+     * and started it again: XAML compares the running animation's Target with the new one's, refused the mismatch with
+     * E_INVALIDARG, and React Native's noexcept caller aborted the Xbox app's UI thread */
+    if ((t = expr_target_find( impl->owner, FALSE )) && t->origin)
+    {
+        struct expr_anim_target *o = expr_target_find( t->origin, FALSE );
+        if (o && (o->target[0] || !t->target[0])) t = o;
+    }
     if (t && t->target[0])
         hr = WindowsCreateString( t->target, wcslen( t->target ), value );
     LeaveCriticalSection( &expr_targets_cs );
@@ -2711,7 +2717,15 @@ static HRESULT WINAPI expr_anim2_put_Target( void *iface, HSTRING value )
     struct expr_anim_target *t;
 
     EnterCriticalSection( &expr_targets_cs );
-    if ((t = expr_target_find( impl->owner, TRUE ))) lstrcpynW( t->target, str, ARRAY_SIZE(t->target) );
+    /* a clone's Target is its origin's (see get_Target); creating the origin's entry may move the table, so find the
+     * clone's again after it */
+    if ((t = expr_target_find( impl->owner, TRUE )) && t->origin)
+    {
+        struct expr_anim_target *o = expr_target_find( t->origin, TRUE );
+        if (o) lstrcpynW( o->target, str, ARRAY_SIZE(o->target) );
+        t = expr_target_find( impl->owner, FALSE );
+    }
+    if (t) lstrcpynW( t->target, str, ARRAY_SIZE(t->target) );
     LeaveCriticalSection( &expr_targets_cs );
     TRACE_(dcompanim)( "expression %p: Target %s\n", impl->owner, debugstr_w( str ) );
     return t ? S_OK : E_OUTOFMEMORY;

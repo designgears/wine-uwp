@@ -1,0 +1,6 @@
+MODULE  = windows.ui.popups.dll
+IMPORTS = combase user32 uuid
+
+SOURCES = \
+	main.c \
+	popups.rc

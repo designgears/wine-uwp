@@ -13565,3 +13565,43 @@ progress to the catalogue size, 73.4 GB, and the package is 133.6 GB (uncompress
 bytes). A UWP install's total is now the installer's own: 943 Mbps shown, of 133.6 GB
 (`docs/screenshots/xbox-gears-download-line-rate.png`). More read-ahead (24 blocks) did not help, and neither did
 WinHTTP's 8 KiB read buffer, though raising it to 256 KiB halved wineserver's CPU during the download; it is kept.
+
+## 2026-10-27: Gears of War 4 (UWP, D3D12) reaches its title screen
+
+Five refusals in a row, each found from the last line before the crash:
+
+- `StoreContext.GetAppLicenseAsync` was E_NOTIMPL; the game's licence task failed unobserved and
+  `_ExceptionHolder::ReportUnhandledError` broke into the debugger. It now returns a completed operation with an
+  active, non-trial licence and no add-ons (`dlls/windows.services.store`).
+- `ExtendedExecutionSession` had no registration. C++/CX threw on `ref new`, and throwing a `Platform::Exception`
+  needs vcruntime140_app's `__GetPlatformExceptionInfo`, a stub. Stand-in beside StoreContext: always Allowed, never
+  revoked (`extexec.c`). The stub itself is still a stub.
+- msvcp140_app stubbed `Concurrency::details::platform::GetNextAsyncId`, which msvcp140 implements: the two specs had
+  drifted by that one line.
+- Windows' `MessageDialog`/`UICommand` (Windows.UI.Immersive.dll) delay-load the shell's DirectUI (`DUI70.dll`) and
+  raised 0x505. New `dlls/windows.ui.popups`: a task dialog with the app's own button labels (comctl32 6 through a
+  manifest resource), the text also logged as ERR. The message was Gears' GW401 warning: it reads the NVIDIA driver
+  version as "Unknown" (the registry's `Control\Video` and `Control\Class` keys have 35.0.15.6094, so it asks
+  something else). A plain message box first mapped OK to the first command, "More Information".
+- `IDXGIFactory2::CreateSwapChainForCoreWindow` was an E_NOTIMPL stub, a `LowLevelFatalError` in D3D12Util.cpp. It
+  now takes the HWND from `ICoreWindowInterop` and goes through `CreateSwapChainForHwnd`, which already takes a D3D12
+  queue. The title screen then draws (`docs/screenshots/gears4-title-screen.png`).
+
+Unreal's own crash reports are empty `LocalState/Logs/UnrealAutoReportDump*.txt`; its log lines arrive through
+`OutputDebugString`, so `WINEDEBUG=warn+seh` is how to read them.
+
+Later the same day:
+
+- The Xbox app's UI-thread abort (10-27, twice): React Native's `UIElement.StartAnimation` threw in a `noexcept`
+  caller; the return address put it in C++/WinRT's E_INVALIDARG arm. XAML's
+  `FacadeAnimationHelper::StartSingleAnimation` refuses (resource 0x101e) an animation whose Target differs from the
+  one already running on that facade, and our ExpressionAnimation clones kept a copy of their origin's Target from
+  clone time. Clones now read and write the origin's Target. Not reproduced on demand, so unconfirmed.
+- Gears' stall after the intro: presents stop, every thread idle but the UI thread, which spins in Unreal's
+  "process game-thread tasks until a condition holds" loop (read from memory: the exe's code is encrypted on disk, so
+  static disassembly and whatfn.py show garbage). Ruled out: the GW401 dialog (its thread has exited and Continue was
+  returned), CoreWindow deactivation, the licence operation completing inline (a pool-thread completion stalls the
+  same), and a zero video memory budget (fixed, `wined3d`, but the stall remains). Next: the condition functor
+  (`r8` of fn 0x144d6a7e0) and what it waits for.
+- `git checkout FILE` in the Wine tree to drop one experiment threw away the whole uncommitted licence work in that
+  file. Commit finished work before experimenting on top of it.

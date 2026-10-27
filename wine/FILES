@@ -481,3 +481,9 @@ dlls/xmllite/reader.c
 dlls/webview2host/Makefile.in
 dlls/webview2host/main.c
 dlls/webview2host/webview2host.spec
+dlls/windows.services.store/extexec.c
+dlls/windows.ui.popups/Makefile.in
+dlls/windows.ui.popups/main.c
+dlls/windows.ui.popups/popups.rc
+dlls/windows.ui.popups/windows.ui.popups.manifest
+dlls/windows.ui.popups/windows.ui.popups.spec

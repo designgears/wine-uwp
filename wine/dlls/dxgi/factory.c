@@ -325,14 +325,40 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForHwnd(IWineDXGIFa
     return DXGI_ERROR_UNSUPPORTED;
 }
 
+/* ICoreWindowInterop {45d64a29-a63e-4cb6-b498-5781d298cb4f}: get_WindowHandle is slot 3 */
+static const GUID IID_ICoreWindowInterop_ = {0x45d64a29, 0xa63e, 0x4cb6, {0xb4, 0x98, 0x57, 0x81, 0xd2, 0x98, 0xcb, 0x4f}};
+
+/* A CoreWindow is an HWND underneath, and its swap chain is that window's: Gears of War 4 (D3D12) creates its only
+ * swap chain here, and the E_NOTIMPL this used to return was a LowLevelFatalError at start-up. */
 static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForCoreWindow(IWineDXGIFactory *iface,
         IUnknown *device, IUnknown *window, const DXGI_SWAP_CHAIN_DESC1 *desc,
         IDXGIOutput *output, IDXGISwapChain1 **swapchain)
 {
-    FIXME("iface %p, device %p, window %p, desc %p, output %p, swapchain %p stub!\n",
+    HRESULT (STDMETHODCALLTYPE *get_window_handle)(IUnknown *, HWND *);
+    IUnknown *interop;
+    HWND hwnd = NULL;
+    HRESULT hr;
+
+    TRACE("iface %p, device %p, window %p, desc %p, output %p, swapchain %p.\n",
             iface, device, window, desc, output, swapchain);
 
-    return E_NOTIMPL;
+    if (!device || !window || !desc || !swapchain)
+        return DXGI_ERROR_INVALID_CALL;
+    if (FAILED(hr = IUnknown_QueryInterface(window, &IID_ICoreWindowInterop_, (void **)&interop)))
+    {
+        WARN("Window %p is not a CoreWindow, hr %#lx.\n", window, hr);
+        return DXGI_ERROR_INVALID_CALL;
+    }
+    get_window_handle = (*(void ***)interop)[3];
+    hr = get_window_handle(interop, &hwnd);
+    IUnknown_Release(interop);
+    if (FAILED(hr) || !hwnd)
+    {
+        WARN("No window handle for CoreWindow %p, hr %#lx.\n", window, hr);
+        return FAILED(hr) ? hr : DXGI_ERROR_INVALID_CALL;
+    }
+    TRACE("CoreWindow %p is window %p.\n", window, hwnd);
+    return IWineDXGIFactory_CreateSwapChainForHwnd(iface, device, hwnd, desc, NULL, output, swapchain);
 }
 
 static HRESULT STDMETHODCALLTYPE dxgi_factory_GetSharedResourceAdapterLuid(IWineDXGIFactory *iface,

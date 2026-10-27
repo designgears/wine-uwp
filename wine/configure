@@ -1626,6 +1626,7 @@ enable_windows_system_profile_systemmanufacturers
 enable_windows_system_user
 enable_windows_ui_core_textinput
 enable_windows_ui_notifications
+enable_windows_ui_popups
 enable_windows_ui_shell_taskbarmanager
 enable_windows_ui_xaml
 enable_windows_ui
@@ -22815,6 +22816,7 @@ wine_fn_config_makefile dlls/windows.system.user enable_windows_system_user
 wine_fn_config_makefile dlls/windows.ui.core.textinput enable_windows_ui_core_textinput
 wine_fn_config_makefile dlls/windows.ui.core.textinput/tests enable_tests
 wine_fn_config_makefile dlls/windows.ui.notifications enable_windows_ui_notifications
+wine_fn_config_makefile dlls/windows.ui.popups enable_windows_ui_popups
 wine_fn_config_makefile dlls/windows.ui.shell.taskbarmanager enable_windows_ui_shell_taskbarmanager
 wine_fn_config_makefile dlls/windows.ui.xaml enable_windows_ui_xaml
 wine_fn_config_makefile dlls/windows.ui.xaml/tests enable_tests

@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     27acdc2eb90c311f4a725efea8b6aed9478a1d00
-                 winhttp: Read the socket in 256 KiB pieces, not 8 KiB.
+  wine HEAD:     87fcbc354fa699c7f6e26fc689d9fdc13d98eb98
+                 Gears of War 4 (UWP, D3D12) starts and reaches its title screen.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-10-27T11:52:00Z
+  captured:      2026-10-27T13:11:54Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

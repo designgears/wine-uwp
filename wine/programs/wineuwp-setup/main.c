@@ -1621,7 +1621,13 @@ static void register_wine_classes(void)
     if (in_sys32( L"windows.ui.notifications.dll" ))
         set_class_dll( L"Windows.UI.Notifications.ToastNotificationManager", L"windows.ui.notifications.dll" );
     if (in_sys32( L"windows.services.store.dll" ))
+    {
         set_class( L"Windows.Services.Store.StoreContext", L"windows.services.store.dll", 1 );
+        set_class( L"Windows.ApplicationModel.ExtendedExecution.ExtendedExecutionSession", L"windows.services.store.dll", 1 );
+    }
+    /* Windows' Windows.UI.Immersive.dll needs the shell's DirectUI: a game's error dialog crashed instead of showing */
+    set_class( L"Windows.UI.Popups.MessageDialog", L"windows.ui.popups.dll", 1 );
+    set_class( L"Windows.UI.Popups.UICommand", L"windows.ui.popups.dll", 1 );
 
     /* Gaming Services: the client classes replace the package's own DLL (OverridesPackage), whose NT services
      * cannot run under Wine */
@@ -1714,6 +1720,16 @@ static void refresh_wine_modules(void)
     {
         copy_file( from, to );
         printf( "refreshed: appxinstall.dll in the prefix\n" );
+    }
+    free( from );
+    free( to );
+    /* a module newer than the prefix is not there until its next update, and its classes are registered now */
+    from = wine_pe( L"windows.ui.popups" );
+    to = strfw( L"%s\\windows.ui.popups.dll", sys32 );
+    if (exists( from ) && !same_file( from, to ))
+    {
+        copy_file( from, to );
+        printf( "refreshed: windows.ui.popups.dll in the prefix\n" );
     }
     free( from );
     free( to );
@@ -1884,7 +1900,12 @@ static void collect_checked_classes( BOOL write )
     if (in_sys32( L"windows.ui.shell.taskbarmanager.dll" ))
         check_class( L"Windows.UI.Shell.TaskbarManager", L"windows.ui.shell.taskbarmanager.dll", 1 );
     if (in_sys32( L"windows.services.store.dll" ))
+    {
         check_class( L"Windows.Services.Store.StoreContext", L"windows.services.store.dll", 1 );
+        check_class( L"Windows.ApplicationModel.ExtendedExecution.ExtendedExecutionSession", L"windows.services.store.dll", 1 );
+    }
+    check_class( L"Windows.UI.Popups.MessageDialog", L"windows.ui.popups.dll", 1 );
+    check_class( L"Windows.UI.Popups.UICommand", L"windows.ui.popups.dll", 1 );
     if (in_sys32( L"winexboxauth.dll" ))
     {
         check_class( L"Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager", L"winexboxauth.dll", 1 );
