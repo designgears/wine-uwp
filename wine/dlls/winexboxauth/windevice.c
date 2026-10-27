@@ -1124,6 +1124,18 @@ HRESULT windev_device_ticket( char **ticket )
     return hr;
 }
 
+/* a compact device ticket for another service (Xbox Live: "user.auth.xboxlive.com", "mbi_ssl") */
+HRESULT windev_service_ticket( const char *scope, const char *policy, char **ticket )
+{
+    HRESULT hr;
+
+    if (FAILED(hr = windev_ready())) return hr;
+    EnterCriticalSection( &windev_cs );
+    hr = windev_exchange( "{d6d5a677-0872-4ab0-9442-bb792fce85c5}", scope, policy, ticket );
+    LeaveCriticalSection( &windev_cs );
+    return hr;
+}
+
 /* ---- licensing.mp.microsoft.com: the content keys of a package this account is entitled to ---- */
 
 HRESULT content_keys( const char *content_id, const char *market, struct content_key **keys, unsigned *count,

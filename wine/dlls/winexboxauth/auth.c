@@ -675,6 +675,77 @@ HRESULT xbl_user_authenticate( const char *msa_token, char **user_token, ULONGLO
 /* xsts.auth.xboxlive.com: user token -> XSTS token for one relying party. XalAuthenticator::get_xsts_token: the device
  * token (and the title token, when SISU gave one) bind the XSTS token to our proof key, which is what makes signed
  * requests acceptable. *answer gets the whole reply (DisplayClaims.xui[0] has the claims). */
+/* An Xbox Live device token for this prefix's Windows device: device/authenticate with the device's own Microsoft
+ * account ticket (RPS), as Windows sends it. Title storage refuses writes from XSTS tokens of any other device type
+ * ("Access is denied due to platform restriction policies", 403 code 2016), and so presumably do other PC-only title
+ * services; the Xbox app's client has to stay on Android for SISU. Kept for the process. */
+static CRITICAL_SECTION windows_device_cs;
+static CRITICAL_SECTION_DEBUG windows_device_cs_debug =
+{
+    0, 0, &windows_device_cs,
+    { &windows_device_cs_debug.ProcessLocksList, &windows_device_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": windows_device_cs") }
+};
+static CRITICAL_SECTION windows_device_cs = { &windows_device_cs_debug, -1, 0, 0, 0, 0 };
+
+static HRESULT windows_device_token( char **token )
+{
+    static char *cached;
+    static ULONGLONG cached_expires;
+    const char *url = "https://device.auth.xboxlive.com/device/authenticate";
+    char *ticket = NULL, *e, *key, *body;
+    struct buf h = {0}, resp = {0};
+    struct json *j;
+    DWORD status;
+    HRESULT hr;
+
+    *token = NULL;
+    EnterCriticalSection( &windows_device_cs );
+    if (cached && cached_expires > now_s() + 3600)
+    {
+        *token = str_dup( cached );
+        LeaveCriticalSection( &windows_device_cs );
+        return S_OK;
+    }
+    if (FAILED(hr = windev_service_ticket( "user.auth.xboxlive.com", "mbi_ssl", &ticket )))
+    {
+        LeaveCriticalSection( &windows_device_cs );
+        WARN( "no Windows device ticket for Xbox Live (%#lx)\n", hr );
+        return hr;
+    }
+    e = json_escape( ticket );
+    str_wipe_free( ticket );
+    key = proof_key_json();
+    body = strf( "{\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\",\"Properties\":{\"AuthMethod\":"
+                 "\"RPS\",\"SiteName\":\"user.auth.xboxlive.com\",\"RpsTicket\":\"%s\",\"ProofKey\":%s}}", e, key );
+    str_wipe_free( e );
+    free( key );
+    signed_headers( &h, url, body, TRUE );
+    status = http_request( L"POST", url, buf_str( &h ), body, strlen( body ), &resp );
+    str_wipe_free( body );
+    buf_free( &h );
+    j = parse_buf( &resp );
+    if (status != 200 || !*jget( j, "Token" ))
+    {
+        log_xbl_error( "device/authenticate (Windows)", status, &resp );
+        hr = status ? XA_E_XBL : XA_E_NETWORK;
+    }
+    else
+    {
+        str_set( &cached, jget( j, "Token" ) );
+        cached_expires = parse_iso( jget( j, "NotAfter" ) );
+        if (!cached_expires) cached_expires = now_s() + 86400;
+        *token = str_dup( cached );
+        TRACE( "Xbox Live device token for the Windows device received (valid %I64u h)\n",
+               (cached_expires - now_s()) / 3600 );
+        hr = S_OK;
+    }
+    LeaveCriticalSection( &windows_device_cs );
+    json_free( j );
+    buf_free( &resp );
+    return hr;
+}
+
 HRESULT xbl_xsts( const char *user_token, const char *rp, char **token, ULONGLONG *expires, struct json **answer,
                   BOOL with_title )
 {
@@ -686,8 +757,12 @@ HRESULT xbl_xsts( const char *user_token, const char *rp, char **token, ULONGLON
 
     *token = NULL;
     if (answer) *answer = NULL;
-    if (FAILED(xbl_device_token( &device_token, FALSE, NULL ))) str_set( &device_token, "" );
-    if (with_title)
+    if (with_title == XSTS_WINDOWS_DEVICE)
+    {
+        if (FAILED(windows_device_token( &device_token ))) str_set( &device_token, "" );
+    }
+    else if (FAILED(xbl_device_token( &device_token, FALSE, NULL ))) str_set( &device_token, "" );
+    if (with_title == TRUE)
     {
         EnterCriticalSection( &account.cs );
         if (account.title_expires > now_s() + 60) title_token = str_dup( account.title_token );
@@ -1761,7 +1836,8 @@ HRESULT get_token_for_url( const char *url, BOOL force, char **header, BOOL with
         free( shown );
         return S_OK;
     }
-    key = with_title ? str_dup( rp ) : strf( "%s (no title)", rp );
+    key = with_title == XSTS_WINDOWS_DEVICE ? strf( "%s (Windows device)", rp )
+                                            : with_title ? str_dup( rp ) : strf( "%s (no title)", rp );
     EnterCriticalSection( &account.cs );
     signed_in = account.signed_in;
     uhs = str_dup( account.uhs );

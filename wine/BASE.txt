@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     42c321ba3a0da5e2c0681d9ff5191dd43ac9d941
-                 winexboxauth: Local game saves, XboxLiveDeviceAddress and a title storage client; vcruntime140_app: Implement __GetPlatformExceptionInfo.
+  wine HEAD:     5910ef8b745f8ad1aa326bbe3672f74264a8b520
+                 winexboxauth: Sync UWP titles' connected storage with Xbox Live title storage.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-10-27T14:33:15Z
+  captured:      2026-10-27T14:58:59Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

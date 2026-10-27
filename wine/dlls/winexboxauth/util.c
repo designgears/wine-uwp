@@ -383,7 +383,8 @@ DWORD http_request( const WCHAR *method, const char *url, const char *headers, c
         }
         buf_addn( response, chunk, read );
         free( chunk );
-        if (response->n > (16u << 20)) break;
+        /* a title storage blob may be as large as its 256 MiB quota */
+        if (response->n > (320u << 20)) break;
     }
 done:
     if (!status)

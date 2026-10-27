@@ -1049,7 +1049,7 @@ static struct request_result *xsts_token_result( struct token_work *w )
         TRACE( "  Xbox Live: not signed in (%#lx)\n", hr );
         return request_result_create( w->ui ? WTRS_USER_CANCEL : WTRS_USER_INTERACTION_REQUIRED, w->scope );
     }
-    if (FAILED(hr = get_token_for_url( url, w->force, &header, TRUE )) || !header)
+    if (FAILED(hr = get_token_for_url( url, w->force, &header, XSTS_WINDOWS_DEVICE )) || !header)
     {
         TRACE( "  Xbox Live: no token for %s (%#lx)\n", debugstr_an(url, strcspn( url, "?" )), hr );
         if (!(result = request_result_create( WTRS_PROVIDER_ERROR, w->scope ))) return NULL;

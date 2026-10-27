@@ -207,6 +207,9 @@ HRESULT sign_in_with_device_code_client( const char *client_id, volatile LONG *c
 HRESULT sign_in_with_device_code( volatile LONG *cancelled );
 void sign_out( void );
 void open_browser( const char *url );
+/* with_title: FALSE, TRUE (the title token when there is one), or XSTS_WINDOWS_DEVICE: no title token, and the
+ * device is this prefix's Windows device (windevice.c) rather than the Xbox app's Android one */
+#define XSTS_WINDOWS_DEVICE 2
 HRESULT get_token_for_url( const char *url, BOOL force, char **header, BOOL with_title );
 char *stored_msa_account( void );
 char *refresh_store_key( const char *client_id );
@@ -231,6 +234,7 @@ struct content_key
 
 HRESULT windev_ready( void );
 HRESULT windev_device_ticket( char **ticket );
+HRESULT windev_service_ticket( const char *scope, const char *policy, char **ticket );
 HRESULT content_keys( const char *content_id, const char *market, struct content_key **keys, unsigned *count,
                       char **package_full_name );
 
@@ -361,6 +365,21 @@ IInspectable *buffer_create( BYTE *bytes, UINT32 size );
 
 DWORD xbl_call( const char *method, const char *url, const char *extra, const void *body, size_t len,
                 struct buf *resp );
+
+/* gamesave.c's files: names hex-encoded, writes atomic */
+WCHAR *hex_name( const char *name );
+char *unhex_name( const WCHAR *hex );
+WCHAR *path_join( const WCHAR *a, const WCHAR *b );
+void make_dirs( const WCHAR *path );
+BOOL read_file( const WCHAR *path, BYTE **data, DWORD *size );
+BOOL write_file( const WCHAR *path, const void *data, DWORD size );
+
+/* cloudsave.c: connected storage synced with Xbox Live title storage */
+char *cloud_base( const char *scid, const char *xuid );
+void cloud_sync( const char *base, const WCHAR *dir );
+void cloud_blob_written( const WCHAR *container_dir, const char *blob );
+void cloud_container_changed( const char *base, const WCHAR *dir, const char *container );
+void cloud_container_deleted( const char *base, const char *container );
 HRESULT make_memory_stream( const void *bytes, size_t len, IInspectable **out );
 
 #endif /* __WINE_WINEXBOXAUTH_PRIVATE_H */

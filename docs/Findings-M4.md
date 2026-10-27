@@ -13673,3 +13673,36 @@ service). "Unable to connect to the Gears of War services" and the Store-user no
   token bound to its own title through WAM and its package identity, and we have no equivalent yet. "Unable to connect
   to the Gears of War services" is probably the same cause. `cloudsave.c` has the signed request helper, and
   `probe-xboxauth.exe call "METHOD URL"` (body in `XBL_BODY`, headers in `XBL_EXTRA`) drives it.
+
+## 2026-10-27: Cloud saves for UWP titles: the Windows device, not the title
+
+- **The 403 code 2016 ("platform restriction policies") on every title storage write was the device type.** Our XSTS
+  tokens carried the Android device the Xbox app's MSA client needs for SISU. An XSTS token for the same user with a
+  **Windows** device token is allowed to write. No title binding is needed: the lock, uploads and container writes all
+  succeed with the Xbox app's user token plus the Windows device.
+- **Windows' device token** is `device/authenticate` with `AuthMethod: RPS`, `SiteName: user.auth.xboxlive.com`, the
+  device's own MSA ticket for `user.auth.xboxlive.com`/`mbi_ssl` (RST2 with our Windows device identity,
+  `windevice.c`, `windev_service_ticket`) **with no `t=` prefix** (with it: 403), and our ProofKey. Without a ProofKey:
+  400. `auth.c` `windows_device_token`; `get_token_for_url(..., XSTS_WINDOWS_DEVICE)` mints XSTS with it, without a
+  title token (a title token minted for another device is refused), cached under its own key. UWP XSAPI's
+  `WebAuthenticationCoreManager` provider and title storage use it. The Xbox app stays on Android.
+- **Dead end first, for the record:** a Store app's package SID (`ms-app://S-1-15-2-...`, derived from the package
+  family name) is a real MSA client. Device code refuses it ("not supported for this feature"). The authorize endpoint
+  accepts `XboxLive.signin` with redirect `ms-app://<sid>/`, and a browser sign-in returns a refresh token. But SISU
+  answers 401 for it, and `title/authenticate` answers 403 with `d=`/`t=` and any device type (400 with the Windows
+  device). Not needed in the end.
+- **Title storage protocol, as measured** (beyond xodus' `docs/xbox/titlestorage.md`):
+  - every request needs `x-xbl-pfn`, or it is 403;
+  - `PUT`/`DELETE` of containers needs the lock held, or it is 409;
+  - the container body is `{"atoms":[{"atom":"<GUID>","name":"<blob>"}]}`, an array;
+  - `POST /atoms/<GUID>` `{"size":n}` answers an Azure SAS `blobUri` (`sp=w`); blocks go there as
+    `&comp=block&blockid=<b64>` with `x-ms-version: 2015-04-05` (201), then `POST /atoms/<GUID>?commit=true`
+    `{"blockIds":[...],"size":n}` (201);
+  - the index entry carries an `etag`, which the sync compares;
+  - `GET /<atom>,binary` returns the bytes.
+- **The sync** (`cloudsave.c`): GetForUserAsync takes the lock, reads the index and downloads containers whose etag
+  changed (local changes win). It uploads local containers that are new or dirty, and removes synced ones the cloud no
+  longer has. Each submit uploads in the background (only blobs written since the last sync get new atoms), and a
+  container delete is sent too. State per container is in `.sync`, `.changed` and `.dirty`. It was verified end to end
+  with `probe-xboxauth.exe cloudsync "SCID DIR"`: upload, download into an empty directory, and remote deletion, on
+  Gears' SCID. The test container was deleted afterwards.

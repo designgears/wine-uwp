@@ -21,7 +21,7 @@
 /*
  * On Windows a UWP title's saves go through the connected storage service, which syncs them with Xbox Live title
  * storage; Windows' Windows.Gaming.XboxLive.Storage.dll cannot be activated without it (Gears of War 4: "Failed to
- * create game", 0x80040154). This keeps them on disk instead, with no cloud sync:
+ * create game", 0x80040154). This keeps them on disk, synced with title storage by cloudsave.c:
  *
  *   %LOCALAPPDATA%\wineuwp\gamesave\<service config id>\<xuid>\<container>\<blob>
  *
@@ -94,7 +94,7 @@ static const GUID IID_IBufferByteAccess_ = {0x905a0fef,0xbc53,0x11df,{0x8c,0x49,
 
 /* ---- names and paths ---- */
 
-static WCHAR *hex_name( const char *name )
+WCHAR *hex_name( const char *name )
 {
     size_t i, n = strlen( name );
     WCHAR *ret = malloc( (2 * n + 1) * sizeof(WCHAR) );
@@ -104,7 +104,7 @@ static WCHAR *hex_name( const char *name )
     return ret;
 }
 
-static char *unhex_name( const WCHAR *hex )
+char *unhex_name( const WCHAR *hex )
 {
     size_t i, n = wcslen( hex );
     char *ret;
@@ -121,14 +121,14 @@ static char *unhex_name( const WCHAR *hex )
     return ret;
 }
 
-static WCHAR *path_join( const WCHAR *a, const WCHAR *b )
+WCHAR *path_join( const WCHAR *a, const WCHAR *b )
 {
     WCHAR *ret = malloc( (wcslen( a ) + wcslen( b ) + 2) * sizeof(WCHAR) );
     if (ret) swprintf( ret, wcslen( a ) + wcslen( b ) + 2, L"%s\\%s", a, b );
     return ret;
 }
 
-static void make_dirs( const WCHAR *path )
+void make_dirs( const WCHAR *path )
 {
     WCHAR *p = wcsdup( path ), *s;
     if (!p) return;
@@ -143,7 +143,7 @@ static void make_dirs( const WCHAR *path )
     free( p );
 }
 
-static BOOL read_file( const WCHAR *path, BYTE **data, DWORD *size )
+BOOL read_file( const WCHAR *path, BYTE **data, DWORD *size )
 {
     HANDLE f = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
     DWORD got = 0;
@@ -163,7 +163,7 @@ static BOOL read_file( const WCHAR *path, BYTE **data, DWORD *size )
     return ok;
 }
 
-static BOOL write_file( const WCHAR *path, const void *data, DWORD size )
+BOOL write_file( const WCHAR *path, const void *data, DWORD size )
 {
     WCHAR *tmp = malloc( (wcslen( path ) + 5) * sizeof(WCHAR) );
     HANDLE f;
@@ -573,6 +573,7 @@ struct provider
     struct object obj;
     IInspectable *user;
     WCHAR *dir;                 /* ...\gamesave\<scid>\<xuid> */
+    char *cloud;                /* its title storage URL, NULL when not signed in */
 };
 
 static struct provider *provider_from( void *iface ) { return CONTAINING_RECORD( OBJ_AT(iface, 0), struct provider, obj ); }
@@ -582,6 +583,7 @@ static void provider_destroy( struct object *obj )
     struct provider *p = CONTAINING_RECORD( obj, struct provider, obj );
     if (p->user) IInspectable_Release( p->user );
     free( p->dir );
+    free( p->cloud );
 }
 
 struct container
@@ -664,7 +666,11 @@ static HRESULT submit_write( const char *name, IInspectable *value, void *ctx )
     if ((path = blob_path( s->c, name )))
     {
         if (!write_file( path, bytes ? bytes : (BYTE *)"", bytes ? length : 0 )) s->status = GS_OUT_OF_LOCAL_STORAGE;
-        else s->written++;
+        else
+        {
+            cloud_blob_written( s->c->dir, name );
+            s->written++;
+        }
         free( path );
     }
     if (buffer) IInspectable_Release( buffer );
@@ -675,7 +681,11 @@ static HRESULT submit_delete( const char *name, void *ctx )
 {
     struct submit *s = ctx;
     WCHAR *path = blob_path( s->c, name );
-    if (path && DeleteFileW( path )) s->deleted++;
+    if (path && DeleteFileW( path ))
+    {
+        cloud_blob_written( s->c->dir, name );
+        s->deleted++;
+    }
     free( path );
     return S_OK;
 }
@@ -703,6 +713,7 @@ static HRESULT submit_updates( struct container *c, IInspectable *writes, const 
     }
     TRACE( "GameSaveContainer(%s).%s: %u written, %u deleted, display name %s\n", debugstr_a(c->name), name, s.written,
            s.deleted, debugstr_a(shown) );
+    if (!s.status) cloud_container_changed( c->provider->cloud, c->dir, c->name );
     free( shown );
     return complete_operation( name, s.status, out );
 }
@@ -1074,6 +1085,7 @@ static HRESULT WINAPI provider_DeleteContainerAsync( void *iface, HSTRING name, 
     }
     if (!dir || !RemoveDirectoryW( dir )) status = GS_INVALID_CONTAINER_NAME;
     TRACE( "GameSaveProvider.DeleteContainerAsync(%s)\n", debugstr_a(n) );
+    if (!status) cloud_container_deleted( p->cloud, n );
     free( pattern );
     free( dir );
     free( n );
@@ -1163,6 +1175,8 @@ static HRESULT get_for_user( IInspectable *user, HSTRING scid, const char *name,
         swprintf( sub, n, L"%s\\%S\\%S", base, S(id), *S(xid) ? xid : "offline" );
         make_dirs( sub );
         p->dir = sub;
+        /* down before the title reads anything; uploads of what is newer here */
+        if ((p->cloud = cloud_base( id, xid ))) cloud_sync( p->cloud, p->dir );
     }
     TRACE( "GameSaveProvider.%s(scid %s) -> %s\n", name, debugstr_a(id), debugstr_w(p->dir) );
     free( id );

@@ -562,6 +562,26 @@ int WINAPI XboxAuthSelfTest( const char *what, const char *arg )
         buf_free( &resp );
         return status / 100 == 2 ? 0 : 1;
     }
+    if (!strcmp( what, "cloudsync" ) && arg)
+    {
+        /* "SCID DIR": syncs DIR (a gamesave.c user directory) with title storage */
+        const char *sp = strchr( arg, ' ' );
+        char *scid = sp ? str_dupn( arg, sp - arg ) : NULL, *xuid, *base;
+        WCHAR *dir;
+
+        if (!scid) return 2;
+        sign_in_silently();
+        xuid = account_field( &account.xid );
+        base = cloud_base( scid, xuid );
+        dir = widen( sp + 1 );
+        printf( "syncing %s\n", base ? "with title storage" : "(not signed in)" );
+        cloud_sync( base, dir );
+        free( dir );
+        free( base );
+        free( xuid );
+        free( scid );
+        return 0;
+    }
     if (!strcmp( what, "get" ) && arg)
     {
         unsigned char *body = NULL;
