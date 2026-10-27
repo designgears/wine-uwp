@@ -1554,6 +1554,7 @@ enable_vcomp140
 enable_vcomp90
 enable_vcruntime140
 enable_vcruntime140_1
+enable_vcruntime140_app
 enable_vdhcp_vxd
 enable_vdmdbg
 enable_ver
@@ -22709,6 +22710,7 @@ wine_fn_config_makefile dlls/vcomp140 enable_vcomp140
 wine_fn_config_makefile dlls/vcomp90 enable_vcomp90
 wine_fn_config_makefile dlls/vcruntime140 enable_vcruntime140
 wine_fn_config_makefile dlls/vcruntime140_1 enable_vcruntime140_1
+wine_fn_config_makefile dlls/vcruntime140_app enable_vcruntime140_app
 wine_fn_config_makefile dlls/vdhcp.vxd enable_vdhcp_vxd
 wine_fn_config_makefile dlls/vdmdbg enable_vdmdbg
 wine_fn_config_makefile dlls/ver.dll16 enable_ver

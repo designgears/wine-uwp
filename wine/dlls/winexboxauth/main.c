@@ -36,6 +36,10 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
         *factory = web_auth_manager_factory();
     else if (!wcscmp( name, L"Windows.ApplicationModel.Store.Preview.StoreConfiguration" ))
         *factory = store_configuration_factory();
+    else if (!wcscmp( name, L"Windows.Gaming.XboxLive.Storage.GameSaveProvider" ))
+        *factory = game_save_provider_factory();
+    else if (!wcscmp( name, L"Windows.Networking.XboxLive.XboxLiveDeviceAddress" ))
+        *factory = device_address_factory();
     else
     {
         TRACE( "%s: no stand-in\n", debugstr_w(name) );
@@ -542,6 +546,21 @@ int WINAPI XboxAuthSelfTest( const char *what, const char *arg )
             str_wipe_free( h );
         }
         return SUCCEEDED(hr) ? 0 : 1;
+    }
+    if (!strcmp( what, "call" ) && arg)
+    {
+        /* "METHOD URL", body from XBL_BODY, extra headers from XBL_EXTRA ("A: b|C: d") */
+        const char *sp = strchr( arg, ' ' ), *body = getenv( "XBL_BODY" );
+        char *method = sp ? str_dupn( arg, sp - arg ) : NULL;
+        struct buf resp = {0};
+        DWORD status;
+
+        if (!method) return 2;
+        status = xbl_call( method, sp + 1, getenv( "XBL_EXTRA" ), body, body ? strlen( body ) : 0, &resp );
+        printf( "%s -> HTTP %lu, %u bytes\n%.2000s\n", method, status, (unsigned)resp.n, resp.p ? resp.p : "" );
+        free( method );
+        buf_free( &resp );
+        return status / 100 == 2 ? 0 : 1;
     }
     if (!strcmp( what, "get" ) && arg)
     {

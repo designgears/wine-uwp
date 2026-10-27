@@ -23,7 +23,7 @@
 @ cdecl __CxxUnregisterExceptionObject(ptr long) ucrtbase.__CxxUnregisterExceptionObject
 @ cdecl __DestructExceptionObject(ptr) ucrtbase.__DestructExceptionObject
 @ stub __FrameUnwindFilter
-@ stub __GetPlatformExceptionInfo
+@ cdecl __GetPlatformExceptionInfo(ptr)
 @ stub __NLG_Dispatch2
 @ stub __NLG_Return2
 @ cdecl __RTCastToVoid(ptr) ucrtbase.__RTCastToVoid

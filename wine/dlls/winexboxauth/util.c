@@ -830,6 +830,7 @@ static HRESULT WINAPI async_GetResults( void *iface, void *result )
         *(INT32 *)result = op->i4;
         break;
     case R_TRANSFER:
+    case R_I8:
         if (!result) return E_POINTER;
         ((INT32 *)result)[0] = op->i4;
         ((INT32 *)result)[1] = op->i4b;

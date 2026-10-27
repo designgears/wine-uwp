@@ -3,6 +3,9 @@ IMPORTS   = uuid combase winhttp bcrypt crypt32 advapi32 shell32 ole32
 
 SOURCES = \
 	auth.c \
+	cloudsave.c \
+	deviceaddr.c \
+	gamesave.c \
 	identity.c \
 	main.c \
 	storeconfig.c \

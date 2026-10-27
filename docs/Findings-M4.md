@@ -13650,3 +13650,26 @@ the user, main menu with the gamertag). Some requests have a Url with no host (`
 default xboxlive.com token. Still open: leaving Options shows "unknown error 0x00000c32": the save goes through
 `Windows.Gaming.XboxLive.Storage.GameSaveProvider`, whose Windows DLL cannot be activated here (no connected-storage
 service). "Unable to connect to the Gears of War services" and the Store-user notice are also open.
+
+## 2026-10-27: Gears of War 4 starts its campaign; cloud saves blocked on the title token
+
+- **Crash after sign-in**: Gears' C++/CX code throws when `PushNotificationChannelManager` fails, and the throw goes
+  through `vcruntime140_app!__GetPlatformExceptionInfo`. Our build tree only had a stale 10-12 `vcruntime140_app.dll`
+  with no source, where that export was a stub, so the process aborted. `dlls/vcruntime140_app` is a module again,
+  built from vcruntime140's sources, and `__GetPlatformExceptionInfo` is implemented in `vcruntime140/misc.c`.
+- **Settings 0xc32 / campaign 0x80040154 (part 1)**: `Windows.Gaming.XboxLive.Storage.GameSaveProvider` was missing.
+  `dlls/winexboxauth/gamesave.c` now keeps connected storage under
+  `%LOCALAPPDATA%\wineuwp\gamesave\<scid>\<xuid>\`. There is no cloud sync yet.
+- **Campaign 0x80040154 (part 2)**: `Windows.Networking.XboxLive.XboxLiveDeviceAddress` was missing. Gears calls
+  `GetLocal` before it creates any game. `deviceaddr.c` serves a random 64-byte snapshot for the life of the process.
+  With it, Campaign -> Solo plays the prologue (`docs/screenshots/gears4-campaign-prologue.png`).
+- **Two instances**: once, starting Gears from the Xbox app while a scripted copy was already running left two
+  GearGame.exe processes, and the title screen stuck after Enter. Run only one.
+- **Cloud saves**: the title storage REST protocol is documented in xodus-gaming/xodus `docs/xbox/titlestorage.md`
+  (docs only; no code was used). With our XSTS token, `GET .../connectedstorage/users/xuid(X)/scids/<scid>/` answers
+  404 code 2005 ("no data"), and `/lock` answers 2038, so reads are authorised. Every write (`PUT /lock`,
+  `POST /atoms/<guid>`, `PUT /savedgames/<name>`) gets **403 code 2016, "platform restriction policies"**. The token is
+  bound to the Xbox app's title (tid 328178078), not Gears' (552499398). A first-party UWP title on Windows gets a
+  token bound to its own title through WAM and its package identity, and we have no equivalent yet. "Unable to connect
+  to the Gears of War services" is probably the same cause. `cloudsave.c` has the signed request helper, and
+  `probe-xboxauth.exe call "METHOD URL"` (body in `XBL_BODY`, headers in `XBL_EXTRA`) drives it.

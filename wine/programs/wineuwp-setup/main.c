@@ -1684,7 +1684,10 @@ static void register_wine_classes(void)
         }
         set_class( L"Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager", L"winexboxauth.dll", 0 );
         set_class( L"Windows.ApplicationModel.Store.Preview.StoreConfiguration", L"winexboxauth.dll", 0 );
-        printf( "installed: Xbox sign-in (XboxAuthManager, WebAuthenticationCoreManager, StoreConfiguration): "
+        set_class( L"Windows.Gaming.XboxLive.Storage.GameSaveProvider", L"winexboxauth.dll", 0 );
+        set_class( L"Windows.Networking.XboxLive.XboxLiveDeviceAddress", L"winexboxauth.dll", 0 );
+        printf( "installed: Xbox sign-in (XboxAuthManager, WebAuthenticationCoreManager, StoreConfiguration, "
+                "GameSaveProvider, XboxLiveDeviceAddress): "
                 "Wine's winexboxauth\n" );
     }
 
@@ -1910,6 +1913,8 @@ static void collect_checked_classes( BOOL write )
     {
         check_class( L"Windows.Security.Authentication.Web.Core.WebAuthenticationCoreManager", L"winexboxauth.dll", 1 );
         check_class( L"Windows.ApplicationModel.Store.Preview.StoreConfiguration", L"winexboxauth.dll", 1 );
+        check_class( L"Windows.Gaming.XboxLive.Storage.GameSaveProvider", L"winexboxauth.dll", 1 );
+        check_class( L"Windows.Networking.XboxLive.XboxLiveDeviceAddress", L"winexboxauth.dll", 1 );
     }
     if (in_sys32( L"windows.media.devices.dll" ))
     {

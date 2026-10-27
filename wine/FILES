@@ -489,3 +489,9 @@ dlls/windows.ui.popups/windows.ui.popups.manifest
 dlls/windows.ui.popups/windows.ui.popups.spec
 libs/vkd3d/libs/vkd3d/command.c
 libs/vkd3d/libs/vkd3d/vkd3d_private.h
+dlls/vcruntime140_app/Makefile.in
+dlls/vcruntime140_app/vcruntime140_app.spec
+dlls/winexboxauth/cloudsave.c
+dlls/winexboxauth/deviceaddr.c
+dlls/winexboxauth/gamesave.c
+dlls/vcruntime140/misc.c

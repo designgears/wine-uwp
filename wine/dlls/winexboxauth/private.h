@@ -289,7 +289,7 @@ HRESULT WINAPI closable_Close( void *iface );
 
 /* ---- IAsyncOperation<T> / IAsyncAction ---- */
 
-enum result_kind { R_ACTION, R_IFACE, R_STRINGS1, R_STRINGS2, R_I4, R_TRANSFER };
+enum result_kind { R_ACTION, R_IFACE, R_STRINGS1, R_STRINGS2, R_I4, R_TRANSFER, R_I8 /* i4 low, i4b high */ };
 
 struct async
 {
@@ -353,6 +353,14 @@ IActivationFactory *xboxauth_manager_factory( void );
 IActivationFactory *xboxauth_init_args_factory( void );
 IActivationFactory *web_auth_manager_factory( void );
 IActivationFactory *store_configuration_factory( void );
+IActivationFactory *game_save_provider_factory( void );
+IActivationFactory *device_address_factory( void );
+
+BYTE *buffer_bytes( IInspectable *buffer, UINT32 *length, UINT32 *capacity );
+IInspectable *buffer_create( BYTE *bytes, UINT32 size );
+
+DWORD xbl_call( const char *method, const char *url, const char *extra, const void *body, size_t len,
+                struct buf *resp );
 HRESULT make_memory_stream( const void *bytes, size_t len, IInspectable **out );
 
 #endif /* __WINE_WINEXBOXAUTH_PRIVATE_H */
