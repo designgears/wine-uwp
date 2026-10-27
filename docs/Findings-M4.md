@@ -13523,3 +13523,15 @@ moves when *anything* changes:
 
 After: **1.1 s** for the same scroll (113, 111), 1.1 s for Apps; 1.0 s (102, 102) once each visual surface keeps its DC and DIB instead of making them per frame. `trace+dcompperf` then shows 0.4-2 ms walks and under 0.5 ms raster per frame through the scroll: the rest of the UI thread is XAML and the Store's own code. Home scrolled and Apps are pixel-identical to the old
 build (AE 0). calc AE 3924.73, mp 236, as the control.
+
+## 2026-10-27: the Store died at start-up on `:0` (CompositionVisualSurface's partner interface)
+
+On the user's desktop the Store fail-fasted at start-up in `visual_surface_put_SourceVisual`, called from
+`windows.ui.xaml.dll+0x46d15a` (in `CUIElement::Arrange`'s neighbourhood) with a `Vector2` as the "visual". XAML queries a
+visual surface for the private `ICompositionVisualSurfacePartner` `{f26da89e-683d-4c67-aea7-ba29b2217a70}` and calls
+slot 7, `put_RealizationSize(Vector2)`. The catch-all QI answered with the object's own table, where slot 7 is
+`put_SourceVisual`. On `:97` the size was evidently 0,0, which arrived as `put_SourceVisual(NULL)` and silently dropped
+the surface's source; on `:0` it was non-zero and was dereferenced. Windows' `dcomp.pdb` names the five methods
+(`Partner@CompositionVisualSurface` vtable at `dcomp.dll+0x19ea38`): get/put `RealizationSize`, get/put `Stretch`,
+`Freeze`. The visual surface now has a real partner view that stores them. The Store then starts on `:0`; calc AE
+3924.73 and mp 236, the same as the control. Open: app tiles on Trending apps show no icons on `:0`.

@@ -10760,13 +10760,84 @@ struct visual_surface
     HBITMAP dib, old_bmp;       /* Store's UI thread while it scrolled */
     BYTE *bits;
     unsigned int dib_w, dib_h;
+    const void **partner_vtbl;  /* ICompositionVisualSurfacePartner, XAML's; the catch-all answered it with the */
+    Vector2 realization;        /* object's own table, and its put_RealizationSize landed on put_SourceVisual */
+    INT32 stretch;
 };
 static void *visual_surface_vtbl[COMP_OBJECT_SLOTS];
+static void *visual_surface_partner_vtbl[11];
+DEFINE_GUID( IID_ICompositionVisualSurfacePartner, 0xf26da89e, 0x683d, 0x4c67, 0xae, 0xa7, 0xba, 0x29, 0xb2, 0x21, 0x7a, 0x70 );
 static struct visual_surface *impl_from_visual_surface( void *iface ) { return CONTAINING_RECORD( iface, struct visual_surface, vtbl ); }
 static HRESULT WINAPI visual_surface_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    struct visual_surface *impl = impl_from_visual_surface( iface );
     if (IsEqualGUID( iid, &IID_ICompositionObject )) return create_composition_object_view( iface, out );
+    if (IsEqualGUID( iid, &IID_ICompositionVisualSurfacePartner ))
+    {
+        if (!out) return E_POINTER;
+        InterlockedIncrement( &impl->ref );
+        *out = &impl->partner_vtbl;
+        return S_OK;
+    }
     return comp_object_QueryInterface( iface, iid, out );
+}
+static ULONG WINAPI visual_surface_Release( void *iface );
+static struct visual_surface *visual_surface_from_partner( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct visual_surface, partner_vtbl );
+}
+static HRESULT WINAPI visual_surface_partner_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return visual_surface_QueryInterface( &visual_surface_from_partner( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI visual_surface_partner_AddRef( void *iface )
+{
+    return InterlockedIncrement( &visual_surface_from_partner( iface )->ref );
+}
+static ULONG WINAPI visual_surface_partner_Release( void *iface )
+{
+    return visual_surface_Release( &visual_surface_from_partner( iface )->vtbl );
+}
+static HRESULT WINAPI visual_surface_partner_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    return comp_object_GetIids( &visual_surface_from_partner( iface )->vtbl, count, iids );
+}
+static HRESULT WINAPI visual_surface_partner_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return comp_object_GetRuntimeClassName( &visual_surface_from_partner( iface )->vtbl, name );
+}
+static HRESULT WINAPI visual_surface_partner_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    return comp_object_GetTrustLevel( &visual_surface_from_partner( iface )->vtbl, level );
+}
+static HRESULT WINAPI visual_surface_partner_get_RealizationSize( void *iface, Vector2 *value )
+{
+    if (!value) return E_POINTER;
+    *value = visual_surface_from_partner( iface )->realization;
+    return S_OK;
+}
+static HRESULT WINAPI visual_surface_partner_put_RealizationSize( void *iface, Vector2 value )
+{
+    TRACE( "%p, %g,%g.\n", visual_surface_from_partner( iface ), value.X, value.Y );
+    visual_surface_from_partner( iface )->realization = value;
+    return S_OK;
+}
+static HRESULT WINAPI visual_surface_partner_get_Stretch( void *iface, INT32 *value )
+{
+    if (!value) return E_POINTER;
+    *value = visual_surface_from_partner( iface )->stretch;
+    return S_OK;
+}
+static HRESULT WINAPI visual_surface_partner_put_Stretch( void *iface, INT32 value )
+{
+    TRACE( "%p, %d.\n", visual_surface_from_partner( iface ), value );
+    visual_surface_from_partner( iface )->stretch = value;
+    return S_OK;
+}
+static HRESULT WINAPI visual_surface_partner_Freeze( void *iface )
+{
+    TRACE( "%p.\n", visual_surface_from_partner( iface ) );
+    return S_OK;
 }
 static ULONG WINAPI visual_surface_Release( void *iface )
 {
@@ -10840,12 +10911,24 @@ static HRESULT create_visual_surface( void **out )
         visual_surface_vtbl[8] = visual_surface_get_SourceOffset;  visual_surface_vtbl[9] = visual_surface_put_SourceOffset;
         visual_surface_vtbl[10] = visual_surface_get_SourceSize;   visual_surface_vtbl[11] = visual_surface_put_SourceSize;
         visual_surface_vtbl[0] = visual_surface_QueryInterface;
+        visual_surface_partner_vtbl[0] = visual_surface_partner_QueryInterface;
+        visual_surface_partner_vtbl[1] = visual_surface_partner_AddRef;
+        visual_surface_partner_vtbl[2] = visual_surface_partner_Release;
+        visual_surface_partner_vtbl[3] = visual_surface_partner_GetIids;
+        visual_surface_partner_vtbl[4] = visual_surface_partner_GetRuntimeClassName;
+        visual_surface_partner_vtbl[5] = visual_surface_partner_GetTrustLevel;
+        visual_surface_partner_vtbl[6] = visual_surface_partner_get_RealizationSize;
+        visual_surface_partner_vtbl[7] = visual_surface_partner_put_RealizationSize;
+        visual_surface_partner_vtbl[8] = visual_surface_partner_get_Stretch;
+        visual_surface_partner_vtbl[9] = visual_surface_partner_put_Stretch;
+        visual_surface_partner_vtbl[10] = visual_surface_partner_Freeze;
         InterlockedExchange( &ready, 2 );
     }
     while (ready != 2) Sleep( 0 );
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
     comp_map_owner_gone( &impl->vtbl );
     impl->vtbl = (const void **)visual_surface_vtbl;
+    impl->partner_vtbl = (const void **)visual_surface_partner_vtbl;
     impl->kind = "CompositionVisualSurface";
     impl->ref = 1;
     TRACE( "visual surface %p.\n", impl );
