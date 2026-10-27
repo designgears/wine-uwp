@@ -10756,6 +10756,10 @@ struct visual_surface
     BOOL rendered;
     struct paint_op *last_ops;  /* the walk that made the surface's pixels: the same walk again makes the same pixels */
     unsigned int last_count;
+    HDC dc;                     /* the walk's target, kept across frames: making one per frame was a tenth of the */
+    HBITMAP dib, old_bmp;       /* Store's UI thread while it scrolled */
+    BYTE *bits;
+    unsigned int dib_w, dib_h;
 };
 static void *visual_surface_vtbl[COMP_OBJECT_SLOTS];
 static struct visual_surface *impl_from_visual_surface( void *iface ) { return CONTAINING_RECORD( iface, struct visual_surface, vtbl ); }
@@ -10775,6 +10779,15 @@ static ULONG WINAPI visual_surface_Release( void *iface )
         /* the painter may still hold the surface for this frame: it is a comp object of its own and refcounted */
         if (impl->surface) IUnknown_Release( (IUnknown *)&impl->surface->vtbl );
         free( impl->last_ops );
+        if (impl->dc)
+        {
+            /* a walk on another thread may be drawing into it: as free(), after the walk */
+            walk_guard_enter();
+            SelectObject( impl->dc, impl->old_bmp );
+            DeleteDC( impl->dc );
+            walk_guard_leave();
+            retire_bitmap( impl->dib );
+        }
         free( impl );
     }
     return ref;
@@ -10875,7 +10888,6 @@ static void visual_surface_render( struct visual_surface *impl )
     BITMAPINFO info = { { 0 } };
     RECT area;
     BYTE *bits = NULL;
-    HBITMAP dib = NULL, old = NULL;
     HDC dc = NULL;
     void *out;
     BOOL same;
@@ -10898,18 +10910,31 @@ static void visual_surface_render( struct visual_surface *impl )
     }
     if (!surface_ensure_cache( impl->surface, w, h, 4 )) return;
 
-    info.bmiHeader.biSize = sizeof(info.bmiHeader);
-    info.bmiHeader.biWidth = w;
-    info.bmiHeader.biHeight = -(LONG)h;
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-    if (!(dc = CreateCompatibleDC( NULL )) || !(dib = CreateDIBSection( dc, &info, DIB_RGB_COLORS, (void **)&bits, NULL, 0 )))
+    if (!impl->dc || impl->dib_w != w || impl->dib_h != h)
     {
-        if (dc) DeleteDC( dc );
-        return;
+        if (!impl->dc && !(impl->dc = CreateCompatibleDC( NULL ))) return;
+        if (impl->dib)
+        {
+            SelectObject( impl->dc, impl->old_bmp );
+            retire_bitmap( impl->dib );
+            impl->dib = NULL;
+        }
+        info.bmiHeader.biSize = sizeof(info.bmiHeader);
+        info.bmiHeader.biWidth = w;
+        info.bmiHeader.biHeight = -(LONG)h;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        if (!(impl->dib = CreateDIBSection( impl->dc, &info, DIB_RGB_COLORS, (void **)&impl->bits, NULL, 0 ))) return;
+        impl->old_bmp = SelectObject( impl->dc, impl->dib );
+        impl->dib_w = w;
+        impl->dib_h = h;
+        free( impl->last_ops );
+        impl->last_ops = NULL;
+        impl->last_count = 0;
     }
-    old = SelectObject( dc, dib );
+    dc = impl->dc;
+    bits = impl->bits;
     SetRect( &area, 0, 0, w, h );
 
     saved_current = paint_current;
@@ -10962,6 +10987,7 @@ static void visual_surface_render( struct visual_surface *impl )
         impl->last_count = impl->last_ops ? paint_lists[2].count : 0;
 
         raster_transparent = TRUE;
+        memset( bits, 0, (size_t)w * h * 4 );
         raster_ops( dc, bits, w, &paint_lists[2], &area );
         raster_transparent = saved_transparent;
         GdiFlush();
@@ -10986,9 +11012,6 @@ static void visual_surface_render( struct visual_surface *impl )
     }
     impl->surface->cache_valid = TRUE;
     impl->surface->opaque = FALSE;
-    SelectObject( dc, old );
-    DeleteDC( dc );
-    DeleteObject( dib );
 }
 /* the surface a CompositionVisualSurface shows now, with a reference, or NULL; *is_visual_surface says whether the
  * facade is one */

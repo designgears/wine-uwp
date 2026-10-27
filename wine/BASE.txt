@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     d125abbd49fd553d5b4bb3f11b14a5cb94e31254
-                 dcomp: Render gradients, effect graphs and visual surfaces only when their inputs change.
+  wine HEAD:     ac35c126fc08d6f03087fa96054e59408a8c61f0
+                 dcomp: Keep a visual surface's DC and DIB across frames.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-10-27T00:21:17Z
+  captured:      2026-10-27T00:27:24Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

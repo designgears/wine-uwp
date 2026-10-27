@@ -13521,5 +13521,5 @@ moves when *anything* changes:
   surfaces' generation and mapping, colours, flood colours, composite/blend modes, opacities with their live
   values) and the graph renders only when that changes; `paint_effect_sprite` uses it too.
 
-After: **1.1 s** for the same scroll (113, 111), 1.1 s for Apps. Home scrolled and Apps are pixel-identical to the old
+After: **1.1 s** for the same scroll (113, 111), 1.1 s for Apps; 1.0 s (102, 102) once each visual surface keeps its DC and DIB instead of making them per frame. `trace+dcompperf` then shows 0.4-2 ms walks and under 0.5 ms raster per frame through the scroll: the rest of the UI thread is XAML and the Store's own code. Home scrolled and Apps are pixel-identical to the old
 build (AE 0). calc AE 3924.73, mp 236, as the control.
