@@ -1879,6 +1879,7 @@ static void collect_checked_classes( BOOL write )
     {
         check_class( L"Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager", ic, 1 );
         check_class( L"Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions", ic, 1 );
+        check_class( L"Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallOptions", ic, 1 );
     }
     if (in_sys32( L"windows.ui.shell.taskbarmanager.dll" ))
         check_class( L"Windows.UI.Shell.TaskbarManager", L"windows.ui.shell.taskbarmanager.dll", 1 );

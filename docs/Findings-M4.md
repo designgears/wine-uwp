@@ -13535,3 +13535,33 @@ the surface's source; on `:0` it was non-zero and was dereferenced. Windows' `dc
 (`Partner@CompositionVisualSurface` vtable at `dcomp.dll+0x19ea38`): get/put `RealizationSize`, get/put `Stretch`,
 `Freeze`. The visual surface now has a real partner view that stores them. The Store then starts on `:0`; calc AE
 3924.73 and mp 236, the same as the control. Open: app tiles on Trending apps show no icons on `:0`.
+
+## 2026-10-27: an interrupted install started over from nothing
+
+Gears of War 4 (EAppx, 78.8 GB download, 132 GB unpacked) had unpacked 132 GB when the Xbox app closed; installs run in
+the app's process, so the install died with it. Starting it again deleted all of it: `appx_install` began with
+`remove_tree( NAME.new )`, so `extract()`'s "already there at its size" skip, written for resuming, never had anything
+to skip. `NAME.new` now carries `.wine-uwp-partial` (the package full name) while unpacking; a new install of the same
+package keeps the directory and resumes, anything else is removed as before. A failure keeps it too, a cancel does
+not. A file cut short by the kill has the wrong size and is unpacked again. The app's exit itself left no trace in
+the log (no crash, no OOM kill); the relaunch runs with `WINE_UWP_TRACE_EXIT=1`.
+
+The queue itself also vanished with the app (it lived only in winegameplatform's memory). Each unfinished item is now
+saved as `stage\.install-queue\STOREID` (store id, paused, chosen features), removed on completion or cancel, and the
+queue is rebuilt from those on the app's first queue call: Gears came back as Downloading after a restart and its
+unpacker skipped the files already on disk (`docs/screenshots/xbox-queue-restored-after-restart.png`). A restored item
+resumes unless it was paused. `restore_queue` is a flag, not an INIT_ONCE: the restore fires ItemAdded, and a handler
+that enumerates the queue from inside that would wait on itself.
+
+Downloads were slow (~280 Mbps on Gears, the user's Windows and Xodus faster): `source.c` fetched one 8 MiB block at
+a time on one connection, only when the unpacker asked for it, so every block paid a request's latency and the
+network sat idle while it was decrypted and written. The install thread used ~11% CPU. A sequential read now keeps
+the next 8 blocks in flight on pool threads (direct-mapped slots, a slot's fetch never cancelled under it, close waits
+for them): ~455 Mbps steady on the same download, 37% CPU on the install thread.
+
+The rest of the "slow" was the display. With read-ahead the CDN sockets carried ~830-860 Mbps (`ss -ti`
+`bytes_received`, the user's gigabit line) while the queue showed ~450: winegameplatform scaled the installer's
+progress to the catalogue size, 73.4 GB, and the package is 133.6 GB (uncompressed EAppx; network bytes = unpacked
+bytes). A UWP install's total is now the installer's own: 943 Mbps shown, of 133.6 GB
+(`docs/screenshots/xbox-gears-download-line-rate.png`). More read-ahead (24 blocks) did not help, and neither did
+WinHTTP's 8 KiB read buffer, though raising it to 256 KiB halved wineserver's CPU during the download; it is kept.

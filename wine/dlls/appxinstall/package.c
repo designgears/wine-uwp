@@ -386,7 +386,7 @@ HRESULT package_read( const struct package *pkg, unsigned int index, BYTE **data
     HRESULT hr;
 
     if (!pkg->xvd && !pkg->eappx && !pkg->dir) return zip_read( pkg->zip, zip_entry( pkg->zip, index ), data, size );
-    if (package_size( pkg, index ) > 64u << 20) return HRESULT_FROM_WIN32( ERROR_FILE_TOO_LARGE );
+    if (package_size( pkg, index ) > 1u << 30) return HRESULT_FROM_WIN32( ERROR_FILE_TOO_LARGE );
     b.capacity = package_size( pkg, index );
     if (!(b.data = malloc( b.capacity + 1 ))) return E_OUTOFMEMORY;
     if (FAILED(hr = package_extract( pkg, index, append, &b )))

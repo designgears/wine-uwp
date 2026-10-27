@@ -784,6 +784,19 @@ static void stage_logo( const struct package *pkg, int index, const WCHAR *dest 
 
 /* ---- staging ---- */
 
+/* whether NAME.new holds an unfinished unpacking of the package FULL */
+static BOOL resumable( const WCHAR *dest, const WCHAR *full )
+{
+    WCHAR *path = path_join( dest, L".wine-uwp-partial" );
+    char *text = path ? read_text( path ) : NULL, *want = utf8_dup( full );
+    BOOL ret = text && want && !strcmp( text, want );
+
+    free( path );
+    free( text );
+    free( want );
+    return ret;
+}
+
 static HRESULT lock_stage( const WCHAR *stage_root, const WCHAR *stage, HANDLE *lock )
 {
     WCHAR *locks, *name, *path;
@@ -951,7 +964,8 @@ HRESULT CDECL appx_install( const struct appx_install_params *params )
     unsigned int i, fw_count = 0;
     int logo;
     HRESULT hr;
-    char *s;
+    char *s, *want_utf8 = NULL;
+    WCHAR *partial = NULL;
 
     if (!params->package || !params->data_dir || !params->windows_tree) return E_INVALIDARG;
     if (FAILED(hr = xts_self_test())) return hr;
@@ -1043,14 +1057,20 @@ HRESULT CDECL appx_install( const struct appx_install_params *params )
         if (backup && exists( backup ) && !exists( final )) MoveFileW( backup, final );
         free( backup );
     }
-    remove_tree( dest );
+    /* an interrupted install of this same package (the app closed, say) is resumed: extract() skips every file
+     * already there at its size. Anything else in NAME.new is stale. */
+    want_utf8 = utf8_dup( full );
+    if (!resumable( dest, full )) remove_tree( dest );
     if (!create_directories( dest )) { hr = HRESULT_FROM_WIN32( GetLastError() ); goto done; }
+    if (!want_utf8) { hr = E_OUTOFMEMORY; goto done; }
+    CHECK( write_text( dest, L".wine-uwp-partial", want_utf8 ) );
     seed_from_installed( final, dest, full, params );
     if (logo >= 0) stage_logo( pkg, logo, dest );
     else if (m->logo) report( params, APPX_EVENT_MESSAGE, 0, 0, L"warning: manifest logo %s was not included; "
                               L"installing without a launcher icon", m->logo );
     CHECK( extract( pkg, dest, params ) );
     CHECK( write_chunk_metadata( pkg, dest, full, params ) );
+    if ((partial = path_join( dest, L".wine-uwp-partial" ))) DeleteFileW( partial );
     package_close( pkg );
     pkg = NULL;
 
@@ -1220,7 +1240,12 @@ HRESULT CDECL appx_install( const struct appx_install_params *params )
     report( params, APPX_EVENT_INSTALLED, 0, 0, L"%s", stage );
 
 done:
-    if (FAILED(hr) && dest) remove_tree( dest );   /* never another package's download or backup */
+    /* never another package's download or backup; a failure partway through unpacking is kept to resume, a cancel
+     * is not */
+    if (FAILED(hr) && dest && (hr == HRESULT_FROM_WIN32( ERROR_CANCELLED ) || !resumable( dest, full )))
+        remove_tree( dest );
+    free( want_utf8 );
+    free( partial );
     if (lock != INVALID_HANDLE_VALUE) CloseHandle( lock );
     if (temp) remove_tree( temp );
     package_close( pkg );

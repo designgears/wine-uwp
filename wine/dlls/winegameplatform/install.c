@@ -503,6 +503,56 @@ static void report( struct install *in )
     report_ex( in, FALSE, FALSE );
 }
 
+/* ---- the saved queue ----
+ *
+ * The queue lives in the app's process, so it went with the app: an install left half done came back as an empty
+ * queue, with its files on disk and nothing to resume it from. Each unfinished item is kept as
+ * stage\.install-queue\STOREID (store id, paused, chosen features) until it completes or is canceled, and the queue
+ * is rebuilt from those on first use. The installer resumes from what it finds on disk. */
+
+static void queue_file( const WCHAR *store_id, WCHAR *buf, size_t size )
+{
+    stage_root( buf, size );
+    if (buf[0]) swprintf( buf + wcslen( buf ), size - wcslen( buf ), L"\\.install-queue\\%s", store_id );
+}
+
+static void queue_save( struct install *in )
+{
+    WCHAR path[MAX_PATH], *slash;
+    char text[8192], *id;
+    size_t len;
+    unsigned i;
+    HANDLE file;
+    DWORD written;
+
+    queue_file( in->s.store_id, path, ARRAY_SIZE(path) );
+    if (!path[0] || !(id = utf8_dup( in->s.store_id ))) return;
+    AcquireSRWLockShared( &installs_lock );
+    len = snprintf( text, sizeof(text), "store %s\npaused %d\nchosen %d\n", id, in->paused, in->features_chosen );
+    for (i = 0; i < in->features.count && len < sizeof(text); i++)
+        len += snprintf( text + len, sizeof(text) - len, "feature %s\n", in->features.items[i] );
+    ReleaseSRWLockShared( &installs_lock );
+    free( id );
+    if (len >= sizeof(text)) return;
+    if ((slash = wcsrchr( path, '\\' )))
+    {
+        *slash = 0;
+        CreateDirectoryW( path, NULL );
+        *slash = '\\';
+    }
+    file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
+    if (file == INVALID_HANDLE_VALUE) return;
+    WriteFile( file, text, len, &written, NULL );
+    CloseHandle( file );
+}
+
+static void queue_forget( const WCHAR *store_id )
+{
+    WCHAR path[MAX_PATH];
+    queue_file( store_id, path, ARRAY_SIZE(path) );
+    if (path[0]) DeleteFileW( path );
+}
+
 /* ---- the install worker ---- */
 
 static void guid_text( const GUID *id, char *buf )
@@ -624,6 +674,9 @@ static void CALLBACK installer_event( void *context, enum appx_event event, UINT
         now = GetTickCount64();
         if (!total) break;
         AcquireSRWLockExclusive( &installs_lock );
+        /* a UWP package's progress is its own bytes, which is what is downloaded: the catalogue's size can be far off
+         * (Gears of War 4: 73.4 GB listed, 132 GB fetched, so the speed read at half the line rate) */
+        if (in->uwp) in->s.total = total;
         /* byte-precise progress avoids permille quantization on very large packages */
         in->s.done = min( in->s.total, (UINT64)((long double)in->s.total * min( completed, total ) / total) );
         if (in->cancel)
@@ -906,6 +959,7 @@ done:
     report( in );
     if (SUCCEEDED(hr) || canceled)
     {
+        queue_forget( in->s.store_id );
         /* completed and canceled items leave the queue after their terminal state is observable */
         if (!canceled) Sleep( 1000 );
         report_ex( in, TRUE, TRUE );
@@ -1130,13 +1184,109 @@ HRESULT WINAPI rq_CreateForStoreId( struct factory *f, HSTRING store, HSTRING sk
 
 /* ---- PackageQueue ---- */
 
+static void set_paused( struct install *in, BOOL pause );
+
+/* queues an install of STORE_ID and starts its worker; an unfinished one of the same product is resumed instead */
+static struct install *queue_add( const WCHAR *store_id, const struct strlist *features, BOOL chosen, BOOL paused )
+{
+    struct install *in, **grown;
+    struct product d;
+    HANDLE thread;
+    unsigned i;
+
+    AcquireSRWLockShared( &installs_lock );
+    for (i = 0, in = NULL; i < installs_count && !in; i++)
+        if (!wcsicmp( installs[i]->s.store_id, store_id ) && !installs[i]->cancel &&
+            (installs[i]->s.state == ST_WAITING || installs[i]->s.state == ST_STREAMING || installs[i]->s.state == ST_PAUSED))
+            in = installs[i];
+    ReleaseSRWLockShared( &installs_lock );
+    if (in)
+    {
+        TRACE( "install %s is already queued\n", debugstr_w( store_id ) );
+        set_paused( in, FALSE );
+        return in;
+    }
+
+    if (!(in = calloc( 1, sizeof(*in) ))) return NULL;
+    CoCreateGuid( &in->s.id );
+    lstrcpynW( in->s.store_id, store_id, ARRAY_SIZE(in->s.store_id) );
+    strlist_copy( &in->features, features );
+    in->features_chosen = chosen;
+    in->paused = paused;
+    query_product( in->s.store_id, &d );
+    lstrcpynW( in->s.family, d.family, ARRAY_SIZE(in->s.family) );
+    in->uwp = d.uwp;
+    stage_name_for_family( d.family, in->stage, ARRAY_SIZE(in->stage) );
+    instance_for( d.family[0] ? d.family : in->s.store_id, in->s.instance );
+    in->s.state = paused ? ST_PAUSED : ST_WAITING;
+    in->s.total = d.size;
+    if (!d.uwp) in->s.total = gdk_request_size( in->s.store_id, in->features_chosen ? &in->features : NULL, d.size );
+    AcquireSRWLockExclusive( &installs_lock );
+    if ((grown = realloc( installs, (installs_count + 1) * sizeof(*installs) )))
+    {
+        installs = grown;
+        installs[installs_count++] = in;
+    }
+    ReleaseSRWLockExclusive( &installs_lock );
+    queue_save( in );
+    report_ex( in, TRUE, FALSE );
+    if ((thread = CreateThread( NULL, 0, install_thread, in, 0, NULL ))) CloseHandle( thread );
+    return in;
+}
+
+static void restore_queue_items( void )
+{
+    WCHAR dir[MAX_PATH], path[MAX_PATH], store_id[64];
+    WIN32_FIND_DATAW fd;
+    char text[8192], *line, *next;
+    HANDLE find;
+
+    queue_file( L"*", dir, ARRAY_SIZE(dir) );
+    if (!dir[0] || (find = FindFirstFileW( dir, &fd )) == INVALID_HANDLE_VALUE) return;
+    *wcsrchr( dir, '\\' ) = 0;
+    do
+    {
+        struct strlist features = { 0 };
+        BOOL paused = FALSE, chosen = FALSE;
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        swprintf( path, ARRAY_SIZE(path), L"%s\\%s", dir, fd.cFileName );
+        if (!read_small_file( path, text, sizeof(text) )) continue;
+        store_id[0] = 0;
+        for (line = text; line && *line; line = next)
+        {
+            if ((next = strchr( line, '\n' ))) *next++ = 0;
+            if (!strncmp( line, "store ", 6 )) MultiByteToWideChar( CP_UTF8, 0, line + 6, -1, store_id, ARRAY_SIZE(store_id) );
+            else if (!strncmp( line, "paused ", 7 )) paused = atoi( line + 7 );
+            else if (!strncmp( line, "chosen ", 7 )) chosen = atoi( line + 7 );
+            else if (!strncmp( line, "feature ", 8 )) strlist_add( &features, line + 8 );
+        }
+        if (store_id[0])
+        {
+            TRACE( "restoring the queued install of %s%s\n", debugstr_w( store_id ), paused ? ", paused" : "" );
+            queue_add( store_id, &features, chosen, paused );
+        }
+        strlist_free( &features );
+    } while (FindNextFileW( find, &fd ));
+    FindClose( find );
+    return;
+}
+
+/* not an INIT_ONCE: restoring reports the items, and a handler that enumerates the queue from that report would wait
+ * for itself. A caller racing the first one sees the items arrive through ItemAdded instead. */
+static void restore_queue( void )
+{
+    static LONG restored;
+    if (!InterlockedCompareExchange( &restored, 1, 0 )) restore_queue_items();
+}
+
 HRESULT WINAPI pq_SubmitRequestAsync( struct factory *f, IInspectable *request, INT32 priority, HSTRING cv, IInspectable **out )
 {
     struct package_request *r = NULL;
-    struct install *in, **grown;
+    struct strlist features = { 0 };
+    struct install *in;
     struct async *op;
-    struct product d;
-    HANDLE thread;
+    BOOL chosen;
 
     if (!out || !request) return E_POINTER;
     if (FAILED(IInspectable_QueryInterface( request, &IID_IPackageRequest, (void **)&r ))) return E_INVALIDARG;
@@ -1145,40 +1295,28 @@ HRESULT WINAPI pq_SubmitRequestAsync( struct factory *f, IInspectable *request, 
         IInspectable_Release( (IInspectable *)r );
         return E_INVALIDARG;
     }
-    if (!(in = calloc( 1, sizeof(*in) )) || !(op = async_create( &IID_IAsyncOperation_Guid, TRUE )))
+    restore_queue();
+    if (!(op = async_create( &IID_IAsyncOperation_Guid, TRUE )))
     {
-        free( in );
         IInspectable_Release( (IInspectable *)r );
         return E_OUTOFMEMORY;
     }
-    CoCreateGuid( &in->s.id );
-    lstrcpynW( in->s.store_id, r->store_id, ARRAY_SIZE(in->s.store_id) );
-    strlist_copy( &in->features, &r->features );
-    in->features_chosen = r->features_chosen;
-    request_features_from_specifiers( r, &in->features, &in->features_chosen );
+    strlist_copy( &features, &r->features );
+    chosen = r->features_chosen;
+    request_features_from_specifiers( r, &features, &chosen );
+    in = queue_add( r->store_id, &features, chosen, FALSE );
     IInspectable_Release( (IInspectable *)r );
-    query_product( in->s.store_id, &d );
-    lstrcpynW( in->s.family, d.family, ARRAY_SIZE(in->s.family) );
-    in->uwp = d.uwp;
-    stage_name_for_family( d.family, in->stage, ARRAY_SIZE(in->stage) );
-    instance_for( d.family[0] ? d.family : in->s.store_id, in->s.instance );
-    in->s.state = ST_WAITING;
-    in->s.total = d.size;
-    if (!d.uwp) in->s.total = gdk_request_size( in->s.store_id, in->features_chosen ? &in->features : NULL, d.size );
+    strlist_free( &features );
+    if (!in)
+    {
+        IInspectable_Release( async_iface( op ) );
+        return E_OUTOFMEMORY;
+    }
     TRACE( "PackageQueue.SubmitRequestAsync(%s, priority %d) -> installation %s\n", debugstr_w( in->s.store_id ), priority,
            debugstr_guid( &in->s.id ) );
-    AcquireSRWLockExclusive( &installs_lock );
-    if ((grown = realloc( installs, (installs_count + 1) * sizeof(*installs) )))
-    {
-        installs = grown;
-        installs[installs_count++] = in;
-    }
-    ReleaseSRWLockExclusive( &installs_lock );
     /* already complete when handed out: SubmitRequestAsync answers as soon as the item is queued */
     async_finish_guid( op, S_OK, &in->s.id );
     *out = async_iface( op );
-    report_ex( in, TRUE, FALSE );
-    if ((thread = CreateThread( NULL, 0, install_thread, in, 0, NULL ))) CloseHandle( thread );
     return S_OK;
 }
 
@@ -1198,6 +1336,7 @@ HRESULT WINAPI pq_Enumerate( struct factory *f, IInspectable **out )
     unsigned i;
 
     if (!out) return E_POINTER;
+    restore_queue();
     if (!(view = hstring_view_create())) return E_OUTOFMEMORY;
     AcquireSRWLockShared( &installs_lock );
     for (i = 0; i < installs_count; i++) hstring_view_add( view, installs[i]->s.instance );
@@ -1225,6 +1364,7 @@ static BOOL snapshot( const WCHAR *instance, const GUID *id, struct install_snap
 {
     struct install *in;
 
+    restore_queue();
     AcquireSRWLockShared( &installs_lock );
     if ((in = find_install( instance, id ))) *snap = in->s;
     ReleaseSRWLockShared( &installs_lock );
@@ -1333,6 +1473,7 @@ static void set_paused( struct install *in, BOOL pause )
     new_state = in->s.state;
     ReleaseSRWLockExclusive( &installs_lock );
     if (!changed) return;
+    queue_save( in );
     TRACE( "install %s: %s (state %d -> %d)\n", debugstr_w( in->s.store_id ), pause ? "paused" : "resumed", old_state, new_state );
     report( in );
 }

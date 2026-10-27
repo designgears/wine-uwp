@@ -1259,11 +1259,28 @@ static const void *preview_size_vtbl[] = { OBJ_METHODS, fs_get_TotalSize, fs_get
 
 /* What a feature adds on its own: the regions the choice with it needs that the choice without it does not. A
  * region another feature also needs (game#hd1 for HD1 next to Game) is shared. */
+/* Whether every recipe installs this feature: the base game, which the app shows as Required. */
+static BOOL gdk_feature_required( const struct gdk_package *pkg, const char *feature )
+{
+    struct strlist parts = {0};
+    BOOL all = pkg->recipe_count > 0;
+    unsigned i;
+
+    for (i = 0; i < pkg->recipe_count && all; i++)
+    {
+        strlist_split( &parts, pkg->recipes[i].included, ';' );
+        all = strlist_has( &parts, feature );
+        strlist_free( &parts );
+    }
+    return all;
+}
+
 static UINT64 gdk_feature_size( const struct gdk_package *pkg, const char *feature, BOOL *shared )
 {
     struct strlist with = {0}, without = {0}, tw = {0}, two = {0}, langs = {0};
     UINT64 size = 0;
     unsigned i, j;
+    BOOL required;
 
     gdk_selected_features( pkg, NULL, &with );
     strlist_add_unique( &with, feature );
@@ -1271,11 +1288,20 @@ static UINT64 gdk_feature_size( const struct gdk_package *pkg, const char *featu
     gdk_tags( pkg, &with, &tw );
     gdk_tags( pkg, &without, &two );
     user_languages( &langs );
+    required = gdk_feature_required( pkg, feature );
     *shared = FALSE;
     for (i = 0; i < pkg->region_count; i++)
     {
         const struct gdk_region *r = &pkg->regions[i];
-        if (r->id >= 0x40000000 || !r->tags.count) continue;
+        if (r->id >= 0x40000000 && r->id != 0x40000003) continue;
+        /* the untagged regions are in every install; they are the bulk of the base game, which showed only
+         * its tagged few hundred megabytes beside a 147 GB total */
+        if (!r->tags.count)
+        {
+            if (required && gdk_region_wanted( r, &tw, &langs )) size += r->length;
+            continue;
+        }
+        if (r->id >= 0x40000000) continue;
         if (gdk_region_wanted( r, &tw, &langs ) && !gdk_region_wanted( r, &two, &langs ))
         {
             size += r->length;

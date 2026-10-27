@@ -40,9 +40,10 @@ static WCHAR *strndupW( const WCHAR *s, UINT len )
 
 static void append_child( struct xml_node *parent, struct xml_node *child )
 {
-    struct xml_node **p = &parent->children;
-    while (*p) p = &(*p)->next;
-    *p = child;
+    /* a block map File has a Block child per 64 KiB: walking the list for each was quadratic, hours for a 73 GB game */
+    if (parent->last_child) parent->last_child->next = child;
+    else parent->children = child;
+    parent->last_child = child;
     child->parent = parent;
 }
 

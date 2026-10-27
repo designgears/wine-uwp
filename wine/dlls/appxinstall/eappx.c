@@ -82,9 +82,23 @@ static UINT64 le64( const BYTE *p ) { return le32( p ) | ((UINT64)le32( p + 4 ) 
 
 static const struct footer *find_footer( const struct footer *footers, unsigned int count, UINT64 id )
 {
-    unsigned int i;
-    for (i = 0; i < count; i++) if (footers[i].id == id) return &footers[i];
+    unsigned int lo = 0, hi = count;
+
+    /* sorted by id when read: a game has thousands of files and each is looked up */
+    while (lo < hi)
+    {
+        unsigned int mid = lo + (hi - lo) / 2;
+        if (footers[mid].id == id) return &footers[mid];
+        if (footers[mid].id < id) lo = mid + 1;
+        else hi = mid;
+    }
     return NULL;
+}
+
+static int __cdecl footer_compare( const void *a, const void *b )
+{
+    const struct footer *x = a, *y = b;
+    return x->id < y->id ? -1 : x->id > y->id;
 }
 
 static HRESULT read_footers( struct source *source, const BYTE *head, struct footer **out, unsigned int *count )
@@ -111,6 +125,7 @@ static HRESULT read_footers( struct source *source, const BYTE *head, struct foo
         footers[i].stored = le64( f + 32 );
     }
     free( table );
+    qsort( footers, n, sizeof(*footers), footer_compare );
     *out = footers;
     *count = n;
     return S_OK;
@@ -124,7 +139,8 @@ static HRESULT read_plain( struct source *source, const struct footer *f, BYTE *
     HRESULT hr;
     int ret;
 
-    if (f->stored > (64u << 20) || f->size > (64u << 20)) return HRESULT_FROM_WIN32( ERROR_FILE_TOO_LARGE );
+    /* a block map is ~100 bytes per 64 KiB block: 73 GB of Gears of War 4 is over 100 MB of it */
+    if (f->stored > (1u << 30) || f->size > (1u << 30)) return HRESULT_FROM_WIN32( ERROR_FILE_TOO_LARGE );
     if (!(raw = malloc( f->stored ? f->stored : 1 ))) return E_OUTOFMEMORY;
     if (FAILED(hr = source_read( source, f->offset, raw, f->stored ))) { free( raw ); return hr; }
     if (f->compression != 1)

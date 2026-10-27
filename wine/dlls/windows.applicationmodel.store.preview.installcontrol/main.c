@@ -1398,6 +1398,100 @@ done:
     return item;
 }
 
+/* The catalogue: a product's package family and Windows Update category, by product id. */
+static BOOL catalog_product( const WCHAR *product_id, WCHAR **family, char *category, size_t size )
+{
+    const struct json *product, *skus;
+    struct json *root = NULL;
+    WCHAR path[256];
+    DWORD status;
+    char *body;
+    const char *name;
+    unsigned int i;
+    int len;
+
+    *family = NULL;
+    category[0] = 0;
+    swprintf( path, ARRAY_SIZE(path), L"/v7.0/products/%s?market=US&languages=en-US&fieldsTemplate=details", product_id );
+    if (FAILED(appx_store_get( L"displaycatalog.mp.microsoft.com", path, &body, &status ))) return FALSE;
+    if (status == 200) root = json_parse( body, strlen( body ) );
+    appx_free( body );
+
+    product = json_get( root, "Product" );
+    name = json_str( json_get( json_get( product, "Properties" ), "PackageFamilyName" ) );
+    if (product->type != JSON_OBJECT || !name || !name[0])
+    {
+        WARN( "catalogue: HTTP %lu, no packaged app for %s.\n", status, debugstr_w( product_id ) );
+        json_free( root );
+        return FALSE;
+    }
+    len = MultiByteToWideChar( CP_UTF8, 0, name, -1, NULL, 0 );
+    if ((*family = malloc( len * sizeof(WCHAR) ))) MultiByteToWideChar( CP_UTF8, 0, name, -1, *family, len );
+    skus = json_get( product, "DisplaySkuAvailabilities" );
+    for (i = 0; i < json_count( skus ) && !category[0]; i++)
+        lstrcpynA( category, json_str( json_get( json_get( json_get( json_get( json_at( skus, i ), "Sku" ), "Properties" ),
+                                                           "FulfillmentData" ), "WuCategoryId" ) ), size );
+    json_free( root );
+    if (*family && category[0]) return TRUE;
+    WARN( "catalogue: %s has no Windows Update category.\n", debugstr_w( product_id ) );
+    free( *family );
+    *family = NULL;
+    return FALSE;
+}
+
+/* An item installing another product, staged beside the running package: DATADIR/stage/NAME. */
+static struct install_item *product_install( const WCHAR *id, BOOL launch_after )
+{
+    WCHAR *family = NULL, *stage = NULL, *own_family, *own_stage, *product_id, *slash, *under;
+    struct appx_store_package package;
+    char own_version[32], category[64], *url = NULL, *version, *end;
+    struct install_item *item = NULL;
+    HRESULT hr;
+
+    if (!own_package( &own_family, own_version, sizeof(own_version), &own_stage ))
+    {
+        WARN( "no package identity.\n" );
+        return NULL;
+    }
+    if (!(product_id = wcsdup( id )) || !catalog_product( id, &family, category, sizeof(category) )) goto done;
+    if ((item = find_item( family )))
+    {
+        item_start( item );
+        goto done;
+    }
+    if (FAILED(hr = appx_store_find_package( category, family, &package )))
+    {
+        WARN( "%s: the Store has no package, hr %#lx.\n", debugstr_w( family ), hr );
+        goto done;
+    }
+    version = strchr( package.moniker, '_' ) + 1;
+    if (FAILED(appx_store_package_url( &package, &url ))) goto done;
+    if ((end = strchr( version, '_' ))) *end = 0;
+    if (!(slash = wcsrchr( own_stage, '/' )) || !(under = wcschr( family, '_' ))) goto done;
+    if (!(stage = malloc( ((slash - own_stage) + 1 + (under - family) + 1) * sizeof(WCHAR) ))) goto done;
+    memcpy( stage, own_stage, (slash - own_stage + 1) * sizeof(WCHAR) );
+    memcpy( stage + (slash - own_stage + 1), family, (under - family) * sizeof(WCHAR) );
+    stage[(slash - own_stage + 1) + (under - family)] = 0;
+    MESSAGE( "wine: store install: %s is %s %s, into %s\n", debugstr_w( id ), debugstr_w( family ), version,
+             debugstr_w( stage ) );
+    if (SUCCEEDED(item_create( product_id, family, stage, url, version, &item )))
+    {
+        product_id = family = stage = NULL;
+        url = NULL;
+        item->launch_after = launch_after;
+        item_start( item );
+    }
+
+done:
+    free( product_id );
+    free( family );
+    free( stage );
+    free( own_family );
+    free( own_stage );
+    appx_free( url );
+    return item;
+}
+
 /* What a search operation is asked to do; its async parameter. */
 struct search
 {
@@ -1405,6 +1499,8 @@ struct search
     LONG ref;
     BOOL all;
     BOOL auto_install;
+    WCHAR *product_id;          /* installing this product rather than searching for an update */
+    BOOL launch_after;
 };
 
 static inline struct search *impl_from_IUnknown( IUnknown *iface )
@@ -1434,7 +1530,11 @@ static ULONG WINAPI search_Release( IUnknown *iface )
     struct search *impl = impl_from_IUnknown( iface );
     ULONG ref = InterlockedDecrement( &impl->ref );
 
-    if (!ref) free( impl );
+    if (!ref)
+    {
+        free( impl->product_id );
+        free( impl );
+    }
     return ref;
 }
 
@@ -1462,7 +1562,8 @@ static HRESULT search_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT 
         return S_OK;
     }
     search = impl_from_IUnknown( param );
-    item = search_update( search->auto_install );
+    item = search->product_id ? product_install( search->product_id, search->launch_after )
+                              : search_update( search->auto_install );
     TRACE( "-> %s.\n", item ? "an update" : "no update" );
     result->vt = VT_UNKNOWN;
     if (!search->all)
@@ -1497,6 +1598,280 @@ static HRESULT search_create( BOOL all, BOOL auto_install, IUnknown **out )
     impl->auto_install = auto_install;
     *out = &impl->IUnknown_iface;
     return S_OK;
+}
+
+/* AppInstallOptions: a property bag the Store fills in before StartProductInstallWithOptionsAsync. Its two
+ * interfaces are not in the IDL here; their slots are in this order in the metadata. */
+
+DEFINE_GUID( IID_IAppInstallOptions, 0xc9808300, 0x1cb8, 0x4eb6, 0x8c, 0x9f, 0x6a, 0x30, 0xc6, 0x4a, 0x5b, 0x51 );
+DEFINE_GUID( IID_IAppInstallOptions2, 0x8a04c0d7, 0xc94b, 0x425e, 0x95, 0xb4, 0xbf, 0x27, 0xfa, 0xea, 0xee, 0x89 );
+
+enum { OPT_FORCE_NON_REMOVABLE, OPT_ALLOW_RESTART, OPT_REPAIR, OPT_LAUNCH_AFTER, OPT_PIN_DESKTOP, OPT_PIN_START,
+       OPT_PIN_TASKBAR, OPT_ALL_USERS, OPT_STAGE_ONLY, OPT_BOOL_COUNT };
+enum { OPT_CATALOG, OPT_CAMPAIGN, OPT_EXTENDED_CAMPAIGN, OPT_STRING_COUNT };
+
+struct install_options
+{
+    const void **vtbl;          /* IAppInstallOptions */
+    const void **vtbl2;         /* IAppInstallOptions2 */
+    LONG ref;
+    SRWLOCK lock;
+    boolean bools[OPT_BOOL_COUNT];
+    HSTRING strings[OPT_STRING_COUNT];
+    INT32 completed_mode, progress_mode;
+    IInspectable *volume;
+};
+
+static const void *install_options_vtbl[28], *install_options2_vtbl[14];
+
+static struct install_options *install_options_from( void *iface )
+{
+    if (iface && *(const void ***)iface == install_options_vtbl)
+        return CONTAINING_RECORD( iface, struct install_options, vtbl );
+    if (iface && *(const void ***)iface == install_options2_vtbl)
+        return CONTAINING_RECORD( iface, struct install_options, vtbl2 );
+    return NULL;
+}
+
+static HRESULT WINAPI install_options_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct install_options *impl = install_options_from( iface );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAppInstallOptions ))
+        *out = &impl->vtbl;
+    else if (IsEqualGUID( iid, &IID_IAppInstallOptions2 ))
+        *out = &impl->vtbl2;
+    else
+    {
+        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    InterlockedIncrement( &impl->ref );
+    return S_OK;
+}
+
+static ULONG WINAPI install_options_AddRef( void *iface )
+{
+    return InterlockedIncrement( &install_options_from( iface )->ref );
+}
+
+static ULONG WINAPI install_options_Release( void *iface )
+{
+    struct install_options *impl = install_options_from( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    unsigned int i;
+
+    if (!ref)
+    {
+        for (i = 0; i < OPT_STRING_COUNT; i++) WindowsDeleteString( impl->strings[i] );
+        if (impl->volume) IInspectable_Release( impl->volume );
+        free( impl );
+    }
+    return ref;
+}
+
+static HRESULT WINAPI install_options_GetIids( void *iface, ULONG *iid_count, IID **iids )
+{
+    FIXME( "iface %p stub!\n", iface );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI install_options_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return class_name( CLASS_PREFIX L"AppInstallOptions", name );
+}
+
+static HRESULT WINAPI install_options_GetTrustLevel( void *iface, TrustLevel *trust_level )
+{
+    *trust_level = BaseTrust;
+    return S_OK;
+}
+
+#define OPTION_BOOL( name, index ) \
+    static HRESULT WINAPI install_options_get_##name( void *iface, boolean *value ) \
+    { \
+        if (!value) return E_POINTER; \
+        *value = install_options_from( iface )->bools[index]; \
+        return S_OK; \
+    } \
+    static HRESULT WINAPI install_options_put_##name( void *iface, boolean value ) \
+    { \
+        install_options_from( iface )->bools[index] = !!value; \
+        return S_OK; \
+    }
+OPTION_BOOL( ForceUseOfNonRemovableStorage, OPT_FORCE_NON_REMOVABLE )
+OPTION_BOOL( AllowForcedAppRestart, OPT_ALLOW_RESTART )
+OPTION_BOOL( Repair, OPT_REPAIR )
+OPTION_BOOL( LaunchAfterInstall, OPT_LAUNCH_AFTER )
+OPTION_BOOL( PinToDesktopAfterInstall, OPT_PIN_DESKTOP )
+OPTION_BOOL( PinToStartAfterInstall, OPT_PIN_START )
+OPTION_BOOL( PinToTaskbarAfterInstall, OPT_PIN_TASKBAR )
+OPTION_BOOL( InstallForAllUsers, OPT_ALL_USERS )
+OPTION_BOOL( StageButDoNotInstall, OPT_STAGE_ONLY )
+#undef OPTION_BOOL
+
+#define OPTION_STRING( name, index ) \
+    static HRESULT WINAPI install_options_get_##name( void *iface, HSTRING *value ) \
+    { \
+        struct install_options *impl = install_options_from( iface ); \
+        HRESULT hr; \
+        if (!value) return E_POINTER; \
+        AcquireSRWLockShared( &impl->lock ); \
+        hr = WindowsDuplicateString( impl->strings[index], value ); \
+        ReleaseSRWLockShared( &impl->lock ); \
+        return hr; \
+    } \
+    static HRESULT WINAPI install_options_put_##name( void *iface, HSTRING value ) \
+    { \
+        struct install_options *impl = install_options_from( iface ); \
+        HSTRING copy, old; \
+        HRESULT hr; \
+        if (FAILED(hr = WindowsDuplicateString( value, &copy ))) return hr; \
+        AcquireSRWLockExclusive( &impl->lock ); \
+        old = impl->strings[index]; \
+        impl->strings[index] = copy; \
+        ReleaseSRWLockExclusive( &impl->lock ); \
+        WindowsDeleteString( old ); \
+        return S_OK; \
+    }
+OPTION_STRING( CatalogId, OPT_CATALOG )
+OPTION_STRING( CampaignId, OPT_CAMPAIGN )
+OPTION_STRING( ExtendedCampaignId, OPT_EXTENDED_CAMPAIGN )
+#undef OPTION_STRING
+
+static HRESULT WINAPI install_options_get_TargetVolume( void *iface, IInspectable **value )
+{
+    struct install_options *impl = install_options_from( iface );
+
+    if (!value) return E_POINTER;
+    AcquireSRWLockShared( &impl->lock );
+    if ((*value = impl->volume)) IInspectable_AddRef( *value );
+    ReleaseSRWLockShared( &impl->lock );
+    return S_OK;
+}
+
+static HRESULT WINAPI install_options_put_TargetVolume( void *iface, IInspectable *value )
+{
+    struct install_options *impl = install_options_from( iface );
+    IInspectable *old;
+
+    if (value) IInspectable_AddRef( value );
+    AcquireSRWLockExclusive( &impl->lock );
+    old = impl->volume;
+    impl->volume = value;
+    ReleaseSRWLockExclusive( &impl->lock );
+    if (old) IInspectable_Release( old );
+    return S_OK;
+}
+
+static HRESULT WINAPI install_options_get_CompletedInstallToastNotificationMode( void *iface, INT32 *value )
+{
+    if (!value) return E_POINTER;
+    *value = install_options_from( iface )->completed_mode;
+    return S_OK;
+}
+
+static HRESULT WINAPI install_options_put_CompletedInstallToastNotificationMode( void *iface, INT32 value )
+{
+    install_options_from( iface )->completed_mode = value;
+    return S_OK;
+}
+
+static HRESULT WINAPI install_options_get_InstallInProgressToastNotificationMode( void *iface, INT32 *value )
+{
+    if (!value) return E_POINTER;
+    *value = install_options_from( iface )->progress_mode;
+    return S_OK;
+}
+
+static HRESULT WINAPI install_options_put_InstallInProgressToastNotificationMode( void *iface, INT32 value )
+{
+    install_options_from( iface )->progress_mode = value;
+    return S_OK;
+}
+
+static const void *install_options_vtbl[28] =
+{
+    install_options_QueryInterface,
+    install_options_AddRef,
+    install_options_Release,
+    install_options_GetIids,
+    install_options_GetRuntimeClassName,
+    install_options_GetTrustLevel,
+    install_options_get_CatalogId,
+    install_options_put_CatalogId,
+    install_options_get_ForceUseOfNonRemovableStorage,
+    install_options_put_ForceUseOfNonRemovableStorage,
+    install_options_get_AllowForcedAppRestart,
+    install_options_put_AllowForcedAppRestart,
+    install_options_get_Repair,
+    install_options_put_Repair,
+    install_options_get_TargetVolume,
+    install_options_put_TargetVolume,
+    install_options_get_LaunchAfterInstall,
+    install_options_put_LaunchAfterInstall,
+    install_options_get_PinToDesktopAfterInstall,
+    install_options_put_PinToDesktopAfterInstall,
+    install_options_get_PinToStartAfterInstall,
+    install_options_put_PinToStartAfterInstall,
+    install_options_get_PinToTaskbarAfterInstall,
+    install_options_put_PinToTaskbarAfterInstall,
+    install_options_get_CompletedInstallToastNotificationMode,
+    install_options_put_CompletedInstallToastNotificationMode,
+    install_options_get_InstallInProgressToastNotificationMode,
+    install_options_put_InstallInProgressToastNotificationMode,
+};
+
+static const void *install_options2_vtbl[14] =
+{
+    install_options_QueryInterface,
+    install_options_AddRef,
+    install_options_Release,
+    install_options_GetIids,
+    install_options_GetRuntimeClassName,
+    install_options_GetTrustLevel,
+    install_options_get_InstallForAllUsers,
+    install_options_put_InstallForAllUsers,
+    install_options_get_StageButDoNotInstall,
+    install_options_put_StageButDoNotInstall,
+    install_options_get_CampaignId,
+    install_options_put_CampaignId,
+    install_options_get_ExtendedCampaignId,
+    install_options_put_ExtendedCampaignId,
+};
+
+static HRESULT install_options_create( IInspectable **out )
+{
+    struct install_options *impl;
+
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->vtbl = install_options_vtbl;
+    impl->vtbl2 = install_options2_vtbl;
+    impl->ref = 1;
+    InitializeSRWLock( &impl->lock );
+    *out = (IInspectable *)&impl->vtbl;
+    return S_OK;
+}
+
+/* Installing a product: the catalogue, Windows Update and appx_install, on the thread pool. */
+static HRESULT product_install_async( HSTRING product_id, void *options, IAsyncOperation_IVectorView_AppInstallItem **operation )
+{
+    struct install_options *opts = install_options_from( options );
+    struct search *search;
+    IUnknown *unknown;
+    HRESULT hr;
+
+    *operation = NULL;
+    TRACE( "product %s.\n", debugstr_hstring( product_id ) );
+    if (FAILED(hr = search_create( TRUE, FALSE, &unknown ))) return hr;
+    search = impl_from_IUnknown( unknown );
+    search->launch_after = opts && opts->bools[OPT_LAUNCH_AFTER];
+    if (!(search->product_id = wcsdup( WindowsGetStringRawBuffer( product_id, NULL ) ))) hr = E_OUTOFMEMORY;
+    else hr = async_operation_items_create( NULL, unknown, search_callback, operation );
+    IUnknown_Release( unknown );
+    return hr;
 }
 
 static BOOL auto_install_of( IAppUpdateOptions *options )
@@ -2080,18 +2455,14 @@ static HRESULT WINAPI manager3_StartProductInstallAsync( IAppInstallManager3 *if
         HSTRING flight_id, HSTRING client_id, boolean repair, boolean force, HSTRING correlation_vector,
         IInspectable *target_volume, IAsyncOperation_IVectorView_AppInstallItem **operation )
 {
-    FIXME( "iface %p, product %s stub!\n", iface, debugstr_hstring( product_id ) );
-    *operation = NULL;
-    return E_NOTIMPL;
+    return product_install_async( product_id, NULL, operation );
 }
 
 static HRESULT WINAPI manager3_StartProductInstallForUserAsync( IAppInstallManager3 *iface, __x_ABI_CWindows_CSystem_CIUser *user,
         HSTRING product_id, HSTRING catalog_id, HSTRING flight_id, HSTRING client_id, boolean repair, boolean force,
         HSTRING correlation_vector, IInspectable *target_volume, IAsyncOperation_IVectorView_AppInstallItem **operation )
 {
-    FIXME( "iface %p, product %s stub!\n", iface, debugstr_hstring( product_id ) );
-    *operation = NULL;
-    return E_NOTIMPL;
+    return product_install_async( product_id, NULL, operation );
 }
 
 static HRESULT WINAPI manager3_UpdateAppByPackageFamilyNameForUserAsync( IAppInstallManager3 *iface,
@@ -2253,9 +2624,7 @@ static HRESULT WINAPI manager6_StartProductInstallWithOptionsAsync( IAppInstallM
         __x_ABI_CWindows_CApplicationModel_CStore_CPreview_CInstallControl_CIAppInstallOptions *options,
         IAsyncOperation_IVectorView_AppInstallItem **operation )
 {
-    FIXME( "iface %p, product %s stub!\n", iface, debugstr_hstring( product_id ) );
-    *operation = NULL;
-    return E_NOTIMPL;
+    return product_install_async( product_id, options, operation );
 }
 
 static HRESULT WINAPI manager6_StartProductInstallWithOptionsForUserAsync( IAppInstallManager6 *iface,
@@ -2264,9 +2633,7 @@ static HRESULT WINAPI manager6_StartProductInstallWithOptionsForUserAsync( IAppI
         __x_ABI_CWindows_CApplicationModel_CStore_CPreview_CInstallControl_CIAppInstallOptions *options,
         IAsyncOperation_IVectorView_AppInstallItem **operation )
 {
-    FIXME( "iface %p, product %s stub!\n", iface, debugstr_hstring( product_id ) );
-    *operation = NULL;
-    return E_NOTIMPL;
+    return product_install_async( product_id, options, operation );
 }
 
 static HRESULT WINAPI manager6_GetIsPackageIdentityAllowedToInstallAsync( IAppInstallManager6 *iface,
@@ -2381,6 +2748,8 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
 
     TRACE( "%s.\n", debugstr_w( name ) );
 
+    if (!wcscmp( name, CLASS_PREFIX L"AppInstallOptions" ))
+        return install_options_create( instance );
     if (!wcscmp( name, RuntimeClass_Windows_ApplicationModel_Store_Preview_InstallControl_AppUpdateOptions ))
     {
         struct update_options *impl;
@@ -2426,6 +2795,7 @@ static struct factory factories[] =
 {
     {{&factory_vtbl}, RuntimeClass_Windows_ApplicationModel_Store_Preview_InstallControl_AppInstallManager},
     {{&factory_vtbl}, RuntimeClass_Windows_ApplicationModel_Store_Preview_InstallControl_AppUpdateOptions},
+    {{&factory_vtbl}, CLASS_PREFIX L"AppInstallOptions"},
 };
 
 HRESULT WINAPI DllCanUnloadNow(void)

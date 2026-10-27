@@ -183,7 +183,7 @@ enum request_state
     REQUEST_STATE_RESPONSE_RECEIVED,
 };
 
-#define READ_BUFFER_SIZE 8192
+#define READ_BUFFER_SIZE (256 * 1024) /* 8192 cost a socket read per 8 KiB: a download topped out at ~450 Mbps */
 
 struct read_buffer
 {

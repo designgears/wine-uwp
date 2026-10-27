@@ -267,7 +267,7 @@ HRESULT zip_read( const struct zip *zip, const struct zip_entry *entry, BYTE **d
     struct buffer b = { 0 };
     HRESULT hr;
 
-    if (entry->size > 64u << 20) return HRESULT_FROM_WIN32( ERROR_FILE_TOO_LARGE );
+    if (entry->size > 1u << 30) return HRESULT_FROM_WIN32( ERROR_FILE_TOO_LARGE );
     if (!(b.data = malloc( entry->size + 1 ))) return E_OUTOFMEMORY;
     b.capacity = entry->size;
     if (FAILED(hr = zip_extract( zip, entry, append, &b )))

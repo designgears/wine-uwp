@@ -2,8 +2,9 @@
  * appxinstall: a package's bytes, from a file or an http(s) URL
  *
  * A URL is read with range requests: a zip's directory and a few members cost a few requests and a sequential read
- * streams the whole thing, with nothing written to disk. Reads go through an 8 MiB block cache; a read of a whole
- * block or more goes straight to the server.
+ * streams the whole thing, with nothing written to disk. Reads go through 8 MiB blocks. A sequential read keeps the
+ * next PREFETCH blocks in flight, each its own range request on a pool thread: one request at a time, started only
+ * when the unpacker asked for it, got ~35 MB/s out of a CDN that serves a parallel client several times that.
  *
  * Copyright 2026 wine-uwp contributors
  *
@@ -31,6 +32,19 @@
 WINE_DEFAULT_DEBUG_CHANNEL(appxinstall);
 
 #define BLOCK (8u << 20)
+#define PREFETCH 8
+
+/* one block of a URL: fetched by a pool thread, kept until another block takes its place (direct-mapped) */
+struct block
+{
+    struct source *source;
+    UINT64 index;                   /* which block; ~0 when empty */
+    BYTE *data;
+    ULONG size;
+    HRESULT hr;
+    BOOL busy;                      /* a fetch is running */
+    HANDLE done;                    /* set while not busy */
+};
 
 struct source
 {
@@ -43,9 +57,8 @@ struct source
     WCHAR *host, *path;
     INTERNET_PORT port;
     BOOL secure;
-    BYTE *cache;
-    UINT64 cache_start;
-    ULONG cache_size;
+    struct block blocks[PREFETCH];
+    UINT64 last;                    /* the block read last, to tell a sequential read */
     /* a window onto another source */
     struct source *parent;
     UINT64 base;
@@ -213,12 +226,15 @@ static HRESULT http_fetch( struct source *source, UINT64 start, UINT64 end, BYTE
 HRESULT source_open( const WCHAR *path, const struct appx_install_params *params, struct source **out )
 {
     struct source *source;
+    unsigned int i;
     LARGE_INTEGER size;
     HRESULT hr;
 
     if (!(source = calloc( 1, sizeof(*source) ))) return E_OUTOFMEMORY;
     source->params = params;
     source->file = INVALID_HANDLE_VALUE;
+    source->last = ~(UINT64)1;
+    for (i = 0; i < PREFETCH; i++) source->blocks[i].index = ~(UINT64)0;
     if (is_url( path ))
     {
         report( params, APPX_EVENT_MESSAGE, 0, 0, L"downloading %s", path );
@@ -263,6 +279,67 @@ UINT64 source_size( const struct source *source )
     return source->size;
 }
 
+static void CALLBACK block_fetch( TP_CALLBACK_INSTANCE *instance, void *context )
+{
+    struct block *block = context;
+    struct source *source = block->source;
+    UINT64 start = block->index * BLOCK, end = min( start + BLOCK, source->size );
+
+    block->size = end - start;
+    block->hr = http_fetch( source, start, end, block->data );
+    block->busy = FALSE;
+    SetEvent( block->done );
+}
+
+/* starts fetching block index into its slot, unless it is there or another fetch holds the slot */
+static HRESULT block_start( struct source *source, UINT64 index, BOOL wait )
+{
+    struct block *block = &source->blocks[index % PREFETCH];
+
+    if (index * BLOCK >= source->size) return S_OK;
+    if (block->index == index && (block->busy || SUCCEEDED(block->hr))) return S_OK;
+    if (block->busy)
+    {
+        if (!wait) return S_OK;
+        WaitForSingleObject( block->done, INFINITE );
+    }
+    if (!block->data && !(block->data = malloc( BLOCK ))) return E_OUTOFMEMORY;
+    if (!block->done && !(block->done = CreateEventW( NULL, TRUE, TRUE, NULL ))) return HRESULT_FROM_WIN32( GetLastError() );
+    block->source = source;
+    block->index = index;
+    block->hr = E_PENDING;
+    block->busy = TRUE;
+    ResetEvent( block->done );
+    if (!TrySubmitThreadpoolCallback( block_fetch, block, NULL ))
+    {
+        block_fetch( NULL, block );
+        return S_OK;
+    }
+    return S_OK;
+}
+
+/* block index, fetched; a sequential read also starts the ones after it */
+static HRESULT block_get( struct source *source, UINT64 index, struct block **out )
+{
+    struct block *block = &source->blocks[index % PREFETCH];
+    BOOL sequential = index == source->last || index == source->last + 1;
+    HRESULT hr;
+    UINT64 i;
+
+    if (FAILED(hr = block_start( source, index, TRUE ))) return hr;
+    if (sequential)
+        for (i = 1; i < PREFETCH; i++) block_start( source, index + i, FALSE );
+    source->last = index;
+    WaitForSingleObject( block->done, INFINITE );
+    if (FAILED(hr = block->hr))
+    {
+        block->index = ~(UINT64)0;
+        return hr;
+    }
+    *out = block;
+    return S_OK;
+}
+
 HRESULT source_read( struct source *source, UINT64 offset, void *buffer, ULONG size )
 {
     BYTE *out = buffer;
@@ -284,29 +361,13 @@ HRESULT source_read( struct source *source, UINT64 offset, void *buffer, ULONG s
 
     while (size)
     {
+        UINT64 index = offset / BLOCK;
+        struct block *block;
         ULONG n;
 
-        if (source->cache && offset >= source->cache_start && offset < source->cache_start + source->cache_size)
-        {
-            n = min( size, source->cache_start + source->cache_size - offset );
-            memcpy( out, source->cache + (offset - source->cache_start), n );
-        }
-        else if (size >= BLOCK)
-        {
-            n = size - size % BLOCK;
-            if (FAILED(hr = http_fetch( source, offset, offset + n, out ))) return hr;
-        }
-        else
-        {
-            UINT64 start = offset - offset % BLOCK, end = min( start + BLOCK, source->size );
-
-            if (!source->cache && !(source->cache = malloc( BLOCK ))) return E_OUTOFMEMORY;
-            source->cache_size = 0;
-            if (FAILED(hr = http_fetch( source, start, end, source->cache ))) return hr;
-            source->cache_start = start;
-            source->cache_size = end - start;
-            continue;
-        }
+        if (FAILED(hr = block_get( source, index, &block ))) return hr;
+        n = min( size, block->size - (offset - index * BLOCK) );
+        memcpy( out, block->data + (offset - index * BLOCK), n );
         out += n;
         offset += n;
         size -= n;
@@ -316,12 +377,20 @@ HRESULT source_read( struct source *source, UINT64 offset, void *buffer, ULONG s
 
 void source_close( struct source *source )
 {
+    unsigned int i;
+
     if (!source) return;
+    for (i = 0; i < PREFETCH; i++)   /* a prefetch still running reads the connection and its buffer */
+        if (source->blocks[i].done)
+        {
+            WaitForSingleObject( source->blocks[i].done, INFINITE );
+            CloseHandle( source->blocks[i].done );
+        }
+    for (i = 0; i < PREFETCH; i++) free( source->blocks[i].data );
     if (source->file != INVALID_HANDLE_VALUE) CloseHandle( source->file );
     if (source->connection) WinHttpCloseHandle( source->connection );
     if (source->session) WinHttpCloseHandle( source->session );
     free( source->host );
     free( source->path );
-    free( source->cache );
     free( source );
 }

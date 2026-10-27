@@ -76,6 +76,7 @@ struct xml_node
     unsigned int attr_count;
     WCHAR *text;
     struct xml_node *parent, *children, *next;
+    struct xml_node *last_child;    /* the parser's, for appending */
 };
 HRESULT xml_parse( const BYTE *data, ULONG size, struct xml_node **root );
 void xml_free( struct xml_node *root );
