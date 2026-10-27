@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     87fcbc354fa699c7f6e26fc689d9fdc13d98eb98
-                 Gears of War 4 (UWP, D3D12) starts and reaches its title screen.
+  wine HEAD:     ee1261224081ed3cd9f273e71be9e682d95068a6
+                 winexboxauth: Serve the Xbox Live token provider to UWP titles' XSAPI.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-10-27T13:45:27Z
+  captured:      2026-10-27T14:03:16Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

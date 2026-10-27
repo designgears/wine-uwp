@@ -69,6 +69,8 @@ static const GUID IID_IBufferByteAccess_ = {0x905a0fef,0xbc53,0x11df,{0x8c,0x49,
 static const GUID IID_IOutputStream_ = {0x905a0fe6,0xbc53,0x11df,{0x8c,0x49,0x00,0x1e,0x4f,0xc6,0x86,0xda}};
 
 #define MSA_PROVIDER_ID "https://login.microsoft.com"
+/* the Xbox Live token provider a UWP title's XSAPI asks for: its requests name a Url and get an XSTS token */
+#define XSTS_PROVIDER_ID "https://xsts.auth.xboxlive.com"
 
 /* ---- the stored Microsoft account ---- */
 
@@ -440,6 +442,7 @@ static char *web_account_user_name( void )
 struct provider
 {
     struct object obj;
+    BOOL xsts;
     char *authority;
     IInspectable *user;
 };
@@ -453,8 +456,14 @@ static void provider_destroy( struct object *obj )
     free( p->authority );
 }
 
-static HRESULT WINAPI provider_get_Id( void *iface, HSTRING *v ) { return to_hstr( MSA_PROVIDER_ID, v ); }
-static HRESULT WINAPI provider_get_DisplayName( void *iface, HSTRING *v ) { return to_hstr( "Microsoft account", v ); }
+static HRESULT WINAPI provider_get_Id( void *iface, HSTRING *v )
+{
+    return to_hstr( provider_from( iface, 0 )->xsts ? XSTS_PROVIDER_ID : MSA_PROVIDER_ID, v );
+}
+static HRESULT WINAPI provider_get_DisplayName( void *iface, HSTRING *v )
+{
+    return to_hstr( provider_from( iface, 0 )->xsts ? "Xbox Live" : "Microsoft account", v );
+}
 static HRESULT WINAPI provider_get_IconUri( void *iface, IInspectable **v )
 {
     if (!v) return E_POINTER;
@@ -1002,7 +1011,8 @@ static struct request_result *request_result_create( INT32 status, const char *s
 struct token_work
 {
     char *scope, *extra;
-    BOOL msa, ui, oauth2_response;
+    char *url, *method, *body;   /* an Xbox Live request's Url, HttpMethod and RequestBody */
+    BOOL msa, xsts, force, ui, oauth2_response;
     IInspectable *account_in;
 };
 
@@ -1011,8 +1021,78 @@ static void token_work_free( void *ctx )
     struct token_work *w = ctx;
     if (w->account_in) IInspectable_Release( w->account_in );
     free( w->scope );
+    free( w->url );
+    free( w->method );
+    str_wipe_free( w->body );
     str_wipe_free( w->extra );
     free( w );
+}
+
+/* An Xbox Live request: the XSTS Authorization header for its Url as the token, and the user's claims and the request's
+ * Signature as properties, which is what XSAPI reads (XboxUserId, Gamertag, AgeGroup, Privileges, Signature). */
+static struct request_result *xsts_token_result( struct token_work *w )
+{
+    /* a Url with no host (XSAPI building one from a service endpoint it lacks) gets the default xboxlive.com token */
+    const char *url = w->url && !_strnicmp( w->url, "http", 4 ) ? w->url : "https://xboxlive.com";
+    char *header = NULL, *sig = NULL, *xid, *gtg, *agg, *prv;
+    struct signing_policy policy;
+    struct request_result *result;
+    struct provider *provider;
+    struct web_account *wa;
+    struct token_response *resp;
+    IInspectable *props;
+    HRESULT hr;
+
+    account_init();
+    if (FAILED(hr = sign_in_silently()))
+    {
+        TRACE( "  Xbox Live: not signed in (%#lx)\n", hr );
+        return request_result_create( w->ui ? WTRS_USER_CANCEL : WTRS_USER_INTERACTION_REQUIRED, w->scope );
+    }
+    if (FAILED(hr = get_token_for_url( url, w->force, &header, TRUE )) || !header)
+    {
+        TRACE( "  Xbox Live: no token for %s (%#lx)\n", debugstr_an(url, strcspn( url, "?" )), hr );
+        if (!(result = request_result_create( WTRS_PROVIDER_ERROR, w->scope ))) return NULL;
+        result->error = provider_error_create( (UINT32)(FAILED(hr) ? hr : E_FAIL), "no Xbox Live token for this URL" );
+        return result;
+    }
+    if (find_policy( url, &policy ))
+    {
+        struct url_parts u;
+        split_url( url, &u );
+        sig = sign_request( policy.version, policy.max_body_bytes, w->method && *w->method ? w->method : "GET",
+                            u.path_and_query, header, w->body, w->body ? strlen( w->body ) : 0, 0 );
+        url_parts_free( &u );
+    }
+    xid = account_field( &account.xid );
+    gtg = account_field( &account.gtg );
+    agg = account_field( &account.agg );
+    prv = account_field( &account.prv );
+    props = make_string_map( "XboxUserId", S(xid), "Gamertag", S(gtg), "AgeGroup", S(agg), "Privileges", S(prv),
+                             "Signature", S(sig), "Environment", "prod", "Sandbox", "RETAIL", NULL );
+    result = request_result_create( WTRS_SUCCESS, w->scope );
+    provider = provider_create( "consumers", NULL );
+    if (provider) provider->xsts = TRUE;
+    wa = provider ? web_account_create( provider, S(xid), S(gtg) ) : NULL;
+    if (result && props && (resp = token_response_create( header, wa )))
+    {
+        IInspectable_Release( resp->properties );
+        resp->properties = props;
+        props = NULL;
+        vector_view_add( result->data, (IInspectable *)&resp->obj.vtbl[0] );
+    }
+    TRACE( "  Xbox Live token for %s (xuid %s, signature %s)\n", debugstr_an(url, strcspn( url, "?" )), S(xid),
+           sig ? "yes" : "no" );
+    if (props) IInspectable_Release( props );
+    if (wa) obj_Release( &wa->obj );
+    if (provider) obj_Release( &provider->obj );
+    free( xid );
+    free( gtg );
+    free( agg );
+    free( prv );
+    free( sig );
+    str_wipe_free( header );
+    return result;
 }
 
 static HRESULT token_work( struct async *op, void *ctx )
@@ -1021,7 +1101,8 @@ static HRESULT token_work( struct async *op, void *ctx )
     struct request_result *result;
     char *id = stored_msa_account();
 
-    if (!w->msa) result = request_result_create( WTRS_PROVIDER_NOT_AVAILABLE, w->scope );
+    if (w->xsts) result = xsts_token_result( w );
+    else if (!w->msa) result = request_result_create( WTRS_PROVIDER_NOT_AVAILABLE, w->scope );
     else if (!id) result = request_result_create( w->ui ? WTRS_USER_CANCEL : WTRS_USER_INTERACTION_REQUIRED, w->scope );
     else
     {
@@ -1119,6 +1200,14 @@ static HRESULT get_web_token( IInspectable *request, IInspectable *account_in, B
             free( enc );
             free( claims );
         }
+        w->url = map_lookup( map, L"Url" );
+        w->method = map_lookup( map, L"HttpMethod" );
+        w->body = map_lookup( map, L"RequestBody" );
+        if ((wrapped = map_lookup( map, L"ForceRefresh" )))
+        {
+            w->force = !_stricmp( wrapped, "true" ) || !strcmp( wrapped, "1" );
+            free( wrapped );
+        }
         IInspectable_Release( map );
     }
     IInspectable_Release( req );
@@ -1128,6 +1217,7 @@ static HRESULT get_web_token( IInspectable *request, IInspectable *account_in, B
 
     w->scope = str_dup( S(scope) );
     w->msa = provider_id && !_stricmp( provider_id, MSA_PROVIDER_ID );
+    w->xsts = provider_id && !_stricmp( provider_id, XSTS_PROVIDER_ID );
     w->ui = ui;
     wrapped = strf( ", %s,", S(props) );
     w->oauth2_response = wrapped && strstr( wrapped, ", oauth2_response=1," ) != NULL;
@@ -1155,12 +1245,14 @@ static HRESULT find_provider( HSTRING id, HSTRING authority, IInspectable *user,
 {
     char *pid = from_hstr( id ), *auth = authority ? from_hstr( authority ) : str_dup( "consumers" );
     BOOL msa = pid && !_stricmp( pid, MSA_PROVIDER_ID ) && (!auth || !*auth || !_stricmp( auth, "consumers" ));
+    BOOL xsts = pid && !_stricmp( pid, XSTS_PROVIDER_ID );
     struct provider *p = NULL;
     HRESULT hr;
 
     TRACE( "WebAuthenticationCoreManager.FindAccountProviderAsync(\"%s\", \"%s\", user %s) -> %s\n", S(pid), S(auth),
-           user ? "given" : "none", msa ? "Microsoft account" : "none" );
-    if (msa) p = provider_create( auth && *auth ? auth : "consumers", user );
+           user ? "given" : "none", msa ? "Microsoft account" : xsts ? "Xbox Live" : "none" );
+    if (msa || xsts) p = provider_create( auth && *auth ? auth : "consumers", user );
+    if (p) p->xsts = xsts;
     hr = completed_iface( &IID_AsyncOp_WebAccountProvider, "FindAccountProviderAsync",
                           p ? (IUnknown *)&p->obj.vtbl[0] : NULL, out );
     free( pid );
@@ -1174,7 +1266,7 @@ static struct provider *our_provider( IInspectable *provider )
     IInspectable *p = NULL;
     HSTRING h = NULL;
     char *id = NULL;
-    BOOL ours;
+    BOOL ours, xsts;
 
     if (!provider || FAILED(IInspectable_QueryInterface( provider, &IID_IWebAccountProvider, (void **)&p ))) return NULL;
     if (SUCCEEDED(SLOT(p, 6, HRESULT (WINAPI *)( void *, HSTRING * ))( p, &h )))
@@ -1184,8 +1276,11 @@ static struct provider *our_provider( IInspectable *provider )
     }
     IInspectable_Release( p );
     ours = id && !_stricmp( id, MSA_PROVIDER_ID );
+    xsts = id && !_stricmp( id, XSTS_PROVIDER_ID );
     free( id );
-    return ours ? provider_create( "consumers", NULL ) : NULL;
+    if (!ours && !xsts) return NULL;
+    if ((p = (IInspectable *)provider_create( "consumers", NULL ))) ((struct provider *)p)->xsts = xsts;
+    return (struct provider *)p;
 }
 
 /* ---- FindAllAccountsResult ---- */
@@ -1253,7 +1348,15 @@ static HRESULT WINAPI wacm_FindAccountAsync( void *iface, IInspectable *provider
     EnterCriticalSection( &account.cs );
     cid = str_dup( S(account.msa_user_id) );
     LeaveCriticalSection( &account.cs );
-    if (p && have && want && (!_stricmp( want, have ) || !_stricmp( want, cid ))) wa = make_web_account( p );
+    if (p && p->xsts)
+    {
+        /* XSAPI keeps the Xbox Live account by its id, the xuid, and takes "not found" for a sign-out */
+        char *xid = account_field( &account.xid ), *gtg = account_field( &account.gtg );
+        if (want && *S(xid) && !strcmp( want, xid )) wa = web_account_create( p, xid, S(gtg) );
+        free( xid );
+        free( gtg );
+    }
+    else if (p && have && want && (!_stricmp( want, have ) || !_stricmp( want, cid ))) wa = make_web_account( p );
     TRACE( "WebAuthenticationCoreManager.FindAccountAsync(%s) -> %s\n", want && *want ? "an id" : "\"\"",
            wa ? "the Microsoft account" : !have ? "none (not signed in)" : p ? "none (another account)" : "none (provider)" );
     if (p) obj_Release( &p->obj );

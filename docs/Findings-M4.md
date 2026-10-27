@@ -13636,3 +13636,17 @@ on the user's `:0` (175 Hz NVIDIA). The fix is only proven by the probe until it
 **Method worth keeping.** `probe-peek` + `objcopy`/`llvm-objdump` on the decrypted exe named the wait. For vkd3d
 state, scan the heap for `d3d12_command_queue_vtbl` (wined3d.dll base + `llvm-nm` RVA; vkd3d lives inside wined3d.dll)
 and decode `op_queue`. Struct offsets come from `llvm-dwarfdump --name=<struct> -c` on the build's `.o`.
+
+## 2026-10-27: Gears of War 4 signs in to Xbox Live (UWP XSAPI)
+
+After the fence fix the title screen said "Failed to sign in to an Xbox Live profile". A UWP title's XSAPI signs in
+through `WebAuthenticationCoreManager` with provider `https://xsts.auth.xboxlive.com`: requests carry `Url`,
+`HttpMethod`, `RequestHeaders`, `RequestBody`, `Target`, `Policy` properties, and the response's token is the whole
+`XBL3.0 x=uhs;token` header, with `XboxUserId`, `Gamertag`, `AgeGroup`, `Privileges` and `Signature` as properties.
+`winexboxauth` found no such provider. With it, Gears reached the main menu signed in and was then returned to the
+title screen ("Sign in status change occurred") a few seconds later: XSAPI re-checks its account with
+`FindAccountAsync(provider, xuid)`, and "not found" is a sign-out. Answering that keeps it signed in (screenshot from
+the user, main menu with the gamertag). Some requests have a Url with no host (`?entitlementIds=...`); they get the
+default xboxlive.com token. Still open: leaving Options shows "unknown error 0x00000c32": the save goes through
+`Windows.Gaming.XboxLive.Storage.GameSaveProvider`, whose Windows DLL cannot be activated here (no connected-storage
+service). "Unable to connect to the Gears of War services" and the Store-user notice are also open.
