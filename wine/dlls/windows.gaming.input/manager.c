@@ -19,6 +19,7 @@
 
 #include "private.h"
 #include "provider.h"
+#include "roapi.h"
 
 #include "wine/debug.h"
 
@@ -125,59 +126,97 @@ static HRESULT WINAPI controller_GetTrustLevel( IGameController *iface, TrustLev
 static HRESULT WINAPI controller_add_HeadsetConnected( IGameController *iface, ITypedEventHandler_IGameController_Headset *handler,
                                                        EventRegistrationToken *token )
 {
-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token );
-    return E_NOTIMPL;
+    static LONG64 next_token;
+
+    /* never raised; C++/CX callers throw on a failed registration */
+    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
+    if (!token) return E_POINTER;
+    token->value = InterlockedIncrement64( &next_token );
+    return S_OK;
 }
 
 static HRESULT WINAPI controller_remove_HeadsetConnected( IGameController *iface, EventRegistrationToken token )
 {
-    FIXME( "iface %p, token %I64x stub!\n", iface, token.value );
-    return E_NOTIMPL;
+    TRACE( "iface %p, token %I64x.\n", iface, token.value );
+    return S_OK;
 }
 
 static HRESULT WINAPI controller_add_HeadsetDisconnected( IGameController *iface, ITypedEventHandler_IGameController_Headset *handler,
                                                           EventRegistrationToken *token )
 {
-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token );
-    return E_NOTIMPL;
+    static LONG64 next_token;
+
+    /* never raised; C++/CX callers throw on a failed registration */
+    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
+    if (!token) return E_POINTER;
+    token->value = InterlockedIncrement64( &next_token );
+    return S_OK;
 }
 
 static HRESULT WINAPI controller_remove_HeadsetDisconnected( IGameController *iface, EventRegistrationToken token )
 {
-    FIXME( "iface %p, token %I64x stub!\n", iface, token.value );
-    return E_NOTIMPL;
+    TRACE( "iface %p, token %I64x.\n", iface, token.value );
+    return S_OK;
 }
 
 static HRESULT WINAPI controller_add_UserChanged( IGameController *iface,
                                                   ITypedEventHandler_IGameController_UserChangedEventArgs *handler,
                                                   EventRegistrationToken *token )
 {
-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token );
-    return E_NOTIMPL;
+    static LONG64 next_token;
+
+    /* never raised; C++/CX callers throw on a failed registration */
+    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
+    if (!token) return E_POINTER;
+    token->value = InterlockedIncrement64( &next_token );
+    return S_OK;
 }
 
 static HRESULT WINAPI controller_remove_UserChanged( IGameController *iface, EventRegistrationToken token )
 {
-    FIXME( "iface %p, token %I64x stub!\n", iface, token.value );
-    return E_NOTIMPL;
+    TRACE( "iface %p, token %I64x.\n", iface, token.value );
+    return S_OK;
 }
 
 static HRESULT WINAPI controller_get_Headset( IGameController *iface, IHeadset **value )
 {
-    FIXME( "iface %p, value %p stub!\n", iface, value );
-    return E_NOTIMPL;
+    TRACE( "iface %p, value %p: no headset.\n", iface, value );
+    if (!value) return E_POINTER;
+    *value = NULL;
+    return S_OK;
 }
 
 static HRESULT WINAPI controller_get_IsWireless( IGameController *iface, boolean *value )
 {
-    FIXME( "iface %p, value %p stub!\n", iface, value );
-    return E_NOTIMPL;
+    FIXME( "iface %p, value %p semi-stub, reporting wired.\n", iface, value );
+    if (!value) return E_POINTER;
+    *value = FALSE;
+    return S_OK;
 }
 
 static HRESULT WINAPI controller_get_User( IGameController *iface, __x_ABI_CWindows_CSystem_CIUser **value )
 {
-    FIXME( "iface %p, value %p stub!\n", iface, value );
-    return E_NOTIMPL;
+    /* every controller belongs to the prefix's one user: User.GetDefault() */
+    static const GUID iid_IUserStatics2 = {0x74a37e11, 0x2eb5, 0x4487, {0xb0, 0xd5, 0x2c, 0x67, 0x90, 0xe0, 0x13, 0xe9}};
+    static const WCHAR user_class[] = L"Windows.System.User";
+    __x_ABI_CWindows_CSystem_CIUserStatics2 *statics;
+    HSTRING str;
+    HRESULT hr;
+
+    TRACE( "iface %p, value %p.\n", iface, value );
+    if (!value) return E_POINTER;
+    *value = NULL;
+    if (FAILED(hr = WindowsCreateString( user_class, wcslen( user_class ), &str ))) return hr;
+    hr = RoGetActivationFactory( str, &iid_IUserStatics2, (void **)&statics );
+    WindowsDeleteString( str );
+    if (FAILED(hr))
+    {
+        WARN( "no Windows.System.User, hr %#lx: no user.\n", hr );
+        return S_OK;
+    }
+    hr = __x_ABI_CWindows_CSystem_CIUserStatics2_GetDefault( statics, value );
+    __x_ABI_CWindows_CSystem_CIUserStatics2_Release( statics );
+    return hr;
 }
 
 static const struct IGameControllerVtbl controller_vtbl =
