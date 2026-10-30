@@ -792,6 +792,13 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetBackgroundColor(IDXGISwapCha
 
 static HRESULT STDMETHODCALLTYPE d3d11_swapchain_SetRotation(IDXGISwapChain4 *iface, DXGI_MODE_ROTATION rotation)
 {
+    /* UWP's DirectX template sets the identity rotation unconditionally and throws if that fails. */
+    if (rotation == DXGI_MODE_ROTATION_IDENTITY)
+    {
+        TRACE("iface %p, rotation %#x.\n", iface, rotation);
+        return S_OK;
+    }
+
     FIXME("iface %p, rotation %#x stub!\n", iface, rotation);
 
     return E_NOTIMPL;
@@ -2899,6 +2906,13 @@ static HRESULT STDMETHODCALLTYPE d3d12_swapchain_GetBackgroundColor(IDXGISwapCha
 
 static HRESULT STDMETHODCALLTYPE d3d12_swapchain_SetRotation(IDXGISwapChain4 *iface, DXGI_MODE_ROTATION rotation)
 {
+    /* UWP's DirectX template sets the identity rotation unconditionally and throws if that fails. */
+    if (rotation == DXGI_MODE_ROTATION_IDENTITY)
+    {
+        TRACE("iface %p, rotation %#x.\n", iface, rotation);
+        return S_OK;
+    }
+
     FIXME("iface %p, rotation %#x stub!\n", iface, rotation);
 
     return E_NOTIMPL;
