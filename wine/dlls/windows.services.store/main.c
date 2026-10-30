@@ -31,6 +31,10 @@
  * GetAppLicenseAsync is answered: Gears of War 4 asks for its licence at start-up, and an E_NOTIMPL there became an
  * unobserved task exception that ended the game. The licence is the one this prefix has (the user owns what the Xbox
  * app installed): active, not a trial, with no add-ons. The operation is already complete when handed out.
+ *
+ * GetStoreProductsAsync, GetAssociatedStoreProductsAsync and GetUserCollectionAsync answer an empty product list:
+ * Phantom Dust's in-game shop lists the Store add-ons first, and an E_NOTIMPL there was an error dialog instead of
+ * the shop. Nothing can be bought through the Store here, so there is nothing to list.
  */
 
 #include <stdarg.h>
@@ -54,6 +58,10 @@ DEFINE_GUID( IID_IStoreAppLicense2, 0xb4666e91, 0x4443, 0x40b3, 0x99, 0x3f, 0x28
 /* IAsyncOperation<StoreAppLicense>, IMapView<String, StoreLicense> (piid.py) */
 DEFINE_GUID( IID_IAsyncOperation_StoreAppLicense, 0x3866370b, 0xafc6, 0x5d01, 0x84, 0xc2, 0x45, 0x74, 0x62, 0x8d, 0xe5, 0x39 );
 DEFINE_GUID( IID_IMapView_StoreLicense, 0x7dbaefd8, 0xc83a, 0x5ce3, 0xaf, 0x87, 0xac, 0xde, 0x89, 0x51, 0x97, 0xab );
+DEFINE_GUID( IID_IStoreProductQueryResult, 0xd805e6c5, 0xd456, 0x4ff6, 0x80, 0x49, 0x90, 0x76, 0xd5, 0x16, 0x5f, 0x73 );
+/* IAsyncOperation<StoreProductQueryResult>, IMapView<String, StoreProduct> (piid.py) */
+DEFINE_GUID( IID_IAsyncOperation_StoreProductQueryResult, 0x9699e7bb, 0xea1f, 0x5e03, 0x94, 0x39, 0xc8, 0x0e, 0x69, 0x77, 0xb7, 0x11 );
+DEFINE_GUID( IID_IMapView_StoreProduct, 0xa84c3142, 0x171e, 0x551a, 0xb0, 0x10, 0xa3, 0x7b, 0xbf, 0x97, 0xb2, 0x17 );
 DEFINE_GUID( IID_IAsyncInfo_, 0x00000036, 0x0000, 0x0000, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 );
 
 static const WCHAR class_name[] = L"Windows.Services.Store.StoreContext";
@@ -314,6 +322,139 @@ static HRESULT WINAPI context_GetAppLicenseAsync( struct object *iface, struct o
     return S_OK;
 }
 
+/* ---- product queries: an empty IMapView<String, StoreProduct> ---- */
+
+static const void *query_result_vtbl[8], *products_vtbl[10], *query_op_vtbl[9], *query_info_vtbl[11];
+static struct object query_result = { query_result_vtbl }, products = { products_vtbl };
+static struct object query_op = { query_op_vtbl }, query_info = { query_info_vtbl };
+
+static HRESULT WINAPI query_result_QueryInterface( struct object *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IStoreProductQueryResult ))
+    {
+        *out = &query_result;
+        return S_OK;
+    }
+    FIXME( "StoreProductQueryResult: %s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static HRESULT WINAPI query_result_GetRuntimeClassName( struct object *iface, HSTRING *name )
+{
+    static const WCHAR str[] = L"Windows.Services.Store.StoreProductQueryResult";
+    return WindowsCreateString( str, wcslen( str ), name );
+}
+static HRESULT WINAPI query_result_get_Products( struct object *iface, struct object **value )
+{
+    if (!value) return E_POINTER;
+    *value = &products;
+    return S_OK;
+}
+static HRESULT WINAPI query_result_get_ExtendedError( struct object *iface, HRESULT *value )
+{
+    if (!value) return E_POINTER;
+    *value = S_OK;
+    return S_OK;
+}
+
+static HRESULT WINAPI products_QueryInterface( struct object *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IMapView_StoreProduct ))
+    {
+        *out = &products;
+        return S_OK;
+    }
+    FIXME( "Products: %s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static HRESULT WINAPI products_GetRuntimeClassName( struct object *iface, HSTRING *name )
+{
+    static const WCHAR str[] = L"Windows.Foundation.Collections.IMapView`2<String, Windows.Services.Store.StoreProduct>";
+    return WindowsCreateString( str, wcslen( str ), name );
+}
+
+static HRESULT WINAPI query_op_QueryInterface( struct object *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAsyncOperation_StoreProductQueryResult ))
+        *out = &query_op;
+    else if (IsEqualGUID( iid, &IID_IAsyncInfo_ )) *out = &query_info;
+    else
+    {
+        FIXME( "product query operation: %s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    return S_OK;
+}
+static HRESULT WINAPI query_op_GetRuntimeClassName( struct object *iface, HSTRING *name )
+{
+    static const WCHAR str[] = L"Windows.Foundation.IAsyncOperation`1<Windows.Services.Store.StoreProductQueryResult>";
+    return WindowsCreateString( str, wcslen( str ), name );
+}
+static HRESULT WINAPI query_op_put_Completed( struct object *iface, IUnknown *handler )
+{
+    HRESULT (WINAPI *invoke)( IUnknown *, struct object *, INT32 );
+
+    if (!handler) return E_POINTER;
+    invoke = (*(void ***)handler)[3];   /* a delegate: IUnknown, then Invoke */
+    invoke( handler, &query_op, 1 /* Completed */ );
+    return S_OK;
+}
+static HRESULT WINAPI query_op_GetResults( struct object *iface, struct object **result )
+{
+    TRACE( "-> no products.\n" );
+    if (!result) return E_POINTER;
+    *result = &query_result;
+    return S_OK;
+}
+
+static HRESULT WINAPI context_GetStoreProductsAsync( struct object *iface, IUnknown *kinds, IUnknown *ids,
+                                                     struct object **operation )
+{
+    TRACE( "kinds %p, ids %p, operation %p.\n", kinds, ids, operation );
+    if (!operation) return E_POINTER;
+    *operation = &query_op;
+    return S_OK;
+}
+static HRESULT WINAPI context_GetAssociatedStoreProductsAsync( struct object *iface, IUnknown *kinds,
+                                                               struct object **operation )
+{
+    TRACE( "kinds %p, operation %p.\n", kinds, operation );
+    if (!operation) return E_POINTER;
+    *operation = &query_op;
+    return S_OK;
+}
+
+static void init_query_vtables(void)
+{
+    const void **v;
+
+    v = query_result_vtbl;
+    v[0] = query_result_QueryInterface; v[1] = object_AddRef; v[2] = object_Release; v[3] = object_GetIids;
+    v[4] = query_result_GetRuntimeClassName; v[5] = object_GetTrustLevel;
+    v[6] = query_result_get_Products; v[7] = query_result_get_ExtendedError;
+
+    v = products_vtbl;
+    v[0] = products_QueryInterface; v[1] = object_AddRef; v[2] = object_Release; v[3] = object_GetIids;
+    v[4] = products_GetRuntimeClassName; v[5] = object_GetTrustLevel;
+    v[6] = addons_Lookup; v[7] = addons_get_Size; v[8] = addons_HasKey; v[9] = addons_Split;
+
+    v = query_op_vtbl;
+    v[0] = query_op_QueryInterface; v[1] = object_AddRef; v[2] = object_Release; v[3] = object_GetIids;
+    v[4] = query_op_GetRuntimeClassName; v[5] = object_GetTrustLevel;
+    v[6] = query_op_put_Completed; v[7] = license_op_get_Completed; v[8] = query_op_GetResults;
+
+    v = query_info_vtbl;
+    v[0] = query_op_QueryInterface; v[1] = object_AddRef; v[2] = object_Release; v[3] = object_GetIids;
+    v[4] = query_op_GetRuntimeClassName; v[5] = object_GetTrustLevel;
+    v[6] = license_info_get_Id; v[7] = license_info_get_Status; v[8] = license_info_get_ErrorCode;
+    v[9] = license_info_Cancel; v[10] = license_info_Close;
+}
+
 static void init_license_vtables(void)
 {
     const void **v;
@@ -406,7 +547,11 @@ static void init_vtables(void)
     context_vtbl[7] = context_add_OfflineLicensesChanged;
     context_vtbl[8] = context_remove_OfflineLicensesChanged;
     context_vtbl[11] = context_GetAppLicenseAsync;
+    context_vtbl[13] = context_GetStoreProductsAsync;
+    context_vtbl[14] = context_GetAssociatedStoreProductsAsync;
+    context_vtbl[16] = context_GetAssociatedStoreProductsAsync;   /* GetUserCollectionAsync: same parameters */
     init_license_vtables();
+    init_query_vtables();
 
     statics_vtbl[0] = statics_QueryInterface;
     statics_vtbl[1] = object_AddRef;
