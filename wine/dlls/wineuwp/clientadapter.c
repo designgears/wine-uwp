@@ -173,6 +173,9 @@ struct window_adapter
     boolean suppress_overlays, multiview_policy;
     INT32 launch_windowing_mode;
     struct view_size { float width, height; } launch_size, min_size;
+    BOOL full_screen;                    /* entered through put_SuppressSystemOverlays */
+    LONG windowed_style;
+    RECT windowed_rect;
 };
 
 static struct window_adapter *from_window( void *iface ) { return CONTAINING_RECORD( iface, struct window_adapter, vtbl_window ); }
@@ -361,7 +364,72 @@ static HRESULT WINAPI avca_put_launch_size( void *iface, struct view_size size )
 static HRESULT WINAPI avca_get_min_size( void *iface, void *size ) { memcpy( size, &from_view( iface )->min_size, sizeof(from_view( iface )->min_size) ); return S_OK; }
 static HRESULT WINAPI avca_put_min_size( void *iface, struct view_size size ) { from_view( iface )->min_size = size; return S_OK; }
 static HRESULT WINAPI avca_get_suppress( void *iface, boolean *value ) { *value = from_view( iface )->suppress_overlays; return S_OK; }
-static HRESULT WINAPI avca_put_suppress( void *iface, boolean value ) { from_view( iface )->suppress_overlays = value; return S_OK; }
+
+/* twinapi.appcore's CApplicationView, with no shell full-screen broker to ask, passes its FULL_SCREEN_TYPE here
+ * through WindowServer::put_SuppressSystemOverlays: TryEnterFullScreenMode sends its FullScreenSystemOverlayMode
+ * (0 Standard, 1 Minimal), ExitFullScreenMode and SuppressSystemOverlays(false) send 3, SuppressSystemOverlays(true)
+ * sends 2. On Windows the shell then makes the window cover its monitor; do that here, as a borderless window the
+ * size of the monitor, which is also what get_IsFullScreenMode (avca_get_is_full_screen) looks for. */
+static void set_full_screen( struct window_adapter *adapter, BOOL enter )
+{
+    HWND hwnd = adapter->hwnd;
+    LONG style;
+
+    if (!hwnd) return;
+    style = GetWindowLongW( hwnd, GWL_STYLE );
+    if (enter)
+    {
+        MONITORINFO info = {.cbSize = sizeof(info)};
+
+        if (!GetMonitorInfoW( MonitorFromWindow( hwnd, MONITOR_DEFAULTTONEAREST ), &info )) return;
+        if (!adapter->full_screen)
+        {
+            adapter->windowed_style = style;
+            GetWindowRect( hwnd, &adapter->windowed_rect );
+            adapter->full_screen = TRUE;
+        }
+        TRACE( "hwnd %p entering full screen on %s\n", hwnd, wine_dbgstr_rect( &info.rcMonitor ) );
+        SetWindowLongW( hwnd, GWL_STYLE, style & ~(WS_CAPTION | WS_THICKFRAME) );
+        SetWindowPos( hwnd, HWND_TOP, info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right - info.rcMonitor.left,
+                      info.rcMonitor.bottom - info.rcMonitor.top, SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW );
+    }
+    else if (adapter->full_screen)
+    {
+        RECT *rect = &adapter->windowed_rect;
+
+        TRACE( "hwnd %p leaving full screen for %s\n", hwnd, wine_dbgstr_rect( rect ) );
+        adapter->full_screen = FALSE;
+        SetWindowLongW( hwnd, GWL_STYLE, adapter->windowed_style );
+        SetWindowPos( hwnd, NULL, rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top,
+                      SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER );
+    }
+    else if (!(style & WS_CAPTION))
+    {
+        /* made full screen some other way (DXGI's Alt+Enter); give the window its frame back */
+        MONITORINFO info = {.cbSize = sizeof(info)};
+        int width, height;
+
+        if (!GetMonitorInfoW( MonitorFromWindow( hwnd, MONITOR_DEFAULTTONEAREST ), &info )) return;
+        width = (info.rcWork.right - info.rcWork.left) * 3 / 4;
+        height = (info.rcWork.bottom - info.rcWork.top) * 3 / 4;
+        TRACE( "hwnd %p leaving full screen it did not enter here\n", hwnd );
+        SetWindowLongW( hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW );
+        SetWindowPos( hwnd, NULL, info.rcWork.left + (info.rcWork.right - info.rcWork.left - width) / 2,
+                      info.rcWork.top + (info.rcWork.bottom - info.rcWork.top - height) / 2, width, height,
+                      SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER );
+    }
+}
+
+static HRESULT WINAPI avca_put_suppress( void *iface, boolean value )
+{
+    struct window_adapter *adapter = from_view( iface );
+
+    TRACE( "full screen type %u\n", value );
+    adapter->suppress_overlays = value;
+    if (value <= 1) set_full_screen( adapter, TRUE );
+    else if (value == 3) set_full_screen( adapter, FALSE );
+    return S_OK;
+}
 static HRESULT WINAPI avca_get_title( void *iface, HSTRING *value ) { return WindowsDuplicateString( from_view( iface )->title, value ); }
 static HRESULT WINAPI avca_put_title( void *iface, HSTRING value )
 {
