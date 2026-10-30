@@ -74,10 +74,12 @@ static const GUID IID_IIterator_ContainerInfo = {0x0ecd9756,0x3e0d,0x523f,{0xa5,
 static const GUID IID_IVectorView_BlobInfo = {0xb9c466a0,0x2a3f,0x5f28,{0xa1,0xc1,0x9c,0xb1,0x92,0xf6,0xc7,0x86}};
 static const GUID IID_IIterable_BlobInfo = {0xa7c456d7,0xfa9f,0x536f,{0x8e,0xd2,0x45,0x95,0x45,0x81,0x1e,0xd4}};
 static const GUID IID_IIterator_BlobInfo = {0xaaaf545b,0xf5e9,0x5da6,{0xaf,0x70,0x9d,0x90,0x4c,0x7a,0x4d,0x37}};
-static const GUID IID_IMapView_String_Buffer = {0x10f6b0f3,0x55a9,0x55c2,{0x9d,0x4f,0xf6,0x3e,0x32,0x07,0x11,0x79}};
-static const GUID IID_IKeyValuePair_String_Buffer = {0x1709dda3,0xd77b,0x5301,{0xae,0x12,0x8d,0xb4,0x5c,0x50,0x24,0xcf}};
-static const GUID IID_IIterable_KVP_String_Buffer = {0xaec4873f,0x4329,0x509a,{0xb4,0x8a,0x2b,0x94,0x2a,0x77,0xcb,0x73}};
-static const GUID IID_IIterator_KVP_String_Buffer = {0x592d3059,0x50bd,0x5ce9,{0xb9,0xbc,0xe3,0x67,0x25,0xa8,0xfd,0x20}};
+/* IMapView<String, IBuffer> and its pair, iterable and iterator (piid.py --signature; the earlier values matched
+ * nothing, so a title's blob map was never enumerated and SubmitUpdatesAsync wrote nothing) */
+static const GUID IID_IMapView_String_Buffer = {0x2cfeec4f,0xe261,0x5f4c,{0xae,0xe1,0xc7,0x85,0x18,0xe9,0xd5,0xb9}};
+static const GUID IID_IKeyValuePair_String_Buffer = {0x9114f794,0x2ceb,0x5b03,{0x9b,0x22,0x36,0x88,0x4e,0x1f,0x58,0xb3}};
+static const GUID IID_IIterable_KVP_String_Buffer = {0x3c9ffa92,0x5123,0x5ac4,{0xb1,0x11,0x03,0xc2,0x15,0xf0,0xc5,0x1c}};
+static const GUID IID_IIterator_KVP_String_Buffer = {0x790acb62,0xc4b3,0x57ea,{0xa1,0x52,0x9e,0x21,0x93,0x71,0xc6,0xdc}};
 /* IIterable<IKeyValuePair<String, Object>>, what an IPropertySet is enumerated as */
 static const GUID IID_IIterable_KVP_String_Object = {0xfe2f3d47,0x5d47,0x5499,{0x83,0x74,0x43,0x0c,0x7c,0xda,0x02,0x04}};
 static const GUID IID_IBuffer_ = {0x905a0fe0,0xbc53,0x11df,{0x8c,0x49,0x00,0x1e,0x4f,0xc6,0x86,0xda}};
@@ -310,8 +312,8 @@ static HRESULT complete_result( const GUID *async_iid, const WCHAR *cls, const G
     r->status = status;
     r->value = value;
     TRACE( "%s -> status %#x\n", name, status );
+    /* completed_iface takes the result's reference */
     hr = completed_iface( async_iid, name, (IUnknown *)&r->obj.vtbl[0], out );
-    obj_Release( &r->obj );
     return hr;
 }
 
@@ -663,6 +665,8 @@ static HRESULT submit_write( const char *name, IInspectable *value, void *ctx )
     if (!*name || s->status) return S_OK;
     if (value) IInspectable_QueryInterface( value, &IID_IBuffer_, (void **)&buffer );
     bytes = buffer_bytes( buffer, &length, &capacity );
+    TRACE( "  blob %s: value %p, buffer %p, length %u, capacity %u, bytes %p\n", debugstr_a(name), value, buffer,
+           length, capacity, bytes );
     if ((path = blob_path( s->c, name )))
     {
         if (!write_file( path, bytes ? bytes : (BYTE *)"", bytes ? length : 0 )) s->status = GS_OUT_OF_LOCAL_STORAGE;
@@ -705,6 +709,7 @@ static HRESULT submit_updates( struct container *c, IInspectable *writes, const 
         for_each_pair( iterable, submit_write, &s );
         IInspectable_Release( iterable );
     }
+    else if (writes) ERR( "%s: the writes are not an %s; nothing is saved\n", name, debugstr_guid( iterable_iid ) );
     if (!s.status) for_each_string( deletes, submit_delete, &s );
     if (!s.status && shown && *shown && (path = path_join( c->dir, L".display" )))
     {
