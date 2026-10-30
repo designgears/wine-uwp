@@ -498,5 +498,6 @@ dlls/winexboxauth/gamesave.c
 dlls/vcruntime140/misc.c
 dlls/wpnapps/main.c
 dlls/windows.gaming.input/manager.c
+dlls/d3d11/videoproc.c
 dlls/winegstreamer/mfplat.c
 dlls/bcrypt/bcrypt_main.c
