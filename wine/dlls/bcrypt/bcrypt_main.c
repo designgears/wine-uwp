@@ -2159,6 +2159,8 @@ static NTSTATUS encrypt_aes_gcm( struct key *key, const UCHAR *input, ULONG inpu
     if (info->dwFlags & BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG) FIXME( "call chaining not implemented\n" );
 
     if (input && !input_len) return STATUS_SUCCESS;
+    /* a size query, as in decrypt_aes_gcm; CryptoWinRT's CryptographicEngine.EncryptAndAuthenticate makes one */
+    if (!output) return STATUS_SUCCESS;
     if (output_len < *ret_len) return STATUS_BUFFER_TOO_SMALL;
 
     EnterCriticalSection( &key->s.cs );
