@@ -27,6 +27,7 @@
 #include "roapi.h"
 #include "winstring.h"
 #include "inspectable.h"
+#include "eventtoken.h"
 #include "wine/debug.h"
 #include "wine/exception.h"
 #include <stdio.h>
@@ -1212,6 +1213,8 @@ static void hook_add_visibility_changed( void )
     IUnknown_Release( (IUnknown *)window );
 }
 
+static void start_app_exit_watchdog( void );
+
 static LRESULT CALLBACK core_window_subclass_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
 {
     hook_add_visibility_changed();
@@ -1250,6 +1253,11 @@ static LRESULT CALLBACK core_window_subclass_proc( HWND hwnd, UINT msg, WPARAM w
         return 0;
     }
     if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_NCDESTROY && hwnd == hosted_core_window)
+    {
+        TRACE( "CoreWindow %p destroyed\n", hwnd );
+        start_app_exit_watchdog();
+    }
     return CallWindowProcW( core_window_proc_orig, hwnd, msg, wparam, lparam );
 }
 
@@ -1408,6 +1416,139 @@ static HRESULT do_activate_protocol( struct registrar *reg, const WCHAR *uri )
     return hr;
 }
 
+/* When the app's main view finishes, CoreApplication::TearDown waits for every view thread to end. On Windows it
+ * never gets to the end of that wait: the process lifetime manager terminates the app (PsmShutdownApplication /
+ * HamTerminateSelfEx). Here nothing does, and a view thread twinapi parked in
+ * CoreApplicationViewAgileContainer::WaitForViewReady at start-up never returns, so the process stayed alive with
+ * no window and its audio still playing (Phantom Dust's "End Game"). Stand in for the lifetime manager: when the
+ * hosted CoreWindow is destroyed (core_window_subclass_proc), its thread ends (which frees the window without a
+ * WM_NCDESTROY) or CoreApplication.Exiting is raised, wait a moment, and if the app has no window left by then, end
+ * the process. */
+DEFINE_GUID(IID_ICoreApplicationExit_local, 0xcf86461d, 0x261e, 0x4b72, 0x9a, 0xcd, 0x44, 0xed, 0x2a, 0xce, 0x6a, 0x29);
+DEFINE_GUID(IID_IEventHandler_IInspectable, 0xc50898f6, 0xc536, 0x5f47, 0x85, 0x83, 0x8b, 0x2c, 0x24, 0x38, 0xa1, 0x3b);
+
+#define APP_EXIT_GRACE_MS 3000
+
+static BOOL CALLBACK find_visible_app_window( HWND hwnd, LPARAM lparam )
+{
+    DWORD pid;
+
+    GetWindowThreadProcessId( hwnd, &pid );
+    if (pid != GetCurrentProcessId() || !IsWindowVisible( hwnd )) return TRUE;
+    *(HWND *)lparam = hwnd;
+    return FALSE;
+}
+
+static DWORD WINAPI app_exit_thread( void *arg )
+{
+    HWND visible = NULL;
+
+    SetThreadDescription( GetCurrentThread(), L"wine_uwp_app_exit" );
+    Sleep( APP_EXIT_GRACE_MS );
+    if (hosted_core_window && IsWindow( hosted_core_window ))
+    {
+        TRACE( "CoreWindow %p is still there; not ending the app\n", hosted_core_window );
+        return 0;
+    }
+    EnumWindows( find_visible_app_window, (LPARAM)&visible );
+    if (visible)
+    {
+        TRACE( "window %p is still visible; not ending the app\n", visible );
+        return 0;
+    }
+    ERR( "the app's window has been gone for %u ms and the process is still running; ending it, as Windows' "
+         "lifetime manager would\n", APP_EXIT_GRACE_MS );
+    TerminateProcess( GetCurrentProcess(), 0 );
+    return 0;
+}
+
+static void start_app_exit_watchdog( void )
+{
+    HANDLE thread;
+
+    if ((thread = CreateThread( NULL, 0, app_exit_thread, NULL, 0, NULL ))) CloseHandle( thread );
+}
+
+static HRESULT WINAPI exiting_QueryInterface( IUnknown *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
+        IsEqualGUID( iid, &IID_IEventHandler_IInspectable ))
+    {
+        *out = iface;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI exiting_AddRef( IUnknown *iface ) { return 2; }
+static ULONG WINAPI exiting_Release( IUnknown *iface ) { return 1; }
+static HRESULT WINAPI exiting_Invoke( IUnknown *iface, IInspectable *sender, IInspectable *args )
+{
+    TRACE( "CoreApplication.Exiting\n" );
+    start_app_exit_watchdog();
+    return S_OK;
+}
+
+static const struct
+{
+    HRESULT (WINAPI *QueryInterface)( IUnknown *, REFIID, void ** );
+    ULONG (WINAPI *AddRef)( IUnknown * );
+    ULONG (WINAPI *Release)( IUnknown * );
+    HRESULT (WINAPI *Invoke)( IUnknown *, IInspectable *, IInspectable * );
+} exiting_vtbl = { exiting_QueryInterface, exiting_AddRef, exiting_Release, exiting_Invoke };
+static struct { const void *vtbl; } exiting_handler = { &exiting_vtbl };
+
+static DWORD WINAPI view_thread_exit_thread( void *arg )
+{
+    HANDLE thread = arg;
+
+    SetThreadDescription( GetCurrentThread(), L"wine_uwp_view_watch" );
+    WaitForSingleObject( thread, INFINITE );
+    CloseHandle( thread );
+    TRACE( "the CoreWindow's thread has ended\n" );
+    start_app_exit_watchdog();
+    return 0;
+}
+
+/* ICoreApplicationExit: slot 6 Exit, 7 add_Exiting, 8 remove_Exiting */
+static void watch_app_exit( void )
+{
+    static const WCHAR name[] = L"Windows.ApplicationModel.Core.CoreApplication";
+    HRESULT (WINAPI **vtbl)( void *, ... );
+    EventRegistrationToken token;
+    HSTRING str;
+    void *exit = NULL;
+    HRESULT hr;
+
+    if (FAILED( WindowsCreateString( name, ARRAY_SIZE(name) - 1, &str ) )) return;
+    hr = RoGetActivationFactory( str, &IID_ICoreApplicationExit_local, &exit );
+    WindowsDeleteString( str );
+    if (FAILED( hr ) || !exit)
+    {
+        ERR( "no ICoreApplicationExit, hr %#lx; the process may outlive the app\n", hr );
+        return;
+    }
+    vtbl = *(void **)exit;
+    hr = ((HRESULT (WINAPI *)( void *, void *, EventRegistrationToken * ))vtbl[7])( exit, &exiting_handler, &token );
+    TRACE( "add_Exiting hr %#lx\n", hr );
+    ((ULONG (WINAPI *)( void * ))vtbl[2])( exit );
+}
+
+static void watch_view_thread( void )
+{
+    DWORD tid = hosted_core_window ? GetWindowThreadProcessId( hosted_core_window, NULL ) : 0;
+    HANDLE thread, waiter;
+
+    if (!tid || !(thread = OpenThread( SYNCHRONIZE, FALSE, tid )))
+    {
+        ERR( "no CoreWindow thread to watch (window %p, tid %lu)\n", hosted_core_window, tid );
+        return;
+    }
+    TRACE( "watching the CoreWindow's thread %04lx\n", tid );
+    if ((waiter = CreateThread( NULL, 0, view_thread_exit_thread, thread, 0, NULL ))) CloseHandle( waiter );
+    else CloseHandle( thread );
+}
+
 static HRESULT do_activate(struct registrar *reg)
 {
     IActivatableApplication *app;
@@ -1444,6 +1585,8 @@ static HRESULT do_activate(struct registrar *reg)
         if (!core_window) WARN("no core window in this process to show\n");
         drive_view_startup( args );
         start_activation_inbox( reg );
+        watch_app_exit();
+        watch_view_thread();
     }
 
     IInspectable_Release(args);
