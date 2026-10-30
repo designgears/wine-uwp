@@ -1044,7 +1044,14 @@ static struct request_result *xsts_token_result( struct token_work *w )
     HRESULT hr;
 
     account_init();
-    if (FAILED(hr = sign_in_silently()))
+    /* RequestTokenAsync is the title's "sign in" button (UWP XSAPI's SignInAsync after a silent attempt): with nobody
+     * signed in, run the device-code sign-in in the user's browser, as Windows would show its account picker */
+    if (FAILED(hr = sign_in_silently()) && w->ui)
+    {
+        MESSAGE( "Xbox Live sign-in requested by the app: approve it in the browser window that opens\n" );
+        if (SUCCEEDED(hr = sign_in_with_device_code( NULL ))) hr = sign_in_silently();
+    }
+    if (FAILED(hr))
     {
         TRACE( "  Xbox Live: not signed in (%#lx)\n", hr );
         return request_result_create( w->ui ? WTRS_USER_CANCEL : WTRS_USER_INTERACTION_REQUIRED, w->scope );
