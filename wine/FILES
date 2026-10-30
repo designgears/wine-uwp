@@ -69,6 +69,7 @@ dlls/dxgi/dxgi_private.h
 dlls/dxgi/factory.c
 dlls/dxgi/Makefile.in
 dlls/dxgi/output.c
+dlls/dxgi/swapchain.c
 dlls/edputil/edputil.spec
 dlls/edputil/main.c
 dlls/edputil/Makefile.in
@@ -495,3 +496,7 @@ dlls/winexboxauth/cloudsave.c
 dlls/winexboxauth/deviceaddr.c
 dlls/winexboxauth/gamesave.c
 dlls/vcruntime140/misc.c
+dlls/wpnapps/main.c
+dlls/windows.gaming.input/manager.c
+dlls/winegstreamer/mfplat.c
+dlls/bcrypt/bcrypt_main.c
