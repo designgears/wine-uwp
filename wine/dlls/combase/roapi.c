@@ -558,8 +558,13 @@ static HRESULT WINAPI mva_get_MainView( struct main_view_app *app, IInspectable 
 
     hr = ((HRESULT (WINAPI *)(void *, IInspectable **))(*(struct slots **)app->real)->slot[8])( app->real, out );
     if (FAILED(hr) || !*out || view_has_window( *out ) == S_OK) return hr;
-    if (FAILED(mva_get_Views( app, (void **)&views )) || !views) return hr;
+    if (FAILED(mva_get_Views( app, (void **)&views )) || !views)
+    {
+        TRACE( "main view %p has no window and there are no views to pick from\n", *out );
+        return hr;
+    }
     ((HRESULT (WINAPI *)(void *, UINT32 *))(*views)->slot[7])( views, &count );   /* get_Size */
+    TRACE( "main view %p has no window; %u view(s)\n", *out, count );
     for (i = 0; i < count; i++)
     {
         if (FAILED(((HRESULT (WINAPI *)(void *, UINT32, IInspectable **))(*views)->slot[6])( views, i, &view )) || !view) continue;
@@ -582,11 +587,86 @@ static const void *main_view_app_vtbl[] =
     mva_get_Views, mva_CreateNewView, mva_get_MainView,
 };
 
+/* CoreApplication's factory asked for as IActivationFactory (C++/CX's vccorlib caches factories that way and
+ * QueryInterfaces them later): ICoreImmersiveApplication from it has to be the wrapper above too. GameChat, in a
+ * Phantom Dust lobby, reads MainView.CoreWindow.Dispatcher through such a cached factory. */
+struct core_app_factory
+{
+    const void **vtbl;
+    LONG refs;
+    IActivationFactory *real;
+};
+
+static HRESULT WINAPI caf_QueryInterface( struct core_app_factory *f, REFIID iid, void **out )
+{
+    struct main_view_app *app;
+    HRESULT hr;
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IActivationFactory ))
+    {
+        InterlockedIncrement( &f->refs );
+        *out = f;
+        return S_OK;
+    }
+    if (FAILED(hr = IActivationFactory_QueryInterface( f->real, iid, out )) || !IsEqualGUID( iid, &IID_ICoreImmersiveApplication_ ))
+        return hr;
+    if (!(app = malloc( sizeof(*app) ))) return hr;
+    app->vtbl = main_view_app_vtbl;
+    app->refs = 1;
+    app->real = *out;
+    *out = app;
+    return S_OK;
+}
+static ULONG WINAPI caf_AddRef( struct core_app_factory *f ) { return InterlockedIncrement( &f->refs ); }
+static ULONG WINAPI caf_Release( struct core_app_factory *f )
+{
+    ULONG refs = InterlockedDecrement( &f->refs );
+    if (!refs)
+    {
+        IActivationFactory_Release( f->real );
+        free( f );
+    }
+    return refs;
+}
+static HRESULT WINAPI caf_GetIids( struct core_app_factory *f, ULONG *count, IID **iids )
+{
+    return IActivationFactory_GetIids( f->real, count, iids );
+}
+static HRESULT WINAPI caf_GetRuntimeClassName( struct core_app_factory *f, HSTRING *name )
+{
+    return IActivationFactory_GetRuntimeClassName( f->real, name );
+}
+static HRESULT WINAPI caf_GetTrustLevel( struct core_app_factory *f, TrustLevel *level )
+{
+    return IActivationFactory_GetTrustLevel( f->real, level );
+}
+static HRESULT WINAPI caf_ActivateInstance( struct core_app_factory *f, IInspectable **out )
+{
+    return IActivationFactory_ActivateInstance( f->real, out );
+}
+
+static const void *core_app_factory_vtbl[] =
+{
+    caf_QueryInterface, caf_AddRef, caf_Release, caf_GetIids, caf_GetRuntimeClassName, caf_GetTrustLevel,
+    caf_ActivateInstance,
+};
+
 static void wrap_core_application( const WCHAR *name, REFIID iid, void **factory )
 {
     struct main_view_app *app;
 
     if (!name || wcscmp( name, L"Windows.ApplicationModel.Core.CoreApplication" )) return;
+    if (IsEqualGUID( iid, &IID_IActivationFactory ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IUnknown ))
+    {
+        struct core_app_factory *f;
+
+        if (!(f = malloc( sizeof(*f) ))) return;
+        f->vtbl = core_app_factory_vtbl;
+        f->refs = 1;
+        f->real = *factory;
+        *factory = f;
+        return;
+    }
     if (!IsEqualGUID( iid, &IID_ICoreImmersiveApplication_ )) return;
     if (!(app = malloc( sizeof(*app) ))) return;
     app->vtbl = main_view_app_vtbl;
