@@ -18,6 +18,7 @@ A product on top of this (a setup UI, an AppImage, branding) lives in its own re
 | `install-app.py` | an `.msixbundle`/`.msix` into `stage/<app>`, with frameworks, `identity.env`, `launch.env`, icon, URI schemes; `--info` previews one |
 | Wine's `programs/wineuwp-launch` | `wineuwp-launch.exe`: starts an installed app from a plain `wine` command; the installer copies it into each stage |
 | `make-test-bundle.py` | rebuilds an `.msixbundle` from a staged package, to test installs without the real download |
+| `inhibit-idle.py` | runs an app with the desktop kept from dimming, locking or suspending (D-Bus: portal, ScreenSaver, GNOME/MATE session) |
 | `wine-uwp` | the command: `setup`, `run`, `install`, `harvest`, `new-prefix`, `activate URI` |
 | `build-dist.sh` | an installed tree from this checkout (host Wine build + everything above) |
 
