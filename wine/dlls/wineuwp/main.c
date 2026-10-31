@@ -407,6 +407,40 @@ static void launch_window_size( int *width, int *height )
     *width = CORE_WINDOW_WIDTH;
     *height = CORE_WINDOW_HEIGHT;
 }
+/* Windows' taskbar and title bar show the package's logo; a CoreWindow has no icon of its own, so the
+ * frame here got Wine's. install-app.py keeps the logo as .wine-uwp-icon.png in the stage directory,
+ * which is WINE_UWP_PACKAGE_PATH, and user32 reads PNG data as an icon. */
+static void set_package_icon( HWND hwnd )
+{
+    WCHAR path[MAX_PATH];
+    HANDLE file;
+    DWORD size, got;
+    HICON big_icon, small_icon;
+    BYTE *data;
+    DWORD len = GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_PATH", path, ARRAY_SIZE(path) );
+
+    if (!len || len + 20 > ARRAY_SIZE(path)) return;
+    lstrcatW( path, L"\\.wine-uwp-icon.png" );
+    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+    if (file == INVALID_HANDLE_VALUE) return;
+    size = GetFileSize( file, NULL );
+    if (size == INVALID_FILE_SIZE || size > 16 << 20 || !(data = malloc( size )))
+    {
+        CloseHandle( file );
+        return;
+    }
+    if (ReadFile( file, data, size, &got, NULL ) && got == size)
+    {
+        big_icon = CreateIconFromResourceEx( data, size, TRUE, 0x00030000, 0, 0, LR_DEFAULTCOLOR );
+        small_icon = CreateIconFromResourceEx( data, size, TRUE, 0x00030000, GetSystemMetrics( SM_CXSMICON ),
+                                          GetSystemMetrics( SM_CYSMICON ), LR_DEFAULTCOLOR );
+        TRACE( "icon %s: %p %p\n", debugstr_w(path), big_icon, small_icon );
+        if (big_icon) SendMessageW( hwnd, WM_SETICON, ICON_BIG, (LPARAM)big_icon );
+        if (small_icon) SendMessageW( hwnd, WM_SETICON, ICON_SMALL, (LPARAM)small_icon );
+    }
+    CloseHandle( file );
+    free( data );
+}
 static void current_view_size( FLOAT *width, FLOAT *height )
 {
     RECT rc;
@@ -1142,6 +1176,7 @@ static BOOL CALLBACK show_core_window( HWND hwnd, LPARAM param )
             if (GetEnvironmentVariableW( L"WINE_UWP_WINDOW_TITLE", title, ARRAY_SIZE(title) ) && title[0])
                 SetWindowTextW( hwnd, title );
         }
+        set_package_icon( hwnd );
         ShowWindow( hwnd, SW_SHOW );
         SetForegroundWindow( hwnd );
         SetTimer( hwnd, WM_WINE_UWP_VISIBLE, 3000, NULL );   /* see core_window_subclass_proc */
