@@ -3676,6 +3676,13 @@ static void note_retrieved_message( const MSG *msg )
     BOOL pointer = (message >= WM_POINTERUPDATE && message <= WM_POINTERLEAVE) ||
                    message == WM_POINTERWHEEL || message == WM_POINTERHWHEEL;
 
+    /* A mouse message that follows its mouse-in-pointer WM_POINTER* send keeps that pointer current: on Windows the
+     * mouse message is generated while the pointer message is handled, so it is still the current message's pointer.
+     * Windows.UI's CoreWindow asks GetPointerInfo while handling the click that activates it, and a refusal there
+     * throws and destroys the CoreWindow (Phantom Dust's window vanished when clicked from another window). */
+    if (!pointer && message >= WM_MOUSEFIRST && message <= WM_MOUSELAST && get_user_thread_info()->current_pointer_id == 1)
+        return;
+
     get_user_thread_info()->current_pointer_id = pointer ? LOWORD( msg->wParam ) : 0;
 }
 

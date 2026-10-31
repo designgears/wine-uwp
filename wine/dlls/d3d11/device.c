@@ -3535,14 +3535,15 @@ static HRESULT STDMETHODCALLTYPE d3d11_video_context_DecoderExtension(ID3D11Vide
 static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorSetOutputTargetRect(
         ID3D11VideoContext *iface, ID3D11VideoProcessor *processor, BOOL enable, const RECT *rect)
 {
-    FIXME("iface %p, processor %p, enable %d, rect %s, stub!\n", iface, processor, enable, wine_dbgstr_rect(rect));
+    TRACE("iface %p, processor %p, enable %d, rect %s.\n", iface, processor, enable, wine_dbgstr_rect(rect));
+
+    d3d_video_processor_set_rect(processor, D3D_VIDEO_PROCESSOR_RECT_OUTPUT, 0, enable, rect);
 }
 
 static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorSetOutputBackgroundColor(
         ID3D11VideoContext *iface, ID3D11VideoProcessor *processor, BOOL yuv, const D3D11_VIDEO_COLOR *color)
 {
-    FIXME("iface %p, processor %p, yuv %d, color {%.8e, %.8e, %.8e, %.8e}, stub!\n",
-            iface, processor, yuv, color->RGBA.R, color->RGBA.G, color->RGBA.B, color->RGBA.A);
+    FIXME("iface %p, processor %p, yuv %d, color %p, stub!\n", iface, processor, yuv, color);
 }
 
 static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorSetOutputColorSpace(ID3D11VideoContext *iface,
@@ -3637,22 +3638,27 @@ static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorSetStreamOutputR
         ID3D11VideoContext *iface, ID3D11VideoProcessor *processor, UINT stream_idx,
         D3D11_VIDEO_PROCESSOR_OUTPUT_RATE rate, BOOL repeat, const DXGI_RATIONAL *custom_rate)
 {
-    FIXME("iface %p, processor %p, stream_idx %u, rate %#x, repeat %d, custom_rate %u/%u, stub!\n",
-            iface, processor, stream_idx, rate, repeat, custom_rate->Numerator, custom_rate->Denominator);
+    /* custom_rate may be NULL */
+    FIXME("iface %p, processor %p, stream_idx %u, rate %#x, repeat %d, custom_rate %p, stub!\n",
+            iface, processor, stream_idx, rate, repeat, custom_rate);
 }
 
 static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorSetStreamSourceRect(ID3D11VideoContext *iface,
         ID3D11VideoProcessor *processor, UINT stream_idx, BOOL enable, const RECT *rect)
 {
-    FIXME("iface %p, processor %p, stream_idx %u, enable %d, rect %s, stub!\n",
+    TRACE("iface %p, processor %p, stream_idx %u, enable %d, rect %s.\n",
             iface, processor, stream_idx, enable, wine_dbgstr_rect(rect));
+
+    d3d_video_processor_set_rect(processor, D3D_VIDEO_PROCESSOR_RECT_SOURCE, stream_idx, enable, rect);
 }
 
 static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorSetStreamDestRect(ID3D11VideoContext *iface,
         ID3D11VideoProcessor *processor, UINT stream_idx, BOOL enable, const RECT *rect)
 {
-    FIXME("iface %p, processor %p, stream_idx %u, enable %d, rect %s, stub!\n",
+    TRACE("iface %p, processor %p, stream_idx %u, enable %d, rect %s.\n",
             iface, processor, stream_idx, enable, wine_dbgstr_rect(rect));
+
+    d3d_video_processor_set_rect(processor, D3D_VIDEO_PROCESSOR_RECT_DEST, stream_idx, enable, rect);
 }
 
 static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorSetStreamAlpha(ID3D11VideoContext *iface,
@@ -3673,9 +3679,9 @@ static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorSetStreamPixelAs
         ID3D11VideoContext *iface, ID3D11VideoProcessor *processor, UINT stream_idx,
         BOOL enable, const DXGI_RATIONAL *src_ratio, const DXGI_RATIONAL *dst_ratio)
 {
-    FIXME("iface %p, processor %p, stream_idx %u, enable %d, src_ratio %u/%u, dst_ratio %u/%u stub!\n",
-            iface, processor, stream_idx, enable, src_ratio->Numerator, src_ratio->Denominator,
-            dst_ratio->Numerator, dst_ratio->Denominator);
+    /* the ratios may be NULL when disabled */
+    FIXME("iface %p, processor %p, stream_idx %u, enable %d, src_ratio %p, dst_ratio %p, stub!\n",
+            iface, processor, stream_idx, enable, src_ratio, dst_ratio);
 }
 
 static void STDMETHODCALLTYPE d3d11_video_context_VideoProcessorSetStreamLumaKey(ID3D11VideoContext *iface,
@@ -3814,9 +3820,13 @@ static HRESULT STDMETHODCALLTYPE d3d11_video_context_VideoProcessorBlt(
         ID3D11VideoContext *iface, ID3D11VideoProcessor *processor, ID3D11VideoProcessorOutputView *view,
         UINT frame_idx, UINT stream_count, const D3D11_VIDEO_PROCESSOR_STREAM *streams)
 {
-    FIXME("iface %p, processor %p, view %p, frame_idx %u, stream_count %u, streams %p, stub!\n",
+    struct d3d11_device_context *context = impl_from_ID3D11VideoContext(iface);
+
+    TRACE("iface %p, processor %p, view %p, frame_idx %u, stream_count %u, streams %p.\n",
             iface, processor, view, frame_idx, stream_count, streams);
-    return E_NOTIMPL;
+
+    return d3d_video_processor_blt((ID3D11DeviceContext *)&context->ID3D11DeviceContext4_iface,
+            processor, view, stream_count, streams);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d11_video_context_NegotiateCryptoSessionKeyExchange(
@@ -7986,9 +7996,21 @@ static HRESULT STDMETHODCALLTYPE d3d11_video_device_CreateVideoDecoder(ID3D11Vid
 static HRESULT STDMETHODCALLTYPE d3d11_video_device_CreateVideoProcessor(ID3D11VideoDevice1 *iface,
         ID3D11VideoProcessorEnumerator *enumerator, UINT rate_conversion_index, ID3D11VideoProcessor **processor)
 {
-    FIXME("iface %p, enumerator %p, rate_conversion_index %u, processor %p, stub!\n",
+    struct d3d_device *device = impl_from_ID3D11VideoDevice1(iface);
+    struct d3d_video_processor *object;
+    HRESULT hr;
+
+    TRACE("iface %p, enumerator %p, rate_conversion_index %u, processor %p.\n",
             iface, enumerator, rate_conversion_index, processor);
-    return E_NOTIMPL;
+
+    *processor = NULL;
+    if (rate_conversion_index)
+        return E_INVALIDARG;
+    if (FAILED(hr = d3d_video_processor_create(device, enumerator, &object)))
+        return hr;
+
+    *processor = &object->ID3D11VideoProcessor_iface;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d11_video_device_CreateAuthenticatedChannel(ID3D11VideoDevice1 *iface,
@@ -8033,23 +8055,60 @@ static HRESULT STDMETHODCALLTYPE d3d11_video_device_CreateVideoProcessorInputVie
         ID3D11VideoDevice1 *iface, ID3D11Resource *resource, ID3D11VideoProcessorEnumerator *enumerator,
         const D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC *desc, ID3D11VideoProcessorInputView **view)
 {
-    FIXME("iface %p, resource %p, enumerator %p, desc %p, view %p, stub!\n", iface, resource, enumerator, desc, view);
-    return E_NOTIMPL;
+    struct d3d_device *device = impl_from_ID3D11VideoDevice1(iface);
+    struct d3d_video_processor_view *object;
+    HRESULT hr;
+
+    TRACE("iface %p, resource %p, enumerator %p, desc %p, view %p.\n", iface, resource, enumerator, desc, view);
+
+    *view = NULL;
+    if (!desc)
+        return E_INVALIDARG;
+    if (FAILED(hr = d3d_video_processor_view_create(device, resource, desc, NULL, &object)))
+        return hr;
+
+    *view = &object->ID3D11VideoProcessorInputView_iface;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d11_video_device_CreateVideoProcessorOutputView(
         ID3D11VideoDevice1 *iface, ID3D11Resource *resource, ID3D11VideoProcessorEnumerator *enumerator,
         const D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC *desc, ID3D11VideoProcessorOutputView **view)
 {
-    FIXME("iface %p, resource %p, enumerator %p, desc %p, view %p, stub!\n", iface, resource, enumerator, desc, view);
-    return E_NOTIMPL;
+    struct d3d_device *device = impl_from_ID3D11VideoDevice1(iface);
+    struct d3d_video_processor_view *object;
+    HRESULT hr;
+
+    TRACE("iface %p, resource %p, enumerator %p, desc %p, view %p.\n", iface, resource, enumerator, desc, view);
+
+    *view = NULL;
+    if (!desc)
+        return E_INVALIDARG;
+    if (FAILED(hr = d3d_video_processor_view_create(device, resource, NULL, desc, &object)))
+        return hr;
+
+    *view = &object->ID3D11VideoProcessorOutputView_iface;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d11_video_device_CreateVideoProcessorEnumerator(ID3D11VideoDevice1 *iface,
         const D3D11_VIDEO_PROCESSOR_CONTENT_DESC *desc, ID3D11VideoProcessorEnumerator **enumerator)
 {
-    FIXME("iface %p, desc %p, enumerator %p, stub!\n", iface, desc, enumerator);
-    return E_NOTIMPL;
+    struct d3d_device *device = impl_from_ID3D11VideoDevice1(iface);
+    struct d3d_video_processor_enum *object;
+    HRESULT hr;
+
+    TRACE("iface %p, desc %p, enumerator %p.\n", iface, desc, enumerator);
+
+    *enumerator = NULL;
+    if (!desc)
+        return E_INVALIDARG;
+
+    if (FAILED(hr = d3d_video_processor_enum_create(device, desc, &object)))
+        return hr;
+
+    *enumerator = &object->ID3D11VideoProcessorEnumerator_iface;
+    return S_OK;
 }
 
 static UINT STDMETHODCALLTYPE d3d11_video_device_GetVideoDecoderProfileCount(ID3D11VideoDevice1 *iface)

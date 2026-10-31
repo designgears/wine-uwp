@@ -1331,6 +1331,10 @@ def install_package(args, resources):
     if appinstaller:
         with open(os.path.join(dest, ".wine-uwp-appinstaller"), "w") as f:
             f.write(appinstaller + "\n")
+    # local.env: this install's own settings (wineuwp-launch reads it last, e.g. WINE_UWP_INJECT for a mod); an update
+    # keeps it
+    if os.path.exists(os.path.join(final, "local.env")):
+        shutil.copy2(os.path.join(final, "local.env"), os.path.join(dest, "local.env"))
     publish_stage(dest, final)
     say(f"STAGE Installed {title} {info['version']}")
     say(f"INSTALLED {stage}")
