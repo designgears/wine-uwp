@@ -493,6 +493,7 @@ struct main_view_app
     const void **vtbl;
     LONG refs;
     IInspectable *real;   /* ICoreImmersiveApplication */
+    IUnknown *outer;      /* the factory wrapper below, when it handed this out: the object's IUnknown */
 };
 
 static HRESULT view_has_window( IInspectable *view )
@@ -516,6 +517,7 @@ static HRESULT WINAPI mva_QueryInterface( struct main_view_app *app, REFIID iid,
         *out = app;
         return S_OK;
     }
+    if (app->outer && IsEqualGUID( iid, &IID_IUnknown )) return IUnknown_QueryInterface( app->outer, iid, out );
     return IInspectable_QueryInterface( app->real, iid, out );
 }
 static ULONG WINAPI mva_AddRef( struct main_view_app *app ) { return InterlockedIncrement( &app->refs ); }
@@ -525,6 +527,7 @@ static ULONG WINAPI mva_Release( struct main_view_app *app )
     if (!refs)
     {
         IInspectable_Release( app->real );
+        if (app->outer) IUnknown_Release( app->outer );
         free( app );
     }
     return refs;
@@ -549,35 +552,146 @@ static HRESULT WINAPI mva_CreateNewView( struct main_view_app *app, HSTRING type
 {
     return ((HRESULT (WINAPI *)(void *, HSTRING, HSTRING, void **))(*(struct slots **)app->real)->slot[7])( app->real, type, entry, view );
 }
-static HRESULT WINAPI mva_get_MainView( struct main_view_app *app, IInspectable **out )
+/* The first view that has a window, or NULL. */
+static IInspectable *find_window_view( IInspectable *real )
 {
     struct slots **views = NULL;
     IInspectable *view = NULL;
     UINT32 count = 0, i;
-    HRESULT hr;
 
-    hr = ((HRESULT (WINAPI *)(void *, IInspectable **))(*(struct slots **)app->real)->slot[8])( app->real, out );
-    if (FAILED(hr) || !*out || view_has_window( *out ) == S_OK) return hr;
-    if (FAILED(mva_get_Views( app, (void **)&views )) || !views)
-    {
-        TRACE( "main view %p has no window and there are no views to pick from\n", *out );
-        return hr;
-    }
+    if (FAILED(((HRESULT (WINAPI *)(void *, void **))(*(struct slots **)real)->slot[6])( real, (void **)&views )) || !views)
+        return NULL;
     ((HRESULT (WINAPI *)(void *, UINT32 *))(*views)->slot[7])( views, &count );   /* get_Size */
-    TRACE( "main view %p has no window; %u view(s)\n", *out, count );
+    TRACE( "%u view(s)\n", count );
     for (i = 0; i < count; i++)
     {
         if (FAILED(((HRESULT (WINAPI *)(void *, UINT32, IInspectable **))(*views)->slot[6])( views, i, &view )) || !view) continue;
         if (view_has_window( view ) == S_OK)
         {
-            TRACE( "main view %p has no window, answering view %u (%p)\n", *out, i, view );
-            IInspectable_Release( *out );
-            *out = view;
+            TRACE( "view %u (%p) has the window\n", i, view );
             break;
         }
         IInspectable_Release( view );
+        view = NULL;
     }
     IUnknown_Release( (IUnknown *)views );
+    return view;
+}
+
+/* Finding the window's view calls into other threads: asking a view for its CoreWindow is a call into the view's
+ * thread, and getting the views unmarshals them, which in Wine makes a RemAddRef call to the thread that owns each
+ * one. A caller can hold a lock one of those threads is waiting for: a title's Xbox Live code reads MainView with a
+ * lock held that its own view thread waits on, so looking in the caller deadlocked at start-up (black screen, audio
+ * playing); it only reads MainView.CoreWindow there and copes with NULL. The caller can't know which locks it holds,
+ * so an MTA caller makes none of those calls itself: they run on a helper MTA thread, and the caller waits for the
+ * answer. Only when that takes longer than VIEW_LOOKUP_TIMEOUT_MS - a view thread that doesn't answer for that long
+ * is blocked, most likely on the caller - does it get the real main view, as it did before the wrapper. Callers
+ * arriving meanwhile wait for the same lookup instead of starting another, and a lookup that ends late cleans up
+ * after itself. */
+#define VIEW_LOOKUP_TIMEOUT_MS 1000
+
+struct view_lookup
+{
+    LONG refs;
+    HANDLE done;
+    IInspectable *real;     /* ICoreImmersiveApplication */
+    IInspectable *main;     /* the real main view */
+    IInspectable *result;   /* the view with the window, or NULL; set before done */
+};
+
+static SRWLOCK view_lookup_lock = SRWLOCK_INIT;
+static struct view_lookup *view_lookup_current;
+
+static void view_lookup_release( struct view_lookup *lookup )
+{
+    if (InterlockedDecrement( &lookup->refs )) return;
+    if (lookup->result) IInspectable_Release( lookup->result );
+    IInspectable_Release( lookup->main );
+    IInspectable_Release( lookup->real );
+    CloseHandle( lookup->done );
+    free( lookup );
+}
+
+static DWORD WINAPI view_lookup_thread( void *arg )
+{
+    struct view_lookup *lookup = arg;
+    HRESULT init = CoInitializeEx( NULL, COINIT_MULTITHREADED );
+
+    if (view_has_window( lookup->main ) == S_OK) IInspectable_AddRef( (lookup->result = lookup->main) );
+    else lookup->result = find_window_view( lookup->real );
+    AcquireSRWLockExclusive( &view_lookup_lock );
+    if (view_lookup_current == lookup) view_lookup_current = NULL;
+    ReleaseSRWLockExclusive( &view_lookup_lock );
+    SetEvent( lookup->done );
+    view_lookup_release( lookup );
+    if (SUCCEEDED(init)) CoUninitialize();
+    return 0;
+}
+
+/* The view with the window, looked for on another MTA thread; NULL if there is none or no answer in time. */
+static IInspectable *find_window_view_mta( IInspectable *real, IInspectable *main )
+{
+    struct view_lookup *lookup;
+    IInspectable *view = NULL;
+
+    AcquireSRWLockExclusive( &view_lookup_lock );
+    if ((lookup = view_lookup_current)) InterlockedIncrement( &lookup->refs );
+    else if ((lookup = calloc( 1, sizeof(*lookup) )) && (lookup->done = CreateEventW( NULL, TRUE, FALSE, NULL )))
+    {
+        lookup->refs = 2;
+        IInspectable_AddRef( (lookup->real = real) );
+        IInspectable_AddRef( (lookup->main = main) );
+        /* (one that never ends holds on to its thread, so not one of the pool's short ones) */
+        if (QueueUserWorkItem( view_lookup_thread, lookup, WT_EXECUTELONGFUNCTION ))
+            view_lookup_current = lookup;
+        else
+        {
+            lookup->refs = 1;
+            view_lookup_release( lookup );
+            lookup = NULL;
+        }
+    }
+    else
+    {
+        free( lookup );
+        lookup = NULL;
+    }
+    ReleaseSRWLockExclusive( &view_lookup_lock );
+    if (!lookup) return NULL;
+
+    if (!WaitForSingleObject( lookup->done, VIEW_LOOKUP_TIMEOUT_MS ))
+    {
+        if ((view = lookup->result)) IInspectable_AddRef( view );
+    }
+    else WARN( "no answer from the views' threads in %u ms; answering the main view\n", VIEW_LOOKUP_TIMEOUT_MS );
+    view_lookup_release( lookup );
+    return view;
+}
+
+static HRESULT WINAPI mva_get_MainView( struct main_view_app *app, IInspectable **out )
+{
+    APTTYPEQUALIFIER qualifier;
+    IInspectable *view;
+    APTTYPE type;
+    HRESULT hr;
+
+    hr = ((HRESULT (WINAPI *)(void *, IInspectable **))(*(struct slots **)app->real)->slot[8])( app->real, out );
+    if (FAILED(hr) || !*out) return hr;
+    if (SUCCEEDED(CoGetApartmentType( &type, &qualifier )) && type == APTTYPE_MTA)
+        view = find_window_view_mta( app->real, *out );
+    /* An STA caller can't use an MTA thread's answer. Its calls into other apartments pump its messages while they
+     * wait, as they would if it asked the views itself, so it looks itself. */
+    else if (view_has_window( *out ) == S_OK)
+        return hr;
+    else
+        view = find_window_view( app->real );
+    if (view && view != *out)
+    {
+        TRACE( "main view %p has no window, answering %p\n", *out, view );
+        IInspectable_Release( *out );
+        *out = view;
+    }
+    else if (view) IInspectable_Release( view );
     return hr;
 }
 
@@ -587,11 +701,12 @@ static const void *main_view_app_vtbl[] =
     mva_get_Views, mva_CreateNewView, mva_get_MainView,
 };
 
-/* CoreApplication's factory asked for as IActivationFactory (C++/CX's vccorlib caches factories that way and
- * QueryInterfaces them later): ICoreImmersiveApplication from it has to be the wrapper above too (a title's GameChat
- * reads MainView.CoreWindow.Dispatcher through such a cached factory). It is a tear-off, like the wrapper above:
- * IActivationFactory and IInspectable are this object, ICoreImmersiveApplication the wrapper, and everything else,
- * IUnknown included, comes from CoreApplication itself, so the object's identity stays CoreApplication's. */
+/* CoreApplication's factory asked for as IActivationFactory or IUnknown: ICoreImmersiveApplication from it has to be
+ * the wrapper above too (a title's GameChat reads MainView.CoreWindow.Dispatcher through it). C++/CX's vccorlib asks
+ * for IActivationFactory, QueryInterfaces that for IUnknown, caches the IUnknown and QueryInterfaces it for each
+ * interface it is asked for later, so IUnknown has to be this object as well: it is the object's identity, and the
+ * ICoreImmersiveApplication wrapper it hands out answers IUnknown with it too. The other interfaces come from
+ * CoreApplication itself (their IUnknown is CoreApplication's), as they would without the wrapper. */
 struct core_app_factory
 {
     const void **vtbl;
@@ -604,7 +719,7 @@ static HRESULT WINAPI caf_QueryInterface( struct core_app_factory *f, REFIID iid
     struct main_view_app *app;
     HRESULT hr;
 
-    if (IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IActivationFactory ))
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IActivationFactory ))
     {
         InterlockedIncrement( &f->refs );
         *out = f;
@@ -616,6 +731,8 @@ static HRESULT WINAPI caf_QueryInterface( struct core_app_factory *f, REFIID iid
     app->vtbl = main_view_app_vtbl;
     app->refs = 1;
     app->real = *out;
+    app->outer = (IUnknown *)f;
+    InterlockedIncrement( &f->refs );
     *out = app;
     return S_OK;
 }
@@ -658,8 +775,7 @@ static void wrap_core_application( const WCHAR *name, REFIID iid, void **factory
     struct main_view_app *app;
 
     if (!name || wcscmp( name, L"Windows.ApplicationModel.Core.CoreApplication" )) return;
-    /* not IUnknown: that is the identity, which stays CoreApplication's */
-    if (IsEqualGUID( iid, &IID_IActivationFactory ) || IsEqualGUID( iid, &IID_IInspectable ))
+    if (IsEqualGUID( iid, &IID_IActivationFactory ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IUnknown ))
     {
         struct core_app_factory *f;
 
@@ -675,6 +791,7 @@ static void wrap_core_application( const WCHAR *name, REFIID iid, void **factory
     app->vtbl = main_view_app_vtbl;
     app->refs = 1;
     app->real = *factory;
+    app->outer = NULL;
     *factory = app;
 }
 
