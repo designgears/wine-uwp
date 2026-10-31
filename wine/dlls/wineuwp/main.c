@@ -1464,12 +1464,16 @@ DEFINE_GUID(IID_IEventHandler_IInspectable, 0xc50898f6, 0xc536, 0x5f47, 0x85, 0x
 
 #define APP_EXIT_GRACE_MS 3000
 
+/* A message box or dialog (MessageDialog's, class #32770) doesn't count: on Windows it goes with the app. Phantom
+ * Dust closed with its Store error still up kept running behind that dialog. */
 static BOOL CALLBACK find_visible_app_window( HWND hwnd, LPARAM lparam )
 {
+    WCHAR class_name[16];
     DWORD pid;
 
     GetWindowThreadProcessId( hwnd, &pid );
     if (pid != GetCurrentProcessId() || !IsWindowVisible( hwnd )) return TRUE;
+    if (GetClassNameW( hwnd, class_name, ARRAY_SIZE(class_name) ) && !wcscmp( class_name, L"#32770" )) return TRUE;
     *(HWND *)lparam = hwnd;
     return FALSE;
 }
@@ -1480,16 +1484,19 @@ static DWORD WINAPI app_exit_thread( void *arg )
 
     SetThreadDescription( GetCurrentThread(), L"wine_uwp_app_exit" );
     Sleep( APP_EXIT_GRACE_MS );
-    if (hosted_core_window && IsWindow( hosted_core_window ))
+    for (;;)
     {
-        TRACE( "CoreWindow %p is still there; not ending the app\n", hosted_core_window );
-        return 0;
-    }
-    EnumWindows( find_visible_app_window, (LPARAM)&visible );
-    if (visible)
-    {
-        TRACE( "window %p is still visible; not ending the app\n", visible );
-        return 0;
+        if (hosted_core_window && IsWindow( hosted_core_window ))
+        {
+            TRACE( "CoreWindow %p is still there; not ending the app\n", hosted_core_window );
+            return 0;
+        }
+        visible = NULL;
+        EnumWindows( find_visible_app_window, (LPARAM)&visible );
+        if (!visible) break;
+        /* checked again until it goes: one look let a window closed a moment later keep the process alive */
+        TRACE( "window %p is still visible; not ending the app yet\n", visible );
+        Sleep( 1000 );
     }
     ERR( "the app's window has been gone for %u ms and the process is still running; ending it, as Windows' "
          "lifetime manager would\n", APP_EXIT_GRACE_MS );
