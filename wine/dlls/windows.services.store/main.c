@@ -32,9 +32,12 @@
  * unobserved task exception that ended the game. The licence is the one this prefix has (the user owns what the Xbox
  * app installed): active, not a trial, with no add-ons. The operation is already complete when handed out.
  *
- * GetStoreProductsAsync, GetAssociatedStoreProductsAsync and GetUserCollectionAsync answer an empty product list:
- * Phantom Dust's in-game shop lists the Store add-ons first, and an E_NOTIMPL there was an error dialog instead of
- * the shop. Nothing can be bought through the Store here, so there is nothing to list.
+ * GetStoreProductsAsync, GetAssociatedStoreProductsAsync and GetUserCollectionAsync complete with an empty product
+ * list whose ExtendedError is 0x80072efd, what Windows reports when the Store can't be reached: nothing can be bought
+ * through the Store here. Phantom Dust's in-game shop lists the Store add-ons first. An E_NOTIMPL from the method was
+ * an error dialog; an empty list with S_OK took a path the game never meets on Windows (its shop always has add-ons)
+ * and left a shop B could not leave. With the error it shows its own "unable to complete the action" message and the
+ * shop closes as usual.
  */
 
 #include <stdarg.h>
@@ -354,7 +357,8 @@ static HRESULT WINAPI query_result_get_Products( struct object *iface, struct ob
 static HRESULT WINAPI query_result_get_ExtendedError( struct object *iface, HRESULT *value )
 {
     if (!value) return E_POINTER;
-    *value = S_OK;
+    /* what Windows reports when the Store can't be reached (HRESULT_FROM_WIN32(ERROR_INTERNET_CANNOT_CONNECT)) */
+    *value = 0x80072efd;
     return S_OK;
 }
 
