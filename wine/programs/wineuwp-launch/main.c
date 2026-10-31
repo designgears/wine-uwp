@@ -36,6 +36,13 @@
  *   5. the app (UWP_EXE, or --exe), from the stage directory, with the rest of the command line; its exit code is
  *      ours.
  *
+ * local.env, same format and optional, is read last on both paths, so what it sets wins: settings that belong to this
+ * install rather than to the package (install-app.py keeps it across updates). One is WINE_UWP_INJECT,
+ * "DLL!EXPORT[;DLL!EXPORT...]" with DLL relative to the stage: the app starts suspended, each DLL is loaded into it
+ * by a remote LoadLibraryW thread, then EXPORT (a thread start routine) runs there, and the app is resumed - what a
+ * mod's launcher does on Windows through the package debugger (Phantom Dust Rebirth's pdlaunch.exe with
+ * pdnet.dll!PdInjectedInit), which Wine doesn't have. The app is resumed even when a step fails.
+ *
  *   wineuwp-launch.exe [--stage DIR] [--defaults FILE] [--graphics DRIVER] [--exe EXE] [args...]
  *
  * --graphics sets HKCU\Software\Wine\Drivers\Graphics, which has no environment override; run.sh pins x11 so a
@@ -55,6 +62,7 @@
 #include "winreg.h"
 #include "winsvc.h"
 #include "winuser.h"
+#include "psapi.h"
 
 static WCHAR dir[MAX_PATH];
 static BOOL quiet;   /* started by run.sh: report on stderr, no message box */
@@ -143,6 +151,81 @@ static BOOL load_env_file( const WCHAR *name, BOOL required )
 
     swprintf( path, ARRAY_SIZE(path), L"%s\\%s", dir, name );
     return load_env_path( path, required, FALSE );
+}
+
+static WCHAR *env( const WCHAR *name );
+
+/* runs start(arg) in the process and waits for it */
+static BOOL run_remote( HANDLE process, LPTHREAD_START_ROUTINE start, void *arg, const WCHAR *what )
+{
+    HANDLE thread = CreateRemoteThread( process, NULL, 0, start, arg, 0, NULL );
+    DWORD wait;
+
+    if (!thread)
+    {
+        fprintf( stderr, "wineuwp-launch: %ls: CreateRemoteThread failed (%lu)\n", what, GetLastError() );
+        return FALSE;
+    }
+    wait = WaitForSingleObject( thread, 30000 );
+    CloseHandle( thread );
+    if (wait == WAIT_OBJECT_0) return TRUE;
+    fprintf( stderr, "wineuwp-launch: %ls: no answer in 30 s\n", what );
+    return FALSE;
+}
+
+static HMODULE find_remote_module( HANDLE process, const WCHAR *path )
+{
+    HMODULE modules[1024];
+    WCHAR name[MAX_PATH];
+    DWORD needed = 0, i;
+
+    if (!EnumProcessModulesEx( process, modules, sizeof(modules), &needed, LIST_MODULES_64BIT )) return NULL;
+    for (i = 0; i < needed / sizeof(HMODULE) && i < ARRAY_SIZE(modules); i++)
+        if (GetModuleFileNameExW( process, modules[i], name, ARRAY_SIZE(name) ) && !wcsicmp( name, path ))
+            return modules[i];
+    return NULL;
+}
+
+/* one "DLL!EXPORT" of WINE_UWP_INJECT into the suspended app */
+static void inject( HANDLE process, WCHAR *spec )
+{
+    WCHAR path[MAX_PATH], *export = wcschr( spec, '!' );
+    LPTHREAD_START_ROUTINE load = (LPTHREAD_START_ROUTINE)GetProcAddress( GetModuleHandleW( L"kernel32.dll" ), "LoadLibraryW" );
+    HMODULE remote, local;
+    FARPROC init;
+    SIZE_T bytes;
+    void *remote_path;
+    char name[256];
+
+    if (!export || !export[1])
+    {
+        fprintf( stderr, "wineuwp-launch: WINE_UWP_INJECT entry %ls is not DLL!EXPORT\n", spec );
+        return;
+    }
+    *export++ = 0;
+    if (spec[0] == '\\' || (spec[0] && spec[1] == ':')) lstrcpynW( path, spec, ARRAY_SIZE(path) );
+    else swprintf( path, ARRAY_SIZE(path), L"%s\\%s", dir, spec );
+    WideCharToMultiByte( CP_ACP, 0, export, -1, name, sizeof(name), NULL, NULL );
+
+    /* the export's offset is the same in both copies: find it in a local one loaded as an image only */
+    if (!(local = LoadLibraryExW( path, NULL, DONT_RESOLVE_DLL_REFERENCES )) || !(init = GetProcAddress( local, name )))
+    {
+        fprintf( stderr, "wineuwp-launch: %ls: cannot load it or no export %s (%lu)\n", path, name, GetLastError() );
+        if (local) FreeLibrary( local );
+        return;
+    }
+    bytes = (wcslen( path ) + 1) * sizeof(WCHAR);
+    if ((remote_path = VirtualAllocEx( process, NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE )) &&
+        WriteProcessMemory( process, remote_path, path, bytes, NULL ) &&
+        run_remote( process, load, remote_path, path ))
+    {
+        if (!(remote = find_remote_module( process, path )))
+            fprintf( stderr, "wineuwp-launch: %ls did not load in the app\n", path );
+        else if (run_remote( process, (LPTHREAD_START_ROUTINE)((BYTE *)remote + ((BYTE *)init - (BYTE *)local)), NULL, export ))
+            fprintf( stderr, "wineuwp-launch: loaded %ls and ran %s\n", path, name );
+    }
+    if (remote_path) VirtualFreeEx( process, remote_path, 0, MEM_RELEASE );
+    FreeLibrary( local );
 }
 
 static WCHAR *env( const WCHAR *name )
@@ -322,7 +405,7 @@ int WINAPI wWinMain( HINSTANCE instance, HINSTANCE prev, WCHAR *cmdline, int sho
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi;
     WCHAR arg[MAX_PATH], defaults[MAX_PATH] = L"", graphics[64] = L"", exe_arg[MAX_PATH] = L"";
-    WCHAR *exe, *family, *path, *command, *p, *slash;
+    WCHAR *exe, *family, *path, *command, *p, *slash, *injects, *spec, *ctx;
     const WCHAR *tail = GetCommandLineW(), *rest;
     BOOL staged = FALSE;
     DWORD code = 0;
@@ -359,6 +442,7 @@ int WINAPI wWinMain( HINSTANCE instance, HINSTANCE prev, WCHAR *cmdline, int sho
         load_env_path( defaults, TRUE, TRUE );
         add_frameworks();
     }
+    load_env_file( L"local.env", FALSE );
     SetEnvironmentVariableW( L"WINE_UWP_PACKAGE_PATH", dir );
     /* EOS's Linux bootstrapper issues native Linux syscalls from its high-address helper */
     if (file_exists( L"EasyAntiCheat\\Settings.json" ) && !GetEnvironmentVariableW( L"WINE_HACK_NATIVE_SYSCALLS", NULL, 0 ))
@@ -385,10 +469,23 @@ int WINAPI wWinMain( HINSTANCE instance, HINSTANCE prev, WCHAR *cmdline, int sho
     else swprintf( path, len, L"%s\\%s", dir, exe );
     swprintf( command, len + wcslen( tail ) + 4, *tail ? L"\"%s\" %s" : L"\"%s\"", path, tail );
 
-    if (!CreateProcessW( path, command, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, dir, &si, &pi ))
+    injects = env( L"WINE_UWP_INJECT" );
+    if (injects && !*injects)
+    {
+        free( injects );
+        injects = NULL;
+    }
+    if (!CreateProcessW( path, command, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT | (injects ? CREATE_SUSPENDED : 0),
+                         NULL, dir, &si, &pi ))
     {
         fail( L"Cannot start %s (error %lu)", path, GetLastError() );
         return 1;
+    }
+    if (injects)
+    {
+        for (spec = wcstok( injects, L";", &ctx ); spec; spec = wcstok( NULL, L";", &ctx )) inject( pi.hProcess, spec );
+        ResumeThread( pi.hThread );
+        free( injects );
     }
     CloseHandle( pi.hThread );
     WaitForSingleObject( pi.hProcess, INFINITE );
