@@ -12,6 +12,8 @@
 #   wine-uwp harvest ISO      extract the Windows files from an ISO     (command-line setup, step 1)
 #   wine-uwp new-prefix       build the Wine prefix from them            (step 2)
 #   wine-uwp install PACKAGE  install an .msixbundle/.msix/.appx         (step 3)
+#   wine-uwp install-store ID download and install a Store app by Store id (9PCDNBHR11MR) or package family; an
+#                             encrypted one with your account's licence (signs in through the browser if needed)
 #   wine-uwp info PACKAGE [ICON]  describe a package as JSON (and write its logo to ICON)
 #   wine-uwp latest APPINSTALLER  the version an .appinstaller (file or URL) serves
 #
@@ -98,8 +100,10 @@ case $cmd in
     running "$app" || (setsid "${APPIMAGE:-$0}" run "$app" >/dev/null 2>&1 &) ;;
   # Wine's appxinstall, through its command line (programs/wineuwp-install): Unix paths are fine
   install)    PATH="$bin:$PATH" exec wine wineuwp-install "${1:?usage: wine-uwp install PACKAGE}" "$data" --windows "$data/windows" ;;
+  install-store) PATH="$bin:$PATH" exec wine wineuwp-install "${1:?usage: wine-uwp install-store STOREID|FAMILY}" "$data" \
+                --windows "$data/windows" --store ;;
   info)       PATH="$bin:$PATH" exec wine wineuwp-install "${1:?usage: wine-uwp info PACKAGE [ICON]}" "$data" --info \
                 --windows "$data/windows" ${2:+--icon "$2"} ;;
   latest)     PATH="$bin:$PATH" exec wine wineuwp-install "${1:?usage: wine-uwp latest APPINSTALLER}" --latest ;;
-  *)          sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+  *)          sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac

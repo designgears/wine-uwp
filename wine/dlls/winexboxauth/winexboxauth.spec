@@ -7,3 +7,4 @@
 @ stdcall XboxAuthOwnsProduct(str)
 @ stdcall XboxAuthSelfTest(str str)
 @ stdcall XboxAuthSetTitleContext(str long)
+@ stdcall XboxAuthSignIn()

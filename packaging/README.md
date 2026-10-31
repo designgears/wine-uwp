@@ -31,6 +31,7 @@ packaging/build-dist.sh OUT          # OUT/bin/wine-uwp, Wine, the scripts and s
 OUT/bin/wine-uwp harvest Windows.iso # or download one: packaging/harvest/download_iso.py OUT.iso
 OUT/bin/wine-uwp new-prefix
 OUT/bin/wine-uwp install App.msixbundle
+OUT/bin/wine-uwp install-store 9PCDNBHR11MR  # or a Store app by Store id: signs in, downloads, and opens an encrypted (EAppx) package with your licence
 OUT/bin/wine-uwp run
 ```
 
