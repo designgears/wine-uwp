@@ -1421,7 +1421,12 @@ HRESULT sign_in_with_device_code_client( const char *client_id, volatile LONG *c
     expires_in = jnum( j, "expires_in" );
     deadline = now_s() + (expires_in > 0 ? (ULONGLONG)expires_in : 900);
     verify = *jget( j, "verification_uri" ) ? jget( j, "verification_uri" ) : "https://www.microsoft.com/link";
-    printf( "DEVICE_CODE client=%s user_code=%s verify=%s expires=%.0f\n", client, user_code, verify, expires_in );
+    printf( "\nSign in with your Microsoft account:\n"
+            "  1. Open %s (your browser should open it by itself)\n"
+            "  2. Enter the code  %s\n"
+            "  3. Sign in and allow access.\n"
+            "Waiting for you to finish (the code is valid for %.0f minutes)...\n\n",
+            verify, user_code, (expires_in > 0 ? expires_in : 900) / 60 );
     fflush( stdout );
     MESSAGE( "device code obtained: client %s, user code %s, valid %.0f s, verification %s\n", client, user_code,
              expires_in, verify );

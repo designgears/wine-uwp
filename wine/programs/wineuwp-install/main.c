@@ -5,7 +5,13 @@
  *                   [--tags 'a;b'] [--languages 'en-US;en'] [--keys FILE|-] [--keys-once FILE]
  *   wineuwp-install PACKAGE [DATADIR] --info [--windows TREE] [--icon OUT]
  *   wineuwp-install APPINSTALLER --latest
+ *   wineuwp-install STOREID|FAMILY [DATADIR --windows TREE [--stage NAME]] --store [--allow-older]
  *
+ * --store installs the Store's newest package of a product (its Store id) or package family, downloaded from the
+ * Store's delivery service; an encrypted one (EAppx/EMsix) is opened with the signed-in account's licence, after a
+ * browser sign-in if nobody is signed in. Without DATADIR it only reports what it would install. When the licensing
+ * service refuses the newest package's licence, --allow-older installs the newest older version the catalogue still
+ * lists that it does license.
  * PACKAGE is a file, an http(s) URL, or an installed package's directory (Program Files\WindowsApps\<full name> of a
  * Windows installation, as stage-app.sh staged them); paths may be Unix paths. Progress goes to stdout as lines:
  * "PID <pid>", "STAGE <what>", "PROGRESS <done> <total>", other messages as they are, and "INSTALLED <stage>" last on
@@ -39,8 +45,10 @@
 #include "winnls.h"
 #include "wincon.h"
 #include "wine/appxinstall.h"
+#include "wine/storecatalogue.h"
 
 static volatile LONG paused, cancelled;
+static char store_keys[8192];   /* --store: the licence's content keys, wiped after the install */
 static const WCHAR *pause_file;
 
 /* writes a line as UTF-8 to stdout, which a host process reads */
@@ -169,50 +177,286 @@ static char *read_keys( const WCHAR *source, BOOL once )
     return ret;
 }
 
-/* The Store's newest package of a family and its download address, through the catalogue and the
- * delivery service: what an install from the Store would fetch. */
-static int store_package( const WCHAR *family )
+/* winexboxauth.dll: the signed-in account's Store licences */
+typedef HRESULT (WINAPI *content_keys_fn)( const char *, const char *, char *, UINT32 );
+#define XA_E_MSA 0x80047802   /* winexboxauth: the licensing service (or login.live.com) refused */
+
+static content_keys_fn store_sign_in(void)
 {
-    struct appx_store_package package;
-    char *body, *url, category[64], *p, *end;
-    WCHAR path[512];
-    DWORD status;
+    typedef HRESULT (WINAPI *signin_fn)( void );
+    HMODULE auth = LoadLibraryW( L"winexboxauth.dll" );
+    content_keys_fn get_keys = auth ? (void *)GetProcAddress( auth, "XboxAuthContentKeys" ) : NULL;
+    signin_fn sign_in = auth ? (void *)GetProcAddress( auth, "XboxAuthSignIn" ) : NULL;
     HRESULT hr;
 
-    swprintf( path, ARRAY_SIZE(path), L"/v7.0/products/lookup?alternateId=PackageFamilyName&value=%s"
-              L"&market=US&languages=en-US&fieldsTemplate=details", family );
+    if (!get_keys)
+    {
+        fail( "--store: no winexboxauth.dll for the licence" );
+        return NULL;
+    }
+    if (sign_in)
+    {
+        out( "STAGE Signing in" );
+        if (FAILED(hr = sign_in()))
+        {
+            switch ((ULONG)hr)
+            {
+            case 0x80047805: fail( "The sign-in code expired before the sign-in was finished. Run the command again." ); break;
+            case 0x80047804: fail( "Could not reach Microsoft's sign-in service. Check the internet connection." ); break;
+            case 0x80047802: fail( "Microsoft's sign-in refused the request (error %#lx).", hr ); break;
+            case 0x80047803: fail( "Signed in, but Xbox Live refused the account (error %#lx). An Xbox profile may need "
+                                   "creating first at https://www.xbox.com.", hr ); break;
+            default: fail( "Sign-in failed (error %#lx).", hr ); break;
+            }
+            return NULL;
+        }
+    }
+    return get_keys;
+}
+
+/* A Store id is 12 letters and digits (9PCDNBHR11MR); a package family name is Name_PublisherId, the name 3 to 50
+ * letters, digits, dots and dashes, the publisher id 13 base-32 characters. Anything else is refused before it goes
+ * into a catalogue URL. A Store id is upper-cased, as the catalogue spells it. */
+static BOOL valid_store_id( WCHAR *id, BOOL *family )
+{
+    const WCHAR *underscore = wcschr( id, '_' ), *p;
+    size_t len = wcslen( id );
+
+    if ((*family = underscore != NULL))
+    {
+        if (underscore - id < 3 || underscore - id > 50 || wcslen( underscore + 1 ) != 13) return FALSE;
+        for (p = id; p < underscore; p++)
+            if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '.' || *p == '-'))
+                return FALSE;
+        for (p = underscore + 1; *p; p++) if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9'))) return FALSE;
+        return TRUE;
+    }
+    if (len != 12) return FALSE;
+    for (p = id; *p; p++)
+    {
+        if (*p >= 'a' && *p <= 'z') *(WCHAR *)p -= 'a' - 'A';
+        if (!((*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9'))) return FALSE;
+    }
+    return TRUE;
+}
+
+/* one package the catalogue lists for the product */
+struct store_candidate
+{
+    const char *full_name, *format, *content_id;   /* in the parsed catalogue */
+    ULONGLONG version;
+};
+
+static ULONGLONG full_name_version( const char *full_name )
+{
+    unsigned int v[4] = {0};
+    const char *p = strchr( full_name, '_' );
+    if (p) sscanf( p + 1, "%u.%u.%u.%u", &v[0], &v[1], &v[2], &v[3] );
+    return ((ULONGLONG)v[0] << 48) | ((ULONGLONG)v[1] << 32) | ((ULONGLONG)v[2] << 16) | v[3];
+}
+
+/* ASCII case-insensitive strstr: the catalogue spells package names in its own case */
+static const char *find_nocase( const char *hay, const char *needle )
+{
+    size_t n = strlen( needle );
+    for (; *hay; hay++) if (!_strnicmp( hay, needle, n )) return hay;
+    return NULL;
+}
+
+/* The catalogue's x64/neutral packages of the family (it lists every version it still serves, each with its own
+ * format and content id), newest first; free the array with free(). */
+static struct store_candidate *store_candidates( const struct json *product, const char *family, unsigned int *count )
+{
+    const char *name_end = strchr( family, '_' );
+    size_t name_len = name_end ? name_end - family : 0;
+    struct catalogue_package *pkgs;
+    struct store_candidate *list, c;
+    unsigned int n, i, j, total = 0;
+
+    *count = 0;
+    if (!name_len || !(pkgs = catalogue_packages( product, &n ))) return NULL;
+    if (!(list = calloc( n, sizeof(*list) )))
+    {
+        free( pkgs );
+        return NULL;
+    }
+    for (i = 0; i < n; i++)
+    {
+        c.full_name = json_str( json_get( pkgs[i].json, "PackageFullName" ) );
+        if (_strnicmp( c.full_name, family, name_len ) || c.full_name[name_len] != '_') continue;
+        if (!find_nocase( c.full_name, "_x64_" ) && !find_nocase( c.full_name, "_neutral_" )) continue;
+        for (j = 0; j < total; j++) if (!_stricmp( list[j].full_name, c.full_name )) break;
+        if (j < total) continue;
+        c.format = json_str( json_get( pkgs[i].json, "PackageFormat" ) );
+        c.content_id = json_str( json_get( pkgs[i].json, "ContentId" ) );
+        c.version = full_name_version( c.full_name );
+        for (j = total; j > 0 && list[j - 1].version < c.version; j--) list[j] = list[j - 1];
+        list[j] = c;
+        total++;
+    }
+    free( pkgs );
+    *count = total;
+    return list;
+}
+
+/* The Store's newest package of a product (a Store id) or package family, through the catalogue and the delivery
+ * service: what an install from the Store would fetch. *url_ret receives its download address, and keys (keys_size
+ * bytes) its content keys if it is encrypted. With url_ret NULL it only reports what it found.
+ *
+ * The licensing service refuses keys for some packages (HTTP 400, fault 3043 DeviceNameNotHexBinary) while it still
+ * issues them for older content of the same product. That is a version the Store doesn't offer any more, so going
+ * down the catalogue's older versions only happens when asked to (allow_older, --allow-older). */
+static int store_package( const WCHAR *arg, BOOL allow_older, WCHAR **url_ret, char *keys, UINT32 keys_size )
+{
+    struct appx_store_package package;
+    struct store_candidate *list = NULL, *chosen = NULL, newest;
+    const struct json *product;
+    struct json *root;
+    char *body, *url, category[64], family_a[256];
+    unsigned int count, i;
+    WCHAR path[512], family[256], id[64];
+    content_keys_fn get_keys = NULL;
+    BOOL by_family, listed;
+    DWORD status;
+    HRESULT hr;
+    int ret = 1;
+
+    if (wcslen( arg ) >= ARRAY_SIZE(id) || !valid_store_id( lstrcpyW( id, arg ), &by_family ))
+    {
+        fail( "--store: %ls is neither a Store id (12 letters and digits, e.g. 9WZDNCRFHVN5) nor a package family name "
+              "(Name_PublisherId)", arg );
+        return 2;
+    }
+    if (by_family)
+        swprintf( path, ARRAY_SIZE(path), L"/v7.0/products/lookup?alternateId=PackageFamilyName&value=%s"
+                  L"&market=US&languages=en-US&fieldsTemplate=details", id );
+    else
+        swprintf( path, ARRAY_SIZE(path), L"/v7.0/products/%s?market=US&languages=en-US&fieldsTemplate=details", id );
     if (FAILED(hr = appx_store_get( L"displaycatalog.mp.microsoft.com", path, &body, &status )))
     {
         fail( "--store: catalogue error %#lx", hr );
         return 1;
     }
-    category[0] = 0;
-    if ((p = strstr( body, "\"WuCategoryId\":\"" )) && (end = strchr( p += 16, '"' )) && end - p < sizeof(category))
-    {
-        memcpy( category, p, end - p );
-        category[end - p] = 0;
-    }
+    root = json_parse( body, strlen( body ) );
     appx_free( body );
-    if (!category[0])
+    product = catalogue_product( root );
+    lstrcpynA( family_a, json_str( json_get( json_get( product, "Properties" ), "PackageFamilyName" ) ), sizeof(family_a) );
+    list = store_candidates( product, family_a, &count );
+    lstrcpynA( category, catalogue_wu_category( product, ~0u ), sizeof(category) );
+    if (!category[0] || !family_a[0])
     {
-        fail( "--store: the catalogue has no category for this family (HTTP %lu)", status );
-        return 1;
+        fail( "--store: the catalogue has no app package for this product (HTTP %lu)", status );
+        goto done;
     }
-    out( "category %s", category );
+    MultiByteToWideChar( CP_UTF8, 0, family_a, -1, family, ARRAY_SIZE(family) );
+    out( "family %s, category %s", family_a, category );
     if (FAILED(hr = appx_store_find_package( category, family, &package )))
     {
         fail( "--store: no package, error %#lx", hr );
-        return 1;
+        goto done;
     }
     out( "package %s", package.moniker );
+
+    /* the delivery service's newest first, then the catalogue's older ones */
+    for (i = 0; i < count; i++) if (!_stricmp( list[i].full_name, package.moniker )) break;
+    if ((listed = i < count))
+    {
+        newest = list[i];
+        memmove( list + 1, list, i * sizeof(*list) );
+        list[0] = newest;
+    }
+    else
+    {
+        /* the catalogue doesn't describe it: its format is unknown, so it is installed as is. An encrypted one fails
+         * in the installer, which says so. */
+        out( "the catalogue does not list %s; installing it without a licence", package.moniker );
+        newest.full_name = package.moniker;
+        newest.format = newest.content_id = "";
+        newest.version = full_name_version( package.moniker );
+        chosen = &newest;
+    }
+
+    for (i = 0; listed && i < count; i++)
+    {
+        struct store_candidate *c = list + i;
+
+        if (i && c->version >= list[0].version) continue;
+        out( "%s: format %s%s%s", c->full_name, c->format[0] ? c->format : "unknown",
+             c->content_id[0] ? ", content id " : "", c->content_id );
+        if (catalogue_format_xvc( c->format ))
+        {
+            fail( "--store: a GDK (.msixvc) title; install it from the Xbox app" );
+            goto done;
+        }
+        if (!catalogue_format_encrypted( c->format ) || !url_ret)
+        {
+            chosen = c;
+            break;
+        }
+        if (!c->content_id[0]) continue;
+        if (!get_keys && !(get_keys = store_sign_in())) goto done;
+        out( "STAGE Getting the licence" );
+        hr = get_keys( c->content_id, "US", keys, keys_size );
+        if (SUCCEEDED(hr))
+        {
+            chosen = c;
+            break;
+        }
+        SecureZeroMemory( keys, keys_size );
+        if ((ULONG)hr != XA_E_MSA)
+        {
+            fail( "--store: licence error %#lx", hr );
+            goto done;
+        }
+        if (!allow_older)
+        {
+            fail( "The Store's licensing service refused the licence for %s. Older versions of this product may still "
+                  "be licensed: --allow-older (wine-uwp install-store ID --allow-older) installs the newest one that "
+                  "is, which the Store no longer offers.", c->full_name );
+            goto done;
+        }
+        out( "the licensing service refused %s; trying an older version (--allow-older)", c->full_name );
+    }
+    if (!chosen)
+    {
+        if (by_family)
+            fail( "The Store gave no licence for any version of this package. Does the signed-in account own it?" );
+        else
+            fail( "The Store gave no licence for any version of this package. Does the signed-in account own it? "
+                  "(A free app needs \"Get\" once: https://apps.microsoft.com/detail/%ls)", id );
+        goto done;
+    }
+    if (chosen != list && chosen != &newest &&
+        FAILED(hr = appx_store_find_package_moniker( category, family, chosen->full_name, &package )))
+    {
+        SecureZeroMemory( keys, keys_size );
+        fail( "--store: the delivery service no longer has %s, error %#lx", chosen->full_name, hr );
+        goto done;
+    }
+    if (chosen != list && chosen != &newest) out( "package %s", package.moniker );
+
     if (FAILED(hr = appx_store_package_url( &package, &url )))
     {
+        if (keys) SecureZeroMemory( keys, keys_size );
         fail( "--store: no download address, error %#lx", hr );
-        return 1;
+        goto done;
     }
-    out( "url %.48s...", url );
+    if (!url_ret)
+    {
+        out( "url %.48s...", url );
+        appx_free( url );
+        ret = 0;
+        goto done;
+    }
+    *url_ret = malloc( (strlen( url ) + 1) * sizeof(WCHAR) );
+    if (*url_ret) MultiByteToWideChar( CP_UTF8, 0, url, -1, *url_ret, strlen( url ) + 1 );
     appx_free( url );
-    return 0;
+    ret = *url_ret ? 0 : 1;
+
+done:
+    free( list );
+    json_free( root );
+    return ret;
 }
 
 static void usage(void)
@@ -221,7 +465,7 @@ static void usage(void)
           "[--tags T] [--languages L] [--keys FILE|-] [--keys-once FILE]\n"
           "       wineuwp-install PACKAGE [DATADIR] --info [--windows TREE] [--icon OUT]\n"
           "       wineuwp-install APPINSTALLER --latest\n"
-          "       wineuwp-install FAMILY --store" );
+          "       wineuwp-install STOREID|FAMILY [DATADIR --windows TREE [--stage NAME]] --store [--allow-older]" );
 }
 
 int __cdecl wmain( int argc, WCHAR *argv[] )
@@ -229,7 +473,7 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
     struct appx_install_params params = { 0 };
     const WCHAR *positional[2] = { NULL }, *keys = NULL, *icon = NULL;
     WCHAR *package = NULL, *data_dir = NULL, *windows = NULL, *launch_defaults = NULL, *d3d = NULL, *env;
-    BOOL info = FALSE, latest = FALSE, store = FALSE, keys_once = FALSE;
+    BOOL info = FALSE, latest = FALSE, store = FALSE, keys_once = FALSE, allow_older = FALSE;
     unsigned int npos = 0;
     HRESULT hr;
     int i;
@@ -242,6 +486,7 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
         if (!wcscmp( a, L"--info" )) info = TRUE;
         else if (!wcscmp( a, L"--latest" )) latest = TRUE;
         else if (!wcscmp( a, L"--store" )) store = TRUE;
+        else if (!wcscmp( a, L"--allow-older" )) allow_older = TRUE;
         else if (!wcscmp( a, L"--windows" ) && has_value) windows = path_arg( argv[++i] );
         else if (!wcscmp( a, L"--stage" ) && has_value) params.stage = argv[++i];
         else if (!wcscmp( a, L"--pause-file" ) && has_value) pause_file = path_arg( argv[++i] );
@@ -269,8 +514,20 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
         appx_free( version );
         return 0;
     }
-    if (store) return store_package( positional[0] );
-    if (keys) params.content_keys = read_keys( keys, keys_once );
+    if (store)
+    {
+        WCHAR *url = NULL;
+        int ret;
+
+        if (!data_dir) return store_package( positional[0], allow_older, NULL, NULL, 0 );
+        if (!windows) { fail( "DATADIR and --windows TREE are needed to install" ); return 2; }
+        ret = store_package( positional[0], allow_older, &url, store_keys, sizeof(store_keys) );
+        if (ret) { SecureZeroMemory( store_keys, sizeof(store_keys) ); return ret; }
+        free( package );
+        package = url;
+        if (store_keys[0]) params.content_keys = store_keys;
+    }
+    else if (keys) params.content_keys = read_keys( keys, keys_once );
     else if ((env = _wgetenv( L"WINE_UWP_CONTENT_KEYS" )))
     {
         params.content_keys = utf8( env );
@@ -317,6 +574,7 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
 
     out( "PID %lu", GetCurrentProcessId() );
     hr = appx_install( &params );
+    SecureZeroMemory( store_keys, sizeof(store_keys) );
     if (hr == HRESULT_FROM_WIN32( ERROR_CANCELLED ) || cancelled) return 143;
     if (FAILED(hr))
     {
