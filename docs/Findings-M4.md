@@ -13901,3 +13901,311 @@ No additional runtime patch was needed. The final independent reviews and comple
 The final main.c removes only the trailing blank line from the live-tested source and compiled for both architectures.
 Its rebuilt DLLs were not used for the live COM runs; the exact source and DLL hashes are recorded with that boundary below.
 See [UWP-API-checks.md](UWP-API-checks.md#controller-apartment-execution-november-6-2026) for exact source hashes and per-architecture results.
+
+### Native framework view readiness, November 7, 2026
+
+The consumer isolated a keyboard failure after application startup. W reached the application's
+held-key tree and stayed there until release. Disabling gamepads did not restore keyboard handling.
+The consumer restored the controller settings after that test. These observations did not support
+another keyboard producer or controller-priority change.
+
+The application's `IFrameworkView::Run` contained its keyboard polling loop. The normal first-view
+startup called Initialize, SetWindow, Load and Activate, but Run never began. The existing native
+container was waiting in `CoreApplicationViewAgileContainer::WaitForViewReady`, with its notification
+event unsignaled. Disabling `WINE_UWP_DRIVE_FIRST_VIEW` created a second framework view and crashed;
+the consumer restored the original launcher.
+
+In one controlled live diagnostic, the consumer duplicated that original event handle and signaled
+it once. The same view thread returned from WaitForViewReady, advanced from state 4 to state 5,
+entered the application's Run method, and reached its W-key poll. The same held-key input produced
+no application response before the signal and a visible response afterward. A subsequent read-only
+sample observed the application's polled W-state byte change from
+zero to one while held and back to zero on release. This establishes the missing readiness
+notification as the cause in that run. It does not establish a persistent startup fix.
+
+The installed native twinapi.appcore DLL has stamp `b42682f9`. Its matching public PDB maps
+WaitForViewReady to RVA `c410` and SignalViewReady to `30524`. Native ActivateInternal calls
+SignalViewReady after its Load and Activate sequence; wineuwp's direct first-view sequence omits it.
+SignalViewReady acquires and releases CoreApplication's suspend lock around SetEvent. Production
+code must preserve that native operation, not substitute the external diagnostic helper.
+
+The mapped CoreApplicationView COM interfaces expose neither a readiness notification nor a
+container getter. The private view-instance-ID getter fail-fasts when the ID is zero, as it is in
+this startup state. Captured object offsets are diagnostic evidence only. A proposed wrapper around
+the native wait would retain its actual container argument on the view thread, but this checkout
+has no general inline-detour facility. Its timing and installation remain under investigation.
+No runtime source change or persistent readiness fix has been made at this point.
+
+The signaled session subsequently failed to close after Exit to Desktop and Yes, confirmed by
+the consumer. The application's Run method did not return during a 55-second
+trace. Earlier sessions without the signal had closed through that menu. This is a further
+lifecycle failure to diagnose, not evidence that signaling the event alone is shippable.
+The captured Run body loops while its AppThread remains alive and calls CoreApplication.Exit
+only after leaving that loop. It also processes dispatcher events on each iteration. The native
+container's captured dispatcher pointer is nonnull. Live shutdown tracing remains in progress.
+
+The menu's independent call to CoreApplication::Exit was then observed on AppThread.
+NtQueryEvent reported its notification event signaled. The exact main thread, identified by
+Linux tid and Wine tid, was already inside CoreApplication::TearDown. Its captured call arguments
+show CoWaitForMultipleHandles waiting indefinitely on the original container's +0x48 handle.
+Native teardown posts a close delegate through CoreDispatcher::RunAsync before that wait.
+This narrows the failure to view shutdown. It also invalidates the inference that the lack of
+CloseWindow breakpoint hits in a later trace means teardown never started: the first confirmed
+exit request preceded attachment of those breakpoints. No shutdown mutation was made.
+
+A fresh startup trace captured the same view thread entering WaitForViewReady before the
+wineuwp startup APC. Its native stack still contained both the wait and its view-thread caller
+during eight startup callbacks. The candidate now prepares a redirect before combase returns
+the CoreApplication factory; native code creates the main view before calling the registrar,
+so registrar-time installation would race the view thread. The redirect matches the unique
+view-thread call to the symbol-resolved wait and leaves the original wait function intact.
+A TLS wrapper retains the actual container only during that wait and restores it on unwind.
+The native first-view path defers early callbacks and calls the native readiness method only
+after successful window setup, Load and Activate. XAML does not receive this new notification.
+
+The candidate rejects missing, conflicting or non-executable symbols, an ambiguous call site,
+and an out-of-range rel32 destination. Preparation errors fail the factory query before returning
+an interface. Host tests execute the C installer with mocked Win32 calls and synthetic PE data.
+All 14 cases pass under ASan and UBSan, including TLS exhaustion and code-write rollback.
+A separate check of the captured native DLL identifies exactly one matching call at RVA c31d.
+These checks do not establish native execution, TLS/SEH behavior or application compatibility.
+The updated symbol harvester resolves both required methods from the matching public PDB.
+Linux compilation and the startup/shutdown acceptance run remain pending.
+
+The consumer compiled the frozen candidate with Wine 11.20 in its isolated Linux SDK build.
+Both combase architectures and the x64 wineuwp target linked successfully. Before installing it,
+a fresh baseline run received one diagnostic readiness signal and then its first exit request
+under trace. CoreApplication::Exit, container CloseWindow, RunAsync returning S_OK, the close
+delegate and view CloseWindow all executed. Both view callbacks ran on the view thread.
+FrameworkView::Run still did not return. This rules out a missing queued close callback for that
+run; the remaining failure follows native view CloseWindow. Candidate execution remains pending.
+
+The first candidate startup required no external readiness signal. Its 55-second trace recorded
+Initialize, SetWindow, native SignalViewReady and FrameworkView::Run exactly once each.
+Initialize, SetWindow and Run used the same framework interface and view thread.
+The readiness signal targeted the original container in state 4.
+The runtime log reported S_OK from SetWindow, Load and Activate.
+The symbol harvester also resolved both readiness methods against the actual candidate System32 DLL.
+Application input handling and normal shutdown remain unverified for this candidate at this point.
+
+The candidate then accepted keyboard input without an external readiness signal.
+The application key array changed from zero to one during the hold and returned to zero after release.
+The consumer also reported working application controls.
+The first candidate exit remains under investigation.
+
+The candidate's first exit reached native CoreWindow Close and CoreApplicationView CloseWindow.
+Both calls returned S_OK on the original framework thread. FrameworkView::Run still did not return.
+The baseline also delivered its close callbacks on its original view thread.
+Thus, same-thread delivery does not distinguish the candidate from the diagnostic baseline.
+This candidate fixes the observed startup and keyboard failure, but does not yet pass normal shutdown.
+
+Read-only state inspection confirmed that native WindowServer::DestroyWorkflow ran.
+It selected the host WindowClientAdapter and called its slot 44, which currently returns S_OK without a host close notification.
+However, the native dispatcher also received termination. Its termination byte was set.
+The captured framework stack entered CDispatcher::DrainCoreMessaging from ProcessEvents.
+CoreMessaging symbols mapped the deepest native frame to ResetEvent during UserAdapter queue draining.
+One stack sample cannot distinguish a blocking wait from a busy drain.
+The consumer preserved the live process for repeated samples. No further close request or window message was injected.
+
+Repeated samples then ruled out a persistent drain stall. The framework thread consumed about
+35.5 percent of one CPU core during a two-second measurement. Raw samples reached the game's
+per-loop ApplicationView lookup and its one-millisecond SleepEx call.
+The earlier drain frame was transient. Deeper values in these raw stacks can be stale.
+The actual application thread also remained active.
+
+The captured CoreWindow had no public Closed or Destroying subscribers.
+Its native WM_CLOSE path calls DestroyWorkflow again, which was already marked complete.
+No WM_CLOSE diagnostic was performed because this evidence did not establish a useful causal test.
+The two application lifecycle registrations in Initialize were Suspending and Resuming, not Exiting.
+Their interface IID and slots match Wine's public ICoreApplication declaration.
+
+The consumer tested the compiled readiness failure path in a separate API prefix.
+With the readiness symbols absent, RoGetActivationFactory returned E_NOTIMPL and cleared its output pointer.
+The input pointer was a nonnull sentinel. The log confirms that the candidate builtin DLLs loaded.
+An earlier app-local override attempt failed before the probe reached the factory.
+The consumer restored and byte-checked all six API DLL copies after this test.
+The live game and its installed candidate DLLs remained unchanged.
+
+Native CoreApplication::Exit only signals its exit event and returns S_OK.
+TearDown raises Exiting, requests view closure, and waits indefinitely for each view thread.
+CreateShutdownMonitor watches the main thread handle. Its wait has no timeout.
+That monitor cannot complete teardown while a framework view remains in Run.
+
+The matching CoreUIComponents PDB names adapter slot 44 OnOwnerClosed and slot 45 OnOwnerDestroyed.
+OnOwnerClosed calls NavigationClient::OnCloseWindow, which calls OnClosing.
+NavigationClient also registers a CoreApplication.Exiting handler. This handler selects disconnect reason zero.
+OnClosing passes that reason to IExportTask::PrepareToDisconnect before raising the adapter's Closed event.
+The server implementation calls ForegroundTaskManagerWrapper::AbortTask for reason zero.
+For an active task, the wrapper calls an external ICallbackForegroundTaskManager::AbortTask implementation.
+The host adapter currently omits this request. The external callback's exact behavior still needs verification.
+This evidence does not justify an arbitrary process or thread termination.
+
+The external task-manager loader names `ExecModelClient.dll` and resolves its
+`CreateForegroundTaskManager` export. Matching public PDBs for twinui.appcore, twinui and
+twinui.pcshell contain no AbortTask or ICallbackForegroundTaskManager implementation.
+The investigation also found a separate ImmersiveNavigationClient::OnCloseWindow override,
+which calls Uninitialize rather than the NavigationClient::OnClosing path above.
+Thus the mapped AbortTask chain establishes one native implementation, not yet the desktop
+shutdown contract. The exact host behavior still needs verification; no termination fix
+or additional live close request has been applied.
+
+A stronger desktop-specific route exists directly in the application's native twinapi teardown.
+After raising Exiting, TearDown checks IsApplicationActivationWatcherEnabled, which returns true
+for device family Desktop. It calls RMCLIENT!HamConnectForExtendedExecution and, on success,
+HamTerminateSelfEx with reason 3, then disconnects. A failed connection skips the termination request
+and proceeds to view shutdown. The captured main-thread raw stack contains the failure-branch
+return address, but this is not a true unwind or a live return-value measurement.
+The exact loaded RMCLIENT and a first-exit connection-result trace are the next discriminators.
+The harvested desktop set has no ExecModelClient.dll; no ISO search or phone-path workaround is needed.
+
+The loaded RMCLIENT is the pristine harvested native DLL, stamp e882f393, image size 36000.
+Its matching PDB maps HamConnectForExtendedExecution to RVA 4330 and HamTerminateSelfEx to 12a30.
+Connection creation uses RPC binding and a resource-manager RPC call. TerminateSelfEx sends
+RPC operation 10 with the supplied reason; it does not terminate locally.
+The same twinapi connection import is also used by CPlmSuspendControl at RVA 890cf.
+A host bridge must therefore preserve suspend-control use and all ordinary native results.
+The current TearDown call lies in a PE runtime-function entry spanning RVAs 37738 through 379c2.
+Any future caller check must validate the actual call-return address and chained unwind records,
+not assume that one contiguous range covers every supported build.
+
+The consumer preserved the hung candidate's logs and save data, then closed only that process.
+It launched the identical frozen candidate for a fresh first-exit trace. Another running game
+was taking foreground focus, so the consumer stopped input and requested coordination.
+No exit request or new shutdown implementation has been applied in that fresh run.
+
+The fresh first-exit trace confirmed the missing desktop service handoff. CoreApplication.Exit
+ran once. On the main thread, HamConnectForExtendedExecution returned EPT_NT_NOT_REGISTERED
+(`c0020036`) and left its output connection null. HamTerminateSelfEx was never reached during
+the 50-second capture, and the process remained alive. No replayed exit or live workaround was
+used. The three relevant RMCLIENT imports in this twinapi are delay imports. A bridge at those
+named imports must retain native RMCLIENT for ordinary calls and only supply the missing host
+shutdown service for the validated TearDown caller.
+
+The candidate now wraps only twinapi's named HamConnectForExtendedExecution,
+HamTerminateSelfEx and HamDisconnectForExtendedExecution delay imports. Connect calls native
+RMCLIENT first. The host fallback requires the exact missing-endpoint status, an empty output,
+successful hosted native-view startup, and a return address whose PE unwind chain resolves to
+the matching public TearDown symbol. It issues one process-local connection owned by that thread.
+Only that connection, that thread, a validated TearDown caller and reason 3 can request host
+process termination. Other connections retain native termination and disconnect results.
+Disconnect releases the host connection; rejected use never passes the synthetic token to RMCLIENT.
+
+The import installer validates all three named slots before changing them, retains native RMCLIENT,
+and restores every original slot on a protection failure. Unsupported symbols, unwind metadata,
+import layouts or protection regions leave native shutdown intact and produce an error log.
+Shutdown preparation runs only after readiness preparation succeeds, so combase retains wineuwp
+while its callbacks are installed. A missing shutdown bridge does not undo working readiness.
+
+`tests/test_native_shutdown.py` executes this C code with Win32 mocks under ASan and UBSan.
+It covers native success, informational and failure forwarding; wrong caller, startup context,
+thread, connection and reason; duplicate connection and disconnect; connection reuse; contiguous,
+split and both chained-unwind forms; invalid bounds, overlap and cycles; and 19 installation cases
+including absent imports/exports, unexpected targets and protection rollback.
+The existing 14 readiness checks and 42 WinRT host regression cases also pass.
+A separate host check maps the captured native twinapi image, validates the three actual teardown
+return addresses, rejects the suspend-control caller, and routes the complete synthetic connection
+sequence through the production wrappers. It uses a termination mock and does not run native code.
+The unwind traversal follows the forms used by Wine's
+[unwinder](https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/unwind.c)
+and Microsoft's [x64 unwind layout](https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64).
+
+The consumer separately inspected current WineGDK and upstream Wine CoreApplication sources.
+Neither inspected implementation supplied this native RMCLIENT shutdown handoff. No source was copied.
+The candidate remains uncommitted pending isolated Linux compilation, first normal exit and Steam
+cleanup, then saved-state reload and keyboard/controller checks. Ponytail and OCR delegate
+reviews, any resulting fixes and re-review remain required before installer integration.
+
+The consumer verified all four frozen source hashes locally and on Deck, then successfully
+built combase for both architectures and wineuwp for x64 in the isolated Wine SDK.
+The harvester resolved all 12 symbols, including TearDown at RVA 37738 for twinapi stamp
+b42682f9 and image size 239000. The reported compiled DLL SHA256 hashes are:
+
+| DLL | SHA256 |
+| --- | --- |
+| combase x64 | `0621a6406d7c146ddec3bf1b7ad5edc6ecf2e28b16a08af71fbb2b8cbffa2894` |
+| combase x86 | `ad305b84d0435bcc13691809eff91f165a1195f89a390e93d843361f23511611` |
+| wineuwp x64 | `81331ab9470350e9bc7f291f8824537bb50c547fc879195047cd4fc4ed40d007` |
+
+The consumer preserved the old process's first-exit trace, then closed that process.
+A complete backup precedes installation of the new candidate.
+This establishes compilation and symbol resolution only. The new bridge's live exit,
+Steam cleanup, saved-state reload and input acceptance checks remain pending.
+Runtime source stays frozen; review and installer integration have not started.
+
+The frozen compiled candidate has now completed two Steam-launched exit checks.
+The first result, for process 178044, was recovered after an interruption: the bridge installation,
+host connection and reason-3 termination messages each appear once, and the recorded process check
+finds no game process. Steam restored its desktop controller configuration. This run has no measured exit latency.
+Evidence is in `/private/tmp/shutdown-candidate-first-result`.
+
+A fresh Steam launch, process 190672, passed the saved-state reload check.
+Synthetic A and Start input through the existing Steam virtual controller worked.
+After normal Exit to Desktop and Yes, a read-only pidfd observer recorded process exit
+1.611915621 seconds after the observer started. This is not a measurement from the exact button
+press. All three bridge messages again appear exactly once. Steam restored the desktop controller
+configuration. The result and logs are in
+`/private/tmp/shutdown-observation-190672`; the reload screenshot is
+`/private/tmp/fh3-shutdown-reloaded-save-menu.png`.
+
+The consumer found that direct Lutris entry 66 still selected the old launcher. After backing up
+that entry, it pointed the entry at the candidate `launch-fh3.sh`. Direct Lutris process 191704
+then passed saved-state reload and keyboard-input checks.
+Synthetic input through the existing Steam virtual controller also produced application responses.
+Evidence is in `/private/tmp/plain-lutris-validation`.
+These controller checks exercise synthetic input through the virtual device. Physical Steam
+Controller operation and normal exit from this direct Lutris session remain under human test.
+
+The consumer reports the same installed wineuwp SHA256,
+`81331ab9470350e9bc7f291f8824537bb50c547fc879195047cd4fc4ed40d007`, throughout these runs.
+The four frozen source hashes were rechecked locally and still match. The consumer has started
+the required read-only Ponytail and OCR review delegates. No duplicate reviews or runtime edits
+are being made here, and AGENTS.md still matches origin/main. Integration, commit and push remain
+on hold until review findings are handled.
+
+Manual checks confirmed physical controller and keyboard input in the direct Lutris launch.
+These checks are separate from the earlier synthetic virtual-controller checks.
+After that session, the consumer's read-only process inspection found process 191704 gone.
+The final log contained the host shutdown connection and native TearDown reason-3 termination
+messages. It is preserved on Deck at
+`candidate/logs/plain-lutris-validation/steam-0-after-exit.log`.
+No normal-exit latency was measured for this direct Lutris run.
+
+The consumer reports that the required Ponytail review completed with no findings. OCR remains
+pending; no duplicate review has been started here. The four runtime/harvester source hashes
+still match the frozen candidate, and AGENTS.md still matches origin/main.
+Installer input hashes were verified in a new download-only install root.
+These preparation steps do not establish installer integration or a completed rollback backup.
+Runtime edits, integration, commit and push remain on hold pending the review.
+
+OCR completed with two reproduced medium correctness findings. The old shutdown validator accepted
+an undefined unwind opcode and a chained RBP frame description whose primary record was frameless.
+The extracted production code could authorize the mocked termination in those cases. Separately,
+the harvester treated TearDown as required, so its absence failed prefix creation even though the
+runtime treats the shutdown bridge as optional. These were synthetic reproductions, not observed
+failures of the previously tested native DLL.
+
+The fixes deliberately narrow shutdown authorization to version-1 frameless unwind records using
+PUSH_NONVOL, ALLOC_SMALL and SAVE_NONVOL, which cover the captured native TearDown. The validator
+checks operation slots, nonvolatile registers, prolog offsets and ordering. Every chain link must
+be frameless; secondary records may add saves but cannot push registers or allocate another stack
+frame. Other versions, framed records and unsupported operations leave shutdown with native RMCLIENT.
+This conservative subset avoids growing a general-purpose unwinder in the broker.
+TearDown is now explicitly optional in the harvester, with a diagnostic when absent. Missing
+required symbols still produce a failing exit status.
+
+The new regressions failed against the prior source. With the fixes, the extracted C passes 15
+focused metadata rejection cases, including both OCR cases, under ASan and UBSan. The tests check
+both rejection of a new host connection and rejection of termination with an already-issued token.
+Valid frameless chained saves, the existing unwind/routing checks and all 19 installation cases pass.
+`tests/test_resolve_symbols.py` exercises the real harvester with mocked PE/PDB inputs: all symbols,
+missing optional TearDown, each of the 11 required symbols missing, and simultaneous optional and
+required omissions. All pass. The 14 readiness checks also pass.
+The captured-native-image host check still accepts the actual teardown call-return sites, rejects
+the suspend-control caller and completes the mocked connection route. Actual PDB parsing still
+resolves optional TearDown to RVA 37738 for b42682f9/239000.
+
+These fixes change wineuwp and the harvester; the earlier live application results apply to the
+previous compiled candidate. The revised source needs a new build and fresh Ponytail/OCR reviews
+from the consumer. No duplicate reviews, Deck operations, integration, commits or history rewriting
+were performed here. AGENTS.md remains identical to origin/main. The requested Conventional Commits
+cleanup is deferred until after the reviews.

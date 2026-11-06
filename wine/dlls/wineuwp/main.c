@@ -18,6 +18,8 @@
  */
 
 #define COBJMACROS
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windows.h"
 #include "winternl.h"
 #include "tlhelp32.h"
@@ -1966,6 +1968,9 @@ static const struct uwp_known_symbol known_8972[] =
 #define SYM_DXAML_CONFIGURE  "?ConfigureCoreWindow@DXamlCore@DirectUI@@QEAAJPEAUICoreWindow@Core@UI@Windows@@_N@Z"
 #define SYM_FA_GETCURRENT    "?GetCurrentNoRef@FrameworkApplication@DirectUI@@SAPEAV12@XZ"
 #define SYM_FA_INVOKECREATED "?InvokeOnWindowCreated@FrameworkApplication@DirectUI@@QEAAJXZ"
+#define SYM_VIEW_WAIT_READY "?WaitForViewReady@CoreApplicationViewAgileContainer@Core@ApplicationModel@Windows@@QEAAXXZ"
+#define SYM_VIEW_SIGNAL_READY "?SignalViewReady@CoreApplicationViewAgileContainer@Core@ApplicationModel@Windows@@QEAAXXZ"
+#define SYM_APP_TEARDOWN "?TearDown@CoreApplication@Core@ApplicationModel@Windows@@QEAAJXZ"
 
 static char *uwp_symbol_table;   /* the file's contents, read once */
 
@@ -1999,6 +2004,7 @@ static void *uwp_symbol( const char *dll, const char *name )
     HMODULE mod;
     DWORD stamp, size;
     const char *line;
+    void *address = NULL;
     unsigned int i;
 
     MultiByteToWideChar( CP_ACP, 0, dll, -1, wdll, ARRAY_SIZE(wdll) );
@@ -2016,8 +2022,16 @@ static void *uwp_symbol( const char *dll, const char *name )
 
         if (sscanf( line, "%63s %x %x %llx %511s", ldll, &lstamp, &lsize, &rva, lname ) != 5) continue;
         if (!_stricmp( ldll, dll ) && lstamp == stamp && lsize == size && !strcmp( lname, name ))
-            return (char *)mod + rva;
+        {
+            if (rva >= size || (address && address != (char *)mod + rva))
+            {
+                ERR( "invalid or conflicting address for %s!%s\n", dll, name );
+                return NULL;
+            }
+            address = (char *)mod + rva;
+        }
     }
+    if (address) return address;
     for (i = 0; i < ARRAY_SIZE(known_8972); i++)
         if (!_stricmp( known_8972[i].dll, dll ) && known_8972[i].stamp == stamp && known_8972[i].size == size &&
             !strcmp( known_8972[i].name, name ))
@@ -2025,6 +2039,405 @@ static void *uwp_symbol( const char *dll, const char *name )
     ERR( "no address for %s!%s in this build (stamp %08lx size %lx); run packaging/harvest/resolve_symbols.py\n",
          dll, name, stamp, size );
     return NULL;
+}
+
+/* Native desktop TearDown asks RMCLIENT's service to terminate the process after
+ * raising Exiting. Wine has no such service. Keep native calls intact except for
+ * its observed missing-endpoint result, in this hosted native-view teardown. */
+static BYTE *shutdown_module;
+static DWORD shutdown_image_size, shutdown_teardown_rva;
+static LONG native_view_started, shutdown_owner;
+static BYTE shutdown_connection;
+static NTSTATUS (WINAPI *native_ham_connect)( void *callback, void **connection );
+static NTSTATUS (WINAPI *native_ham_terminate)( void *connection, ULONG reason );
+static NTSTATUS (WINAPI *native_ham_disconnect)( void *connection );
+
+static BOOL shutdown_image_range( DWORD rva, SIZE_T size )
+{
+    return rva < shutdown_image_size && size <= shutdown_image_size - rva;
+}
+
+static BOOL shutdown_code_range( DWORD begin, DWORD end )
+{
+    const IMAGE_NT_HEADERS *nt = (void *)(shutdown_module + ((IMAGE_DOS_HEADER *)shutdown_module)->e_lfanew);
+    const IMAGE_SECTION_HEADER *section = IMAGE_FIRST_SECTION(nt);
+    unsigned int i;
+
+    if (end <= begin || !shutdown_image_range( begin, end - begin )) return FALSE;
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++, section++)
+        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) && begin >= section->VirtualAddress &&
+            end - section->VirtualAddress <= section->Misc.VirtualSize) return TRUE;
+    return FALSE;
+}
+
+/* Authorize only the version-1, frameless prolog forms used by native TearDown.
+ * This is not an unwinder: unsupported forms leave shutdown with RMCLIENT. All
+ * chain links must also be frameless; secondary records may only add register
+ * saves, never a push or another fixed stack allocation. */
+static BOOL shutdown_unwind_codes( const BYTE *info )
+{
+    unsigned int i, slots, previous = info[1];
+    BOOL pushed = FALSE, allocated = FALSE;
+
+    if ((info[0] & 7) != 1 || info[3]) return FALSE;
+    for (i = 0; i < info[2]; i += slots)
+    {
+        const BYTE *code = info + 4 + i * 2;
+        unsigned int op = code[1] & 15, reg = code[1] >> 4;
+
+        if (!code[0] || code[0] > previous) return FALSE;
+        previous = code[0];
+        if ((info[0] >> 3) == 4 && op != 4) return FALSE;
+        if (pushed && op != 0) return FALSE;
+        switch (op)
+        {
+        case 0: /* UWOP_PUSH_NONVOL */
+        case 4: /* UWOP_SAVE_NONVOL, followed by a scaled offset */
+            if (reg != 3 && reg != 5 && reg != 6 && reg != 7 && reg < 12) return FALSE;
+            slots = op == 4 ? 2 : 1;
+            if (!op) pushed = TRUE;
+            break;
+        case 2: /* UWOP_ALLOC_SMALL */
+            if (allocated) return FALSE;
+            allocated = TRUE;
+            slots = 1;
+            break;
+        default:
+            return FALSE;
+        }
+        if (slots > info[2] - i) return FALSE;
+    }
+    return TRUE;
+}
+
+/* Follow both AMD64 chained-unwind forms, rejecting malformed records and cycles.
+ * A split function's caller can be in a different .pdata entry than its public symbol. */
+static BOOL shutdown_unwind_root( RUNTIME_FUNCTION entry, DWORD *root )
+{
+    const BYTE *info;
+    DWORD tail, flags;
+    unsigned int depth;
+
+    for (depth = 0; depth < 32; depth++)
+    {
+        if (!shutdown_code_range( entry.BeginAddress, entry.EndAddress )) return FALSE;
+        if (entry.UnwindData & 1)
+        {
+            if ((entry.UnwindData & 2) ||
+                !shutdown_image_range( entry.UnwindData & ~1u, sizeof(entry) )) return FALSE;
+            memcpy( &entry, shutdown_module + (entry.UnwindData & ~1u), sizeof(entry) );
+            continue;
+        }
+        if ((entry.UnwindData & 3) || !shutdown_image_range( entry.UnwindData, 4 )) return FALSE;
+        info = shutdown_module + entry.UnwindData;
+        if (info[1] > entry.EndAddress - entry.BeginAddress) return FALSE;
+        flags = info[0] >> 3;
+        if (flags > 4) return FALSE;
+        tail = 4 + ((info[2] + 1u) & ~1u) * 2;
+        if (!shutdown_image_range( entry.UnwindData, tail + (flags == 4 ? sizeof(entry) : flags ? 4 : 0) ))
+            return FALSE;
+        if (!shutdown_unwind_codes( info )) return FALSE;
+        if (flags != 4)
+        {
+            if (flags)
+            {
+                DWORD handler;
+
+                memcpy( &handler, info + tail, sizeof(handler) );
+                if (!shutdown_code_range( handler, handler + 1 )) return FALSE;
+            }
+            *root = entry.BeginAddress;
+            return TRUE;
+        }
+        memcpy( &entry, info + tail, sizeof(entry) );
+    }
+    return FALSE;
+}
+
+static BOOL shutdown_function_root( DWORD rva, DWORD *root )
+{
+    const IMAGE_NT_HEADERS *nt = (void *)(shutdown_module + ((IMAGE_DOS_HEADER *)shutdown_module)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY *dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    const RUNTIME_FUNCTION *table;
+    const RUNTIME_FUNCTION *match = NULL;
+    unsigned int i;
+
+    if (!dir->VirtualAddress || (dir->VirtualAddress & 3) || !dir->Size || dir->Size % sizeof(*table) ||
+        !shutdown_image_range( dir->VirtualAddress, dir->Size )) return FALSE;
+    table = (void *)(shutdown_module + dir->VirtualAddress);
+    for (i = 0; i < dir->Size / sizeof(*table); i++)
+        if (rva >= table[i].BeginAddress && rva < table[i].EndAddress)
+        {
+            if (match) return FALSE;
+            match = table + i;
+        }
+    return match && shutdown_unwind_root( *match, root );
+}
+
+static BOOL shutdown_caller( void *caller )
+{
+    ULONG_PTR rva = (ULONG_PTR)caller - (ULONG_PTR)shutdown_module;
+    DWORD root;
+
+    return shutdown_module && rva < shutdown_image_size &&
+        shutdown_function_root( rva, &root ) && root == shutdown_teardown_rva;
+}
+
+static NTSTATUS WINAPI host_ham_connect( void *callback, void **connection )
+{
+    NTSTATUS status = native_ham_connect( callback, connection );
+
+    if (status != EPT_NT_NOT_REGISTERED || !connection || *connection ||
+        !InterlockedCompareExchange( &native_view_started, 0, 0 ) ||
+        !shutdown_caller( __builtin_return_address(0) ) ||
+        InterlockedCompareExchange( &shutdown_owner, GetCurrentThreadId(), 0 )) return status;
+    *connection = &shutdown_connection;
+    TRACE( "using host shutdown connection after missing RMCLIENT endpoint on tid %lu\n", GetCurrentThreadId() );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS WINAPI host_ham_terminate( void *connection, ULONG reason )
+{
+    if (connection != &shutdown_connection) return native_ham_terminate( connection, reason );
+    if (reason != 3 || InterlockedCompareExchange( &shutdown_owner, 0, 0 ) != GetCurrentThreadId() ||
+        !shutdown_caller( __builtin_return_address(0) )) return STATUS_INVALID_PARAMETER;
+    TRACE( "native TearDown requested host process termination, reason %lu\n", reason );
+    /* This is the service's explicit process-termination request, after Exiting.
+     * ExitProcess would run DLL detach handlers under locks held by other threads. */
+    TerminateProcess( GetCurrentProcess(), 0 );
+    return STATUS_UNSUCCESSFUL;
+}
+
+static NTSTATUS WINAPI host_ham_disconnect( void *connection )
+{
+    DWORD tid = GetCurrentThreadId();
+
+    if (connection != &shutdown_connection) return native_ham_disconnect( connection );
+    if (!shutdown_caller( __builtin_return_address(0) ) ||
+        InterlockedCompareExchange( &shutdown_owner, 0, tid ) != tid) return STATUS_INVALID_PARAMETER;
+    return STATUS_SUCCESS;
+}
+
+/* Only three named imports in twinapi are intercepted. RMCLIENT stays native;
+ * suspend-control and other users of these imports retain its original results. */
+static BOOL prepare_shutdown_host( HMODULE module )
+{
+    static const char *names[] = { "HamConnectForExtendedExecution", "HamTerminateSelfEx",
+                                  "HamDisconnectForExtendedExecution" };
+    void *hooks[] = { host_ham_connect, host_ham_terminate, host_ham_disconnect };
+    void **slots[3] = {0}, *originals[3], *native[3];
+    const IMAGE_NT_HEADERS *nt;
+    const IMAGE_DATA_DIRECTORY *dir;
+    const IMAGE_DELAYLOAD_DESCRIPTOR *desc;
+    MEMORY_BASIC_INFORMATION region;
+    HMODULE rmclient = NULL;
+    BYTE *first, *last;
+    void *teardown;
+    DWORD i, j, k, root, old_protect, unused;
+    SIZE_T count, span;
+
+    shutdown_module = (BYTE *)module;
+    nt = (void *)(shutdown_module + ((IMAGE_DOS_HEADER *)module)->e_lfanew);
+    shutdown_image_size = nt->OptionalHeader.SizeOfImage;
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT ||
+        !(teardown = uwp_symbol( "twinapi.appcore.dll", SYM_APP_TEARDOWN ))) goto failed;
+    shutdown_teardown_rva = (BYTE *)teardown - shutdown_module;
+    if (!shutdown_function_root( shutdown_teardown_rva, &root ) || root != shutdown_teardown_rva) goto failed;
+
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    if (!dir->VirtualAddress || (dir->VirtualAddress & 3) ||
+        !shutdown_image_range( dir->VirtualAddress, dir->Size )) goto failed;
+    desc = (void *)(shutdown_module + dir->VirtualAddress);
+    for (i = 0; i < dir->Size / sizeof(*desc) && desc[i].DllNameRVA; i++)
+    {
+        const IMAGE_THUNK_DATA *imports;
+        void **iat;
+
+        if (!shutdown_image_range( desc[i].DllNameRVA, 1 ) ||
+            !memchr( shutdown_module + desc[i].DllNameRVA, 0, shutdown_image_size - desc[i].DllNameRVA )) goto failed;
+        if (_stricmp( (char *)shutdown_module + desc[i].DllNameRVA, "rmclient.dll" )) continue;
+        if (desc[i].Attributes.AllAttributes != 1 || !desc[i].ImportNameTableRVA ||
+            !desc[i].ImportAddressTableRVA || (desc[i].ImportNameTableRVA % sizeof(*imports)) ||
+            (desc[i].ImportAddressTableRVA % sizeof(*iat)) ||
+            !shutdown_image_range( desc[i].ImportNameTableRVA, sizeof(*imports) ) ||
+            !shutdown_image_range( desc[i].ImportAddressTableRVA, sizeof(*iat) )) goto failed;
+        imports = (void *)(shutdown_module + desc[i].ImportNameTableRVA);
+        iat = (void *)(shutdown_module + desc[i].ImportAddressTableRVA);
+        count = min( (shutdown_image_size - desc[i].ImportNameTableRVA) / sizeof(*imports),
+                     (shutdown_image_size - desc[i].ImportAddressTableRVA) / sizeof(*iat) );
+        for (j = 0; j < count && imports[j].u1.AddressOfData; j++)
+        {
+            ULONG_PTR name = imports[j].u1.AddressOfData;
+
+            if (IMAGE_SNAP_BY_ORDINAL(name)) continue;
+            if (name >= shutdown_image_size || !shutdown_image_range( name, 3 ) ||
+                !memchr( shutdown_module + name + 2, 0, shutdown_image_size - name - 2 )) goto failed;
+            for (k = 0; k < ARRAY_SIZE(names); k++)
+                if (!strcmp( (char *)shutdown_module + name + 2, names[k] ))
+                {
+                    if (slots[k]) goto failed;
+                    slots[k] = iat + j;
+                }
+        }
+        if (j == count) goto failed;
+    }
+    for (i = 0; i < ARRAY_SIZE(slots); i++) if (!slots[i]) goto failed;
+    if (!(rmclient = LoadLibraryExW( L"rmclient.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32 ))) goto failed;
+    for (i = 0; i < ARRAY_SIZE(slots); i++)
+    {
+        if (!(native[i] = (void *)GetProcAddress( rmclient, names[i] ))) goto failed;
+        originals[i] = *slots[i];
+        if (originals[i] != native[i])
+        {
+            ULONG_PTR rva = (ULONG_PTR)originals[i] - (ULONG_PTR)module;
+
+            /* An unresolved delay thunk must still belong to twinapi code. */
+            if (rva >= shutdown_image_size || !shutdown_code_range( rva, rva + 1 )) goto failed;
+        }
+        for (j = 0; j < i; j++) if (slots[i] == slots[j]) goto failed;
+    }
+    first = last = (BYTE *)slots[0];
+    for (i = 1; i < ARRAY_SIZE(slots); i++)
+    {
+        if ((BYTE *)slots[i] < first) first = (BYTE *)slots[i];
+        if ((BYTE *)slots[i] > last) last = (BYTE *)slots[i];
+    }
+    span = last + sizeof(void *) - first;
+    /* One protection region lets a failed install restore every slot together. */
+    if (!VirtualQuery( first, &region, sizeof(region) ) || region.AllocationBase != module ||
+        last + sizeof(void *) > (BYTE *)region.BaseAddress + region.RegionSize ||
+        !VirtualProtect( first, span, PAGE_READWRITE, &old_protect )) goto failed;
+    native_ham_connect = native[0];
+    native_ham_terminate = native[1];
+    native_ham_disconnect = native[2];
+    for (i = 0; i < ARRAY_SIZE(slots); i++) *slots[i] = hooks[i];
+    if (!VirtualProtect( first, span, old_protect, &unused ))
+    {
+        for (i = 0; i < ARRAY_SIZE(slots); i++) *slots[i] = originals[i];
+        if (!VirtualProtect( first, span, old_protect, &unused ))
+            ERR( "could not restore RMCLIENT import protection, error %lu\n", GetLastError() );
+        goto failed;
+    }
+    TRACE( "native TearDown RMCLIENT host bridge installed\n" );
+    return TRUE; /* Keep RMCLIENT loaded for the saved native function pointers. */
+
+failed:
+    if (rmclient) FreeLibrary( rmclient );
+    shutdown_module = NULL;
+    ERR( "native TearDown RMCLIENT host bridge unavailable; preserving native shutdown\n" );
+    return FALSE;
+}
+
+static DWORD view_wait_tls = TLS_OUT_OF_INDEXES;
+static void (WINAPI *native_wait_for_view_ready)( void *container );
+static void (WINAPI *native_signal_view_ready)( void *container );
+
+static void CALLBACK restore_view_wait( BOOL normal, void *previous )
+{
+    TlsSetValue( view_wait_tls, previous );
+}
+
+/* Keep the native container only while its own view thread is waiting. The startup APC
+ * runs inside this wait, after FrameworkView::Initialize has returned. */
+static void WINAPI wait_for_native_view_ready( void *container )
+{
+    void *previous = TlsGetValue( view_wait_tls );
+
+    TlsSetValue( view_wait_tls, container );
+    __TRY
+    {
+        native_wait_for_view_ready( container );
+    }
+    __FINALLY_CTX( restore_view_wait, previous )
+}
+
+/* Called by combase before returning the native CoreApplication factory. Installing in
+ * RegisterActivatableApplication is too late: CoreApplication creates its main view first.
+ * Redirect only the view thread's direct call, whose argument is its container in rdi.
+ * Leave the original wait intact, including its other caller on the application thread. */
+HRESULT WINAPI __wine_uwp_prepare_native_views( void )
+{
+    HMODULE module = GetModuleHandleW( L"twinapi.appcore.dll" );
+    const IMAGE_NT_HEADERS *nt;
+    const IMAGE_SECTION_HEADER *section;
+    BYTE *call = NULL, *code;
+    LONG original, replacement;
+    LONG_PTR distance;
+    DWORD old_protect, unused, error, tls;
+    unsigned int i, j, size;
+    BOOL wait_code = FALSE, signal_code = FALSE;
+    void *wait, *signal;
+
+    if (!module) return E_NOINTERFACE;
+    if (!(wait = uwp_symbol( "twinapi.appcore.dll", SYM_VIEW_WAIT_READY )) ||
+        !(signal = uwp_symbol( "twinapi.appcore.dll", SYM_VIEW_SIGNAL_READY )))
+        return E_NOTIMPL;
+
+    nt = (const IMAGE_NT_HEADERS *)((const BYTE *)module + ((const IMAGE_DOS_HEADER *)module)->e_lfanew);
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return E_NOTIMPL;
+    for (i = 0, section = IMAGE_FIRST_SECTION(nt); i < nt->FileHeader.NumberOfSections; i++, section++)
+    {
+        if (!(section->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        if (section->VirtualAddress >= nt->OptionalHeader.SizeOfImage) return E_UNEXPECTED;
+        size = min( section->Misc.VirtualSize, nt->OptionalHeader.SizeOfImage - section->VirtualAddress );
+        code = (BYTE *)module + section->VirtualAddress;
+        if ((ULONG_PTR)wait - (ULONG_PTR)code < size) wait_code = TRUE;
+        if ((ULONG_PTR)signal - (ULONG_PTR)code < size) signal_code = TRUE;
+        for (j = 0; j + 8 <= size; j++)
+        {
+            if (memcmp( code + j, "\x48\x8b\xcf\xe8", 4 )) continue;
+            memcpy( &original, code + j + 4, sizeof(original) );
+            if (code + j + 8 + original != (BYTE *)wait) continue;
+            if (call)
+            {
+                ERR( "ambiguous native view readiness call sites\n" );
+                return E_UNEXPECTED;
+            }
+            call = code + j + 3;
+        }
+    }
+    if (!call || !wait_code || !signal_code)
+    {
+        ERR( "native view readiness call site not found\n" );
+        return E_NOTIMPL;
+    }
+    distance = (LONG_PTR)wait_for_native_view_ready - (LONG_PTR)(call + 5);
+    replacement = distance;
+    if ((LONG_PTR)replacement != distance)
+    {
+        ERR( "native view readiness wrapper is outside rel32 range\n" );
+        return E_NOTIMPL;
+    }
+    if ((tls = TlsAlloc()) == TLS_OUT_OF_INDEXES) return E_OUTOFMEMORY;
+    if (!VirtualProtect( call + 1, sizeof(replacement), PAGE_EXECUTE_READWRITE, &old_protect ))
+    {
+        error = GetLastError();
+        TlsFree( tls );
+        return HRESULT_FROM_WIN32( error );
+    }
+    memcpy( &original, call + 1, sizeof(original) );
+    native_wait_for_view_ready = wait;
+    native_signal_view_ready = signal;
+    view_wait_tls = tls;
+    memcpy( call + 1, &replacement, sizeof(replacement) );
+    if (!FlushInstructionCache( GetCurrentProcess(), call, 5 ) ||
+        !VirtualProtect( call + 1, sizeof(replacement), old_protect, &unused ))
+    {
+        error = GetLastError();
+        memcpy( call + 1, &original, sizeof(original) );
+        FlushInstructionCache( GetCurrentProcess(), call, 5 );
+        if (!VirtualProtect( call + 1, sizeof(original), old_protect, &unused ))
+            ERR( "could not restore native code protection, error %lu\n", GetLastError() );
+        view_wait_tls = TLS_OUT_OF_INDEXES;
+        TlsFree( tls );
+        return HRESULT_FROM_WIN32( error );
+    }
+    TRACE( "native view readiness wrapper installed at %p\n", call );
+    /* Preparation has succeeded, so combase will keep this DLL loaded even if
+     * an unsupported shutdown layout leaves the native imports untouched. */
+    prepare_shutdown_host( module );
+    return S_OK;
 }
 
 /* CoreApplication::Activate waits on gPsmRegistered until RegisterWithPSM - the process state manager, a service
@@ -2302,12 +2715,19 @@ static HRESULT drive_view_startup( IInspectable *args )
     IInspectable *own_args = NULL;
     WCHAR entry[256], mode[16], *app_id;
     HSTRING entry_point;
+    void *waiting_container = NULL;
+    BOOL native_startup;
     HRESULT hr;
 
-    /* WINE_UWP_DRIVE_VIEW=load stops after Load; any other value also runs Activate, which
-     * currently faults inside windows.ui's CDispatcher (see Findings-M4.md). */
+    /* WINE_UWP_DRIVE_VIEW=load stops after Load; any other value also runs Activate. */
     if (!GetEnvironmentVariableW( L"WINE_UWP_DRIVE_VIEW", mode, ARRAY_SIZE(mode) )) return S_FALSE;
     if (view_startup_done) return S_FALSE;
+    native_startup = drive_first_view() && !GetModuleHandleW( L"Windows.UI.Xaml.dll" );
+    if (native_startup && wcsicmp( mode, L"load" ))
+    {
+        if (view_wait_tls == TLS_OUT_OF_INDEXES) return E_NOTIMPL;
+        if (!(waiting_container = TlsGetValue( view_wait_tls ))) return E_PENDING;
+    }
     if (!args && !(args = own_args = create_launch_args( L"" ))) return E_OUTOFMEMORY;
     if (FAILED( hr = get_current_core_application_view( &view ) ))
     {
@@ -2385,9 +2805,9 @@ static HRESULT drive_view_startup( IInspectable *args )
                 try_configure_from_get_for_current_thread();
             }
 
-            /* SetWindowAndGetDispatcher is only needed for the dispatcher it hands back, and it
-             * does not return when called from here. */
-            if (FAILED( hr2 ))
+            /* XAML is configured above. A native IFrameworkView still needs its SetWindow call
+             * before activation, which SetWindowAndGetDispatcher delivers. */
+            if (FAILED( hr2 ) || !GetModuleHandleW( L"Windows.UI.Xaml.dll" ))
             {
                 ERR( "STEP tid %lu: SetWindowAndGetDispatcher on view %p\n", GetCurrentThreadId(), view );
                 hr2 = internal->vtbl->SetWindowAndGetDispatcher( internal, factory, &win, &disp );
@@ -2397,6 +2817,11 @@ static HRESULT drive_view_startup( IInspectable *args )
             if (win) IUnknown_Release( (IUnknown *)win );
             if (disp) IUnknown_Release( (IUnknown *)disp );
             IUnknown_Release( (IUnknown *)factory );
+        }
+        if (native_startup && FAILED( hr2 ))
+        {
+            hr = hr2;
+            goto done;
         }
     }
 
@@ -2419,11 +2844,18 @@ static HRESULT drive_view_startup( IInspectable *args )
         if (SUCCEEDED( hr = create_activation_callback( &callback ) ))
         {
             mark_psm_registered();
-        hr = internal->vtbl->Activate( internal, callback, args, NULL );
+            hr = internal->vtbl->Activate( internal, callback, args, NULL );
             ERR( "view Activate(callback %p, args %p), hr %#lx\n", callback, args, hr );
             IUnknown_Release( (IUnknown *)callback );
         }
     }
+    if (SUCCEEDED( hr ) && waiting_container)
+    {
+        InterlockedExchange( &native_view_started, 1 );
+        native_signal_view_ready( waiting_container );
+        TRACE( "signaled native view readiness on tid %lu\n", GetCurrentThreadId() );
+    }
+done:
     IUnknown_Release( (IUnknown *)view );
     if (own_args) IInspectable_Release( own_args );
     return hr;

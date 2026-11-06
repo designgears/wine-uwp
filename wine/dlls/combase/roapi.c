@@ -770,29 +770,62 @@ static const void *core_app_factory_vtbl[] =
     caf_ActivateInstance,
 };
 
-static void wrap_core_application( const WCHAR *name, REFIID iid, void **factory )
-{
-    struct main_view_app *app;
+static HRESULT native_view_prepare_result;
 
-    if (!name || wcscmp( name, L"Windows.ApplicationModel.Core.CoreApplication" )) return;
+static BOOL CALLBACK prepare_native_views_once( INIT_ONCE *once, void *param, void **context )
+{
+    HRESULT (WINAPI *prepare)( void );
+    HMODULE module;
+
+    if (!(module = LoadLibraryW( L"wineuwp.dll" )))
+        native_view_prepare_result = HRESULT_FROM_WIN32( GetLastError() );
+    else if (!(prepare = (void *)GetProcAddress( module, "__wine_uwp_prepare_native_views" )))
+        native_view_prepare_result = E_NOTIMPL;
+    else
+        native_view_prepare_result = prepare();
+    /* Keep the module loaded: native code now calls its wait wrapper. */
+    if (FAILED( native_view_prepare_result ))
+    {
+        ERR( "could not prepare native view readiness, hr %#lx\n", native_view_prepare_result );
+        if (module) FreeLibrary( module );
+    }
+    return TRUE;
+}
+
+static HRESULT wrap_core_application( const WCHAR *name, REFIID iid, void **factory )
+{
+    static INIT_ONCE native_views_once = INIT_ONCE_STATIC_INIT;
+    struct main_view_app *app;
+    WCHAR mode[16];
+
+    if (!name || wcscmp( name, L"Windows.ApplicationModel.Core.CoreApplication" )) return S_OK;
+    if (GetEnvironmentVariableW( L"WINE_UWP_DRIVE_FIRST_VIEW", NULL, 0 ) &&
+        GetEnvironmentVariableW( L"WINE_UWP_DRIVE_VIEW", mode, ARRAY_SIZE(mode) ) && wcsicmp( mode, L"load" ))
+    {
+        /* CoreApplication creates its main view before calling the registrar. Prepare here,
+         * before any factory interface escapes and the application can call Run. */
+        InitOnceExecuteOnce( &native_views_once, prepare_native_views_once, NULL, NULL );
+        if (FAILED( native_view_prepare_result )) return native_view_prepare_result;
+    }
     if (IsEqualGUID( iid, &IID_IActivationFactory ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IUnknown ))
     {
         struct core_app_factory *f;
 
-        if (!(f = malloc( sizeof(*f) ))) return;
+        if (!(f = malloc( sizeof(*f) ))) return S_OK;
         f->vtbl = core_app_factory_vtbl;
         f->refs = 1;
         f->real = *factory;
         *factory = f;
-        return;
+        return S_OK;
     }
-    if (!IsEqualGUID( iid, &IID_ICoreImmersiveApplication_ )) return;
-    if (!(app = malloc( sizeof(*app) ))) return;
+    if (!IsEqualGUID( iid, &IID_ICoreImmersiveApplication_ )) return S_OK;
+    if (!(app = malloc( sizeof(*app) ))) return S_OK;
     app->vtbl = main_view_app_vtbl;
     app->refs = 1;
     app->real = *factory;
     app->outer = NULL;
     *factory = app;
+    return S_OK;
 }
 
 /***********************************************************************
@@ -817,7 +850,11 @@ HRESULT WINAPI DECLSPEC_HOTPATCH RoGetActivationFactory(HSTRING classid, REFIID 
     {
         hr = IActivationFactory_QueryInterface(factory, iid, class_factory);
         IActivationFactory_Release(factory);
-        if (SUCCEEDED(hr)) wrap_core_application(name, iid, class_factory);
+        if (SUCCEEDED(hr) && FAILED(hr = wrap_core_application(name, iid, class_factory)))
+        {
+            IUnknown_Release( (IUnknown *)*class_factory );
+            *class_factory = NULL;
+        }
         return hr;
     }
 
@@ -865,8 +902,13 @@ HRESULT WINAPI DECLSPEC_HOTPATCH RoGetActivationFactory(HSTRING classid, REFIID 
         if (SUCCEEDED(hr))
         {
             TRACE("Created interface %p\n", *class_factory);
-            wrap_core_application(name, iid, class_factory);
-            if (name) factory_cache_add(name, factory);
+            hr = wrap_core_application(name, iid, class_factory);
+            if (FAILED(hr))
+            {
+                IUnknown_Release( (IUnknown *)*class_factory );
+                *class_factory = NULL;
+            }
+            else if (name) factory_cache_add(name, factory);
         }
         IActivationFactory_Release(factory);
     }

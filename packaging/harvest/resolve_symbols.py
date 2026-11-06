@@ -24,6 +24,9 @@ import urllib.request
 WANTED = {
     "twinapi.appcore.dll": [
         "?gPsmRegistered@CoreApplication@Core@ApplicationModel@Windows@@0KC",
+        "?WaitForViewReady@CoreApplicationViewAgileContainer@Core@ApplicationModel@Windows@@QEAAXXZ",
+        "?SignalViewReady@CoreApplicationViewAgileContainer@Core@ApplicationModel@Windows@@QEAAXXZ",
+        "?TearDown@CoreApplication@Core@ApplicationModel@Windows@@QEAAJXZ",
         "??_7CoreApplicationView@Core@ApplicationModel@Windows@@6BICoreApplicationView@123@@",
         "PREFIX:??_7CoreApplicationView@Core@ApplicationModel@Windows@@6B?$ImplementsHelper@U?$RuntimeClassFlags@$02@WRL@Microsoft@@$00U?$CloakedIid@UICoreApplicationViewInternal@",
         "PREFIX:??_7CoreApplicationView@Core@ApplicationModel@Windows@@6B?$ImplementsHelper@U?$RuntimeClassFlags@$02@WRL@Microsoft@@$00UICoreApplicationViewInternal3@",
@@ -36,6 +39,8 @@ WANTED = {
         "?InvokeOnWindowCreated@FrameworkApplication@DirectUI@@QEAAJXZ",
     ],
 }
+# The shutdown bridge can be unavailable without preventing native view startup.
+OPTIONAL = {"?TearDown@CoreApplication@Core@ApplicationModel@Windows@@QEAAJXZ"}
 # short names wineuwp uses for the PREFIX: entries (the full decorated names are long and build-stable only in prefix)
 SHORT = {
     "UICoreApplicationViewInternal@": "vtbl.ICoreApplicationViewInternal",
@@ -175,8 +180,10 @@ def main():
                 hits = [want] if want in syms else []
                 key = want
             if len(hits) != 1:
-                print(f"{dll}: {len(hits)} matches for {want[:80]}", file=sys.stderr)
-                failed += 1
+                optional = want in OPTIONAL
+                print(f"{dll}: {len(hits)} matches for {want[:80]}" + (" (optional)" if optional else ""), file=sys.stderr)
+                if not optional:
+                    failed += 1
                 continue
             lines.append(f"{dll} {stamp:08x} {size:x} {syms[hits[0]]:x} {key}\n")
     with open(args.out, "w") as f:
