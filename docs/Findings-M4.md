@@ -14313,3 +14313,14 @@ and windows.web json_object in both x86_64 and i386. The first manual compile
 commands omitted generated module headers and the Store module's PARENTSRC include
 directory; matching the module include paths corrected the checks. Existing compiler
 warnings remain. This is compilation evidence, not a linked/runtime test of the stack.
+
+The fresh Ponytail and OCR reviews covered 048d34e4b7272264106b877dd0f0558cadba046e
+through f749ddc63ad1b03103d452242d7c1f729aa4fa97. OCR reported no concrete correctness
+findings, with 45 of 45 reviewable files covered and no skipped files. Its 14
+exclusions were recorded; ten excluded packaging, test and build files were also
+read. Six large imported files were compared with pristine Wine 11.20, and the
+inherited controller, Store and CoreApplication methods were checked.
+Ponytail found only the two-line attribute file for the removed DXVK patch.
+The cleanup is a separate layer, so the reviewed f749ddc checkpoint and its frozen
+bundle remain unchanged for the full integration build. No Wine source changes
+are included in the cleanup.
