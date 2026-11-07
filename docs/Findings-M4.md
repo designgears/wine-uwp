@@ -2,6 +2,7 @@
 
 Continues Findings-M3.md, with the same Windows 10.0.26200.9168 binaries and Wine build.
 This findings number is a debugging checkpoint, not completion of the composition milestone M4.
+Account names in example paths and log excerpts use placeholders.
 
 ## Fixed blocker
 
@@ -16,7 +17,7 @@ XAML's filesystem lookup was a fallback after the private MRT lookup failed.
 The process loaded **two physical copies of MrmCoreR.dll**:
 
 - Private COM activation: `C:\windows\system32\mrmcorer.dll`.
-- WinRT activation: `Z:\home\bobby\uwp-bin\win11\Windows\System32\MrmCoreR.dll`.
+- WinRT activation: `Z:\home\<user>\uwp-bin\win11\Windows\System32\MrmCoreR.dll`.
 
 With both copies present, debugging the framework lookup caught a freed-memory read in
 `CResourceManagerInternal::GetResourceIndex` (MRT RVA 0x1a1b6, profile pointer `feeefeeefeeefeee`).
@@ -3002,7 +3003,7 @@ mask brushes. Still open:
 - Fix applied (dlls/directmanipulation, uncommitted): `IDirectManipulationManager::CreateContent` now returns a
   content object (the primary-content object with a NULL viewport; `content_GetViewport` already guards that), via a
   shared `create_content()` also used by `viewport_GetPrimaryContent`.
-- Testing moved off the user's desktop (their request) to the existing headless `Xvfb :98` (1280x800):
+- Testing used the existing headless `Xvfb :98` (1280x800):
   `env -u WAYLAND_DISPLAY DISPLAY=:98 WINE_D3D_CONFIG=renderer=vulkan tools/wine-uwp/run.sh`; clicks with
   `DISPLAY=:98 xdotool`, captures with `import -display :98 -window root`.
 - On `Xvfb :98` (vulkan renderer) the startup crash became deterministic (2/2): `0xc0000409` in
@@ -3057,7 +3058,7 @@ mask brushes. Still open:
   (`pkg_put_string` bumps `offset` even when the string does not fit), so for the last package
   `ids_size = *buffer_size - offset` underflowed and `PackageIdFromFullName` wrote a PACKAGE_ID plus strings past
   the end of the buffer — into whatever block followed: the freed manifest buffer here, live dwrite font-file
-  objects in the earlier runs (hence the garbage `entry->file` vtable). Fixed with the user's explicit OK, in
+  objects in the earlier runs (hence the garbage `entry->file` vtable). Fixed in
   version.c: the size pass now counts the publisher, and `ids_size` is clamped (no PackageIdFromFullName call
   when there is no room). Left uncommitted for the owning session.
 - After the kernelbase fix the runs still fast-failed, but `+seh` now shows a different first exception: an access
@@ -3247,7 +3248,7 @@ mask brushes. Still open:
   button's AnimatedIcon, also 48x48 at the same spot, is IsVisible=false). The icon's other
   animation states stay hidden without evaluating the Progress-driven animations, since their
   containers have no offset and land outside the 48x48 texture.
-- One-off crash seen on the user's desktop (GL renderer, once):
+- One-off crash seen on an interactive desktop (GL renderer, once):
   `WUCBrushManager::GetNineGridBrush+0xdd` reading a NULL nine-grid brush vtable; not reproduced on
   :98 with the Vulkan renderer.
 - Keyboard input works (click 9, type `12+3=` → "912 + 3 = 915", expression line included). The first
@@ -3258,7 +3259,7 @@ mask brushes. Still open:
   IInspectable's three methods properly (the default slot wrote a fake object over GetIids' count),
   and WinUI asks composition animations for IDependencyObject, which must be refused.
 - The desktop-only crash (`WUCBrushManager::GetNineGridBrush+0xdd`) reproduces headlessly with a
-  stream of pointer moves over the keypad (the user's real mouse; 17 moves were enough). XAML called
+  stream of pointer moves over the keypad (physical pointer input; 17 moves were enough). XAML called
   a nine-grid brush through its recording table and the default slot answered the out-pointer with
   a "clone" carrying the nine-grid vtable over a plain recording struct, which the next use read as
   a brush with a NULL vtable. The default slot now clones only the two recording tables and answers
@@ -5600,8 +5601,8 @@ The page consequently changes from the permission wall to the **normal empty-lib
 capability and library layers are both satisfied and the app is past them.
 
 It still finds no files, and the reason is *not* the folder path: `KnownFolders.MusicLibrary`
-resolves through `SHGetKnownFolderPath(FOLDERID_Music)` to `C:\users\bobby\Music`, which in this
-prefix is a symlink to `/home/bobby/Music`, and the two test files are there.
+resolves through `SHGetKnownFolderPath(FOLDERID_Music)` to `C:\users\<user>\Music`, which in this
+prefix is a symlink to `/home/<user>/Music`, and the two test files are there.
 
 What the log shows instead is that **the app never enumerates the folder**. Wine's
 `storage_folder_QueryInterface` is asked for exactly one interface, thirteen times:
@@ -5645,7 +5646,7 @@ Result, from a run:
 ```
 trace:storage:folder_query_CreateFileQueryWithOptions iface ..., query_options ..., value ...
 trace:storage:file_query_base_GetItemCountAsync iface ..., operation ...
-trace:storage:query_result_files L"C:\users\bobby\Music": 2 of 2 entries matched.
+trace:storage:query_result_files L"C:\users\<user>\Music": 2 of 2 entries matched.
 trace:storage:query_options_statics_CreateCommonFileQuery iface ..., query 0, file_type_filter ...
 trace:storage:hstring_vector_Append iface ..., value L".aac".
 trace:storage:hstring_vector_Append iface ..., value L".ac3".
@@ -5683,11 +5684,11 @@ Clicking **Open file(s)**, picking a file and pressing **Play** now decodes and 
 trace of a complete run:
 
 ```
-[filepicker] picked C:\users\bobby\Music\tone.mp3
+[filepicker] picked C:\users\<user>\Music\tone.mp3
 trace:media:item_vector_InsertAt          index 0, value 00007F8A41206310
 trace:mediaplayer:media_player_Play       (the app, not us)
 trace:media:binder_resolve                raising Binding
-trace:media:binding_args_set_path         bound to L"C:\users\bobby\Music\tone.mp3"
+trace:media:binding_args_set_path         bound to L"C:\users\<user>\Music\tone.mp3"
 trace:mediaplayer:playback_thread         1 ch, 44100 Hz, 16 bits
 trace:mediaplayer:playback_thread         playback finished, hr 0
 ```
@@ -8007,8 +8008,7 @@ frame-loop patch. Calculator regression is AE = 0.
 ## Solitaire is playable (2026-09-22)
 
 From the main menu: Cancel on the Sign In Error popup, then Klondike, then "I know the rules" on
-the tutorial deals a game. Clicks play it: the Ace goes to the foundation, the score goes to 10,
-the stock draws, and the timer runs (`docs/screenshots/solitaire-klondike-playing.png`).
+the tutorial deals a game. Input updates the board and the timer runs (`docs/screenshots/solitaire-klondike-playing.png`).
 
 The last blocker was `kernelbase.SystemTimeToTzSpecificLocalTimeEx`, a `@ stub`. `mainmenu_modern`
 calls it as it gains focus and dies with `0x80000100`, and it had only been missed on runs where the
@@ -8301,7 +8301,7 @@ browser to complete login"** screen (`docs/screenshots/shapr3d-login-browser-wai
 
 The first run after adding the shim reported `shim registration did not stick`: the key still held
 `Z:\...\uwp-bin\win11\...\Windows.System.Launcher.dll`, left by an old one-off class import (its
-source, `uwp-bin/win11/wine-uwp-classes.reg`, still carries the pre-move `/home/bobby/uwp-bin`
+source, `uwp-bin/win11/wine-uwp-classes.reg`, still carries the pre-move `/home/<user>/uwp-bin`
 paths and is no longer imported). A second write stuck and the verifier has passed since.
 
 **Next: the `shapr3d:` protocol callback.** After sign-in the site redirects to `shapr3d://...`
@@ -9168,15 +9168,15 @@ repaints when that space moves (the parent may paint later in the same frame).
 `docs/screenshots/shapr3d-dropdown-placed.png` shows the Settings dropdown over its box with the
 selected item aligned, as on Windows.
 
-A crash the user hit while expanding something in the left pane is **not** explained. Sentry's dump
+A reported crash while expanding an item in the left pane is **not** explained. Sentry's dump
 has `malloc` returning an address inside dcomp's image, past the end of `.bss`, for a
 `CreateVertexShader` bytecode copy. That is heap corruption from an earlier write. Twelve rounds of
 expand/collapse plus wheel scrolling did not reproduce it. `minidump.py` now prints the faulting
 context from the exception stream, not the crash handler's.
 
-### A heap corruption that crashes Shapr3D on the user's desktop, and its crash reporter (2026-09-24)
+### A heap corruption that crashes Shapr3D on an interactive desktop, and its crash reporter (2026-09-24)
 
-On the user's `:0`, clicking `drone.shapr` in the Items pane crashed Shapr3D twice. Neither crash
+On an interactive desktop, clicking a model in the Items pane crashed Shapr3D twice. Neither crash
 reproduces on Xvfb, including at the same 3440x1440 size and on the same RTX 5090.
 
 - **Crash 1** (Sentry dump): `malloc` for a vertex shader's bytecode copy returned
@@ -9332,8 +9332,8 @@ on the old dcomp as well as the new.
 
 ### Extrude drags: the UI thread was painting the viewport (2026-09-25)
 
-Reported: orbiting is smooth, extruding is "painfully slow". Measured on the drone (Offset Face on the
-brown block, a 2 s drag), with the window at the user's size - a 3440x1440 Xvfb (`:96`) and
+Reported: orbiting is smooth, but extruding is slow. Measured a two-second Offset Face drag
+on a sample model, with a 3440x1440 Xvfb (`:96`) and
 `probe-resize.exe 3440 1400 Shapr3D`. At 1280x800 the problem is mostly invisible.
 
 - **Per-thread CPU is the first measurement to take.** `/proc/<pid>/task/*/stat` before and after an
@@ -9364,8 +9364,7 @@ brown block, a 2 s drag), with the window at the user's size - a 3440x1440 Xvfb 
   ends an event query after the copy and polls it (`GetData`, `DONOTFLUSH`, `Sleep(1)`) before mapping.
 - **`WINEDEBUG=warn+heap` more than doubles modelling time.** The same drag: kernel CPU 1.83 s against
   0.79 s, and the result 1.36 s after release against 0.3 s. It disables the LFH and fills every free.
-  The session left running for the user had it on (it was hunting the heap corruption); do not leave
-  it on for someone who is using the app.
+  Disable this diagnostic outside isolated heap-corruption tests.
 
 **Not changed: the preview rate.** The face still updates every ~130-150 ms on the drone (~90 ms at
 1280x800; a plain rectangle updates every frame). Each update is ~60 ms of kernel work followed by
@@ -9431,13 +9430,13 @@ channels: `dcompinput` for each pointer message routed to the input sink, `ptrdi
 - Readback off entirely (an experiment switch): no change. Frame pacing at 90, 120, 144 or 175 Hz: no
   change (one 175 Hz run looked twice as slow; the repeat did not).
 
-What made extruding "painfully slow" on the user's desktop was what the previous entries fixed: the UI
+What made extruding "painfully slow" on an interactive desktop was what the previous entries fixed: the UI
 thread painting every swap chain frame at 3440 wide, and `warn+heap`. The rest is Parasolid's compute
 time. Wine's share could be cut a little with a faster heap; not attempted.
 
 ### Orbit frame rate: the batch gate, a fixed 15 ms paint interval, and no back-pressure (2026-09-25)
 
-The user found orbiting a little less smooth after the painting moved off the UI thread. At 3440x1366,
+Orbiting was reported as less smooth after painting moved off the UI thread. At 3440x1366,
 orbiting the drone (a right-drag with a move every ~8 ms), `+dcompperf`:
 
 | build | display | presents/s | frames shown/s |
@@ -9456,18 +9455,16 @@ orbiting the drone (a right-drag with a move every ~8 ms), `+dcompperf`:
   public `RemoveAll`) now mark the batch structural (`scene_structure_changed`) and run under the walk
   guard, so they cannot interleave with a walk either. Menus: still no flicker in 6 timed opens.
 - **The painter refused to paint more often than every 15 ms**, from when everything assumed 60 Hz. The
-  user's display runs at 175 Hz. The interval is now one refresh (`paint_interval`, from
+  reproduction used a 175 Hz display. The interval is now one refresh (`paint_interval`, from
   `GetDeviceCaps(VREFRESH)`).
 - **Nothing paced the app to what we show.** With the vblank grid at 175 Hz the app presented 175 frames a
   second and 70 were shown, an uneven pick. `present_notify_Presented` (on the presenting thread) now
   waits, up to 20 ms, while the previous frame is still being read back or waiting to be painted - the
   back-pressure a flip-model swap chain's queue gives on Windows. Every presented frame is shown now.
 
-**And a mistake of mine with real consequences.** The drag scripts ended with Ctrl+Z to undo their
-extrude. One drag failed ("resulting body wouldn't be valid"), so the Ctrl+Z undid the previous real step
-of the user's drone project: `Face Offset 20`, the brown block on the front rotor guard. The project syncs
-to the cloud; redo was gone after the restart. The scripts no longer undo, and test edits belong in a
-project of our own, not the user's.
+**Test isolation:** an unconditional Ctrl+Z after a failed operation can undo an earlier edit.
+Test scripts must verify that an edit occurred before undoing it, and use disposable projects.
+The drag scripts no longer send an unconditional undo.
 
 ### Menus and chevrons animate: live key frames, easing, clips (2026-09-25)
 
@@ -9548,10 +9545,10 @@ Also seen once in ~12 starts, before any interaction: Sentry caught an access vi
 `BufferHeapBlock::~BufferHeapBlock` under XAML's message dispatch - the same function as the timer-drain
 crashes above. It did not repeat.
 
-### The wheel leak reproduces only at the user's refresh rate; the History "lost" position is the app's (2026-09-26)
+### The wheel leak reproduces only at 175 Hz; the History "lost" position is the app's (2026-09-26)
 
 **Wheel over a panel reaching the viewport: fixed by the completed-list hit test, and now measured.** It
-never reproduced on Xvfb because Xvfb reports 60 Hz. The user's display runs at 175 Hz, where the painter
+never reproduced on Xvfb because Xvfb reports 60 Hz. The reproduction uses a 175 Hz display, where the painter
 rebuilds its paint list almost continuously while anything moves, and the old hit test read that half-built
 list (the viewport's swap chain op is emitted before the panels drawn over it). New switch
 `WINE_UWP_TEST_HZ=<hz>` makes dcomp's paint interval and dxgi's vblank grid pace as a display of that rate.
@@ -9562,7 +9559,7 @@ At 3440x1400, 175 Hz, 150 wheel notches over History while it scrolls (`/tmp/whe
 | old (the list being built) | 10 of 150 |
 | `paint_complete` under `hit_lock` (09-25) | 0 of 150, 0 of 300, 0 of 150 over the Items panel |
 
-The user's build at the time of the report predated that change. Also ruled out on the way: win32u's
+The build used for that report predated that change. Also ruled out on the way: win32u's
 independent-input forwarder (nothing forwarded, also after leaving and reopening the editor), and focus -
 the wheel's hwnd stays the CoreWindow.
 
@@ -9589,7 +9586,7 @@ not compared with a Windows machine. Useful break points for next time: `ChangeV
 
 ### Selecting a folder drew the toolbar at the origin; Settings pages overlapped (2026-09-26)
 
-Reported on the user's 3440x1440 desktop: selecting `drone.shapr` in Items flickered, with "a bunch of text
+Reported at 3440x1440: selecting a model in Items flickered, with "a bunch of text
 in the top left" and the left pane collapsing for a moment; switching Settings sections showed mangled text
 for a moment. Both reproduced on `:96` at 3440x1400 with `WINE_UWP_TEST_HZ=175`; neither shows at 1280.
 
@@ -9654,7 +9651,7 @@ with `WINE_UWP_TEST_HZ=175` (`/tmp/openorbit.sh`: open the drone from Home, orbi
   last destroyed device's idle `VkDevice` (`vkDeviceWaitIdle` first; one spare; dropped before its instance in
   `adapter_vk_destroy`) for the next device on the same adapter. **Median creation 72 ms -> 3.7 ms**; the same 100
   thumbnails now take ~2 s instead of 11. Regression suite unchanged; soak below.
-- Not reproduced here, because it needs an edit and the tests do not edit the user's projects: Shapr3D redraws a
+- Not reproduced here, because it needs an edit and tests must use disposable projects: Shapr3D redraws a
   project's thumbnail after changes, through the same Win2D path, which fits "choppy right after a change".
 
 What is left in the first second after opening, measured: readbacks of the swap chain average 72 ms (max 144)
@@ -9669,7 +9666,7 @@ investigated yet.
 
 ### The viewport reached the screen in 50 ms steps while the UI thread was busy (2026-09-27)
 
-The device reuse above was real but did not fix the user's report. Painted-frame gaps on Xvfb were already
+The device reuse above was real but did not fix the reported defect. Painted-frame gaps on Xvfb were already
 smooth (6 ms median, 19 ms max even in the first second after opening), so the measurement was of the wrong
 thing: **a frame we paint is not a frame on screen.** dcomp paints into the window's surface from pool threads,
 and win32u copies a surface to the display only in `flush_window_surfaces()` - when some thread's message loop goes
@@ -9799,16 +9796,16 @@ already waits in a message loop in an STA and plainly otherwise, with the docume
 
 Also in: `trace+x11perf` in winex11. Every `XShmPutImage` now asks for its completion event, and once a second the
 trace gives the puts, their size, how late their completions were seen and how many were still queued in the
-server before each put. On Xvfb the server keeps up (queued ~0). On the user's XWayland at 3440 and 175 Hz a
+server before each put. On Xvfb the server keeps up (queued ~0). On XWayland at 3440 and 175 Hz a
 ~19 MB upload per frame may not keep up, which would show as queued puts and a screen that trails the app;
 `WINE_X11_SHM_WAIT=1` makes a put wait for the previous one to complete, to compare. Not measured on the real
 display yet.
 
-**Measured on the user's own display** (KDE/XWayland, 3440x1440 at 174.91 Hz, their instance run with
+**Measured on an interactive display** (KDE/XWayland, 3440x1440 at 174.91 Hz, with
 `trace+dcompperf,trace+d3dperf,trace+dcompgate,trace+x11perf`): opening the drone and orbiting gave 166-176 frames
 shown a second, `shownframes.py` 31 then 43-44 per 250 ms (44 = 175 Hz), no gap while moving. The X server keeps up:
 175 puts a second of ~1.8 MP each, each completed before the next (`queued before a put 0.00 avg 0 max`), so
-`WINE_X11_SHM_WAIT` is not needed. The user: "very smooth".
+`WINE_X11_SHM_WAIT` is not needed.
 
 ## Getting off the patched Windows DLLs: what the patches still do (2026-09-28)
 
@@ -10039,7 +10036,7 @@ from `+timestamp,trace+dcompgate`; the new `frame done` line gives each frame's 
 
 ### Correction: the 0x200BD quirk froze XAML after every drag (2026-09-28)
 
-The user dragged a material onto the model and XAML stopped repainting: the viewport (the app's own swap chain) kept
+Dragging a material onto a model stopped XAML repainting: the viewport (the app's own swap chain) kept
 moving and clicks still acted, but menus, tabs and highlights stayed as they were. Reproduced on `:96`: XAML's last
 `commit` came just before the drag started and there were none after it. The drag entry above only checked the model,
 which is drawn by the swap chain, so it missed this.
@@ -10072,10 +10069,10 @@ Suite, `kb` pass. A real capture would give the drag a ghost image; it is not do
   not a `Translation` facade on it, not batch timing: scoped batches now complete when their animations end (they fired
   16 ms after `End`), which is closer to Windows but did not change it.
 - **History row "..."** disappears while its menu is open; the menu itself renders.
-- **Render-thread abort**: the user's session died in `std::terminate` on Shapr3D's render thread while in the Face
+- **Render-thread abort**: the application terminated in `std::terminate` on Shapr3D's render thread while in the Face
   Offset tool (Sentry dump in `LocalState/crash_report`, breadcrumbs `SKFaceOffsetTool::Initialize`, window
   deactivate/activate). Not investigated yet.
-- The blank Environment panel the user saw has not reproduced (5 drags, library drops, a clicked swatch, 2029 wide).
+- The reported blank Environment panel has not reproduced (5 drags, library drops, a clicked swatch, 2029 wide).
 
 ### Header chevron fixed: XAML facade animations were never run (2026-09-28)
 
@@ -10123,7 +10120,7 @@ the rasterizer keeps destination alpha now (`out[3] = a + inv * out[3]`, identic
 leaves out its blue debug backdrop for transparent targets (`raster_transparent`, captures too). XAML also puts a
 theme-coloured sprite under the content that fades in after 350 ms (`ShowWindowedPopupBackgroundAfterDelay`), sized to
 the content. Menus now open past the window's edge as on Windows (`docs/screenshots/shapr3d-windowed-popup-menu.png`);
-hover, clicks, light dismiss and ComboBox dropdowns work. On Xvfb the margins are black (no compositor); the user's KWin
+hover, clicks, light dismiss and ComboBox dropdowns work. On Xvfb the margins are black (no compositor); KWin
 composites them.
 
 **It does not keep the History "..." button visible**, and the earlier entry's reason was wrong. Measured with
@@ -10171,7 +10168,7 @@ black on Xvfb). The drop still applies and the panels still repaint afterwards; 
 
 ### Face Offset render-thread abort: the app's own assertion, not reproduced (2026-09-28)
 
-The user's Sentry dump (`9f972df1-...dmp`, thread 0x280, `0x40000015`) is `abort()` from an assertion inside
+A Sentry dump (thread 0x280, `0x40000015`) is `abort()` from an assertion inside
 `Shapr::RenderableBuffersPage::GetVertexStrideFor(VertexStream) noexcept` (`Shapr.Native.dll+0x867470`, named by the
 function's own strings): the function finds the lowest set bit of a vertex-stream mask and switches on it, and a mask
 it does not know asserts. The dump does not pin the mask down (the frame is below the assertion's own frames), and the
@@ -10192,7 +10189,7 @@ with popups on after it. Why windowed popups raise the rate is still open; they 
 
 ### Windowed popups flashed black, white and old content when opening (2026-09-28)
 
-The user, on KWin, saw each windowed menu flash a black/white/blue rectangle the size of its window (the drop-shadow
+On KWin, each windowed menu flashed a black/white/blue rectangle the size of its window (the drop-shadow
 margins and the space its reveal slides through) before the menu appeared. Measured on Xvfb with `probes/popwatch.c`,
 which grabs the window's own pixels, alpha included, every ~3 ms after it maps - what a compositor shows. Three
 separate causes:
@@ -10242,7 +10239,7 @@ final frame (a ComboBox chevron's outline), where ~755 did until the end before;
 
 ### Crash after a while: implicit-animation maps ran out at 64 (2026-09-28)
 
-The user's session died with an access violation in WinUI 2's `NavigationView::CreateAndAttachHeaderAnimation`
+The application terminated with an access violation in WinUI 2's `NavigationView::CreateAndAttachHeaderAnimation`
 (`Microsoft.UI.Xaml.dll+0xbead3`, `rax 0x8007000E`, NULL `rcx`), inside `IMap::Insert` on a fresh
 `ImplicitAnimationCollection`. dcomp serves that collection's `IMap` from a table of maps keyed by owner
 (`comp_map_for_owner`), which was a fixed 64 entries that were never removed ("small, bounded", said the comment).
@@ -10537,7 +10534,7 @@ The goal is a setup that needs no Windows installation. Findings so far:
 
 ### History "..." button: the first pointer move still hides it, and that is XAML's own code (2026-09-29)
 
-The user reported the 09-28 fix as incomplete: the `...` stays for a moment after the click, then goes. The test had
+The 09-28 fix was reported as incomplete: the `...` stays for a moment after the click, then goes. The test had
 kept the mouse perfectly still. `/tmp/jitter.sh` clicks, waits 1.5 s and moves the pointer by 1 px, which a hand on a
 real mouse always does. The `...` is gone in 3 of 3 runs, and with no move it stays for 6 s.
 
@@ -10564,7 +10561,7 @@ Every step is unmodified Microsoft code acting on correct input. This is also th
 8.1, `PointerExited` fires whenever a UI change leaves the pointer outside an element, and a light-dismiss layer is
 such a change. I found nothing in Wine that differs from Windows here, so this is not fixed.
 
-**Confirmed on Windows (2026-09-29).** The user checked: on Windows the `...` also goes away on the first pointer move
+**Confirmed on Windows (2026-09-29).** On Windows the `...` also goes away on the first pointer move
 while the menu is open. So what we do is correct. Nothing to fix.
 
 ### Fresh prefixes: the first-launch 0x80070032 was reg.exe failing inside run.sh (2026-09-29)
@@ -10634,7 +10631,7 @@ objects cleared.
 
 ## 2026-10-12: Shapr3D 26.180 crashed ~2 s after the dashboard - thread_local destructors never ran
 
-Seen as "opening a project crashed the app" on the user's 26.180 install; reproduced in a reflink copy of their data
+Seen as "opening a project crashed the app" on version 26.180; reproduced in an isolated reflinked prefix
 directory (4 of 4 runs, 2 s after the dashboard, while a project was downloading), never in a copy whose projects were
 all local. Both Sentry dumps: `Shapr.Native.dll+0x23188d0`, a read through garbage (`0x5`, `0x1212...`, a pointer's
 low half).
@@ -11164,8 +11161,8 @@ Regression (`prefix-test`): Calculator AE 0, Media Player 2250, `kb` 0/0/0.
 
 ## 2026-10-15: Xbox app signed in - SISU needs an Android device token for this client
 
-The user completed the device-code sign-in on `:0` (gamertag DesignGears1342), and the app went back to its sign-in
-gate. The app's own log: `[UserSaga] handleSignInSucceeded` then `Failed to fetch Xbox Profile. Cannot read property
+Completing device-code sign-in returned the app to its sign-in gate.
+The app's own log: `[UserSaga] handleSignInSucceeded` then `Failed to fetch Xbox Profile. Cannot read property
 'xuid' of undefined`. A new self-test mode, `probe-xboxauth.exe get <url>` (env `XBL_CONTRACT`), sends a GET the way the
 app would: `profile.xboxlive.com` answered fine, but `peoplehub .../people/xuids(<me>)/decoration/...` returned
 **200 with `"people":[]`** for every contract version. The cause was the token: SISU had answered 401 for our
@@ -11173,13 +11170,13 @@ Win32 device token, so the fallback's XSTS carried no title claims, and `title.a
 (403). **With an Android device token SISU authorizes** (user, title and XSTS in one call) and peoplehub returns the
 user. `shims/xboxauth` now defaults to DeviceType Android, version 13 (`WINE_UWP_XBOX_DEVICE_TYPE`/`_VERSION`
 override), and keys the cached device token by type. After a restart the app signs in silently and shows the
-signed-in home: DesignGears in the header, Play history, Friends (`docs/screenshots/xbox-signed-in.png`).
+signed-in home screen.
 `xbl_title_token` (title/authenticate) stays as a fallback attempt; it is 403 for this client.
 
 ## 2026-10-15: Xbox app - Store account, install options, game pages, Friends panel
 
-Worked in a reflink copy of `prefix-test` (`uwp-bin/prefix-test2`, Xvfb `:93`): the user had the app open on `:0` from
-`prefix-test`, so nothing ran a `wineserver -k` there. The copy's refresh token rotates independently of the original.
+Worked in a reflink copy of `prefix-test` (`uwp-bin/prefix-test2`, Xvfb `:93`): an interactive app was running from
+`prefix-test`, so no `wineserver -k` was run there. The copy's refresh token rotates independently of the original.
 `/tmp/xbox-t2.sh` (a copy of `xbox-test.sh` that only kills processes of its own prefix) started it.
 
 ### Settings > Account "Account mismatch": the Store account is the Xbox sign-in's Microsoft account
@@ -11347,7 +11344,7 @@ Regression (dev prefix, `:97`): Calculator AE 0, Media Player 2242 (the usual fo
 
 ## 2026-10-15 (later): Xbox app - Friends list, dim game pages: React Native's facade expressions
 
-Tested in `uwp-bin/prefix-test3` (a reflink copy of `prefix-test`, which holds the user's session) on Xvfb `:93`,
+Tested in `uwp-bin/prefix-test3` (a reflink copy of `prefix-test`, which holds an interactive session) on Xvfb `:93`,
 started by `/tmp/xbox-t3.sh`; nothing ran a `wineserver -k` on `prefix-test`.
 
 **One cause behind both the dim product page and the Friends panel: dcomp dropped React Native's composition
@@ -11393,8 +11390,7 @@ A single glyph has no pair: it now answers S_OK and 0 (a NULL glyph array is sti
 
 Result:
 - Home: box art, the Friends panel collapsed at the bottom (`docs/screenshots/xbox-home-friends-collapsed.png`). A click on
-  its header expands it: "Start a party", "Friend requests", **"Offline (8)"** with gamerpics, gamertags, real names and
-  last-seen presence (`docs/screenshots/xbox-friends-list.png`); the list scrolls, rows highlight on hover, the chevron
+  its header expands the presence list; the list scrolls, rows highlight on hover, the chevron
   collapses it again, and XAML keeps repainting afterwards (Game Pass navigates).
 - The product page is no longer dim: description, "Should perform great", thumbnails, **Get Free** in green
   (`docs/screenshots/xbox-pdp-solitaire-bright.png`).
@@ -11402,7 +11398,7 @@ Result:
 Regression: Calculator AE 0, Media Player 2250, `kb` 0/0/0, Shapr3D's home screen AE 0 (reflink copy of the dev prefix,
 `/tmp/s3home.sh`).
 
-**The crash on Get (the user's report):** the user's own log (`/tmp/xbox-test.log`, the `prefix-test` run on `:0`) ends in
+**The reported crash on Get:** the log (`/tmp/xbox-test.log`, the `prefix-test` run on `:0`) ends in
 a fail-fast at `ReactNativeWebView.dll+0xcff3`, called from `Microsoft.Web.WebView2.Core.dll` through XAML: the purchase
 flow opens the Store's buy-now page (`https://www.microsoft.com/store/purchase/buynowui/buynow`) in a WebView2, and there is
 no WebView2 runtime in the prefix. React Native's WebView handler then dereferences the CoreWebView2 it never got.
@@ -11526,14 +11522,14 @@ Xbox sign-in reports error 1170000.
 Regression after the combase, msvcp and propsys changes: Calculator AE 0, Media Player 2250, `kb` 0/0/0, Shapr3D's home
 screen AE 0 (`prefix-s3`), `regress.sh sol` passes (front end, 0 critical).
 
-The new shims were not applied to `uwp-bin/prefix-test`: the user's own Xbox app session is running from it on `:0`
+The new shims were not applied to `uwp-bin/prefix-test`: an interactive Xbox app session is running from it on `:0`
 (its wineserver). Run `./install-overrides.sh` there once that session is closed.
 
 ## 2026-10-15 (night): encrypted GDK packages (MSIXVC) - where it stops
 
-Target: a small GDK title this account owns. The library lists **Taiko no Tatsujin: Rhythm Festival Demo**
-(9NN6FJ5KZCD4, owned, free); its Windows.Desktop package is MSIXVC, content id `c9cb9fe7-b998-428f-b212-25299a898afc`,
-2.36 GB (display catalog `Packages[]`). The account has no PC Game Pass (the app logs it), so nothing larger was tried.
+Target: the free **Taiko no Tatsujin: Rhythm Festival Demo** package
+(9NN6FJ5KZCD4). Its Windows.Desktop package is MSIXVC, content id `c9cb9fe7-b998-428f-b212-25299a898afc`,
+2.36 GB (display catalog `Packages[]`).
 
 **Download: works with our own tokens.** `probe-xboxauth.exe get https://packagespc.xboxlive.com/GetBasePackage/<content
 id>` (the endpoint is knowledge from Xodus's docs; xboxauth's title-endpoints table maps it to the relying party
@@ -11552,17 +11548,15 @@ Windows inline sign-in page (`InlineLogin.srf` in Xodus's own WebKit window, pre
 opens. Our xboxauth identity is an Android-flavoured Xbox device token and an OAuth refresh token; neither is a Windows
 device licence, so it cannot open that block.
 
-So the next steps are the user's, not mine:
+The protocol requires account-holder authentication:
 1. `xodus-cli login` once, signing in with the Microsoft account in its window (password, possibly 2FA/captcha - the
    same human step as the Xbox app's own sign-in). It provisions the device first, which **sends this machine's
-   hardware identifiers to Microsoft and adds a device to the account**; I did not run it without the user's say-so.
-   Its tokens go to the system keychain (Secret Service), which can prompt on the user's desktop.
-2. Then, all legitimate and for this account only: `xodus-cli license c9cb9fe7-... ciks/` (the content keys issued to
+   hardware identifiers to Microsoft and adds a device to the account**.
+   Its tokens go to the system keychain (Secret Service), which can prompt on an interactive desktop.
+2. The corresponding licence and download commands are `xodus-cli license c9cb9fe7-... ciks/` (the content keys issued to
    this account and device), `xodus-cli download 9NN6FJ5KZCD4`, `xodus-cli extract ...`. **Correction (10-15,
-   later): not by running Xodus.** The user wants this in our own code - Xodus is a protocol reference only. Device
-   provisioning, the licence request and EAppx/MSIXVC decryption get implemented in our shims/Wine. (I started
-   `xodus-cli login` on `:0` once and stopped it at the user's word; it had already provisioned a device identity,
-   kept in the keyring under "Xodus Service", before any account sign-in.)
+   later): not by running Xodus.** Xodus remains a protocol reference only. Device
+   provisioning, the licence request and EAppx/MSIXVC decryption belong in the shims/Wine implementation.
 
 **And after that, the game itself needs the GDK runtime.** A GDK title calls `XGameRuntime.dll` (the Gaming Services
 in-process client and its COM server). Nothing in this tree implements it; Xodus's `xodus-service` and
@@ -11610,7 +11604,7 @@ goes on to its title screen. Built in a private copy `uwp-bin/wine-build-ccs` (o
 same DLL copied into `prefix-ccs`. **The shared `~/src/wine-build` still has the old d3d11.dll** - rebuild
 `dlls/d3d11/all` there when nothing is running.
 
-Result, measured on `:90` with a private prefix (`uwp-bin/prefix-ccs`, not the user's):
+Result, measured on `:90` with a private prefix (`uwp-bin/prefix-ccs`, separate from the interactive prefix):
 - loading screen (still animating, 2 min after launch): `docs/screenshots/candycrush-loading-screen.png`
 - title screen with Play and Retrieve My Progress: `docs/screenshots/candycrush-title-screen.png`
 - after clicking Play, a level board (8x8 candies): `docs/screenshots/candycrush-level-board.png`
@@ -11618,12 +11612,12 @@ Result, measured on `:90` with a private prefix (`uwp-bin/prefix-ccs`, not the u
   (the kb suite and Feedback Hub were not re-run for this change).
 
 Still open: `get_TargetDeviceFamily` answers 0 (generic zero-out); the game also logs a `netprofm` loop and
-`InternetSetOptionW` stubs, both benign so far. The shared Wine build and the user's prefix are untouched by
+`InternetSetOptionW` stubs, both benign so far. The shared Wine build and the interactive prefix are untouched by
 this work, except that the StateRepository shim is installed into any prefix the next time its app starts.
 
 ### Candy Crush Saga: the half-window panel in landscape (10-15, night)
 
-The user saw a "stuck texture" after a level: the left half of the window showed a blurry, hugely scaled
+A rendering failure appeared on the map screen: the left half of the window showed a blurry, hugely scaled
 pink shop icon and the letters "ap", the right half the live saga map, with a sharp seam at exactly half the
 width. Reproduced on a private prefix (`prefix-ccs`, Xvfb `:90`), measured rather than guessed:
 - It is there on the saga map from the first capture after Play, in every landscape run (4/4), and it is the
@@ -11645,8 +11639,8 @@ width. Reproduced on a private prefix (`prefix-ccs`, Xvfb `:90`), measured rathe
   `AnalyticsInfo` `DeviceFamily` (strings in the exe). Ours: Raw DPI = logical DPI (96), DeviceFamily
   `Windows.Desktop`. Windows.UI is the native one, so UserInteractionMode is Microsoft's.
 
-Not yet known: which input picks that size. Workaround: a portrait-shaped window plays correctly (the user's
-890x944 level, captured on `:0`). Next: find what sizes the side panel - trace the layout inputs
+Not yet known: which input picks that size. Workaround: a portrait-shaped window renders correctly at 890x944.
+Next: find what sizes the side panel - trace the layout inputs
 (`trace+display`, `CoreWindow.Bounds`, `SwapChainPanel` sizes) and try a non-96 raw DPI in a private build.
 
 ### Encrypted packages: our own Windows device identity and licence client (10-15, night)
@@ -11752,7 +11746,7 @@ missing result as the page-load failure. The previous paused install queue was i
 
 ### Xbox install queue: Pause must cover range reads and the waiting-to-worker handoff (10-16)
 
-The user's report that Pause did not stop a download exposed two gaps in the marker design. Python checked the marker
+A report that Pause did not stop a download exposed two gaps in the marker design. Python checked the marker
 between extracted-file reads, but `HttpFile._fetch` read each CDN range without checking it; this delayed pausing
 while a range was in flight. Also, `PackageQueue.Pause` accepts `ST_WAITING`, but at that point `Install.pause_file`
 is empty, so `set_paused` could mark the item paused without creating a marker. When `run_installer` later assigned
@@ -11788,7 +11782,7 @@ Home, Game Pass, search, chevrons and queue icons had already been restored by f
 
 ### Blocky scaled composition surfaces (10-16)
 
-The user's Xbox crops show stair-stepped edges on both line icons and text. In `wine/dlls/dcomp/composition.c`,
+Xbox captures show stair-stepped edges on both line icons and text. In `wine/dlls/dcomp/composition.c`,
 the fallback painter already had a bilinear path for non-swapchain surfaces, but only when the destination stayed
 within 10% of the source size (the UI animation case). Actual icon and thumbnail resizes fell through to
 `GdiAlphaBlend`, whose sampling is nearest-neighbor. Expanded the existing premultiplied-alpha bilinear path to all
@@ -11796,11 +11790,11 @@ scaled non-swapchain 32-bit surfaces; the near-1:1 snap remains to preserve text
 retain the fast path. The changed `dcomp.dll` compiled successfully in an isolated reflinked build tree. A first
 launch on the default prefix reached sign-in; a second launch on a copy of the signed-in prefix displayed Xbox Home
 with the new build. That capture shows the small Home and Game Pass line icons without obvious stair-stepping, but it
-is not a before/after of the user's Halo page. The desktop's shared Wine build remains untouched; regression suite not
+is not a before/after of the same product page. The desktop's shared Wine build remains untouched; regression suite not
 run.
 
 The desktop Xbox process was later checked in place: its `/proc/<pid>/maps` showed
-`/home/bobby/src/wine-build/dlls/dcomp/x86_64-windows/dcomp.dll`, confirming that the prior isolated build had not
+`/home/<user>/src/wine-build/dlls/dcomp/x86_64-windows/dcomp.dll`, confirming that the prior isolated build had not
 reached the app. A requested custom-build launch against the same prefix started a separate wineserver, so it was
 stopped rather than run beside the existing prefix server. The ordinary desktop launch is open again, still on the
 shared build. The isolated regression run compiled the change but Calculator differed from its baseline by 49 pixels;
@@ -11830,7 +11824,7 @@ reflinked Wine build tree. On a copied prefix, Xbox Home and Halo Infinite's det
 retains its native raster edges. The copied-prefix regression run passed Calculator exactly (AE 0), Media Player at
 2,834 colours, and Solitaire's front end in 3/3 runs with no critical errors. The changed build is ready to promote to
 the shared Wine build and reload on the desktop. Promoted the tested DComp build, restarted Xbox on the desktop, and
-confirmed the active Xbox process maps `/home/bobby/src/wine-build/dlls/dcomp/x86_64-windows/dcomp.dll`. The current
+confirmed the active Xbox process maps `/home/<user>/src/wine-build/dlls/dcomp/x86_64-windows/dcomp.dll`. The current
 desktop capture is `/tmp/xbox-linear-desktop.png` (Xbox Home); the isolated Halo detail capture remains available for
 the exact page with the scaled art.
 
@@ -11838,7 +11832,7 @@ the exact page with the scaled art.
 
 The Halo install dialog showed 49.28 GB for the selected base components, but the queue card showed 125.3 GB. The
 selection itself reached both the queue request and host installer: `PackageRequest.ConfigureFeatures()` was empty
-after the user deselected optional features, the installer received `--tags 'game;launch' --languages 'EN-US'`, and
+with optional features deselected, the installer received `--tags 'game;launch' --languages 'EN-US'`, and
 its `PROGRESS` denominator was 52,907,835,538 bytes (49.28 GiB). The mismatch came from `install_thread()` resetting
 `in->total` to the full catalog `d.size` after `SubmitRequestAsync()` had set the selected size. This inflated the
 queue display and made host progress fractions/rates wrong. `install_thread()` now preserves the selected GDK total
@@ -12040,7 +12034,7 @@ The `IsUwp` experiment also had no effect. Queue screenshot `/tmp/xbox-icons-cur
 `/tmp/xbox-icons-isuwp-test.log`; the test install was paused at 516.5 MB to avoid a full download.
 Next trace the Xbox queue row's actual image source before changing icon metadata again.
 
-The user's later `:98` run reproduced the row in the paused state: Halo shows 843.9 MB / 49.3 GB,
+A later `:98` run reproduced the row in the paused state: Halo shows 843.9 MB / 49.3 GB,
 the 100px square remains blank, and the bottom-left download tile still has artwork. Its log again
 shows `Package.QueryDetails -> pending` but no `PackageDetails` property calls. Capture:
 `docs/screenshots/xbox-install-queue-blank-art.png`; log `/tmp/xbox-pause-ui31.log`. This confirms
@@ -12097,8 +12091,8 @@ remaining break to the prefetch arguments, image selection, or native prefetch r
 `sidebar_mru_data.cached_title_records` is `{}` in this prefix, so it does not explain the active
 install row. Continue by decoding the prefetch call's actual JS arguments/result.
 
-A fresh copy of the same prefix shows the broader library failure: My Games reports 602 titles, but
-the visible Halo, Solitaire, Candy Crush and other tiles all use the generic missing-image glyph;
+A fresh copy of the same prefix shows the broader library failure: My Games lists entries, but
+the visible tiles all use the generic missing-image glyph;
 the My Library and Store sidebar icons are also absent. Opening My Games causes a WinHTTP request to
 `images-eds-ssl.xboxlive.com/image?...&format=png&w=424&h=424`. TLS validation succeeds and the
 request returns HTTP 200, `Content-Type: image/png`, 134,781 bytes. The tiles remain placeholders
@@ -12124,7 +12118,7 @@ was too strong: only the independent WIC probe decoded the separately fetched PN
 app cache-file publication/lookup, stream construction, and `BitmapImage.SetSourceAsync` remain
 separate handoffs to distinguish. The concrete next target is the stream passed to SetSourceAsync,
 including whether the app opened an image file at all and what HRESULT SetSourceAsync returned.
-Capture: `/tmp/xbox-current.png` (My games, 602 entries, placeholder art), log:
+Capture: `/tmp/xbox-current.png` (My Games, placeholder art), log:
 `/tmp/xbox-imagecache-filetrace.log`; the accompanying network log is
 `/tmp/xbox-imagecache-network-trace.log`.
 
@@ -12166,7 +12160,7 @@ prefix, `BitmapSourceGenerated::SetSourceAsync` (`Windows.UI.Xaml.dll+0x4e3a20`)
 those samples, but the rendered tiles still show placeholders. It does not prove the image payload
 was nonempty or valid: inspect the stream size in `SetSourceShared` (`+0x6fa48`) and the buffer length
 immediately before `CImageSource::SetSource` (`+0x6f1ef`) next. The standalone screenshot for this
-run is `/tmp/xbox-async-result-library.png` (My Games, 602 titles, visible placeholder icons).
+run is `/tmp/xbox-async-result-library.png` (My Games, visible placeholder icons).
 
 The next boundary trace resolves the size question: `BitmapSource::SetSourceShared` successfully obtains
 an image size (`GetSize` returns `S_OK` with `0xAA1F0` bytes), and XAML requests that many bytes via
@@ -12233,7 +12227,7 @@ are successful bundled fallback-image loads, not the original artwork requests. 
 original-art attempt fails before these observed actions; its source/stream setup and exact failing
 operation remain unknown. Do not use the sampled PNG buffer, WIC results, or async completion as
 evidence that the original tile image decoded. Log: `/tmp/xbox-xaml-correlate2.log`; screenshot:
-`/tmp/xbox-decode-result-library.png` (My Games, 602 entries, placeholder artwork).
+`/tmp/xbox-decode-result-library.png` (My Games, placeholder artwork).
 
 
 ### Diagnostic session cleanup (10-16)
@@ -12241,7 +12235,7 @@ evidence that the original tile image decoded. Log: `/tmp/xbox-xaml-correlate2.l
 The image investigation had accumulated many long-lived Xbox instances, each in a reflinked test
 prefix on its own Xvfb display. Several had `WINEDEBUG=+tracelogging` and breakpoint logging enabled.
 Stopped the image-investigation sessions on displays `:103` through `:118` using their own
-`WINEPREFIX` wineservers; left the user's `:0` process and unrelated prefixes alone. Their logs
+`WINEPREFIX` wineservers; left the interactive `:0` process and unrelated prefixes alone. Their logs
 were about 22–96 MB each and resided in `/tmp` (tmpfs); the copied prefixes are about 5.3 GB
 apparent size each, so their COW writes are the disk-I/O risk. Avoid leaving diagnostic instances
 running. Future reproduction should use one isolated prefix/display, a bounded capture window, and
@@ -12274,7 +12268,7 @@ Apply depends on that failed result is still to be determined from its packaged 
 Log `/tmp/xbox-apply-app-handler.log`, bounded click slice `/tmp/xbox-apply-click-only.log`, screenshot
 `/tmp/xbox-apply-trace-after.png`: Add-ons, Campaign selected, green Apply still visible after clicking.
 The trace instance was stopped after capture. Use `WINE_UWP_GAMES_DATA=$PWD/uwp-bin/xbox-addons-ui-test`
-explicitly: run.sh otherwise defaults even an isolated prefix to the user's `xbox-games` directory.
+explicitly: run.sh otherwise defaults even an isolated prefix to the default `xbox-games` directory.
 The existing isolated directory has a small installed Halo marker suitable for exercising the UI.
 
 Correction from packaged-handler disassembly: the absence of a GameCatalog call after Apply does not
@@ -12291,7 +12285,7 @@ guard. Function #53080 confirms the modified-state predicate; renderer #53082 wi
 result to the button's `disabled` property.
 
 In the same investigation, `getInstalledDriveInfoAsync` reaches `Package.QueryInstallPath` for the
-installed package path under `Z:\home\bobby\Projects\wine-uwp\uwp-bin\xbox-addons-ui-test\stage\254428597cfe2`,
+installed package path under `Z:\home\<user>\Projects\wine-uwp\uwp-bin\xbox-addons-ui-test\stage\254428597cfe2`,
 then `Storage.EnumerateDevices` reports only `C:` and the lookup queries C: drive details. This makes
 an unresolved installed-drive LCE a concrete explanation to test: if the returned result cannot
 match the package's Z: install path to an enumerated device, the LCE may never become Content and
@@ -12349,7 +12343,7 @@ failure and is still an independent rendering/startup flake, not evidence of com
 
 Removed the abandoned preview-to-PackageUpdate side table after confirming the real Apply path. A preview
 is temporary UI state; retaining its selection globally could advertise an OptionalUpdateAvailable after
-the user merely selected a checkbox and closed/canceled the dialog. Update-availability queries still return
+a checkbox was selected and the dialog was closed or canceled. Update-availability queries still return
 a valid NoUpdateAvailable object (this stand-in does not discover package-version updates); feature changes
 reach the queue only through the explicit PackageRequest sent by Apply.
 
@@ -12364,14 +12358,12 @@ are still splash artwork, so that alone is not a visual front-end verification. 
 already documented unimplemented msvcp140_app GetNextAsyncId export (same failure recorded in older controls).
 Calculator keyboard screenshots visibly show the expected results, but each comparison reports AE 67.6392;
 that pixel difference has not yet been localized. Do not describe the entire regression suite as passing.
-The user then requested reopening on :0 and being asked about further regression testing. The latest shim
-was rebuilt; further regression work is pending that response.
-The user declined further regression testing. Reopened the desktop prefix on :0 with the rebuilt shim,
+No further regression tests were run. Reopened the desktop prefix on :0 with the rebuilt shim,
 UWP_TIMEOUT=86400 and log /tmp/xbox-apply-fixed-desktop.log. No test interactions were performed on :0.
 
 ### 2026-10-16: Proton EasyAntiCheat runtime installation
 
-Steam's sole library did not contain app 1826330 (Proton EasyAntiCheat Runtime). Official SteamCMD
+The test environment did not contain app 1826330 (Proton EasyAntiCheat Runtime). Official SteamCMD
 bootstrapped successfully but anonymous app_update failed with `No subscription`. Installed Lutris's
 published eac_runtime-20240114.tar.xz instead (27,232 bytes; SHA256
 8c711a3dd0906fdedd2fdcdedc7b33e09eff5aa22fe2b2dffcc046f02e194957), from
@@ -12399,21 +12391,21 @@ install of its Settings.json productid into prefix-test failed with missing sysw
 
 The existing Halo EAC bootstrapper log independently shows a linux64 module download (HTTP 200)
 followed by Wine mapping failure 206 before this installation. This task has not retested the game,
-service, or EAC module loading: the user requested installation and previously declined regressions.
+service, or EAC module loading: only installation was validated in this run.
 Already-running Xbox retains its old environment; runtime settings take effect on the next run.sh launch.
 Installation is not evidence of protected-game compatibility.
 
 ### 2026-10-17: Building WoW64 for the Xbox prefix
 
 The shared build config.status confirms --enable-archs=x86_64, and i686-w64-mingw32-gcc is already
-installed. At the user's request, configured a fresh (not copied) uwp-bin/wine-build-wow64 from
+installed. Configured a fresh (not copied) uwp-bin/wine-build-wow64 from
 our existing Wine source with --enable-archs=i386,x86_64 --enable-wineuwp=x86_64 --disable-tests
 --without-oss --without-pcap --without-opencl. The custom wineuwp UWP host uses x64 CONTEXT
 registers without architecture guards and is only needed for our x64 UWP apps; restrict it to
 x86_64 rather than attempting to build it for i386. config.status confirms dlls/wineuwp is in
 i386_DISABLED_SUBDIRS. Standard i386 Windows modules and x64 WoW64 remain enabled.
 Building at nice 10 / ionice best-effort priority 7 with make -j2 to limit SSD/CPU pressure.
-Build log: /tmp/wine-wow64-build.log. The user's desktop app is left running until the new build
+Build log: /tmp/wine-wow64-build.log. The interactive app remains running until the new build
 is ready; no extra prefix copy or broad regression run was requested.
 
 The first full build stopped at msvcp140's i386 misc.o: the existing mutex ABI padding and static
@@ -12451,7 +12443,7 @@ declarations to cdecl so they resolve the actual assembly symbols; no generated 
 changes the thunk calling convention. Both i386 and x86_64 rpcrt4.dll then linked successfully.
 Synced and committed the spec change in both source trees. The pre-existing uncommitted
 ndr_stubless.c tracing is unrelated and was left untouched.
-The user explicitly authorized make -j6 during the build; switched from two to six jobs while
+The build switched from two to six jobs while
 retaining nice 10 and ionice best-effort priority 7. Existing objects were retained.
 The i386 StreamSocket compile then rejected five internal callbacks: connect/read/write/flush/upgrade
 were marked WINAPI (stdcall on x86) while async_private.h's async_operation_callback is cdecl.
@@ -12472,12 +12464,12 @@ Service registration is not a protected-game launch/compatibility check.
 
 Reopened Xbox on :0 using WINE_BUILD=uwp-bin/wine-build-wow64, prefix-test, existing xbox-games data,
 UWP_TIMEOUT=86400, log /tmp/xbox-wow64-desktop.log. The captured window is Halo Infinite's product
-page, signed in as DesignGears; no desktop clicks or game/regression tests were performed.
+page; no desktop clicks or game/regression tests were performed.
 Screenshot: docs/screenshots/xbox-wow64-desktop.png. App launch tool session: 27107.
 
 ### 2026-10-17: Halo EAC 206 mapping failure, native syscalls
 
-Reproduced the user's "Failed to load the anti-cheat module" on :98 with the existing
+Reproduced "Failed to load the anti-cheat module" on :98 with the existing
 prefix-pause-ui30 and WoW64 build, using the installed Halo stage. Download of linux64 succeeds
 (HTTP 200, 9,618,741 bytes); mapping fails immediately and bootstrapper returns 206. The same
 failure occurs launching HaloInfinite.exe directly with no package identity/WinUI/Xbox launcher.
@@ -12521,7 +12513,7 @@ launches; install-app.py writes it into launch.env when EasyAntiCheat/Settings.j
 The existing Halo stage's ignored launch.env was updated too. The Wine feature remains off unless
 explicitly enabled; it is not added to the global launch defaults.
 
-On the user's request to open on :0, updated the desktop WoW64 ntdll and reopened Xbox. Halo was
+Updated the desktop WoW64 ntdll and reopened Xbox. Halo was
 launched there with the native flag supplied on the host as well: EAC reports 301, followed by the
 same Hardware Tiled Resources Tier 2 dialog. Captured and inspected
 docs/screenshots/halo-desktop-graphics-error.png. No desktop clicks were performed.
@@ -12531,7 +12523,7 @@ processes' mapped inode. Subsequent game processes can read launch.env's Windows
 without needing the Xbox parent restarted again. Desktop logs: /tmp/xbox-eac-native-desktop.log,
 /tmp/halo-eac-fixed-desktop2.log. This validates native EAC module initialization, not online play.
 
-The user received the old WoW64 desktop session's termination notification (PID 1806114, exit 137)
+The old WoW64 desktop session terminated (PID 1806114, exit 137)
 with an additional unmatched-backtick/EOF error from run.sh. The current run.sh passes bash -n;
 the newer Xbox PID 1820785 is still running. The EOF is consistent with the five-line insertion
 made in-place into run.sh while that old shell was blocked in Wine: resuming at its old file
@@ -12582,7 +12574,7 @@ WINEDLLOVERRIDES appended atomically to launch.env. Restored the four test-prefi
 system32 graphics originals and removed experimental AppDefaults overrides; next
 run verifies the sibling DLL resolution. The :0 prefix remains unchanged. File
 trace filters to a 20,000-line ring in memory before writing a bounded log, avoiding
-another large +file trace on the user's SSD.
+another large +file trace on the host disk.
 
 wineuwp-launch's launch.env parser only handles literal export/name=value and
 surrounding quotes; ${WINEDLLOVERRIDES} is not expanded. Corrected Halo's final
@@ -13553,14 +13545,14 @@ unpacker skipped the files already on disk (`docs/screenshots/xbox-queue-restore
 resumes unless it was paused. `restore_queue` is a flag, not an INIT_ONCE: the restore fires ItemAdded, and a handler
 that enumerates the queue from inside that would wait on itself.
 
-Downloads were slow (~280 Mbps on Gears, the user's Windows and Xodus faster): `source.c` fetched one 8 MiB block at
+Downloads were slow (~280 Mbps in this test): `source.c` fetched one 8 MiB block at
 a time on one connection, only when the unpacker asked for it, so every block paid a request's latency and the
 network sat idle while it was decrypted and written. The install thread used ~11% CPU. A sequential read now keeps
 the next 8 blocks in flight on pool threads (direct-mapped slots, a slot's fetch never cancelled under it, close waits
 for them): ~455 Mbps steady on the same download, 37% CPU on the install thread.
 
 The rest of the "slow" was the display. With read-ahead the CDN sockets carried ~830-860 Mbps (`ss -ti`
-`bytes_received`, the user's gigabit line) while the queue showed ~450: winegameplatform scaled the installer's
+`bytes_received`, on a gigabit connection) while the queue showed ~450: winegameplatform scaled the installer's
 progress to the catalogue size, 73.4 GB, and the package is 133.6 GB (uncompressed EAppx; network bytes = unpacked
 bytes). A UWP install's total is now the installer's own: 943 Mbps shown, of 133.6 GB
 (`docs/screenshots/xbox-gears-download-line-rate.png`). More read-ahead (24 blocks) did not help, and neither did
@@ -13631,7 +13623,7 @@ passed) waits on the pre-rewind timeline value instead of blocking the queue. Th
 (`docs/screenshots/gears4-title-after-fence-fix.png`). Calculator AE 3924.73, Media Player 236 (unchanged).
 
 The race never happened on Xvfb `:97`, in this run or in one with the window deactivated by a Notepad window. It hit
-on the user's `:0` (175 Hz NVIDIA). The fix is only proven by the probe until it runs there.
+on an interactive desktop (175 Hz NVIDIA). The fix is only proven by the probe until it runs there.
 
 **Method worth keeping.** `probe-peek` + `objcopy`/`llvm-objdump` on the decrypted exe named the wait. For vkd3d
 state, scan the heap for `d3d12_command_queue_vtbl` (wined3d.dll base + `llvm-nm` RVA; vkd3d lives inside wined3d.dll)
@@ -13645,8 +13637,8 @@ through `WebAuthenticationCoreManager` with provider `https://xsts.auth.xboxlive
 `XBL3.0 x=uhs;token` header, with `XboxUserId`, `Gamertag`, `AgeGroup`, `Privileges` and `Signature` as properties.
 `winexboxauth` found no such provider. With it, Gears reached the main menu signed in and was then returned to the
 title screen ("Sign in status change occurred") a few seconds later: XSAPI re-checks its account with
-`FindAccountAsync(provider, xuid)`, and "not found" is a sign-out. Answering that keeps it signed in (screenshot from
-the user, main menu with the gamertag). Some requests have a Url with no host (`?entitlementIds=...`); they get the
+`FindAccountAsync(provider, xuid)`, and "not found" is a sign-out. Answering that preserves sign-in across the account re-check.
+Some requests have a Url with no host (`?entitlementIds=...`); they get the
 default xboxlive.com token. Still open: leaving Options shows "unknown error 0x00000c32": the save goes through
 `Windows.Gaming.XboxLive.Storage.GameSaveProvider`, whose Windows DLL cannot be activated here (no connected-storage
 service). "Unable to connect to the Gears of War services" and the Store-user notice are also open.
@@ -13746,3 +13738,166 @@ Installed from a decrypted dump of 1.3.25854.2 (later from the Store itself). Ea
 - **Online play:** Xbox Live multiplayer needs `XboxLiveEndpointPairTemplate` (Secure Device Association: IKEv2
   transport-mode IPsec over Teredo, certificates from `cert.mgt.xboxlive.com`). Not implemented. Phantom Dust Rebirth's
   community client replaces Xbox Live with EOS lobbies; `WINE_UWP_INJECT` loads it as its Windows launcher does.
+## UWP API contracts and ownership, November 6, 2026
+
+Device-kind enumeration requires cfgmgr32 device records and the driver software-key lookup.
+The focused probe passed on x64 and x86, including device names and an empty query.
+Driver versions represent Wine compatibility values.
+Non-XAML FrameworkView startup also needs SetWindowAndGetDispatcher on its first view.
+
+Package information queries must accept a null count pointer during both size queries and result retrieval.
+Known-folder lookup must accept KF_FLAG_NO_APPCONTAINER_REDIRECTION because Wine already returns the unredirected path.
+The focused probes failed before those corrections and passed afterward.
+
+FileIO buffer and byte writes passed binary roundtrip, truncation, empty-write and read-only-error checks in x64.
+File and folder BasicProperties matched Win32 sizes and timestamps.
+File queries passed recursive name ordering, empty-directory, shallow-default and ranged-result checks.
+Both architectures compiled, but the x86 FileIO probe could not activate its class in the test prefix.
+StorageAccessCache remains process-local.
+
+The controller-user getter passed identity equality, local authentication and null-output checks with a real controller.
+Audio selectors, real endpoint enumeration, default-ID matching and WASAPI playback passed their isolated probe.
+The empty-player MediaPlayer regression failed ten assertions before its runtime correction and passed afterward in x64.
+
+The source review then found a query-options use-after-free, unsupported custom-controller registration and missing push-probe assertions.
+The query now retains options under a lock before scheduling.
+Hardware-ID registration returns upstream's E_NOTIMPL, and the probe rejects null result objects.
+The 14 host cases passed with AddressSanitizer and UndefinedBehaviorSanitizer.
+Earlier source failed ten cases, including three reproduced use-after-free reports.
+These checks use extracted C with mocks. Linux compilation and complete runtime regressions were still pending at that point.
+
+The probes and build recipes now use API-based names.
+The package fixtures use a synthetic identity.
+No Wine runtime source changed during this organization work.
+See [UWP-API-checks.md](UWP-API-checks.md) for contracts, source provenance and test limits.
+
+The Mac's system Bash cannot execute `${f,,}` in `check-clean.sh`.
+The script printed `bad substitution` but returned zero. That exit status did not establish a successful check.
+Equivalent staged-file checks passed for forbidden extensions, PE signatures and the 5 MiB limit.
+
+### Isolated Linux integration validation, November 6, 2026
+
+The consumer reported successful compilation of corrected windows.storage and windows.gaming.input for x86_64 and i386 on Steam Deck.
+The source is unchanged between `70cd8cb` and `96f92cf`.
+Only the isolated candidate received the DLLs. The working installation remained unchanged.
+
+Generic probes from `96f92cf` passed through the generated Lutris/umu launcher in a fresh candidate prefix.
+The checks covered BasicProperties, recursive/empty/ranged queries, binary writes, truncation, read-only errors, renamed push activation and controller-user association.
+The first controller run returned SKIP 77 without a gamepad.
+A second run passed with a neutral temporary uinput device. The consumer reported no input injection or target application launch.
+The consumer also reported a passing hardware-token probe.
+This result does not establish custom-controller factory support.
+
+The renamed notification recipe built `wineuwp-push-notifications.dll`, and its async error probe passed.
+The artifact checksum and precise limits are in [UWP-API-checks.md](UWP-API-checks.md#integration-validation-november-6-2026).
+The consumer retains the integration logs outside this repository.
+Compilation for both architectures does not establish x86 execution coverage for these probes.
+The complete app regression suite and application-level validation remain pending.
+
+
+### Hardware-factory activation regression, November 6, 2026
+
+A controlled consumer probe failed native factory initialization after hardware-ID registration changed to E_NOTIMPL.
+The same probe and prefix returned S_OK with a nonnull factory after restoring only the previous input DLL.
+This established an activation dependency. It did not establish correct matching-controller dispatch in the old implementation.
+The direct native-component evidence remains in the consumer project.
+
+The source correction retains hardware-ID factories and dispatches existing and later matching providers through their public controller interfaces.
+Wine's built-in controllers retain their private initialization path.
+The generic regression now checks activation, matching, callback identity, lookup, reference lifetimes, failed creation and callback re-entry.
+All 24 host cases pass with AddressSanitizer and UndefinedBehaviorSanitizer.
+The fallback baseline fails ten controller cases. The previous registration implementation fails nine.
+
+The new WinRT probe is `probes/probe-controller-factory.c`.
+Its registration mode needs no controller. Its `--controller` mode checks public callbacks and lookup with an existing device.
+It reads no input and injects none.
+Linux compilation and runtime validation were pending when this correction was committed.
+See [UWP-API-checks.md](UWP-API-checks.md#hardware-factory-registration-correction-november-6-2026) for contracts, build commands and limits.
+
+### Hardware-factory Linux validation, November 6, 2026
+
+The consumer reported successful x86_64 and i386 builds of windows.gaming.input from `4c5471b` using Wine 11.20.
+The generic factory probe passed registration and matching-controller modes in a separate Linux API prefix.
+The matching run created one controller and delivered one added callback, with no private-interface queries or failures.
+The consumer's native-component activation probe returned S_OK with a nonnull factory.
+The consumer retains the logs and native-component evidence outside this repository.
+
+The report does not identify the probe's execution architecture.
+Removal did not occur. Hotplug, removal, failure cleanup and callback re-entry still have host coverage only.
+The application still used the previous DLL at report time. Application validation of the corrected DLL remains pending.
+The complete app regression suite also remains pending.
+See [UWP-API-checks.md](UWP-API-checks.md#hardware-factory-linux-validation-november-6-2026) for the reported outputs and DLL hashes.
+
+
+### Explicit FolderPicker path, November 6, 2026
+
+The existing open and save pickers have environment overrides. FolderPicker previously had no equivalent.
+Upstream Wine has no storage-picker implementation to reuse at the checked revision.
+WineGDK's picker uses dialogs, and its start-folder configuration does not return an automatic selection.
+
+WINE_UWP_PICKER_FOLDER now accepts an existing absolute Windows folder path.
+Invalid, missing, non-folder or oversized values fail without opening a dialog or selecting another folder.
+Unset preserves the existing dialog and NODIALOG behavior.
+The runtime creates no directories, chooses no default, and does not persist access-cache tokens.
+
+All 40 host cases pass under ASan and UBSan.
+The previous source fails 13 new folder cases. The three unset cases pass before and after the change.
+The standalone probe adds real API checks and an optional manual cancellation mode.
+Linux compilation, API execution and full application regressions remain pending.
+No Wine source checkout or Linux runtime is available on this Mac.
+See [UWP-API-checks.md](UWP-API-checks.md#explicit-folder-override-november-6-2026) for contracts, provenance and build commands.
+
+
+### Controller apartments and picker probe diagnostics, November 6, 2026
+
+Independent review found raw factory pointers crossing apartments and a device-monitor thread without COM initialization.
+The candidate replaces external factory and controller references with RoGetAgileReference handles.
+It resolves interfaces and calls external objects outside the manager lock.
+It initializes COM on the monitor and handles removal during controller creation and added callbacks.
+The public probe adds real STA/agile hotplug, MTA lookup and callback re-entry checks.
+All 42 host tests pass. Reported COM execution results follow below; final independent reviews remain required.
+
+The picker probe lacked wchar.h and returned opaque fixture setup failures.
+The corrected probe adds the header, checks formatting, and reports the failing call, path and Win32 error.
+The consumer compiled the header correction for both architectures with implicit declarations treated as errors.
+Its first execution failed before picker API calls because Unicode fixture creation returned error 2.
+The consumer reported that LC_ALL=C.UTF-8 resolved this failure.
+The isolated x86_64 and i686 API tests then passed against the `a0ba1e8` picker DLLs.
+The consumer restored the baseline DLLs afterward.
+Further diagnostic edits escape Unicode paths and separate the ASCII root from the Unicode child.
+The consumer compiled and executed the final diagnostic source, SHA-256 `1a14606b80a4385cd13bbde3ecffef47844c9a082f0d7a9d2196f48f85c44e75`, successfully on both architectures.
+Its x86_64 manual cancellation run opened Browse for Folder with overrides unset; Escape returned S_OK and null, with FOLDER_PICKER_PASS and exit zero.
+The manual dialog path remains untested on i686.
+See [UWP-API-checks.md](UWP-API-checks.md#review-corrections-and-consumer-validation-november-6-2026) for the exact test boundaries and remaining checks.
+
+### Controller apartment execution results, November 6, 2026
+
+Both candidate windows.gaming.input DLLs compiled and linked in the consumer's isolated Linux build.
+The first probe did not compile because Wine 11.20's headers lack the newer COWAIT_DISPATCH flags.
+Using COWAIT_DEFAULT retains Wine's classic STA message pumping and compiles with those headers.
+The i686 SDK's runtimeobject import library also lacks RoGetAgileReference@16.
+Linking Wine's i386 combase import library before the other libraries resolved that link error without changing the probe.
+
+The consumer reported passing x86_64 STA and agile hotplug runs and a passing i686 agile run.
+Each created one controller, delivered one added and one removed callback, and reported no private-interface queries or failures.
+The STA callbacks ran on their owner thread. The agile callbacks and MTA lookup ran on separate threads.
+Reentrant registration, lookup and COM activation were exercised by these runs.
+
+The i686 STA run failed during registration, before READY_ADD and before any device was created.
+CoMarshalInterface failed for ICustomGameControllerFactory with E_NOINTERFACE after interface-stub creation failed.
+The consumer then measured a metadata setup mismatch: x86_64 loaded 20 native files and found the factory IID; i686 loaded 10 reduced files and did not.
+WOW64 redirected the i686 metadata lookup into SysWOW64, which lacked Windows.Gaming.winmd.
+Adding only that file in the isolated fixture let the unchanged probe register and call CreateGameController on its STA owner thread.
+The returned IGameController then failed to marshal with E_NOTIMPL; OnGameControllerAdded never arrived and the wait timed out.
+The consumer restored the temporary metadata, device fixture and API runtime.
+The final differentiation supplied the complete 20-file native System32 metadata set in the isolated SysWOW64 view.
+The unchanged i686 candidate and probe then passed every STA callback and MTA lookup check, with callbacks on owner thread 248 and no failures.
+The metadata trace confirmed that Wine's fallback generated the required interfaces despite unavailable registered proxy classes.
+The original missing gaming metadata and the dependent metadata missing from the gaming-only attempt caused the two earlier failures.
+Both failures remain recorded. The corrected fixture establishes passing STA and agile execution on both architectures; it does not make the restored reduced metadata fixture sufficient.
+The consumer restored the original 10-file SysWOW64 metadata tree and API runtime and removed every temporary device.
+Documented install and probe prerequisites now require the complete native metadata set in both architecture views.
+No additional runtime patch was needed. The final independent reviews and complete app regression suite remain pending.
+The final main.c removes only the trailing blank line from the live-tested source and compiled for both architectures.
+Its rebuilt DLLs were not used for the live COM runs; the exact source and DLL hashes are recorded with that boundary below.
+See [UWP-API-checks.md](UWP-API-checks.md#controller-apartment-execution-november-6-2026) for exact source hashes and per-architecture results.

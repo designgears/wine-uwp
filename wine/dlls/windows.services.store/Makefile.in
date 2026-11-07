@@ -1,6 +1,11 @@
 MODULE  = windows.services.store.dll
-IMPORTS = combase
+IMPORTS = combase propsys
+PARENTSRC = ../windows.devices.enumeration
 
 SOURCES = \
+	async.c \
+	async_private.idl \
 	extexec.c \
-	main.c
+	main.c \
+	updates.c \
+	vector.c

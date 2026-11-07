@@ -26,7 +26,8 @@
  *
  * For scripted runs: WINE_UWP_PICKER_FILE names the file an open picker returns (if it matches the
  * picker's FileTypeFilter), WINE_UWP_PICKER_SAVE_FILE the file a save picker returns (created if it
- * does not exist), and WINE_UWP_PICKER_NODIALOG=1 makes any other pick a cancelled one.
+ * does not exist). WINE_UWP_PICKER_FOLDER names an existing absolute Windows folder path;
+ * invalid folder overrides fail without a dialog. WINE_UWP_PICKER_NODIALOG=1 cancels other picks.
  */
 
 #include "initguid.h"
@@ -632,11 +633,29 @@ static HRESULT WINAPI folder_picker_PickSingleFolderAsync( IFolderPicker *iface,
 {
     IStorageFolder *folder = NULL;
     WCHAR path[MAX_PATH];
+    DWORD length;
     HRESULT hr;
 
     TRACE( "iface %p, operation %p.\n", iface, operation );
 
-    if (dialogs_enabled() && folder_dialog( path )) storage_folder_from_path( path, &folder );
+    if (!operation) return E_POINTER;
+    *operation = NULL;
+    SetLastError( ERROR_SUCCESS );
+    length = GetEnvironmentVariableW( L"WINE_UWP_PICKER_FOLDER", path, ARRAY_SIZE(path) );
+    if (!length && GetLastError() == ERROR_ENVVAR_NOT_FOUND)
+    {
+        if (dialogs_enabled() && folder_dialog( path )) storage_folder_from_path( path, &folder );
+    }
+    else
+    {
+        if (length >= ARRAY_SIZE(path)) return HRESULT_FROM_WIN32( ERROR_FILENAME_EXCED_RANGE );
+        /* Reject empty, relative and drive-relative paths instead of selecting from the current directory. */
+        if (length < 3 || !((path[0] == '\\' && path[1] == '\\') ||
+            (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+             path[1] == ':' && (path[2] == '\\' || path[2] == '/'))))
+            return HRESULT_FROM_WIN32( ERROR_INVALID_NAME );
+        if (FAILED(hr = storage_folder_from_path( path, &folder ))) return hr;
+    }
     TRACE( "picked %s.\n", debugstr_w( folder ? path : NULL ) );
     hr = async_operation_folder_create( (IUnknown *)iface, (IUnknown *)folder, return_result, operation );
     if (folder) IStorageFolder_Release( folder );

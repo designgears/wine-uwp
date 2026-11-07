@@ -38,6 +38,7 @@
 #define WIDL_using_Windows_Storage
 #define WIDL_using_Windows_Storage_Search
 #define WIDL_using_Windows_Storage_Streams
+#define WIDL_using_Windows_Storage_FileProperties
 #include "windows.storage.h"
 #include "windows.storage.streams.h"
 #include "robuffer.h"
@@ -102,6 +103,9 @@ HRESULT async_operation_storage_library_create( IUnknown *invoker, IUnknown *par
 extern IActivationFactory *query_options_factory;
 HRESULT empty_hstring_vector_create( IVector_HSTRING **out );
 HRESULT content_properties_create( const WCHAR *path, IStorageItemContentPropertiesInternal **out );
+HRESULT basic_properties_get_async( IStorageItem *item, IAsyncOperation_BasicProperties **out );
+HRESULT async_operation_basic_properties_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+                                                 IAsyncOperation_BasicProperties **out );
 HRESULT query_options_create( INT32 query, IIterable_HSTRING *file_type_filter, IQueryOptionsInternal **out );
 extern IActivationFactory *userdatapaths_factory;
 extern IActivationFactory *random_access_stream_reference_factory;

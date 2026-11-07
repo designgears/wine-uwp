@@ -524,8 +524,8 @@ static HRESULT WINAPI file_item_DeleteAsync( IStorageItem *iface, StorageDeleteO
 
 static HRESULT WINAPI file_item_GetBasicPropertiesAsync( IStorageItem *iface, IAsyncOperation_BasicProperties **operation )
 {
-    FIXME( "iface %p, operation %p stub!\n", iface, operation );
-    return E_NOTIMPL;
+    TRACE( "iface %p, operation %p.\n", iface, operation );
+    return basic_properties_get_async( iface, operation );
 }
 
 static HRESULT WINAPI file_item_get_Name( IStorageItem *iface, HSTRING *value )

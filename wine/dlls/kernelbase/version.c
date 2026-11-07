@@ -1787,7 +1787,7 @@ LONG WINAPI GetCurrentPackageInfo2( UINT32 flags, UINT32 path_type, UINT32 *buff
 
     TRACE( "(%#x %u %p %p %p)\n", flags, path_type, buffer_size, buffer, count );
 
-    if (!buffer_size || !count) return ERROR_INVALID_PARAMETER;
+    if (!buffer_size) return ERROR_INVALID_PARAMETER;
     if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", full, ARRAY_SIZE(full) ))
         return APPMODEL_ERROR_NO_PACKAGE;
     if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FAMILY_NAME", family, ARRAY_SIZE(family) )) family[0] = 0;
@@ -1838,7 +1838,7 @@ LONG WINAPI GetCurrentPackageInfo2( UINT32 flags, UINT32 path_type, UINT32 *buff
         /* the count is reported on the size query too: MrmCoreR sizes its array from it and treats
          * a zero count as an allocation failure (E_OUTOFMEMORY) */
         *buffer_size = needed;
-        *count = n;
+        if (count) *count = n;
         return ERROR_INSUFFICIENT_BUFFER;
     }
 
@@ -1861,7 +1861,7 @@ LONG WINAPI GetCurrentPackageInfo2( UINT32 flags, UINT32 path_type, UINT32 *buff
         }
     }
     *buffer_size = needed;
-    *count = n;
+    if (count) *count = n;
     return ERROR_SUCCESS;
 }
 

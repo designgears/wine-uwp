@@ -769,8 +769,9 @@ HRESULT playback_play( struct playback *pb )
     if (!pb->path)
     {
         LeaveCriticalSection( &pb->cs );
-        WARN( "no source set.\n" );
-        return MF_E_NOT_INITIALIZED;
+        /* Like IMFMediaEngine::Play, an empty player accepts Play without starting playback. */
+        TRACE( "no source set.\n" );
+        return S_OK;
     }
     if (pb->playing)
     {

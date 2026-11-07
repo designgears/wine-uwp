@@ -27,6 +27,7 @@
 #include "devquery.h"
 #include "aqs.h"
 #include "devpkey.h"
+#include "mmdeviceapi.h"
 
 #include "wine/debug.h"
 
@@ -737,6 +738,146 @@ static HRESULT WINAPI device_statics_CreateFromIdAsyncAdditionalProperties( IDev
     return E_NOTIMPL;
 }
 
+/* Restrict the endpoint fallback to the exact enabled audio-interface query.
+ * Additional conditions, OR and NOT must retain their normal AQS semantics. */
+static BOOL audio_endpoint_query( const struct devquery_params *params, EDataFlow *flow )
+{
+    const struct aqs_expr *expr = params->expr;
+    const GUID *class_guid = NULL;
+    BOOL enabled = FALSE;
+    unsigned int i;
+
+    if (params->type != DevObjectTypeDeviceInterfaceDisplay || !expr || expr->len != 4 ||
+        expr->filters[0].Operator != DEVPROP_OPERATOR_AND_OPEN ||
+        expr->filters[3].Operator != DEVPROP_OPERATOR_AND_CLOSE) return FALSE;
+
+    for (i = 1; i < 3; i++)
+    {
+        const DEVPROP_FILTER_EXPRESSION *filter = &expr->filters[i];
+        const DEVPROPERTY *prop = &filter->Property;
+
+        if (filter->Operator != DEVPROP_OPERATOR_EQUALS || prop->CompKey.Store != DEVPROP_STORE_SYSTEM ||
+            prop->CompKey.LocaleName || !prop->Buffer) return FALSE;
+        if (IsEqualDevPropKey( prop->CompKey.Key, DEVPKEY_DeviceInterface_ClassGuid ) &&
+            prop->Type == DEVPROP_TYPE_GUID && prop->BufferSize == sizeof(GUID) && !class_guid)
+            class_guid = prop->Buffer;
+        else if (IsEqualDevPropKey( prop->CompKey.Key, DEVPKEY_DeviceInterface_Enabled ) &&
+                 prop->Type == DEVPROP_TYPE_BOOLEAN && prop->BufferSize == sizeof(DEVPROP_BOOLEAN) &&
+                 *(DEVPROP_BOOLEAN *)prop->Buffer == DEVPROP_TRUE && !enabled)
+            enabled = TRUE;
+        else
+            return FALSE;
+    }
+    if (!class_guid || !enabled) return FALSE;
+    if (IsEqualGUID( class_guid, &DEVINTERFACE_AUDIO_RENDER )) *flow = eRender;
+    else if (IsEqualGUID( class_guid, &DEVINTERFACE_AUDIO_CAPTURE )) *flow = eCapture;
+    else return FALSE;
+    return TRUE;
+}
+
+/* Audio endpoint algorithm adapted from Appx Portable v2026.11.4,
+ * shim/platform/device_information.cpp (Endpoints).
+ * Copyright (c) 2026 yell0wsuit
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+static HRESULT audio_endpoint_information( IMMDevice *device, EDataFlow flow, IDeviceInformation **info )
+{
+    static const WCHAR prefix[] = L"\\\\?\\SWD#MMDEVAPI#";
+    GUID class_guid = flow == eRender ? DEVINTERFACE_AUDIO_RENDER : DEVINTERFACE_AUDIO_CAPTURE;
+    DEVPROP_BOOLEAN enabled = DEVPROP_TRUE;
+    WCHAR *device_id = NULL, *interface_id = NULL, guid[39];
+    IPropertyStore *store = NULL;
+    PROPVARIANT name;
+    DEVPROPERTY properties[] = {
+        { { DEVPKEY_NAME, DEVPROP_STORE_SYSTEM, NULL }, DEVPROP_TYPE_STRING, 0, NULL },
+        { { DEVPKEY_DeviceInterface_ClassGuid, DEVPROP_STORE_SYSTEM, NULL }, DEVPROP_TYPE_GUID, sizeof(class_guid), &class_guid },
+        { { DEVPKEY_DeviceInterface_Enabled, DEVPROP_STORE_SYSTEM, NULL }, DEVPROP_TYPE_BOOLEAN, sizeof(enabled), &enabled },
+    };
+    DEV_OBJECT object = { DevObjectTypeDeviceInterfaceDisplay, NULL, ARRAY_SIZE(properties), properties };
+    const WCHAR *friendly_name = L"";
+    size_t length;
+    HRESULT hr;
+
+    PropVariantInit( &name );
+    if (FAILED(hr = IMMDevice_GetId( device, &device_id ))) goto done;
+    StringFromGUID2( &class_guid, guid, ARRAY_SIZE(guid) );
+    length = wcslen(prefix) + wcslen(device_id) + 1 + wcslen(guid);
+    if (!(interface_id = malloc( (length + 1) * sizeof(*interface_id) )))
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+    swprintf( interface_id, length + 1, L"%s%s#%s", prefix, device_id, guid );
+
+    if (SUCCEEDED(IMMDevice_OpenPropertyStore( device, STGM_READ, &store )) &&
+        SUCCEEDED(IPropertyStore_GetValue( store, (const PROPERTYKEY *)&DEVPKEY_Device_FriendlyName, &name )) && name.vt == VT_LPWSTR)
+        friendly_name = name.pwszVal;
+    properties[0].Buffer = (void *)friendly_name;
+    properties[0].BufferSize = (wcslen(friendly_name) + 1) * sizeof(WCHAR);
+    object.pszObjectId = interface_id;
+    hr = device_information_create( &object, info );
+
+done:
+    if (store) IPropertyStore_Release( store );
+    PropVariantClear( &name );
+    CoTaskMemFree( device_id );
+    free( interface_id );
+    return hr;
+}
+
+static HRESULT append_audio_endpoints( EDataFlow flow, IVector_IInspectable *vector )
+{
+    IMMDeviceEnumerator *enumerator = NULL;
+    IMMDeviceCollection *collection = NULL;
+    HRESULT hr, com_hr;
+    UINT count, i;
+
+    com_hr = CoInitializeEx( NULL, COINIT_MULTITHREADED );
+    if (FAILED(com_hr) && com_hr != RPC_E_CHANGED_MODE) return com_hr;
+    if (FAILED(hr = CoCreateInstance( &CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
+                                     &IID_IMMDeviceEnumerator, (void **)&enumerator ))) goto done;
+    if (FAILED(hr = IMMDeviceEnumerator_EnumAudioEndpoints( enumerator, flow, DEVICE_STATE_ACTIVE, &collection ))) goto done;
+    if (FAILED(hr = IMMDeviceCollection_GetCount( collection, &count ))) goto done;
+    TRACE( "flow %u, active audio endpoints %u\n", flow, count );
+
+    for (i = 0; i < count; i++)
+    {
+        IDeviceInformation *info;
+        IMMDevice *device;
+
+        if (FAILED(hr = IMMDeviceCollection_Item( collection, i, &device ))) break;
+        hr = audio_endpoint_information( device, flow, &info );
+        IMMDevice_Release( device );
+        if (FAILED(hr)) break;
+        hr = IVector_IInspectable_Append( vector, (IInspectable *)info );
+        IDeviceInformation_Release( info );
+        if (FAILED(hr)) break;
+    }
+
+done:
+    if (collection) IMMDeviceCollection_Release( collection );
+    if (enumerator) IMMDeviceEnumerator_Release( enumerator );
+    if (SUCCEEDED(com_hr)) CoUninitialize();
+    return hr;
+}
+
 static HRESULT find_all_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
 {
     static const struct vector_iids iids =
@@ -752,6 +893,7 @@ static HRESULT find_all_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *
     IVector_IInspectable *vector;
     ULONG filters_len = 0, len, i;
     const DEV_OBJECT *objects;
+    EDataFlow audio_flow;
     HRESULT hr;
 
     TRACE( "invoker %p, param %p, result %p, called_async %d\n", invoker, param, result, called_async );
@@ -765,22 +907,27 @@ static HRESULT find_all_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *
         filters_len = params->expr->len;
     }
     if (FAILED(hr = vector_create( &iids, (void *)&vector ))) return hr;
-    hr = DevGetObjects( params->type, DevQueryFlagNone, params->prop_keys_len, params->prop_keys, filters_len, filters, &len, &objects );
-    if (FAILED(hr))
+    if (audio_endpoint_query( params, &audio_flow ))
+        hr = append_audio_endpoints( audio_flow, vector );
+    else
     {
-        IVector_IInspectable_Release( vector );
-        return hr;
-    }
-    for (i = 0; i < len && SUCCEEDED(hr); i++)
-    {
-        IDeviceInformation *info;
-        if (SUCCEEDED(hr = device_information_create( &objects[i], &info )))
+        hr = DevGetObjects( params->type, DevQueryFlagNone, params->prop_keys_len, params->prop_keys, filters_len, filters, &len, &objects );
+        if (FAILED(hr))
         {
-            hr = IVector_IInspectable_Append( vector, (IInspectable *)info );
-            IDeviceInformation_Release( info );
+            IVector_IInspectable_Release( vector );
+            return hr;
         }
+        for (i = 0; i < len && SUCCEEDED(hr); i++)
+        {
+            IDeviceInformation *info;
+            if (SUCCEEDED(hr = device_information_create( &objects[i], &info )))
+            {
+                hr = IVector_IInspectable_Append( vector, (IInspectable *)info );
+                IDeviceInformation_Release( info );
+            }
+        }
+        DevFreeObjects( len, objects );
     }
-    DevFreeObjects( len, objects );
     if (SUCCEEDED(hr)) hr = IVector_IInspectable_GetView( vector, (void *)&view );
     IVector_IInspectable_Release( vector );
     if (FAILED(hr)) return hr;
@@ -948,9 +1095,45 @@ static HRESULT WINAPI device_statics2_FindAllAsync( IDeviceInformationStatics2 *
                                                     IIterable_HSTRING *additional_properties, DeviceInformationKind kind,
                                                     IAsyncOperation_DeviceInformationCollection **async_operation )
 {
-    FIXME( "iface %p, filter %s, additional_properties %p, kind %u, async_operation %p stub!\n",
+    struct device_information_statics *impl = impl_from_IDeviceInformationStatics2( iface );
+    const DEVPROPCOMPKEY device_default_props[] = {
+        { DEVPKEY_Device_DeviceDesc, DEVPROP_STORE_SYSTEM, NULL },
+        { DEVPKEY_Device_InstanceId, DEVPROP_STORE_SYSTEM, NULL },
+    };
+    DEVPROPCOMPKEY *prop_keys = NULL;
+    struct aqs_expr *expr = NULL;
+    ULONG prop_keys_len = 0;
+    IUnknown *params;
+    HRESULT hr;
+
+    TRACE( "iface %p, filter %s, additional_properties %p, kind %u, async_operation %p\n",
             iface, debugstr_hstring( filter ), additional_properties, kind, async_operation );
-    return E_NOTIMPL;
+
+    if (!async_operation) return E_POINTER;
+    *async_operation = NULL;
+    if (kind == DeviceInformationKind_DeviceInterface)
+        return device_statics_FindAllAsyncAqsFilterAndAdditionalProperties( &impl->IDeviceInformationStatics_iface,
+                                                                           filter, additional_properties, async_operation );
+    if (kind != DeviceInformationKind_Device)
+    {
+        FIXME( "Unsupported device information kind %u\n", kind );
+        return E_NOTIMPL;
+    }
+
+    if (FAILED(hr = devpropcompkeys_init( &prop_keys, &prop_keys_len, device_default_props, ARRAY_SIZE(device_default_props) ))) goto failed;
+    if (additional_properties && FAILED(hr = devpropcompkeys_append_names( &prop_keys, &prop_keys_len, additional_properties ))) goto failed;
+    if (FAILED(hr = aqs_parse_query( WindowsGetStringRawBuffer( filter, NULL ), &expr, NULL ))) goto failed;
+    if (FAILED(hr = devquery_params_create( DevObjectTypeDevice, expr, prop_keys, prop_keys_len, &params ))) goto failed;
+
+    hr = async_operation_inspectable_create( &IID_IAsyncOperation_DeviceInformationCollection, (IUnknown *)iface, params,
+                                             find_all_async, (IAsyncOperation_IInspectable **)async_operation );
+    IUnknown_Release( params );
+    return hr;
+
+failed:
+    free( prop_keys );
+    free_aqs_expr( expr );
+    return hr;
 }
 
 static const char *debugstr_DeviceInformationKind( DeviceInformationKind kind )

@@ -19,6 +19,7 @@
 
 #include "private.h"
 #include "shlobj.h"
+#include "shlwapi.h"
 #include "knownfolders.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(storage);
@@ -465,8 +466,8 @@ static HRESULT WINAPI storage_item_DeleteAsync( IStorageItem *iface, StorageDele
 
 static HRESULT WINAPI storage_item_GetBasicPropertiesAsync( IStorageItem *iface, IAsyncOperation_BasicProperties **operation )
 {
-    FIXME( "iface %p, operation %p stub!\n", iface, operation );
-    return E_NOTIMPL;
+    TRACE( "iface %p, operation %p.\n", iface, operation );
+    return basic_properties_get_async( iface, operation );
 }
 
 static HRESULT WINAPI storage_item_get_Name( IStorageItem *iface, HSTRING *value )
@@ -1716,20 +1717,6 @@ static HRESULT WINAPI folder_query_GetIndexedStateAsync( IStorageFolderQueryOper
                                                  (IAsyncOperation_UINT32 **)operation );
 }
 
-static HRESULT WINAPI folder_query_CreateFileQueryOverloadDefault( IStorageFolderQueryOperations *iface,
-                                                                   IStorageFileQueryResult **value )
-{
-    FIXME( "iface %p, value %p stub!\n", iface, value );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI folder_query_CreateFileQuery( IStorageFolderQueryOperations *iface, CommonFileQuery query,
-                                                    IStorageFileQueryResult **value )
-{
-    FIXME( "iface %p, query %d, value %p stub!\n", iface, query, value );
-    return E_NOTIMPL;
-}
-
 /*
  * StorageFileQueryResult - a file query over a folder, filtered by the options' FileTypeFilter.
  * Like the item query above there is no indexer behind it, so the listing is done afresh on every
@@ -1745,6 +1732,8 @@ struct file_query_result
     IStorageFolder *folder;
     WCHAR *path;
     IQueryOptionsInternal *options;
+    BOOL order_by_name;
+    SRWLOCK options_lock;
 };
 
 static inline struct file_query_result *impl_from_IStorageFileQueryResultInternal( IStorageFileQueryResultInternal *iface )
@@ -1844,6 +1833,124 @@ static BOOL file_matches_filter( const WCHAR *name, IVector_HSTRING *filter )
     return FALSE;
 }
 
+/* Reuse the ordinary directory listing, flattening subfolders for deep file queries. */
+static HRESULT list_query_directory( const WCHAR *path, BOOL deep, IStorageItem ***out_items, UINT32 *out_count )
+{
+    IStorageItem **items, **children, **grown;
+    UINT32 count, directory_count, child_count, i;
+    HRESULT hr;
+
+    *out_items = NULL;
+    *out_count = 0;
+    if (FAILED(hr = list_directory( path, TRUE, deep, &items, &count )))
+    {
+        DWORD attributes = GetFileAttributesW( path );
+        if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) && attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & FILE_ATTRIBUTE_DIRECTORY)) return S_OK;
+        return hr;
+    }
+
+    directory_count = deep ? count : 0;
+    for (i = 0; i < directory_count; i++)
+    {
+        HSTRING child_path;
+        boolean is_folder;
+        DWORD attributes;
+
+        if (FAILED(hr = IStorageItem_IsOfType( items[i], StorageItemTypes_Folder, &is_folder ))) break;
+        if (!is_folder) continue;
+        if (FAILED(hr = IStorageItem_get_Path( items[i], &child_path ))) break;
+        attributes = GetFileAttributesW( WindowsGetStringRawBuffer( child_path, NULL ) );
+        /* Do not recurse through junctions or symbolic links, which can lead back to this folder. */
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        {
+            WindowsDeleteString( child_path );
+            continue;
+        }
+        hr = list_query_directory( WindowsGetStringRawBuffer( child_path, NULL ), TRUE, &children, &child_count );
+        WindowsDeleteString( child_path );
+        if (FAILED(hr)) break;
+        if (!child_count)
+        {
+            free( children );
+            continue;
+        }
+        if (child_count > ~0u - count || !(grown = realloc( items, (SIZE_T)(count + child_count) * sizeof(*items) )))
+        {
+            while (child_count--) IStorageItem_Release( children[child_count] );
+            free( children );
+            hr = E_OUTOFMEMORY;
+            break;
+        }
+        items = grown;
+        memcpy( items + count, children, child_count * sizeof(*items) );
+        count += child_count;
+        free( children );
+    }
+
+    if (FAILED(hr))
+    {
+        while (count--) IStorageItem_Release( items[count] );
+        free( items );
+        return hr;
+    }
+    *out_items = items;
+    *out_count = count;
+    return S_OK;
+}
+
+struct file_query_entry
+{
+    IStorageFile *file;
+    HSTRING name;
+};
+
+static int compare_query_file_names( const void *left, const void *right )
+{
+    const struct file_query_entry *a = left, *b = right;
+
+    /* System.ItemNameDisplay for these filesystem items is their filename. */
+    return StrCmpLogicalW( WindowsGetStringRawBuffer( a->name, NULL ), WindowsGetStringRawBuffer( b->name, NULL ) );
+}
+
+struct file_query_range
+{
+    IUnknown IUnknown_iface;
+    LONG ref;
+    UINT32 start_index;
+    UINT32 max_items;
+    IQueryOptionsInternal *options;
+};
+
+static void file_query_range_destroy( struct file_query_range *range )
+{
+    if (range->options) IQueryOptionsInternal_Release( range->options );
+    free( range );
+}
+
+DEFINE_ASYNC_PARAMS( file_query_range )
+
+static IQueryOptionsInternal *file_query_get_options( struct file_query_result *impl )
+{
+    IQueryOptionsInternal *options;
+
+    AcquireSRWLockShared( &impl->options_lock );
+    if ((options = impl->options)) IQueryOptionsInternal_AddRef( options );
+    ReleaseSRWLockShared( &impl->options_lock );
+    return options;
+}
+
+static struct file_query_range *file_query_range_create( struct file_query_result *impl, UINT32 start, UINT32 count )
+{
+    struct file_query_range *range;
+
+    if (!(range = file_query_range_alloc())) return NULL;
+    range->start_index = start;
+    range->max_items = count;
+    range->options = file_query_get_options( impl );
+    return range;
+}
+
 static HRESULT query_result_files( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
 {
     struct file_query_result *impl = CONTAINING_RECORD( (IStorageFileQueryResultInternal *)invoker,
@@ -1853,18 +1960,31 @@ static HRESULT query_result_files( IUnknown *invoker, IUnknown *param, PROPVARIA
     IVectorView_StorageFile *view;
     IStorageItem **items;
     IStorageFile **files;
-    UINT32 count, kept = 0, i;
+    struct file_query_entry *entries;
+    struct file_query_range *range = param ? file_query_range_from_IUnknown( param ) : NULL;
+    UINT32 count, kept = 0, start, length, i;
+    INT32 depth = 0;
     HRESULT hr;
 
-    if (impl->options) IQueryOptionsInternal_get_FileTypeFilter( impl->options, &filter );
+    if (!called_async) return STATUS_PENDING;
 
-    if (FAILED(hr = list_directory( impl->path, TRUE, FALSE, &items, &count )))
+    if (range->options)
+    {
+        if (FAILED(hr = IQueryOptionsInternal_get_FileTypeFilter( range->options, &filter ))) return hr;
+        if (FAILED(hr = IQueryOptionsInternal_get_FolderDepth( range->options, &depth )))
+        {
+            IVector_HSTRING_Release( filter );
+            return hr;
+        }
+    }
+
+    if (FAILED(hr = list_query_directory( impl->path, depth == 1, &items, &count )))
     {
         if (filter) IVector_HSTRING_Release( filter );
         return hr;
     }
 
-    if (!(files = malloc( max( count, 1 ) * sizeof(*files) )))
+    if (!(entries = calloc( max( count, 1 ), sizeof(*entries) )))
     {
         while (count--) IStorageItem_Release( items[count] );
         free( items );
@@ -1877,24 +1997,37 @@ static HRESULT query_result_files( IUnknown *invoker, IUnknown *param, PROPVARIA
         HSTRING name = NULL;
         BOOL keep = FALSE;
 
-        if (SUCCEEDED(IStorageItem_get_Name( items[i], &name )))
-        {
+        if (SUCCEEDED(hr = IStorageItem_get_Name( items[i], &name )))
             keep = file_matches_filter( WindowsGetStringRawBuffer( name, NULL ), filter );
-            WindowsDeleteString( name );
-        }
 
-        if (keep && SUCCEEDED(IStorageItem_QueryInterface( items[i], &IID_IStorageFile, (void **)&files[kept] )))
-            kept++;
-        IStorageItem_Release( items[i] );
+        if (keep && SUCCEEDED(IStorageItem_QueryInterface( items[i], &IID_IStorageFile, (void **)&entries[kept].file )))
+            entries[kept++].name = name;
+        else WindowsDeleteString( name );
+        if (FAILED(hr)) break;
     }
+    for (i = 0; i < count; i++) IStorageItem_Release( items[i] );
     free( items );
     if (filter) IVector_HSTRING_Release( filter );
 
     TRACE( "%s: %u of %u entries matched.\n", debugstr_w(impl->path), kept, count );
 
-    if (FAILED(hr = file_view_create( files, kept, &view )))
+    if (SUCCEEDED(hr) && impl->order_by_name) qsort( entries, kept, sizeof(*entries), compare_query_file_names );
+    start = range ? min( range->start_index, kept ) : 0;
+    length = range ? min( range->max_items, kept - start ) : kept;
+    files = NULL;
+    if (SUCCEEDED(hr) && !(files = malloc( max( length, 1 ) * sizeof(*files) ))) hr = E_OUTOFMEMORY;
+    for (i = 0; i < kept; i++)
     {
-        while (kept--) IStorageFile_Release( files[kept] );
+        WindowsDeleteString( entries[i].name );
+        if (SUCCEEDED(hr) && i >= start && i - start < length) files[i - start] = entries[i].file;
+        else IStorageFile_Release( entries[i].file );
+    }
+    free( entries );
+    if (FAILED(hr)) return hr;
+
+    if (FAILED(hr = file_view_create( files, length, &view )))
+    {
+        while (length--) IStorageFile_Release( files[length] );
         free( files );
         return hr;
     }
@@ -1907,11 +2040,19 @@ static HRESULT query_result_files( IUnknown *invoker, IUnknown *param, PROPVARIA
 static HRESULT WINAPI file_query_GetFilesAsync( IStorageFileQueryResultInternal *iface, UINT32 start_index,
         UINT32 max_number_of_items, IAsyncOperation_IVectorView_StorageFile **operation )
 {
+    struct file_query_result *impl = impl_from_IStorageFileQueryResultInternal( iface );
+    struct file_query_range *range;
+    HRESULT hr;
+
     TRACE( "iface %p, start_index %u, max_number_of_items %u, operation %p.\n", iface, start_index,
            max_number_of_items, operation );
 
     if (!operation) return E_POINTER;
-    return async_operation_files_create( (IUnknown *)iface, NULL, query_result_files, operation );
+    *operation = NULL;
+    if (!(range = file_query_range_create( impl, start_index, max_number_of_items ))) return E_OUTOFMEMORY;
+    hr = async_operation_files_create( (IUnknown *)iface, &range->IUnknown_iface, query_result_files, operation );
+    IUnknown_Release( &range->IUnknown_iface );
+    return hr;
 }
 
 static HRESULT WINAPI file_query_GetFilesAsyncDefaultStartAndCount( IStorageFileQueryResultInternal *iface,
@@ -1919,8 +2060,7 @@ static HRESULT WINAPI file_query_GetFilesAsyncDefaultStartAndCount( IStorageFile
 {
     TRACE( "iface %p, operation %p.\n", iface, operation );
 
-    if (!operation) return E_POINTER;
-    return async_operation_files_create( (IUnknown *)iface, NULL, query_result_files, operation );
+    return file_query_GetFilesAsync( iface, 0, ~0u, operation );
 }
 
 static const struct IStorageFileQueryResultInternalVtbl file_query_vtbl =
@@ -1949,6 +2089,7 @@ static HRESULT file_query_count( IUnknown *invoker, IUnknown *param, PROPVARIANT
     UINT32 count = 0;
     HRESULT hr;
 
+    if (!called_async) return STATUS_PENDING;
     if (FAILED(hr = query_result_files( invoker, param, &files, called_async ))) return hr;
     view = (IVectorView_StorageFile *)files.punkVal;
     hr = IVectorView_StorageFile_get_Size( view, &count );
@@ -1962,12 +2103,18 @@ static HRESULT WINAPI file_query_base_GetItemCountAsync( IStorageQueryResultBase
         IAsyncOperation_UINT32 **operation )
 {
     struct file_query_result *impl = impl_from_IStorageQueryResultBase_file( iface );
+    struct file_query_range *range;
+    HRESULT hr;
 
     TRACE( "iface %p, operation %p.\n", iface, operation );
 
     if (!operation) return E_POINTER;
-    return async_operation_uint32_create( (IUnknown *)&impl->IStorageFileQueryResultInternal_iface, NULL,
-                                          file_query_count, operation );
+    *operation = NULL;
+    if (!(range = file_query_range_create( impl, 0, ~0u ))) return E_OUTOFMEMORY;
+    hr = async_operation_uint32_create( (IUnknown *)&impl->IStorageFileQueryResultInternal_iface,
+                                        &range->IUnknown_iface, file_query_count, operation );
+    IUnknown_Release( &range->IUnknown_iface );
+    return hr;
 }
 
 static HRESULT WINAPI file_query_base_get_Folder( IStorageQueryResultBase *iface, IStorageFolder **value )
@@ -2028,20 +2175,23 @@ static HRESULT WINAPI file_query_base_GetCurrentQueryOptions( IStorageQueryResul
     TRACE( "iface %p, value %p.\n", iface, value );
 
     if (!value) return E_POINTER;
-    if (impl->options) IQueryOptionsInternal_AddRef( impl->options );
-    *value = (IQueryOptions *)impl->options;
+    *value = (IQueryOptions *)file_query_get_options( impl );
     return S_OK;
 }
 
 static HRESULT WINAPI file_query_base_ApplyNewQueryOptions( IStorageQueryResultBase *iface, IQueryOptions *value )
 {
     struct file_query_result *impl = impl_from_IStorageQueryResultBase_file( iface );
+    IQueryOptionsInternal *previous;
 
     TRACE( "iface %p, value %p.\n", iface, value );
 
-    if (impl->options) IQueryOptionsInternal_Release( impl->options );
+    if (value) IQueryOptionsInternal_AddRef( (IQueryOptionsInternal *)value );
+    AcquireSRWLockExclusive( &impl->options_lock );
+    previous = impl->options;
     impl->options = (IQueryOptionsInternal *)value;
-    if (impl->options) IQueryOptionsInternal_AddRef( impl->options );
+    ReleaseSRWLockExclusive( &impl->options_lock );
+    if (previous) IQueryOptionsInternal_Release( previous );
     return S_OK;
 }
 
@@ -2068,7 +2218,7 @@ static const struct IStorageQueryResultBaseVtbl file_query_base_vtbl =
 };
 
 static HRESULT file_query_result_create( IStorageFolder *folder, const WCHAR *path, IQueryOptionsInternal *options,
-                                         IStorageFileQueryResult **out )
+                                         BOOL order_by_name, IStorageFileQueryResult **out )
 {
     struct file_query_result *impl;
 
@@ -2083,9 +2233,39 @@ static HRESULT file_query_result_create( IStorageFolder *folder, const WCHAR *pa
     }
     IStorageFolder_AddRef( (impl->folder = folder) );
     if ((impl->options = options)) IQueryOptionsInternal_AddRef( options );
+    impl->order_by_name = order_by_name;
+    InitializeSRWLock( &impl->options_lock );
 
     *out = (IStorageFileQueryResult *)&impl->IStorageFileQueryResultInternal_iface;
     return S_OK;
+}
+
+/* Common-query options/result routing adapted from Weather's WineCoreUAP
+ * Search/StorageFolderQueryOperations.c, winefork d7870edf465403a1c172299ba82de8370d9012a8
+ * (LGPL-2.1-or-later). Use this module's existing options, result and async helpers. */
+static HRESULT WINAPI folder_query_CreateFileQuery( IStorageFolderQueryOperations *iface, CommonFileQuery query,
+                                                    IStorageFileQueryResult **value )
+{
+    struct storage_folder *impl = impl_from_IStorageFolderQueryOperations( iface );
+    IQueryOptionsInternal *options;
+    HRESULT hr;
+
+    TRACE( "iface %p, query %d, value %p.\n", iface, query, value );
+
+    if (!value) return E_POINTER;
+    *value = NULL;
+    if (query != CommonFileQuery_DefaultQuery && query != CommonFileQuery_OrderByName) return E_NOTIMPL;
+    if (FAILED(hr = query_options_create( query, NULL, &options ))) return hr;
+    hr = file_query_result_create( &impl->IStorageFolder_iface, impl->path, options,
+                                   query == CommonFileQuery_OrderByName, value );
+    IQueryOptionsInternal_Release( options );
+    return hr;
+}
+
+static HRESULT WINAPI folder_query_CreateFileQueryOverloadDefault( IStorageFolderQueryOperations *iface,
+                                                                   IStorageFileQueryResult **value )
+{
+    return folder_query_CreateFileQuery( iface, CommonFileQuery_DefaultQuery, value );
 }
 
 static HRESULT WINAPI folder_query_CreateFileQueryWithOptions( IStorageFolderQueryOperations *iface,
@@ -2097,7 +2277,7 @@ static HRESULT WINAPI folder_query_CreateFileQueryWithOptions( IStorageFolderQue
 
     if (!value) return E_POINTER;
     return file_query_result_create( &impl->IStorageFolder_iface, impl->path,
-                                     (IQueryOptionsInternal *)query_options, value );
+                                     (IQueryOptionsInternal *)query_options, FALSE, value );
 }
 
 static HRESULT WINAPI folder_query_CreateFolderQueryOverloadDefault( IStorageFolderQueryOperations *iface,

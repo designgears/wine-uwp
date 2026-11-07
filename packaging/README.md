@@ -43,3 +43,36 @@ these steps.
 
 `../check-clean.sh` refuses PE images, app packages and payload, Windows images, metadata and fonts, and anything
 over 5 MB. `githooks/pre-commit` runs it; enable it once per clone with `git config core.hooksPath githooks`.
+
+## Optional runtime components
+
+These recipes build separate components. They do not install DLLs or change a prefix.
+Application-specific installation and launch settings belong in the consumer's integration project.
+See [UWP API checks](../docs/UWP-API-checks.md) for probe coverage and validation limits.
+
+### Push notifications
+
+Run `packaging/build-push-notifications.sh WINE_BUILD WINE_SOURCE OUTPUT` against an already built x64 Wine 11.20 tree.
+The default compiler is `x86_64-w64-mingw32-gcc`. Set `PE_CC` to override it.
+The script downloads unchanged sources from
+[WineGDK b53268302fd0b7479a4cb83d4c7719ba96eb28ad](https://github.com/BedrockNative/WineGDK/tree/b53268302fd0b7479a4cb83d4c7719ba96eb28ad).
+It checks them against `packaging/winegdk-push.sha256` and retains the LGPL license in the source cache.
+The output is `OUTPUT/wineuwp-push-notifications.dll`.
+
+The component supplies PushNotificationChannelManager activation.
+Its channel request completes asynchronously with WPN_E_PLATFORM_UNAVAILABLE and a null channel.
+It does not supply a working notification channel.
+The consumer reported a successful Linux build of the renamed module from `96f92cf`.
+Its factory and async error checks passed through the generated Lutris/umu launcher in a fresh candidate prefix.
+The tested artifact's SHA-256 and validation limits are in [UWP API checks](../docs/UWP-API-checks.md#integration-validation-november-6-2026).
+
+To select the component in a test prefix:
+
+1. Preserve the existing `DllPath` value for the following key:
+   `HKLM\Software\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Networking.PushNotifications.PushNotificationChannelManager`.
+2. Set that value to the DLL's absolute Windows path.
+3. Include `wineuwp-push-notifications=n` in the DLL overrides.
+4. Restore the previous value after the temporary test.
+
+Do not run the component's registration export. It also registers unrelated connectivity classes.
+Build `probes/probe-push-notifications.c` with the generated header in `OUTPUT` and the Wine build/source include directories.

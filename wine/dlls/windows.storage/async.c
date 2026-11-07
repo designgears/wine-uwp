@@ -2265,3 +2265,10 @@ DEFINE_IASYNCOPERATION_IFACE( random_access_stream_ct, IRandomAccessStreamWithCo
 #define IAsyncOperationCompletedHandler_IStorageLibrary IAsyncOperationCompletedHandler_StorageLibrary
 DEFINE_IASYNCOPERATION_IFACE( storage_library, IStorageLibrary,
         L"Windows.Foundation.IAsyncOperation`1<Windows.Storage.StorageLibrary>" )
+
+#define IAsyncOperation_IBasicProperties IAsyncOperation_BasicProperties
+#define IAsyncOperation_IBasicPropertiesVtbl IAsyncOperation_BasicPropertiesVtbl
+#define IID_IAsyncOperation_IBasicProperties IID_IAsyncOperation_BasicProperties
+#define IAsyncOperationCompletedHandler_IBasicProperties IAsyncOperationCompletedHandler_BasicProperties
+DEFINE_IASYNCOPERATION_IFACE( basic_properties, IBasicProperties,
+        L"Windows.Foundation.IAsyncOperation`1<Windows.Storage.FileProperties.BasicProperties>" )

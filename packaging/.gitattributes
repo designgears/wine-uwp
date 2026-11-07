@@ -1,0 +1,2 @@
+# Preserve upstream whitespace and unified-diff context in this source patch.
+dxvk-corewindow.patch -whitespace

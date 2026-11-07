@@ -1,6 +1,7 @@
 /* Windows.Storage.FileIO
  *
  * Copyright 2026 the Wine project authors.
+ * Copyright 2026 Wine Ultimate (buffer write implementation).
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -30,6 +31,7 @@ struct write_param
     BOOL append;
     WCHAR *path;
     WCHAR *text;
+    IBuffer *buffer;
 };
 
 static inline struct write_param *write_param_from_IUnknown( IUnknown *iface )
@@ -60,6 +62,7 @@ static ULONG WINAPI write_param_Release( IUnknown *iface )
     {
         free( impl->path );
         free( impl->text );
+        if (impl->buffer) IBuffer_Release( impl->buffer );
         free( impl );
     }
     return ref;
@@ -466,18 +469,79 @@ static HRESULT WINAPI file_io_statics_ReadBufferAsync( IFileIOStatics *iface, IS
     return hr;
 }
 
+/* Adapted from Wine Ultimate's FileIO.WriteBufferAsync, using this module's async lifetime. */
+static HRESULT write_buffer( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+{
+    struct write_param *impl = write_param_from_IUnknown( param );
+    IBufferByteAccess *access;
+    UINT32 size;
+    DWORD written;
+    BYTE *data;
+    HANDLE file;
+    HRESULT hr;
+
+    if (!called_async) return STATUS_PENDING;
+    if (FAILED(hr = IBuffer_get_Length( impl->buffer, &size ))) return hr;
+    if (FAILED(hr = IBuffer_QueryInterface( impl->buffer, &IID_IBufferByteAccess, (void **)&access ))) return hr;
+    if (SUCCEEDED(hr = IBufferByteAccess_Buffer( access, &data )))
+    {
+        file = CreateFileW( impl->path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+        if (file == INVALID_HANDLE_VALUE) hr = HRESULT_FROM_WIN32( GetLastError() );
+        else
+        {
+            if (!WriteFile( file, data, size, &written, NULL )) hr = HRESULT_FROM_WIN32( GetLastError() );
+            else if (written != size) hr = HRESULT_FROM_WIN32( ERROR_DISK_FULL );
+            CloseHandle( file );
+        }
+    }
+    IBufferByteAccess_Release( access );
+    return hr;
+}
+
 static HRESULT WINAPI file_io_statics_WriteBufferAsync( IFileIOStatics *iface, IStorageFile *file, IBuffer *buffer,
                                                         IAsyncAction **operation )
 {
-    FIXME( "iface %p, file %p, buffer %p, operation %p stub!\n", iface, file, buffer, operation );
-    return E_NOTIMPL;
+    struct write_param *impl;
+    IUnknown *param;
+    HRESULT hr;
+
+    TRACE( "iface %p, file %p, buffer %p, operation %p.\n", iface, file, buffer, operation );
+
+    if (!operation) return E_POINTER;
+    *operation = NULL;
+    if (!buffer) return E_INVALIDARG;
+    if (FAILED(hr = write_param_create( file, NULL, FALSE, &param ))) return hr;
+    impl = write_param_from_IUnknown( param );
+    IBuffer_AddRef( (impl->buffer = buffer) );
+    hr = async_action_create( (IUnknown *)iface, param, write_buffer, operation );
+    IUnknown_Release( param );
+    return hr;
 }
 
 static HRESULT WINAPI file_io_statics_WriteBytesAsync( IFileIOStatics *iface, IStorageFile *file, UINT32 count,
                                                        BYTE *buffer, IAsyncAction **operation )
 {
-    FIXME( "iface %p, file %p, count %u, buffer %p, operation %p stub!\n", iface, file, count, buffer, operation );
-    return E_NOTIMPL;
+    IBufferByteAccess *access;
+    IBuffer *value;
+    BYTE *data;
+    HRESULT hr;
+
+    TRACE( "iface %p, file %p, count %u, buffer %p, operation %p.\n", iface, file, count, buffer, operation );
+
+    if (!operation) return E_POINTER;
+    *operation = NULL;
+    if (count && !buffer) return E_INVALIDARG;
+    if (FAILED(hr = buffer_create( count, &value ))) return hr;
+    if (SUCCEEDED(hr = IBuffer_QueryInterface( value, &IID_IBufferByteAccess, (void **)&access )))
+    {
+        if (SUCCEEDED(hr = IBufferByteAccess_Buffer( access, &data )) && count) memcpy( data, buffer, count );
+        IBufferByteAccess_Release( access );
+    }
+    if (SUCCEEDED(hr)) hr = IBuffer_put_Length( value, count );
+    if (SUCCEEDED(hr)) hr = file_io_statics_WriteBufferAsync( iface, file, value, operation );
+    IBuffer_Release( value );
+    return hr;
 }
 
 static const struct IFileIOStaticsVtbl file_io_statics_vtbl =

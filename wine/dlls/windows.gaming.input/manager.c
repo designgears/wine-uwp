@@ -17,6 +17,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#define WIDL_using_Windows_System
 #include "private.h"
 #include "provider.h"
 #include "roapi.h"
@@ -36,11 +37,33 @@ static CRITICAL_SECTION manager_cs = { &manager_cs_debug, -1, 0, 0, 0, 0 };
 
 static struct list controller_list = LIST_INIT( controller_list );
 
+struct hardware_factory_registration
+{
+    struct list entry;
+    UINT16 vendor_id, product_id;
+    IAgileReference *reference;
+};
+static struct list hardware_factories = LIST_INIT( hardware_factories );
+
+static void hardware_factory_add_controller( struct hardware_factory_registration *registration,
+                                            IGameControllerProvider *provider );
+
+struct gip_factory_registration
+{
+    struct list entry;
+    GUID interface_id;
+    ICustomGameControllerFactory *factory;
+};
+static struct list gip_factories = LIST_INIT( gip_factories );
+
 struct controller
 {
     IGameController IGameController_iface;
     IGameControllerBatteryInfo IGameControllerBatteryInfo_iface;
     IInspectable *IInspectable_inner;
+    IAgileReference *custom_ref;
+    struct hardware_factory_registration *registration;
+    BOOL busy, removed;
     LONG ref;
 
     struct list entry;
@@ -96,13 +119,86 @@ static ULONG WINAPI controller_Release( IGameController *iface )
     {
         /* guard against re-entry if inner releases an outer iface */
         InterlockedIncrement( &impl->ref );
-        IInspectable_Release( impl->IInspectable_inner );
-        ICustomGameControllerFactory_Release( impl->factory );
+        if (impl->custom_ref) IAgileReference_Release( impl->custom_ref );
+        if (impl->IInspectable_inner) IInspectable_Release( impl->IInspectable_inner );
+        if (impl->factory) ICustomGameControllerFactory_Release( impl->factory );
         IGameControllerProvider_Release( impl->provider );
         free( impl );
     }
 
     return ref;
+}
+
+/* Snapshot references, never external COM calls, are taken under manager_cs. */
+static HRESULT controller_snapshot( struct controller ***out, unsigned int *count )
+{
+    struct controller *entry, **items;
+    unsigned int size = 0, i = 0;
+
+    *out = NULL;
+    *count = 0;
+    EnterCriticalSection( &manager_cs );
+    LIST_FOR_EACH_ENTRY( entry, &controller_list, struct controller, entry ) size++;
+    if (!(items = calloc( size ? size : 1, sizeof(*items) )))
+    {
+        LeaveCriticalSection( &manager_cs );
+        return E_OUTOFMEMORY;
+    }
+    LIST_FOR_EACH_ENTRY( entry, &controller_list, struct controller, entry )
+    {
+        IGameController_AddRef( &entry->IGameController_iface );
+        items[i++] = entry;
+    }
+    LeaveCriticalSection( &manager_cs );
+    *out = items;
+    *count = size;
+    return S_OK;
+}
+
+static BOOL object_matches( IUnknown *left, IUnknown *right )
+{
+    IUnknown *a, *b;
+    BOOL match = FALSE;
+
+    if (FAILED(IUnknown_QueryInterface( left, &IID_IUnknown, (void **)&a ))) return FALSE;
+    if (SUCCEEDED(IUnknown_QueryInterface( right, &IID_IUnknown, (void **)&b )))
+    {
+        match = a == b;
+        IUnknown_Release( b );
+    }
+    IUnknown_Release( a );
+    return match;
+}
+
+static HRESULT controller_get_public_iface( struct controller *controller, IGameController **out )
+{
+    IAgileReference *reference;
+
+    *out = NULL;
+    if (!controller->registration)
+    {
+        IGameController_AddRef( (*out = &controller->IGameController_iface) );
+        return S_OK;
+    }
+    EnterCriticalSection( &manager_cs );
+    reference = controller->custom_ref;
+    LeaveCriticalSection( &manager_cs );
+    /* The caller owns a snapshot reference, so custom_ref cannot be destroyed here. */
+    if (!reference) return E_PENDING;
+    return IAgileReference_Resolve( reference, &IID_IGameController, (void **)out );
+}
+
+static BOOL controller_matches_factory( struct controller *controller, ICustomGameControllerFactory *factory )
+{
+    ICustomGameControllerFactory *resolved;
+    BOOL match;
+
+    if (!controller->registration) return controller->factory == factory;
+    if (FAILED(IAgileReference_Resolve( controller->registration->reference,
+                                       &IID_ICustomGameControllerFactory, (void **)&resolved ))) return FALSE;
+    match = object_matches( (IUnknown *)resolved, (IUnknown *)factory );
+    ICustomGameControllerFactory_Release( resolved );
+    return match;
 }
 
 static HRESULT WINAPI controller_GetIids( IGameController *iface, ULONG *iid_count, IID **iids )
@@ -366,8 +462,30 @@ statics_RegisterCustomFactoryForGipInterface( IGameControllerFactoryManagerStati
                                               ICustomGameControllerFactory *factory,
                                               GUID interface_id )
 {
-    FIXME( "iface %p, factory %p, interface_id %s stub!\n", iface, factory, debugstr_guid(&interface_id) );
-    return E_NOTIMPL;
+    struct gip_factory_registration *entry, *registration;
+
+    TRACE( "iface %p, factory %p, interface_id %s.\n", iface, factory, debugstr_guid(&interface_id) );
+    if (!factory) return E_INVALIDARG;
+    if (!(registration = malloc(sizeof(*registration)))) return E_OUTOFMEMORY;
+    registration->interface_id = interface_id;
+    ICustomGameControllerFactory_AddRef( (registration->factory = factory) );
+
+    EnterCriticalSection( &manager_cs );
+    LIST_FOR_EACH_ENTRY( entry, &gip_factories, struct gip_factory_registration, entry )
+    {
+        if (entry->factory == factory && IsEqualGUID( &entry->interface_id, &interface_id ))
+        {
+            LeaveCriticalSection( &manager_cs );
+            ICustomGameControllerFactory_Release( factory );
+            free( registration );
+            return S_OK;
+        }
+    }
+    /* Registrations last for the process lifetime. Wine currently exposes no GIP
+     * providers, so no existing controller matches this factory. */
+    list_add_tail( &gip_factories, &registration->entry );
+    LeaveCriticalSection( &manager_cs );
+    return S_OK;
 }
 
 static HRESULT WINAPI
@@ -375,8 +493,67 @@ statics_RegisterCustomFactoryForHardwareId( IGameControllerFactoryManagerStatics
                                             ICustomGameControllerFactory *factory,
                                             UINT16 vendor_id, UINT16 product_id )
 {
-    FIXME( "iface %p, factory %p, vendor_id %u, product_id %u stub!\n", iface, factory, vendor_id, product_id );
-    return E_NOTIMPL;
+    struct hardware_factory_registration *entry, *registration;
+    ICustomGameControllerFactory *resolved;
+    struct controller **items;
+    struct list *cursor;
+    unsigned int count, i, j;
+    BOOL match;
+    HRESULT hr;
+
+    TRACE( "iface %p, factory %p, vendor_id %u, product_id %u.\n", iface, factory, vendor_id, product_id );
+    if (!factory) return E_INVALIDARG;
+    if (!(registration = calloc( 1, sizeof(*registration) ))) return E_OUTOFMEMORY;
+    registration->vendor_id = vendor_id;
+    registration->product_id = product_id;
+    hr = RoGetAgileReference( AGILEREFERENCE_DEFAULT, &IID_ICustomGameControllerFactory,
+                             (IUnknown *)factory, &registration->reference );
+    if (FAILED(hr))
+    {
+        free( registration );
+        return hr;
+    }
+
+    EnterCriticalSection( &manager_cs );
+    cursor = hardware_factories.next;
+    while (cursor != &hardware_factories)
+    {
+        entry = LIST_ENTRY( cursor, struct hardware_factory_registration, entry );
+        LeaveCriticalSection( &manager_cs );
+        match = FALSE;
+        if (entry->vendor_id == vendor_id && entry->product_id == product_id &&
+            SUCCEEDED(IAgileReference_Resolve( entry->reference, &IID_ICustomGameControllerFactory, (void **)&resolved )))
+        {
+            match = object_matches( (IUnknown *)resolved, (IUnknown *)factory );
+            ICustomGameControllerFactory_Release( resolved );
+        }
+        if (match)
+        {
+            IAgileReference_Release( registration->reference );
+            free( registration );
+            return S_OK;
+        }
+        EnterCriticalSection( &manager_cs );
+        /* Registrations are never removed. Read next after resolving, so concurrent appends are included. */
+        cursor = entry->entry.next;
+    }
+    hr = controller_snapshot( &items, &count );
+    if (SUCCEEDED(hr)) list_add_tail( &hardware_factories, &registration->entry );
+    LeaveCriticalSection( &manager_cs );
+    if (FAILED(hr))
+    {
+        IAgileReference_Release( registration->reference );
+        free( registration );
+        return hr;
+    }
+    for (i = 0; i < count; ++i)
+    {
+        for (j = 0; j < i; ++j) if (items[j]->provider == items[i]->provider) break;
+        if (j == i) hardware_factory_add_controller( registration, items[i]->provider );
+    }
+    for (i = 0; i < count; ++i) IGameController_Release( &items[i]->IGameController_iface );
+    free( items );
+    return S_OK;
 }
 
 static HRESULT WINAPI
@@ -410,35 +587,38 @@ statics2_TryGetFactoryControllerFromGameController( IGameControllerFactoryManage
                                                     ICustomGameControllerFactory *factory,
                                                     IGameController *controller, IGameController **value )
 {
-    struct controller *entry, *other;
-    IGameController *tmp_controller;
-    BOOL found = FALSE;
+    struct controller **items;
+    IGameControllerProvider *provider = NULL;
+    IGameController *current;
+    unsigned int count, i;
+    BOOL removed;
+    HRESULT hr;
 
     TRACE( "iface %p, factory %p, controller %p, value %p.\n", iface, factory, controller, value );
-
-    /* Spider Man Remastered passes a IRawGameController instead of IGameController, query the iface again */
-    if (FAILED(IGameController_QueryInterface( controller, &IID_IGameController, (void **)&tmp_controller ))) goto done;
-
-    EnterCriticalSection( &manager_cs );
-
-    LIST_FOR_EACH_ENTRY( entry, &controller_list, struct controller, entry )
-        if ((found = &entry->IGameController_iface == tmp_controller)) break;
-
-    if (!found) WARN( "Failed to find controller %p\n", controller );
-    else
+    if (!value) return E_POINTER;
+    *value = NULL;
+    if (!factory || !controller) return E_INVALIDARG;
+    if (FAILED(hr = controller_snapshot( &items, &count ))) return hr;
+    for (i = 0; i < count; ++i)
     {
-        LIST_FOR_EACH_ENTRY( other, &controller_list, struct controller, entry )
-            if ((found = entry->provider == other->provider && other->factory == factory)) break;
-        if (!found) WARN( "Failed to find controller %p, factory %p\n", controller, factory );
-        else IGameController_AddRef( (*value = &other->IGameController_iface) );
+        if (FAILED(controller_get_public_iface( items[i], &current ))) continue;
+        if (object_matches( (IUnknown *)current, (IUnknown *)controller )) provider = items[i]->provider;
+        IGameController_Release( current );
+        if (provider) break;
     }
-
-    LeaveCriticalSection( &manager_cs );
-
-    IGameController_Release( tmp_controller );
-
-done:
-    if (!found) *value = NULL;
+    if (provider) for (i = 0; i < count; ++i)
+    {
+        if (items[i]->provider != provider || !controller_matches_factory( items[i], factory )) continue;
+        if (FAILED(controller_get_public_iface( items[i], &current ))) continue;
+        EnterCriticalSection( &manager_cs );
+        removed = items[i]->removed;
+        LeaveCriticalSection( &manager_cs );
+        if (removed) IGameController_Release( current );
+        else *value = current;
+        break;
+    }
+    for (i = 0; i < count; ++i) IGameController_Release( &items[i]->IGameController_iface );
+    free( items );
     return S_OK;
 }
 
@@ -472,13 +652,15 @@ static HRESULT controller_create( ICustomGameControllerFactory *factory, IGameCo
     struct controller *impl;
     HRESULT hr;
 
-    if (!(impl = malloc(sizeof(*impl)))) return E_OUTOFMEMORY;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
     impl->IGameController_iface.lpVtbl = &controller_vtbl;
     impl->IGameControllerBatteryInfo_iface.lpVtbl = &battery_vtbl;
     impl->ref = 1;
+    impl->IInspectable_inner = NULL;
 
     if (FAILED(hr = ICustomGameControllerFactory_CreateGameController( factory, provider, &impl->IInspectable_inner )))
         WARN( "Failed to create game controller, hr %#lx\n", hr );
+    else if (!impl->IInspectable_inner) hr = E_FAIL;
     else if (FAILED(hr = IInspectable_QueryInterface( impl->IInspectable_inner, &IID_IGameControllerImpl, (void **)&inner_impl )))
         WARN( "Failed to find IGameControllerImpl iface, hr %#lx\n", hr );
     else
@@ -502,83 +684,180 @@ static HRESULT controller_create( ICustomGameControllerFactory *factory, IGameCo
     return S_OK;
 }
 
+static void custom_controller_removed( struct controller *controller )
+{
+    ICustomGameControllerFactory *factory;
+    IGameControllerInputSink *sink;
+    IGameController *public_iface;
+
+    if (FAILED(IAgileReference_Resolve( controller->registration->reference,
+                                       &IID_ICustomGameControllerFactory, (void **)&factory ))) return;
+    if (SUCCEEDED(controller_get_public_iface( controller, &public_iface )))
+    {
+        if (SUCCEEDED(IGameController_QueryInterface( public_iface, &IID_IGameControllerInputSink, (void **)&sink )))
+        {
+            IGameControllerInputSink_OnInputSuspended( sink, GetTickCount64() * 10000 );
+            IGameControllerInputSink_Release( sink );
+        }
+        ICustomGameControllerFactory_OnGameControllerRemoved( factory, public_iface );
+        IGameController_Release( public_iface );
+    }
+    ICustomGameControllerFactory_Release( factory );
+}
+
+/* Reserve the provider/factory pair under the lock. Marshal and notify without it. */
+static void hardware_factory_add_controller( struct hardware_factory_registration *registration,
+                                            IGameControllerProvider *provider )
+{
+    ICustomGameControllerFactory *factory = NULL;
+    IGameController *public_iface = NULL;
+    IInspectable *inner = NULL;
+    IGameControllerInputSink *sink;
+    IAgileReference *reference = NULL;
+    struct controller *entry, *controller;
+    BOOL present = FALSE, duplicate = FALSE, notify, release_list = FALSE;
+    UINT16 vendor_id, product_id;
+    HRESULT hr;
+
+    if (FAILED(IGameControllerProvider_get_HardwareVendorId( provider, &vendor_id )) ||
+        FAILED(IGameControllerProvider_get_HardwareProductId( provider, &product_id )) ||
+        vendor_id != registration->vendor_id || product_id != registration->product_id) return;
+    if (!(controller = calloc( 1, sizeof(*controller) ))) return;
+    controller->IGameController_iface.lpVtbl = &controller_vtbl;
+    controller->ref = 1;
+    controller->registration = registration;
+    controller->busy = TRUE;
+    IGameControllerProvider_AddRef( (controller->provider = provider) );
+
+    EnterCriticalSection( &manager_cs );
+    LIST_FOR_EACH_ENTRY( entry, &controller_list, struct controller, entry )
+    {
+        if (entry->provider != provider) continue;
+        present = TRUE;
+        if (entry->registration == registration) { duplicate = TRUE; break; }
+    }
+    if (!present || duplicate)
+    {
+        LeaveCriticalSection( &manager_cs );
+        IGameController_Release( &controller->IGameController_iface );
+        return;
+    }
+    IGameController_AddRef( &controller->IGameController_iface ); /* list reference */
+    list_add_tail( &controller_list, &controller->entry );
+    LeaveCriticalSection( &manager_cs );
+
+    hr = IAgileReference_Resolve( registration->reference, &IID_ICustomGameControllerFactory, (void **)&factory );
+    if (SUCCEEDED(hr)) hr = ICustomGameControllerFactory_CreateGameController( factory, provider, &inner );
+    if (SUCCEEDED(hr) && !inner) hr = E_FAIL;
+    if (SUCCEEDED(hr)) hr = IInspectable_QueryInterface( inner, &IID_IGameController, (void **)&public_iface );
+    if (SUCCEEDED(hr) && !public_iface) hr = E_FAIL;
+    if (SUCCEEDED(hr)) hr = RoGetAgileReference( AGILEREFERENCE_DEFAULT, &IID_IGameController,
+                                               (IUnknown *)public_iface, &reference );
+    EnterCriticalSection( &manager_cs );
+    controller->custom_ref = reference;
+    notify = SUCCEEDED(hr) && !controller->removed;
+    if (FAILED(hr) && !controller->removed)
+    {
+        list_remove( &controller->entry );
+        controller->removed = TRUE;
+        release_list = TRUE;
+    }
+    LeaveCriticalSection( &manager_cs );
+    if (notify)
+    {
+        if (SUCCEEDED(IGameController_QueryInterface( public_iface, &IID_IGameControllerInputSink, (void **)&sink )))
+        {
+            IGameControllerInputSink_OnInputResumed( sink, GetTickCount64() * 10000 );
+            IGameControllerInputSink_Release( sink );
+        }
+        ICustomGameControllerFactory_OnGameControllerAdded( factory, public_iface );
+    }
+    else if (FAILED(hr)) WARN( "Custom controller creation failed, hr %#lx\n", hr );
+    EnterCriticalSection( &manager_cs );
+    controller->busy = FALSE;
+    notify = notify && controller->removed;
+    LeaveCriticalSection( &manager_cs );
+    if (notify) custom_controller_removed( controller );
+    if (public_iface) IGameController_Release( public_iface );
+    if (inner) IInspectable_Release( inner );
+    if (factory) ICustomGameControllerFactory_Release( factory );
+    if (release_list) IGameController_Release( &controller->IGameController_iface );
+    IGameController_Release( &controller->IGameController_iface );
+}
+
 void manager_on_provider_created( IGameControllerProvider *provider )
 {
+    struct hardware_factory_registration *registration;
     IWineGameControllerProvider *wine_provider;
-    struct list *entry, *next, *list;
-    struct controller *controller;
+    struct controller *created[2];
+    struct list *cursor;
     WineGameControllerType type;
+    unsigned int count = 0, i;
     HRESULT hr;
 
     TRACE( "provider %p\n", provider );
-
     if (FAILED(IGameControllerProvider_QueryInterface( provider, &IID_IWineGameControllerProvider,
-                                                       (void **)&wine_provider )))
-    {
-        FIXME( "IWineGameControllerProvider isn't implemented by provider %p\n", provider );
-        return;
-    }
-    if (FAILED(hr = IWineGameControllerProvider_get_Type( wine_provider, &type )))
-    {
-        WARN( "Failed to get controller type, hr %#lx\n", hr );
-        type = WineGameControllerType_Joystick;
-    }
+                                                       (void **)&wine_provider ))) return;
+    if (FAILED(hr = IWineGameControllerProvider_get_Type( wine_provider, &type ))) type = WineGameControllerType_Joystick;
     IWineGameControllerProvider_Release( wine_provider );
 
+    if (SUCCEEDED(controller_create( controller_factory, provider, &created[count] ))) count++;
+    if (type == WineGameControllerType_Gamepad &&
+        SUCCEEDED(controller_create( gamepad_factory, provider, &created[count] ))) count++;
+    if (type == WineGameControllerType_RacingWheel &&
+        SUCCEEDED(controller_create( racing_wheel_factory, provider, &created[count] ))) count++;
     EnterCriticalSection( &manager_cs );
-
-    if (list_empty( &controller_list )) list = &controller_list;
-    else list = list_tail( &controller_list );
-
-    if (SUCCEEDED(controller_create( controller_factory, provider, &controller )))
-        list_add_tail( &controller_list, &controller->entry );
-
-    switch (type)
+    for (i = 0; i < count; ++i)
     {
-    case WineGameControllerType_Joystick: break;
-    case WineGameControllerType_Gamepad:
-        if (SUCCEEDED(controller_create( gamepad_factory, provider, &controller )))
-            list_add_tail( &controller_list, &controller->entry );
-        break;
-    case WineGameControllerType_RacingWheel:
-        if (SUCCEEDED(controller_create( racing_wheel_factory, provider, &controller )))
-            list_add_tail( &controller_list, &controller->entry );
-        break;
+        IGameController_AddRef( &created[i]->IGameController_iface );
+        list_add_tail( &controller_list, &created[i]->entry );
+    }
+    LeaveCriticalSection( &manager_cs );
+    for (i = 0; i < count; ++i)
+    {
+        ICustomGameControllerFactory_OnGameControllerAdded( created[i]->factory, &created[i]->IGameController_iface );
+        IGameController_Release( &created[i]->IGameController_iface );
     }
 
-    LIST_FOR_EACH_SAFE( entry, next, list )
+    EnterCriticalSection( &manager_cs );
+    cursor = hardware_factories.next;
+    while (cursor != &hardware_factories)
     {
-        controller = LIST_ENTRY( entry, struct controller, entry );
-        hr = ICustomGameControllerFactory_OnGameControllerAdded( controller->factory,
-                                                                 &controller->IGameController_iface );
-        if (FAILED(hr)) WARN( "OnGameControllerAdded failed, hr %#lx\n", hr );
-        if (next == &controller_list) break;
+        registration = LIST_ENTRY( cursor, struct hardware_factory_registration, entry );
+        LeaveCriticalSection( &manager_cs );
+        hardware_factory_add_controller( registration, provider );
+        EnterCriticalSection( &manager_cs );
+        cursor = registration->entry.next;
     }
-
     LeaveCriticalSection( &manager_cs );
 }
 
 void manager_on_provider_removed( IGameControllerProvider *provider )
 {
     struct controller *controller, *next;
+    struct list notify = LIST_INIT( notify ), pending = LIST_INIT( pending );
 
     TRACE( "provider %p\n", provider );
-
     EnterCriticalSection( &manager_cs );
-
-    LIST_FOR_EACH_ENTRY( controller, &controller_list, struct controller, entry )
-    {
-        if (controller->provider != provider) continue;
-        ICustomGameControllerFactory_OnGameControllerRemoved( controller->factory,
-                                                              &controller->IGameController_iface );
-    }
-
     LIST_FOR_EACH_ENTRY_SAFE( controller, next, &controller_list, struct controller, entry )
     {
         if (controller->provider != provider) continue;
+        controller->removed = TRUE;
         list_remove( &controller->entry );
+        list_add_tail( controller->busy ? &pending : &notify, &controller->entry );
+    }
+    LeaveCriticalSection( &manager_cs );
+    LIST_FOR_EACH_ENTRY_SAFE( controller, next, &notify, struct controller, entry )
+    {
+        list_remove( &controller->entry );
+        if (controller->registration) custom_controller_removed( controller );
+        else ICustomGameControllerFactory_OnGameControllerRemoved( controller->factory, &controller->IGameController_iface );
         IGameController_Release( &controller->IGameController_iface );
     }
-
-    LeaveCriticalSection( &manager_cs );
+    LIST_FOR_EACH_ENTRY_SAFE( controller, next, &pending, struct controller, entry )
+    {
+        list_remove( &controller->entry );
+        /* The creating thread sends removal after its added callback returns. */
+        IGameController_Release( &controller->IGameController_iface );
+    }
 }

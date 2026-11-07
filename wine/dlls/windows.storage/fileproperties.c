@@ -971,3 +971,141 @@ HRESULT content_properties_create( const WCHAR *path, IStorageItemContentPropert
     *out = &impl->IStorageItemContentPropertiesInternal_iface;
     return S_OK;
 }
+
+/* BasicProperties getters adapted from WineCoreUAP's LGPL implementation by Weather.
+ * Keep filesystem timestamps in WinRT's FILETIME units and support 64-bit file sizes. */
+struct basic_properties
+{
+    IBasicProperties IBasicProperties_iface;
+    LONG ref;
+    UINT64 size;
+    DateTime modified, item_date;
+};
+
+static inline struct basic_properties *impl_from_IBasicProperties( IBasicProperties *iface )
+{
+    return CONTAINING_RECORD( iface, struct basic_properties, IBasicProperties_iface );
+}
+
+static HRESULT WINAPI basic_props_QueryInterface( IBasicProperties *iface, REFIID iid, void **out )
+{
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IBasicProperties ))
+    {
+        IBasicProperties_AddRef( (*out = iface) );
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI basic_props_AddRef( IBasicProperties *iface )
+{
+    return InterlockedIncrement( &impl_from_IBasicProperties( iface )->ref );
+}
+
+static ULONG WINAPI basic_props_Release( IBasicProperties *iface )
+{
+    struct basic_properties *impl = impl_from_IBasicProperties( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref) free( impl );
+    return ref;
+}
+
+static HRESULT WINAPI basic_props_GetIids( IBasicProperties *iface, ULONG *count, IID **iids )
+{
+    if (!count || !iids) return E_POINTER;
+    *count = 0;
+    if (!(*iids = CoTaskMemAlloc( sizeof(**iids) ))) return E_OUTOFMEMORY;
+    **iids = IID_IBasicProperties;
+    *count = 1;
+    return S_OK;
+}
+
+static HRESULT WINAPI basic_props_GetRuntimeClassName( IBasicProperties *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.Storage.FileProperties.BasicProperties";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+
+static HRESULT WINAPI basic_props_GetTrustLevel( IBasicProperties *iface, TrustLevel *level )
+{
+    if (!level) return E_POINTER;
+    *level = BaseTrust;
+    return S_OK;
+}
+
+static HRESULT WINAPI basic_props_get_Size( IBasicProperties *iface, UINT64 *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_IBasicProperties( iface )->size;
+    return S_OK;
+}
+
+static HRESULT WINAPI basic_props_get_DateModified( IBasicProperties *iface, DateTime *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_IBasicProperties( iface )->modified;
+    return S_OK;
+}
+
+static HRESULT WINAPI basic_props_get_ItemDate( IBasicProperties *iface, DateTime *value )
+{
+    if (!value) return E_POINTER;
+    *value = impl_from_IBasicProperties( iface )->item_date;
+    return S_OK;
+}
+
+static const struct IBasicPropertiesVtbl basic_props_vtbl =
+{
+    basic_props_QueryInterface,
+    basic_props_AddRef,
+    basic_props_Release,
+    basic_props_GetIids,
+    basic_props_GetRuntimeClassName,
+    basic_props_GetTrustLevel,
+    basic_props_get_Size,
+    basic_props_get_DateModified,
+    basic_props_get_ItemDate,
+};
+
+static HRESULT read_basic_properties( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )
+{
+    struct basic_properties *impl;
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    FILETIME item_date;
+
+    if (!called_async) return STATUS_PENDING;
+    if (!GetFileAttributesExW( storage_path_param_buffer( param ), GetFileExInfoStandard, &data ))
+        return HRESULT_FROM_WIN32( GetLastError() );
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->IBasicProperties_iface.lpVtbl = &basic_props_vtbl;
+    impl->ref = 1;
+    if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        impl->size = ((UINT64)data.nFileSizeHigh << 32) | data.nFileSizeLow;
+    impl->modified.UniversalTime = ((UINT64)data.ftLastWriteTime.dwHighDateTime << 32) | data.ftLastWriteTime.dwLowDateTime;
+    /* Filesystem fallback only; media-specific dates require a metadata parser. */
+    item_date = data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ? data.ftCreationTime : data.ftLastWriteTime;
+    impl->item_date.UniversalTime = ((UINT64)item_date.dwHighDateTime << 32) | item_date.dwLowDateTime;
+    result->vt = VT_UNKNOWN;
+    result->punkVal = (IUnknown *)&impl->IBasicProperties_iface;
+    return S_OK;
+}
+
+HRESULT basic_properties_get_async( IStorageItem *item, IAsyncOperation_BasicProperties **out )
+{
+    IUnknown *param;
+    HSTRING path;
+    HRESULT hr;
+
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (FAILED(hr = IStorageItem_get_Path( item, &path ))) return hr;
+    hr = storage_path_param_create( WindowsGetStringRawBuffer( path, NULL ), &param );
+    WindowsDeleteString( path );
+    if (FAILED(hr)) return hr;
+    hr = async_operation_basic_properties_create( (IUnknown *)item, param, read_basic_properties, out );
+    IUnknown_Release( param );
+    return hr;
+}

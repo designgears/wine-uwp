@@ -261,15 +261,26 @@ static HRESULT WINAPI media_device_statics_GetTrustLevel(IMediaDeviceStatics *if
 static HRESULT WINAPI media_device_statics_GetAudioCaptureSelector(IMediaDeviceStatics *iface,
         HSTRING *value)
 {
-    FIXME("iface %p, value %p stub!\n", iface, value);
-    return E_NOTIMPL;
+    static const WCHAR selector[] =
+        L"System.Devices.InterfaceClassGuid:=\"{2EEF81BE-33FA-4800-9670-1CD474972C3F}\""
+        L" AND System.Devices.InterfaceEnabled:=System.StructuredQueryType.Boolean#True";
+
+    TRACE("iface %p, value %p\n", iface, value);
+    if (!value) return E_POINTER;
+    return WindowsCreateString(selector, ARRAY_SIZE(selector) - 1, value);
 }
 
 static HRESULT WINAPI media_device_statics_GetAudioRenderSelector(IMediaDeviceStatics *iface,
         HSTRING *value)
 {
-    FIXME("iface %p, value %p stub!\n", iface, value);
-    return E_NOTIMPL;
+    /* Same enabled-interface selector as Appx Portable v2026.11.4's FMOD fallback. */
+    static const WCHAR selector[] =
+        L"System.Devices.InterfaceClassGuid:=\"{E6327CAD-DCEC-4949-AE8A-991E976A79D2}\""
+        L" AND System.Devices.InterfaceEnabled:=System.StructuredQueryType.Boolean#True";
+
+    TRACE("iface %p, value %p\n", iface, value);
+    if (!value) return E_POINTER;
+    return WindowsCreateString(selector, ARRAY_SIZE(selector) - 1, value);
 }
 
 static HRESULT WINAPI media_device_statics_GetVideoCaptureSelector(IMediaDeviceStatics *iface,

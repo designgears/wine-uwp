@@ -502,3 +502,10 @@ dlls/d3d11/videoproc.c
 dlls/winegstreamer/mfplat.c
 dlls/bcrypt/bcrypt_main.c
 include/wine/storecatalogue.h
+dlls/windows.services.store/updates.c
+dlls/cfgmgr32/cfgmgr32.c
+dlls/cfgmgr32/cfgmgr32_private.h
+dlls/cfgmgr32/devobject.c
+dlls/windows.devices.enumeration/information.c
+dlls/windows.gaming.input/main.c
+dlls/shell32/shellpath.c

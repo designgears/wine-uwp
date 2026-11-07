@@ -49,6 +49,7 @@
 #include "winstring.h"
 #include "activation.h"
 #include "roapi.h"
+#include "private.h"
 
 #include "wine/debug.h"
 
@@ -72,6 +73,9 @@ static const WCHAR class_name[] = L"Windows.Services.Store.StoreContext";
 /* extexec.c */
 extern const WCHAR extexec_class_name[];
 IActivationFactory *extexec_factory( void );
+
+/* updates.c */
+HRESULT WINAPI store_get_updates( IUnknown *iface, IInspectable **out );
 
 #define CONTEXT_SLOTS 48
 
@@ -554,6 +558,7 @@ static void init_vtables(void)
     context_vtbl[13] = context_GetStoreProductsAsync;
     context_vtbl[14] = context_GetAssociatedStoreProductsAsync;
     context_vtbl[16] = context_GetAssociatedStoreProductsAsync;   /* GetUserCollectionAsync: same parameters */
+    context_vtbl[23] = store_get_updates;
     init_license_vtables();
     init_query_vtables();
 
