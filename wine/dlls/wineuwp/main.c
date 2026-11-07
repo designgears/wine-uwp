@@ -38,6 +38,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(wineuwp);
 
 static void mark_psm_registered( void );
+HRESULT WINAPI __wine_uwp_prepare_dxgi( void );
 
 static void maybe_start_stack_dumper(void);
 
@@ -2368,7 +2369,9 @@ HRESULT WINAPI __wine_uwp_prepare_native_views( void )
     unsigned int i, j, size;
     BOOL wait_code = FALSE, signal_code = FALSE;
     void *wait, *signal;
+    HRESULT hr;
 
+    if (FAILED(hr = __wine_uwp_prepare_dxgi())) return hr;
     if (!module) return E_NOINTERFACE;
     if (!(wait = uwp_symbol( "twinapi.appcore.dll", SYM_VIEW_WAIT_READY )) ||
         !(signal = uwp_symbol( "twinapi.appcore.dll", SYM_VIEW_SIGNAL_READY )))

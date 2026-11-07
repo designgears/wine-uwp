@@ -1,7 +1,8 @@
 MODULE    = wineuwp.dll
 ENABLE_ARCHS = x86_64
-IMPORTS   = combase kernelbase user32 ole32 uuid
+IMPORTS   = combase kernelbase user32 ole32 uuid dxguid
 
 SOURCES = \
 	clientadapter.c \
+	dxgi.c \
 	main.c

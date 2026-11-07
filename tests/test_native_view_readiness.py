@@ -29,6 +29,7 @@ prefix=r'''
 #define E_UNEXPECTED -3
 #define E_OUTOFMEMORY -4
 #define S_OK 0
+#define FAILED(hr) ((hr) < 0)
 #define TLS_OUT_OF_INDEXES 0xffffffffu
 #define IMAGE_SCN_MEM_EXECUTE 0x20000000u
 #define IMAGE_FILE_MACHINE_AMD64 0x8664
@@ -57,6 +58,7 @@ static void (WINAPI *native_signal_view_ready)(void *);
 static void *wait_for_native_view_ready;
 static int kind, tls_live, protect_calls, flush_calls, writable;
 static int prepare_shutdown_host(HMODULE module) { return 1; }
+static HRESULT __wine_uwp_prepare_dxgi(void) { return kind==14?E_NOTIMPL:S_OK; }
 static HMODULE GetModuleHandleW(const wchar_t *name) { return kind==12?NULL:image; }
 static void *uwp_symbol(const char *dll,const char *name) {
     if (!strcmp(name,"wait")) return kind==1?NULL: image+(kind==6?512:0x1100);
@@ -116,7 +118,7 @@ with tempfile.TemporaryDirectory(prefix='view-readiness-test-') as d:
     cases = ['install', 'missing wait', 'missing signal', 'wrong register', 'ambiguous calls',
              'noncode signal', 'noncode wait', 'wrong architecture', 'write protection failure',
              'cache flush failure', 'restore protection failure', 'TLS exhaustion', 'missing module',
-             'rel32 out of range']
+             'rel32 out of range', 'DXGI adapter failure before readiness changes']
     for i, label in enumerate(cases):
         r=subprocess.run([str(p/'probe'),str(i)],capture_output=True,text=True)
         print(label + ': ' + ('PASS' if r.returncode==0 else 'FAIL'))

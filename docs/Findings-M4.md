@@ -14209,3 +14209,107 @@ previous compiled candidate. The revised source needs a new build and fresh Pony
 from the consumer. No duplicate reviews, Deck operations, integration, commits or history rewriting
 were performed here. AGENTS.md remains identical to origin/main. The requested Conventional Commits
 cleanup is deferred until after the reviews.
+
+### Stock DXVK with a Wine CoreWindow adapter (2026-11-07, validation in progress)
+
+The user rejected maintaining DXVK changes and approved a Wine-side adapter using
+unmodified official DXVK DLLs. The previous recipe applied `dxvk-corewindow.patch`
+and compiled both DXVK and vkd3d-proton. The FH3 consumer then selected downloaded
+vkd3d-proton 2.14, making the latter compilation unnecessary.
+
+Simply selecting Wine's builtin DXGI is not an equivalent replacement: its D3D12
+swapchain calls the Wine vkd3d library directly, while vkd3d-proton uses DXVK's
+DXGI interfaces. Official DXVK still returns E_NOTIMPL for CoreWindow creation.
+The new `wineuwp/dxgi.c` adapter obtains a factory through CreateDXGIFactory1 and
+redirects its shared CoreWindow method-table entry to Wine code. That code reads
+the HWND through ICoreWindowInterop and calls the native CreateSwapChainForHwnd.
+The DLL files and DXVK instruction bytes remain unchanged. Keeping the original
+COM objects also preserves factory identity and the adapter GetParent path.
+
+Installation is opt-in with WINE_UWP_DXVK_COREWINDOW=1, before the native
+CoreApplication factory is returned. The callback broker is pinned and the DXGI
+LoadLibrary reference retained. A protection-restore failure restores the original
+method pointer. The graphics recipe keeps its historical filename for consumer
+compatibility but now only downloads and verifies official DXVK 3.1.1. It no longer
+builds either graphics project. The application must separately select its tested
+vkd3d-proton version. GetCoreWindow is not added by this HWND adapter.
+
+Local ASan/UBSan checks exercise the production adapter's arguments, HRESULT
+propagation, COM reference balance, repeated installation, seven installation
+failures, and three disabled settings. These pass. Native-view preparation also
+checks that a graphics-adapter failure precedes any readiness-code change. These
+host checks do not prove the Windows ABI, a shared factory table in the downloaded
+binary, or application behavior. The Windows probe now includes the adapter
+GetParent path and callback lifetime after FreeLibrary. Isolated compilation and
+stock-DXVK baseline/adapter runs on Deck are pending. Automatic approval review
+initially rejected the source transfer; the user subsequently approved the named
+corewindow-stock-test directory, separate prefix, build and tests. The running FH3
+installation has not been modified.
+
+The isolated Linux build of the complete wineuwp module succeeded. The stock DXVK
+3.1.1 archive passed its pinned checksum. On a separate prefix and Xvfb :98, stock
+DXVK returned E_NOTIMPL from CreateSwapChainForCoreWindow. The unmodified HWND
+control passed, then enabling the Wine adapter passed the CoreWindow, reference,
+null-argument, GetParent and dummy-composition tests twice. The probe rendered a
+blue D3D12 frame; `docs/screenshots/corewindow-stock-dxvk-probe.png` is that probe,
+not a game screen. The DXGI SHA256 was unchanged before/after and matched the
+release extraction: e3c1178eb7f0dd59f91bcfcc257549e5b9cfdb5e8508719293de7f8704f53160.
+
+Two test-environment traps were recorded. RADV cannot present to this Xvfb server
+because it has no DRI3, so the passing isolated presentation checks used lavapipe.
+Wine searches its runtime builtins ahead of WINEDLLPATH, and an absolute candidate
+path still selected the installed wineuwp. A separate copy of the packaged runtime,
+with only its broker replaced, selected the compiled candidate correctly. The
+initial fresh-prefix setup exceeded 60 seconds; the next run used its completed
+setup. No installed runtime, game stage or running game process was changed.
+
+Game validation of this adapter remains pending. A separately running application
+later stopped in its crash reporter using the installed broker and custom DXVK.
+Its module mappings exclude this candidate. The stopped process and diagnostic
+captures were preserved; no cause or fix is established from that observation.
+
+### Local stack reusing upstream PRs (2026-11-07)
+
+The local `gh stack` now uses main -> fh3/upstream-pr3 -> fh3/upstream-pr4 ->
+fh3/platform -> fh3/native-views -> fh3/stock-dxvk. Nothing was pushed.
+PR 3's head is preserved exactly at c48852d05fec8b3a0888ff291549916c9a03ea9f.
+PR 4's three commits were replayed above it without source changes, retaining their
+author attribution; its source head is 9d20c6230149a7003b2c39c710353c900a72f3d3.
+PR 5 is an independent Store installation feature and is not a runtime dependency.
+
+The controller overlap is resolved by using PR 3's default-user lookup, headset,
+wireless and event methods. Our hardware/GIP factory registration and apartment
+marshaling remain above them. Store product queries from PR 3 coexist with our
+update enumeration. PR 4's activation-factory wrapper and bounded MainView lookup
+remain intact; native-view preparation runs before either factory path can escape.
+PR 3's fullscreen, window-exit watchdog, package icon, launcher, video and save
+service changes are inherited. The Wine-side adapter is the final layer; no layer
+in this stack adds or builds a patched DXVK.
+
+The optional WineGDK push recipe is retained for the existing consumer setting.
+Its asynchronous WPN_E_PLATFORM_UNAVAILABLE result differs from PR 3's successful
+synthetic channel. These are not interchangeable results. The combined source
+contains PR 3's builtin wpnapps, but the consumer must compare the two behaviors
+before removing its explicit external-component selection.
+
+An initial conflict-resolution helper truncated the Store module and omitted
+imported source-manifest entries. The final diff review caught this before any
+runtime installation. The module was reconstructed from PR 3 plus the small update
+addition, and the manifest was rebuilt as a unique union. All new Wine sources are
+listed and every listed file exists. Extracted-function tests alone could not
+have detected a truncated activation implementation.
+
+Host validation passed the WinRT ownership and routing cases, native-view readiness
+and rollback checks, native-shutdown metadata/routing/installation cases, symbol
+harvester tests, and DXGI adapter sanitizer checks. Shell syntax, whitespace and
+repository binary checks passed. These tests cover the combined source; they do
+not establish full-runtime or application compatibility. The earlier blue-frame
+probe used the pre-stack broker and must not be reported as testing this stack.
+
+Complete translation-unit compilation also passed in the existing Linux SDK, with
+outputs confined to the isolated test directory: wineuwp main, DXGI adapter and
+client adapter in x86_64; combase roapi, controller manager, Store main and updates,
+and windows.web json_object in both x86_64 and i386. The first manual compile
+commands omitted generated module headers and the Store module's PARENTSRC include
+directory; matching the module include paths corrected the checks. Existing compiler
+warnings remain. This is compilation evidence, not a linked/runtime test of the stack.

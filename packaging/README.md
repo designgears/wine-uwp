@@ -76,3 +76,38 @@ To select the component in a test prefix:
 
 Do not run the component's registration export. It also registers unrelated connectivity classes.
 Build `probes/probe-push-notifications.c` with the generated header in `OUTPUT` and the Wine build/source include directories.
+
+### CoreWindow graphics
+
+Run `packaging/build-corewindow-graphics.sh OUTPUT` with a fresh output directory.
+Despite the historical name, this now downloads the official DXVK 3.1.1 release,
+verifies its pinned archive SHA256, and extracts it without modifying any files.
+It requires curl, tar and sha256sum. It does not compile DXVK or vkd3d-proton.
+The x64 DLLs are `OUTPUT/dxvk/x64/dxgi.dll` and `d3d11.dll`. The upstream release
+includes its license. `SHA256SUMS` and `SOURCE-MANIFEST.txt` record the downloaded inputs.
+
+For a native CoreWindow app, set `WINE_UWP_DXVK_COREWINDOW=1` alongside
+`WINE_UWP_DRIVE_FIRST_VIEW=1`. Before returning CoreApplication, Wine-UWP installs
+an adapter in the loaded DXGI factory's shared COM method table. The adapter obtains
+the HWND through `ICoreWindowInterop` and forwards to DXVK's public
+`CreateSwapChainForHwnd`. Other factory methods and COM object identities stay with
+DXVK. No DXVK source, instructions or DLL files are modified. The broker and DXGI
+remain loaded for the lifetime of the process. Without the opt-in, Wine-UWP does not
+load DXGI or change its factory table.
+
+This replaces `dxvk-corewindow.patch`. Installing stock DXVK without enabling the
+Wine adapter still leaves `CreateSwapChainForCoreWindow` unimplemented. The adapter
+covers the HWND presentation path, not a complete CoreWindow DXGI implementation;
+for example, it does not add `IDXGISwapChain1::GetCoreWindow`.
+
+Supply the application's vkd3d-proton runtime separately. The existing
+`packaging/install-d3d-runtime.sh` accepts `WINE_UWP_DXVK=OUTPUT/dxvk` and
+`WINE_UWP_VKD3D_PROTON=PATH`. Preserve a title's tested vkd3d-proton version.
+
+`probes/probe-corewindow-swapchain.c` checks the real factory, adapter GetParent path,
+references, null arguments, and dummy-composition ResizeBuffers1. Its header lists
+the compile command and baseline/adapter invocations. Run it in a separate prefix
+with stock DLLs beside the executable and native DXGI/D3D12 overrides.
+`tests/test_dxgi_corewindow.py` separately checks forwarding and installation errors
+under ASan/UBSan with mocked COM and Win32 calls. Host checks alone do not establish
+Wine ABI or application compatibility.

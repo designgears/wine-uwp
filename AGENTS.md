@@ -99,6 +99,13 @@ that were ours; the Calculator tree is no longer involved.
   misbehaves on the network, read its WebSocket/AMQP payloads before theorising: Halo's telemetry stream carries its
   own log lines.
 - **`launch.env` is not a shell script to `wineuwp-launch.exe`.** Its parser removes surrounding quotes and sets literal values; it does not expand `${VAR}` or execute shell syntax. Generate complete literal override lists rather than appending a variable reference, even though `run.sh` can source the same file as shell code.
+- **Official DXVK needs the Wine CoreWindow adapter for native UWP presentation.** The historical
+  `packaging/build-corewindow-graphics.sh` now downloads stock DXVK; it no longer patches or compiles it.
+  Set `WINE_UWP_DXVK_COREWINDOW=1` with `WINE_UWP_DRIVE_FIRST_VIEW=1` to install the adapter before
+  the app receives CoreApplication. The adapter redirects the loaded factory's CoreWindow method
+  to its public HWND method; DXVK files and instructions stay unchanged. Test stock DXVK without
+  the flag as an E_NOTIMPL control, then the adapter and adapter-GetParent path with
+  `probe-corewindow-swapchain.c`. Do not infer application compatibility from the host mock tests.
 - **A child's host environment used to be a copy of its parent's, whatever block `CreateProcess` passed.** Wine reads
   `WINEDLLOVERRIDES`, `WINE_HACK_NATIVE_SYSCALLS` and `WINE_UWP_*` with `getenv`, so `launch.env` values set by
   `wineuwp-launch` reached only the game's Windows environment and were lost when EAC's native helper started the game
@@ -1483,3 +1490,9 @@ long-running Wine command exits. Inserting lines earlier in that same file while
 leave its read offset in the middle of a comment, producing a bogus unmatched-backtick/EOF error
 when the old app is stopped. The current script may pass bash -n throughout. Apply script edits
 by atomic replacement (new inode), or after its active invocations finish.
+
+**After merging vendored Wine files, verify both the whole-file diff and `wine/FILES`.**
+Extracted-function host tests can pass even if conflict resolution has removed a
+module's activation exports or dropped another PR's source-manifest entries. Check
+that every newly added Wine source is listed, that each listed file exists, and
+compile the complete affected translation units before freezing a candidate.
