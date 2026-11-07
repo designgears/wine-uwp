@@ -14324,3 +14324,22 @@ Ponytail found only the two-line attribute file for the removed DXVK patch.
 The cleanup is a separate layer, so the reviewed f749ddc checkpoint and its frozen
 bundle remain unchanged for the full integration build. No Wine source changes
 are included in the cleanup.
+
+### Integration build flag correction (2026-11-07)
+
+The full isolated build stopped compiling i386 `mfplat/main.c` at
+`system_time_source_GetCorrelatedTime`, with GCC's internal error in
+`assign_stack_local_1` at `function.c:427` during RTL pass `split1`. The handoff
+script had copied the configure arguments but omitted the existing installer's
+`i386_CFLAGS='-g -O2 -mpreferred-stack-boundary=4 -mincoming-stack-boundary=2'`.
+Its claim to preserve the original build flags was therefore incorrect.
+
+The existing installer documents those flags as its GCC PR109276 workaround.
+The [GCC fix description](https://gcc.gnu.org/pipermail/gcc-cvs/2023-May/382050.html)
+records an i386 stack-alignment compiler crash with `-mpreferred-stack-boundary=2`.
+The corrected handoff exports the original flags before configure and removes
+only the isolated build's `i386-windows` object files before rebuilding. The
+frozen source, bundle and Wine files are unchanged. The corrected build log
+confirms the exact flags and `MFPLAT_COMPILER_REGRESSION_PASS` for the previously
+failing object. Full linking resumed and remains pending, as does runtime
+validation. This is a build recipe correction, not a game crash fix.

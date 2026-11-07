@@ -871,6 +871,14 @@ compiler setup (MSVC-mangled names) with new mingw gcc ones. `rm -rf libs/<lib>/
 directories (`grep -oE '^libs/[^/]+/x86_64-windows/[^:]*\.o' Makefile | xargs -n1 dirname | sort -u | xargs mkdir -p`)
 and rebuild. After a full rebuild, run the suite and `kb` as for any other change.
 
+**Preserve compiler environment flags when reproducing an SDK build.** In the Lutris SDK,
+the existing installer exports `i386_CFLAGS='-g -O2 -mpreferred-stack-boundary=4 -mincoming-stack-boundary=2'`
+before Wine's configure for GCC PR109276. Copying just the configure arguments omitted this workaround
+and the full build stopped in `mfplat`'s `system_time_source_GetCorrelatedTime`, with an internal compiler
+error in `assign_stack_local_1` during RTL `split1`. Reconfigure with the original environment and rebuild
+the isolated `i386-windows` objects after removing the ones compiled with different flags. Do not change
+runtime source to work around an omitted build setting, or mix objects from both configurations.
+
 **A file dialog opened from a test can land on the user's real desktop.** Portal requests go to whatever portal backend the session bus activates. Even under `dbus-run-session` on `:95`, KDE's portal inherits `XDG_SESSION_TYPE=wayland` and draws on the user's Wayland session, and it keeps running after the test. It happened on 09-29. Pass files as arguments instead. To test the real dialog, also export `QT_QPA_PLATFORM=xcb XDG_SESSION_TYPE=x11`. Afterwards kill that bus's `xdg-desktop-portal*`, `kioworker` and `ksecretd` processes: find them by `DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-*` in `/proc/<pid>/environ`, and never touch the user's `/run/user/1000/bus` ones.
 
 **Anything `run.sh` runs after `cd "$S"` runs in the app's environment.** With the stage directory as the working directory and the frameworks on `WINEPATH`, `reg.exe` exits 5 and writes nothing. `run.sh` discarded its output, so every fresh prefix died on its first launch for weeks (Feedback Hub, and every packaged install), while the dev prefixes had the key from before `WINEPATH` existed. **A prefix that has been through many runs hides first-run bugs: test from an empty data directory.** The same run found `[ -x "$PY" ]`, which is false for a bare `python3`, silently skipping the CLSID registrations outside the venv.
