@@ -1321,10 +1321,11 @@ the fully-qualified name. `--grep` first, always.
   a busy view thread, and a title that read MainView while holding a lock its view thread waited on deadlocked at
   start-up. (designgears/wine-uwp#4 moves combase's MainView lookup off an MTA caller's thread.)
 
-## Current state (2026-09-29)
+## Current state
 
 | App | State |
 | --- | --- |
+| Forza Horizon 3 | **Reaches driving gameplay with official unmodified DXVK 3.1.1 and vkd3d-proton 2.14** (11-07). The combined Wine candidate `f749ddc` uses the Wine-side CoreWindow adapter and includes the local PR 3/4 dependency stack. Full build, repeated presentation probes and seven API probes passed. Loaded module paths and hashes were checked; the inspected gameplay capture shows the car driving out of the festival. Testing uses an isolated prefix, runtime and copied saves. The first SUV purchase/colour-confirmation crash, normal exit/reload and longer stability remain unverified. The user has the controls; leave the running game and Steam routing alone. Findings-M4, 2026-11-07 |
 | Note (10-12) | `regress.sh sol` passes again (10-15: our `msvcp140_app` lacked `std::get_new_handler`). `regress.sh fh` still fails on the dev prefix (Feedback Hub blank, 16 fail-fasts): not yet looked at |
 | Calculator | Fully working; the byte-identical regression baseline (249 colours, `magick compare -metric AE` = 0), and the keyboard baseline (`regress.sh kb`). Runs on unmodified CoreMessaging.dll, Windows.UI.dll and Windows.UI.Xaml.dll (no Windows DLL is patched any more) |
 | Feedback Hub | Fully working and interactive (822 colours, 0 fail-fasts) |

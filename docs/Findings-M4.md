@@ -14395,3 +14395,38 @@ graphics files. Installing the selected official graphics binaries in the
 isolated Proton bundle as well, repeating preparation and rechecking all loaded
 paths and hashes corrected the test configuration. Neither graphics project's
 source was modified.
+
+### FH3 gameplay with unmodified DXVK (2026-11-07)
+
+The combined f749ddc candidate loaded the copied profile and reached driving
+gameplay. The inspected `selection-current.png` capture shows the car driving
+out of the festival with the driving HUD visible. `festival-approach.png` shows
+a festival cinematic, and `after-map.png` shows the pause menu; neither should
+be labelled as a driving capture. These game captures and the private integration
+logs are kept outside the repository.
+
+The saved loaded-module evidence identifies the candidate Wine modules and the
+official DXVK 3.1.1 and vkd3d-proton 2.14 binaries. All ten files in the captured
+evidence manifest passed an independent SHA256 check. The integration check
+found the game process still alive after more than eight minutes. All eleven
+original save files and the original file set matched the pre-integration backup;
+the game is using a separate copy of those saves.
+
+A later read-only observation at 13:46 UTC found the copied ProfileData at
+140,484 bytes, modified at 13:45:38 UTC. It and LastModifiedTime differed from
+the original files. This confirms that the running candidate writes profile
+updates to the isolated save directory. It does not prove that a later session
+can reload those updates.
+
+This establishes that the Wine-side adapter can run FH3 into gameplay without
+modifying DXVK's source. It does not establish that the reported first SUV
+purchase/colour-confirmation crash is fixed. The user reports that the purchase
+may already have been saved before the earlier crash, so loading this profile
+does not repeat that transaction. Normal exit and reload, longer gameplay
+stability and a fresh installer using this unpublished source remain unverified.
+The standard four-app regression suite was unavailable on this installation.
+
+The user took over the running game for further play. Automated input, restart,
+save replacement, runtime replacement and Steam routing changes are stopped for
+that session. No installer edit, runtime promotion, push or hosted PR update was
+performed during this integration step.
