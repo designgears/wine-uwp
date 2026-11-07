@@ -106,6 +106,11 @@ that were ours; the Calculator tree is no longer involved.
   to its public HWND method; DXVK files and instructions stay unchanged. Test stock DXVK without
   the flag as an E_NOTIMPL control, then the adapter and adapter-GetParent path with
   `probe-corewindow-swapchain.c`. Do not infer application compatibility from the host mock tests.
+- **A plain `wineboot` prefix does not have every UWP activation registration.** For example,
+  `Windows.Services.Store.StoreContext` is registered by `wineuwp-setup`, not by the Store module's
+  Wine install rules. Its probe returns `REGDB_E_CLASSNOTREG` in an ordinary fresh prefix before
+  calling the DLL. Check the activation registration and use a configured isolated UWP prefix
+  before treating this as a runtime implementation failure.
 - **A child's host environment used to be a copy of its parent's, whatever block `CreateProcess` passed.** Wine reads
   `WINEDLLOVERRIDES`, `WINE_HACK_NATIVE_SYSCALLS` and `WINE_UWP_*` with `getenv`, so `launch.env` values set by
   `wineuwp-launch` reached only the game's Windows environment and were lost when EAC's native helper started the game

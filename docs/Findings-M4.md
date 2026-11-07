@@ -14270,7 +14270,7 @@ captures were preserved; no cause or fix is established from that observation.
 
 ### Local stack reusing upstream PRs (2026-11-07)
 
-The local `gh stack` now uses main -> fh3/upstream-pr3 -> fh3/upstream-pr4 ->
+The initial local `gh stack` used main -> fh3/upstream-pr3 -> fh3/upstream-pr4 ->
 fh3/platform -> fh3/native-views -> fh3/stock-dxvk. Nothing was pushed.
 PR 3's head is preserved exactly at c48852d05fec8b3a0888ff291549916c9a03ea9f.
 PR 4's three commits were replayed above it without source changes, retaining their
@@ -14343,3 +14343,42 @@ frozen source, bundle and Wine files are unchanged. The corrected build log
 confirms the exact flags and `MFPLAT_COMPILER_REGRESSION_PASS` for the previously
 failing object. Full linking resumed and remains pending, as does runtime
 validation. This is a build recipe correction, not a game crash fix.
+
+The full corrected build and distribution assembly subsequently passed with exit
+0 and `FULL_BUILD_PASS`. The assembled runtime identifies source commit
+f749ddc63ad1b03103d452242d7c1f729aa4fa97 and records the corrected i386 flags.
+Its broker SHA256 is 8bfc54f9cc9d003da1426cac3a443c021230c9b949b6890eeb3a12719da1bc4c.
+The broker, combase, storage, controller and Store DLLs were independently hashed
+against the build's manifest. Graphics, API and game checks on this full runtime
+are the next gate; the earlier pre-stack probe result does not cover it.
+
+On that combined runtime, the official DXVK no-adapter control returned
+E_NOTIMPL, the HWND control passed, and two adapter runs passed CoreWindow
+creation, parent-factory lookup, null checks, reference balance and dummy
+composition ResizeBuffers1. The inspected capture
+`docs/screenshots/corewindow-stock-dxvk-stack-probe.png` shows the blue D3D12
+probe rectangle. This used lavapipe on a private Xvfb display, not game rendering
+on the hardware driver. The reported DXGI checksum remained the official
+e3c1178eb7f0dd59f91bcfcc257549e5b9cfdb5e8508719293de7f8704f53160.
+
+Six initial API probes passed: basic properties, file queries, controller-factory
+registration, controller-user association with an enumerated controller, device
+enumeration and the external push component. The Store update probe failed before
+calling the implementation: combase could not find the StoreContext library and
+returned REGDB_E_CLASSNOTREG. The fresh ordinary Wine prefix lacked the activation
+registration that wineuwp-setup creates. Retesting in a configured isolated UWP
+prefix is pending, as are FH3 purchase, save and reload checks.
+
+The Store probe subsequently passed in the copied UWP prefix. Its load trace
+selected builtin windows.services.store, and the operation completed with an
+empty typed collection and empty iterator. All seven API probes therefore have
+passing execution on the combined runtime with the required prefix setup.
+FH3 purchase, save and reload validation is still pending.
+
+At the user's request, the four branches containing our additions are consolidated
+into one local branch, `fh3/compatibility`, above `fh3/upstream-pr3` and
+`fh3/upstream-pr4`. This changes the local stack structure, not the implementation:
+our existing commits remain in its history, and the Wine subtree is identical to
+the frozen f749ddc candidate. `validation/fh3-f749ddc` preserves that exact source
+checkpoint. The earlier frozen bundle retains its original branch names for
+reproducing the build. No stack changes are pushed or submitted to GitHub.
