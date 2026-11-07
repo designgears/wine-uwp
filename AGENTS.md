@@ -106,6 +106,10 @@ that were ours; the Calculator tree is no longer involved.
   to its public HWND method; DXVK files and instructions stay unchanged. Test stock DXVK without
   the flag as an E_NOTIMPL control, then the adapter and adapter-GetParent path with
   `probe-corewindow-swapchain.c`. Do not infer application compatibility from the host mock tests.
+- **Proton can replace graphics DLLs in a copied prefix during launch preparation.** Selecting stock
+  DXVK only in the prefix and stage is insufficient when the Proton bundle still contains another
+  build. Put the selected official graphics DLLs in the isolated Proton graphics directories too,
+  repeat preparation, then verify the prefix, stage and loaded process paths and hashes.
 - **A plain `wineboot` prefix does not have every UWP activation registration.** For example,
   `Windows.Services.Store.StoreContext` is registered by `wineuwp-setup`, not by the Store module's
   Wine install rules. Its probe returns `REGDB_E_CLASSNOTREG` in an ordinary fresh prefix before

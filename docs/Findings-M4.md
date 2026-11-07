@@ -14382,3 +14382,16 @@ our existing commits remain in its history, and the Wine subtree is identical to
 the frozen f749ddc candidate. `validation/fh3-f749ddc` preserves that exact source
 checkpoint. The earlier frozen bundle retains its original branch names for
 reproducing the build. No stack changes are pushed or submitted to GitHub.
+
+The candidate subsequently reached FH3's title screen through the existing Steam
+entry. The loaded-module capture identifies the expected candidate Wine DLLs,
+official DXVK 3.1.1 DXGI and vkd3d-proton 2.14. The log records both installation
+of the Wine CoreWindow adapter and its use for the game's HWND. The inspected
+screen is the title screen with the start prompt; it does not establish purchase,
+save or reload behavior.
+
+During preparation, Proton initially replaced the prefix's DXGI from its bundled
+graphics files. Installing the selected official graphics binaries in the
+isolated Proton bundle as well, repeating preparation and rechecking all loaded
+paths and hashes corrected the test configuration. Neither graphics project's
+source was modified.
