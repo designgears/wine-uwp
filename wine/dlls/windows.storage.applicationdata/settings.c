@@ -4,7 +4,7 @@
  * is not there succeeds and returns null, instead of failing with E_BOUNDS. Apps rely on it -
  * Calculator reads its saved theme with a plain indexer on first launch, and a failure there
  * becomes a KeyNotFoundException that escapes OnLaunched. So the settings are a thin wrapper over
- * a PropertySet that changes that one answer.
+ * a PropertySet that changes that answer (and the same one for removing a key that is not there).
  *
  * Copyright 2026 wine-uwp contributors
  *
@@ -250,7 +250,16 @@ static HRESULT WINAPI settings_map_Insert( IMap_HSTRING_IInspectable *iface, HST
 static HRESULT WINAPI settings_map_Remove( IMap_HSTRING_IInspectable *iface, HSTRING key )
 {
     struct settings *impl = impl_from_IMap_HSTRING_IInspectable( iface );
-    HRESULT hr = IMap_HSTRING_IInspectable_Remove( impl->inner_map, key );
+    boolean found = FALSE;
+    HRESULT hr;
+
+    TRACE( "key %s.\n", debugstr_hstring( key ) );
+
+    /* like Lookup, removing a setting that is not there succeeds: Shapr3D clears its unset editor
+     * settings (IsLagrangeSolverEnabled = null) on first launch, and E_BOUNDS escapes OnLaunched */
+    if (FAILED(hr = IMap_HSTRING_IInspectable_HasKey( impl->inner_map, key, &found ))) return hr;
+    if (!found) return S_OK;
+    hr = IMap_HSTRING_IInspectable_Remove( impl->inner_map, key );
     if (SUCCEEDED(hr) && impl->container) settings_changed();
     return hr;
 }

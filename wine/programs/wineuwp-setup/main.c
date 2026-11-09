@@ -421,7 +421,12 @@ static void stamp_add( const void *p, size_t len )
 static void stamp_file( const WCHAR *path )
 {
     WIN32_FILE_ATTRIBUTE_DATA fa;
-    stamp_add( path, wcslen( path ) * sizeof(WCHAR) );
+    const WCHAR *name = wcsrchr( path, '\\' );
+
+    /* the name, not the whole path: an AppImage mounts the build at a new /tmp/.mount_* path on every launch, and a
+     * stamp holding that path would redo the whole setup each time */
+    name = name ? name + 1 : path;
+    stamp_add( name, wcslen( name ) * sizeof(WCHAR) );
     if (GetFileAttributesExW( path, GetFileExInfoStandard, &fa ))
     {
         stamp_add( &fa.nFileSizeLow, sizeof(fa.nFileSizeLow) );
