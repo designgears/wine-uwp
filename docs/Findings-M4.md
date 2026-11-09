@@ -13706,3 +13706,43 @@ service). "Unable to connect to the Gears of War services" and the Store-user no
   container delete is sent too. State per container is in `.sync`, `.changed` and `.dirty`. It was verified end to end
   with `probe-xboxauth.exe cloudsync "SCID DIR"`: upload, download into an empty directory, and remote deletion, on
   Gears' SCID. The test container was deleted afterwards.
+
+## 2026-10-30 to 11-09: Phantom Dust (UWP, Store EAppx) plays
+
+Installed from a decrypted dump of 1.3.25854.2 (later from the Store itself). Each fix, in the order it was hit:
+
+- **Fresh prefix, no `Packages` folder:** `ApplicationData` created only the last level of
+  `%LOCALAPPDATA%\Packages\<family>\<state>`. It now creates every missing level.
+- **Black window, `SetRotation` throw:** the UWP DirectX template throws when `IDXGISwapChain1::SetRotation(IDENTITY)`
+  fails; it succeeds now.
+- **`__debugbreak` at start-up:** the push-notification channel request failed (`CLASS_E_CLASSNOTAVAILABLE`), which a
+  PPL task turned into an unobserved exception. `wpnapps` answers a channel that never receives.
+- **First button press crashed:** a controller's `User` was NULL and its `UserChanged`/headset events were refused.
+- **Video 0x0:** the game sizes its video texture from `MF_MT_MINIMUM_DISPLAY_APERTURE`, which winegstreamer only set
+  with padding; it is always set now. The frames come as NV12 textures through `VideoProcessorBlt`, which d3d11 now
+  implements on the CPU (Wine's Vulkan renderer logs "Unsupported format NV12" and the frames still convert fine).
+  The white flashes in the first Freia cutscene are in the source video (same in mpv).
+- **Sign-in:** an XSTS `RequestTokenAsync` with nobody signed in starts the browser device-code sign-in.
+- **Saves vanished:** two causes. `GameSaveProvider`'s four `IBuffer` collection IIDs were wrong, so
+  `SubmitUpdatesAsync` wrote nothing while reporting success; and bcrypt's AES-GCM size query failed, so the game's
+  encrypted save buffers were empty. Also a double release of the result object freed the provider at the menu
+  cutscene. On 11-09 a piid.py check of every IID in gamesave.c found its seven `IAsyncOperation<T>` IIDs wrong too
+  (unnoticed: C++/CX doesn't QueryInterface the result); fixed.
+- **The window vanished when clicked from another window:** the activation click made Windows.UI call
+  `GetPointerInfo` while a plain mouse message was current. win32u refused it, Windows.UI threw, and the CoreWindow was
+  destroyed. On Windows the mouse message is generated inside the pointer message, so it keeps the pointer id.
+- **Options > full screen did nothing** (`TryEnterFullScreenMode` has no shell broker): it falls back to the client
+  adapter's `put_SuppressSystemOverlays`, which now makes the window borderless and monitor-sized. That also fixed
+  V-Sync not turning on.
+- **End Game left the process running** (audio playing): see AGENTS.md, `CoreApplication::TearDown`. The first try
+  waited for `CoreApplication.Exiting`, which never fires on this path; thread exit frees windows without
+  `WM_NCDESTROY` in Wine, hence watching the CoreWindow's thread. A MessageDialog left open kept the process alive
+  until dialogs stopped counting. Opt-in since 11-09 (`WINE_UWP_EXIT_WITH_WINDOW`), after review.
+- **In-game shop:** `GetAssociatedStoreProductsAsync` failing with E_NOTIMPL was an error dialog; an empty list with S_OK
+  left a shop the player could not leave (the game's code never meets 0 add-ons on Windows). The result's
+  `ExtendedError` is now 0x80072efd (Store unreachable): the game shows its own message and the shop closes.
+- **The screen dimmed mid-game:** Linux desktops don't count gamepad input as activity. `wine-uwp run` asks the XDG
+  portal, org.freedesktop.ScreenSaver and the GNOME/MATE session manager to inhibit idle.
+- **Online play:** Xbox Live multiplayer needs `XboxLiveEndpointPairTemplate` (Secure Device Association: IKEv2
+  transport-mode IPsec over Teredo, certificates from `cert.mgt.xboxlive.com`). Not implemented. Phantom Dust Rebirth's
+  community client replaces Xbox Live with EOS lobbies; `WINE_UWP_INJECT` loads it as its Windows launcher does.
