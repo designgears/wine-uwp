@@ -495,3 +495,4 @@ dlls/winexboxauth/cloudsave.c
 dlls/winexboxauth/deviceaddr.c
 dlls/winexboxauth/gamesave.c
 dlls/vcruntime140/misc.c
+include/wine/storecatalogue.h

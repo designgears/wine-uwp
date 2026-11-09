@@ -664,22 +664,17 @@ static BOOL json_true( const struct json *value )
     return value->type == JSON_BOOL && value->boolean;
 }
 
-static BOOL starts_with( const char *str, const char *prefix )
-{
-    return !strncmp( str, prefix, strlen( prefix ) );
-}
-
 void query_product( const WCHAR *id, struct product *d )
 {
-    const struct json *prod, *skus, *pkgs, *pk, *deps;
+    struct catalogue_package *pkgs = NULL;
+    const struct json *prod, *pk;
     WCHAR market[8], path[512], cid[64];
     struct json *root = NULL;
     const char *kind, *fmt;
     struct product *grown;
+    unsigned i, count = 0;
     char *body = NULL;
     DWORD status = 0;
-    unsigned i, k, j;
-    BOOL desktop;
 
     memset( d, 0, sizeof(*d) );
     d->type = 2;
@@ -694,7 +689,7 @@ void query_product( const WCHAR *id, struct product *d )
     if (SUCCEEDED(appx_store_get( L"displaycatalog.mp.microsoft.com", path, &body, &status )) && body)
         root = json_parse( body, strlen( body ) );
     appx_free( body );
-    prod = json_at( json_get( root, "Products" ), 0 );
+    prod = catalogue_product( root );
     if (status != 200 || prod->type != JSON_OBJECT)
     {
         TRACE( "Store.QueryProductDetails(%s): catalogue HTTP %lu, no product\n", debugstr_w( id ), status );
@@ -707,37 +702,28 @@ void query_product( const WCHAR *id, struct product *d )
     kind = json_str( json_get( prod, "ProductKind" ) );
     d->type = !strcmp( kind, "Game" ) ? 0 : !strcmp( kind, "Durable" ) ? 1 : 2;
     if (json_true( json_get( json_get( prod, "Properties" ), "IsBundle" ) ) || !strcmp( kind, "Bundle" )) d->type = 3;
-    /* the first package for the desktop, of the first SKU that has one */
-    skus = json_get( prod, "DisplaySkuAvailabilities" );
-    for (i = 0; i < json_count( skus ) && !d->found; i++)
+    /* the first package for the desktop (or a SKU's only package), of the first SKU that has one */
+    pkgs = catalogue_packages( prod, &count );
+    for (i = 0; i < count; i++)
     {
-        const struct json *props = json_get( json_get( json_at( skus, i ), "Sku" ), "Properties" );
-        pkgs = json_get( props, "Packages" );
-        if (!d->wu_category[0])
-            wide_copy( d->wu_category, ARRAY_SIZE(d->wu_category), json_str( json_get( json_get( props, "FulfillmentData" ), "WuCategoryId" ) ) );
-        for (k = 0; k < json_count( pkgs ); k++)
-        {
-            pk = json_at( pkgs, k );
-            deps = json_get( pk, "PlatformDependencies" );
-            desktop = FALSE;
-            for (j = 0; j < json_count( deps ); j++)
-                desktop |= !strcmp( json_str( json_get( json_at( deps, j ), "PlatformName" ) ), "Windows.Desktop" );
-            if (!desktop && json_count( pkgs ) > 1) continue;
-            cid[0] = '{';
-            wide_copy( cid + 1, ARRAY_SIZE(cid) - 2, json_str( json_get( pk, "ContentId" ) ) );
-            wcscat( cid, L"}" );
-            CLSIDFromString( cid, &d->content_id );
-            if (!d->family[0]) wide_copy( d->family, ARRAY_SIZE(d->family), json_str( json_get( pk, "PackageFamilyName" ) ) );
-            d->size = (UINT64)json_get( pk, "MaxInstallSizeInBytes" )->number;
-            if (!d->size) d->size = (UINT64)json_get( pk, "MaxDownloadSizeInBytes" )->number;
-            fmt = json_str( json_get( pk, "PackageFormat" ) );
-            d->uwp = !strstr( fmt, "Xvc" ) && !strstr( fmt, "XVC" );
-            /* EAppx, EAppxBundle, EMsix, EMsixBundle: DRM-encrypted, the keys come with the licence */
-            d->encrypted = d->uwp && (starts_with( fmt, "EAppx" ) || starts_with( fmt, "EMsix" ));
-            d->found = TRUE;
-            break;
-        }
+        if (!pkgs[i].desktop && pkgs[i].sku_packages > 1) continue;
+        pk = pkgs[i].json;
+        cid[0] = '{';
+        wide_copy( cid + 1, ARRAY_SIZE(cid) - 2, json_str( json_get( pk, "ContentId" ) ) );
+        wcscat( cid, L"}" );
+        CLSIDFromString( cid, &d->content_id );
+        if (!d->family[0]) wide_copy( d->family, ARRAY_SIZE(d->family), json_str( json_get( pk, "PackageFamilyName" ) ) );
+        d->size = (UINT64)json_get( pk, "MaxInstallSizeInBytes" )->number;
+        if (!d->size) d->size = (UINT64)json_get( pk, "MaxDownloadSizeInBytes" )->number;
+        fmt = json_str( json_get( pk, "PackageFormat" ) );
+        d->uwp = !catalogue_format_xvc( fmt );
+        d->encrypted = d->uwp && catalogue_format_encrypted( fmt );
+        d->found = TRUE;
+        break;
     }
+    wide_copy( d->wu_category, ARRAY_SIZE(d->wu_category),
+               catalogue_wu_category( prod, i < count ? pkgs[i].sku : ~0u ) );
+    free( pkgs );
     if (!d->found)
     {
         d->found = TRUE;
