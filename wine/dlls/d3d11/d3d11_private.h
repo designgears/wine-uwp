@@ -645,6 +645,68 @@ HRESULT d3d_video_decoder_create(struct d3d_device *device, const D3D11_VIDEO_DE
         const D3D11_VIDEO_DECODER_CONFIG *config, struct d3d_video_decoder **decoder);
 struct d3d_video_decoder *unsafe_impl_from_ID3D11VideoDecoder(ID3D11VideoDecoder *iface);
 
+/* videoproc.c: video processing, done on the CPU through the immediate context */
+struct d3d_video_processor_enum
+{
+    ID3D11VideoProcessorEnumerator ID3D11VideoProcessorEnumerator_iface;
+    LONG refcount;
+
+    struct wined3d_private_store private_store;
+    struct d3d_device *device;
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC desc;
+};
+
+struct d3d_video_processor
+{
+    ID3D11VideoProcessor ID3D11VideoProcessor_iface;
+    LONG refcount;
+
+    struct wined3d_private_store private_store;
+    struct d3d_device *device;
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC desc;
+
+    BOOL output_rect_enabled, src_rect_enabled, dst_rect_enabled;
+    RECT output_rect, src_rect, dst_rect;
+    ID3D11Texture2D *staging;
+    D3D11_TEXTURE2D_DESC staging_desc;
+};
+
+struct d3d_video_processor_view
+{
+    union
+    {
+        ID3D11VideoProcessorInputView ID3D11VideoProcessorInputView_iface;
+        ID3D11VideoProcessorOutputView ID3D11VideoProcessorOutputView_iface;
+    };
+    LONG refcount;
+    BOOL output;
+
+    struct wined3d_private_store private_store;
+    struct d3d_device *device;
+    ID3D11Resource *resource;
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_desc;
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_desc;
+};
+
+enum d3d_video_processor_rect
+{
+    D3D_VIDEO_PROCESSOR_RECT_OUTPUT,
+    D3D_VIDEO_PROCESSOR_RECT_SOURCE,
+    D3D_VIDEO_PROCESSOR_RECT_DEST,
+};
+
+HRESULT d3d_video_processor_enum_create(struct d3d_device *device, const D3D11_VIDEO_PROCESSOR_CONTENT_DESC *desc,
+        struct d3d_video_processor_enum **enumerator);
+HRESULT d3d_video_processor_create(struct d3d_device *device, ID3D11VideoProcessorEnumerator *enumerator,
+        struct d3d_video_processor **processor);
+HRESULT d3d_video_processor_view_create(struct d3d_device *device, ID3D11Resource *resource,
+        const D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC *input_desc,
+        const D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC *output_desc, struct d3d_video_processor_view **view);
+void d3d_video_processor_set_rect(ID3D11VideoProcessor *iface, enum d3d_video_processor_rect which,
+        UINT stream_idx, BOOL enable, const RECT *rect);
+HRESULT d3d_video_processor_blt(ID3D11DeviceContext *context, ID3D11VideoProcessor *processor,
+        ID3D11VideoProcessorOutputView *output, UINT stream_count, const D3D11_VIDEO_PROCESSOR_STREAM *streams);
+
 /* Layered device */
 enum dxgi_device_layer_id
 {

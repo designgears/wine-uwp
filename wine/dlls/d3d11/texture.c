@@ -1043,7 +1043,9 @@ HRESULT d3d_texture2d_create(struct d3d_device *device, const D3D11_TEXTURE2D_DE
                 desc->ArraySize, levels, flags, (struct wined3d_sub_resource_data *)data,
                 texture, &d3d_texture2d_wined3d_parent_ops, &texture->wined3d_texture)))
         {
-            WARN("Failed to create wined3d texture, hr %#lx.\n", hr);
+            WARN("Failed to create wined3d texture, hr %#lx: %ux%u, format %#x, %u levels, %u layers, usage %#x, "
+                    "bind %#x, cpu %#x, misc %#x.\n", hr, desc->Width, desc->Height, desc->Format, desc->MipLevels,
+                    desc->ArraySize, desc->Usage, desc->BindFlags, desc->CPUAccessFlags, desc->MiscFlags);
             free(texture);
             wined3d_mutex_unlock();
             if (hr == WINED3DERR_NOTAVAILABLE || hr == WINED3DERR_INVALIDCALL)

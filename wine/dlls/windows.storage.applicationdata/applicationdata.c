@@ -1584,12 +1584,14 @@ static HRESULT application_data_folder( const WCHAR *state, IStorageFolder **val
 
     if (!CreateDirectoryW( path, NULL ) && GetLastError() != ERROR_ALREADY_EXISTS)
     {
-        /* the Packages\<family> level may not exist yet either */
-        WCHAR *sep = wcsrchr( path, '\\' );
-        *sep = 0;
-        if (!CreateDirectoryW( path, NULL ) && GetLastError() != ERROR_ALREADY_EXISTS)
-            return HRESULT_FROM_WIN32( GetLastError() );
-        *sep = '\\';
+        /* Packages and Packages\<family> may not exist yet either (a fresh prefix has no Packages) */
+        WCHAR *sep = path + wcslen( path ) - wcslen( state ) - wcslen( family ) - 10;
+        while ((sep = wcschr( sep + 1, '\\' )))
+        {
+            *sep = 0;
+            CreateDirectoryW( path, NULL );
+            *sep = '\\';
+        }
         if (!CreateDirectoryW( path, NULL ) && GetLastError() != ERROR_ALREADY_EXISTS)
             return HRESULT_FROM_WIN32( GetLastError() );
     }

@@ -1,5 +1,5 @@
 MODULE    = wineuwp-launch.exe
-IMPORTS   = advapi32 user32
+IMPORTS   = advapi32 user32 psapi
 
 EXTRADLLFLAGS = -mwindows -municode
 

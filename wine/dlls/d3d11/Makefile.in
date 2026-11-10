@@ -18,4 +18,5 @@ SOURCES = \
 	state.c \
 	texture.c \
 	utils.c \
+	videoproc.c \
 	view.c

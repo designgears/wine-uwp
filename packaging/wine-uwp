@@ -74,7 +74,10 @@ case $cmd in
         if [ -e "$data/logs/.$app.stop" ]; then rm -f "$data/logs/.$app.stop"; "$bin/wineserver" -k; fi
         sleep 1
       done ) &
-    UWP_STAGE=$app UWP_TIMEOUT=0 UWP_LOG="$data/logs/$app.log" exec "$root/run.sh" ;;
+    # keep the screen awake while the app runs (inhibit-idle.py: on Windows a controller counts as user activity,
+    # Linux desktops don't see it). It runs run.sh, keeping this pid, so the watcher above still sees the app.
+    UWP_STAGE=$app UWP_TIMEOUT=0 UWP_LOG="$data/logs/$app.log" \
+      exec "$PY" -I "$root/packaging/inhibit-idle.py" "$app" "$root/run.sh" ;;
   stop)
     app=${1:-$(installed | head -1)}
     running "$app" || exit 0
