@@ -41,6 +41,7 @@
 #include "wine/debug.h"
 #include "wine/appxinstall.h"
 #include "wine/json.h"
+#include "wine/storecatalogue.h"
 
 /* what the package's own client answers when the Gaming Services service is not there */
 #define GP_E_NO_SERVICE ((HRESULT)0x87E00196)

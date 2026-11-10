@@ -253,6 +253,27 @@ HRESULT WINAPI XboxAuthOwnsProduct( const char *product )
     return collections_owns( product ? product : "" );
 }
 
+/* Signs in for a program with no app window (wineuwp-install --store): the stored account if there is one, otherwise
+ * the browser device-code sign-in, whose instructions (link and code) go to stdout. */
+HRESULT WINAPI XboxAuthSignIn( void )
+{
+    HRESULT hr = sign_in_silently();
+
+    if (hr == XA_E_NO_ACCOUNT)
+    {
+        hr = sign_in_with_device_code( NULL );
+        if (SUCCEEDED(hr))
+        {
+            char *gamertag = account_field( &account.gtg );
+            if (*gamertag) printf( "Signed in as %s.\n", gamertag );
+            else printf( "Signed in.\n" );
+            fflush( stdout );
+            free( gamertag );
+        }
+    }
+    return hr;
+}
+
 /* The content keys of an encrypted Store package (content id from the catalogue), as "keyid:key;..." in hex for the
  * installer. winegameplatform calls it when the Xbox app installs an EAppx/EMsix or MSIXVC package. */
 HRESULT WINAPI XboxAuthContentKeys( const char *content_id, const char *market, char *out, UINT32 size )

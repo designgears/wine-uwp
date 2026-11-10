@@ -84,6 +84,10 @@ struct appx_store_package
  * WuCategoryId), from the delivery service. */
 HRESULT CDECL appx_store_find_package( const char *category, const WCHAR *family, struct appx_store_package *package );
 
+/* The same for one package by its moniker (case-insensitive), which may be older than the newest. */
+HRESULT CDECL appx_store_find_package_moniker( const char *category, const WCHAR *family, const char *moniker,
+                                               struct appx_store_package *package );
+
 /* Its download address; free it with appx_free. */
 HRESULT CDECL appx_store_package_url( const struct appx_store_package *package, char **url );
 

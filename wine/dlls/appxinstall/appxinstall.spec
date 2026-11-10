@@ -3,5 +3,6 @@
 @ cdecl appx_latest(wstr ptr)
 @ cdecl appx_store_get(wstr wstr ptr ptr)
 @ cdecl appx_store_find_package(str wstr ptr)
+@ cdecl appx_store_find_package_moniker(str wstr str ptr)
 @ cdecl appx_store_package_url(ptr ptr)
 @ cdecl appx_free(ptr)

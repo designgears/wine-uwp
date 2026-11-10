@@ -332,8 +332,10 @@ static BOOL moniker_matches( const char *moniker, const char *name, const char *
 
 /* The packages of a category come from SyncUpdates. The protocol answers with the infrastructure
  * ("non-leaf") updates first; reporting those as installed in the next request is what makes it go
- * on to the packages. Of those, this keeps the family's newest, a bundle or x64. */
-HRESULT CDECL appx_store_find_package( const char *category, const WCHAR *family, struct appx_store_package *package )
+ * on to the packages. Of those, this keeps the family's newest, a bundle or x64; or, with a moniker, that package
+ * (an older version the delivery service still lists). */
+HRESULT CDECL appx_store_find_package_moniker( const char *category, const WCHAR *family, const char *want,
+                                               struct appx_store_package *package )
 {
     static const WCHAR path[] = L"/ClientWebService/client.asmx";
     struct update_ids installed = {0}, other = {0};
@@ -345,7 +347,7 @@ HRESULT CDECL appx_store_find_package( const char *category, const WCHAR *family
     HRESULT hr;
     int pass, len;
 
-    TRACE( "category %s, family %s.\n", debugstr_a( category ), debugstr_w( family ) );
+    TRACE( "category %s, family %s, package %s.\n", debugstr_a( category ), debugstr_w( family ), debugstr_a( want ) );
 
     memset( package, 0, sizeof(*package) );
     len = WideCharToMultiByte( CP_UTF8, 0, family, -1, NULL, 0, NULL, NULL );
@@ -430,6 +432,7 @@ HRESULT CDECL appx_store_find_package( const char *category, const WCHAR *family
                                sizeof(revision) ))
                 strcpy( revision, "1" );
             if (!moniker_matches( moniker, name, publisher, &version ) || (found && version <= best)) continue;
+            if (want && _stricmp( moniker, want )) continue;
             lstrcpynA( package->moniker, moniker, sizeof(package->moniker) );
             lstrcpynA( package->update_id, update_id, sizeof(package->update_id) );
             lstrcpynA( package->revision, revision, sizeof(package->revision) );
@@ -449,6 +452,11 @@ done:
     strbuf_free( &request );
     strbuf_free( &response );
     return hr;
+}
+
+HRESULT CDECL appx_store_find_package( const char *category, const WCHAR *family, struct appx_store_package *package )
+{
+    return appx_store_find_package_moniker( category, family, NULL, package );
 }
 
 /* The first four bytes of a download: a package is a zip ("PK"), its block map a cabinet ("MSCF"). */
