@@ -4,6 +4,7 @@
 @ stdcall XboxAuthGamerPicture(long ptr ptr)
 @ stdcall XboxAuthGetTokenAndSignature(str str long ptr long ptr long ptr ptr long ptr)
 @ stdcall XboxAuthHttpGet(str str str ptr ptr ptr)
+@ stdcall XboxAuthLicenceError(ptr long)
 @ stdcall XboxAuthOwnsProduct(str)
 @ stdcall XboxAuthSelfTest(str str)
 @ stdcall XboxAuthSetTitleContext(str long)

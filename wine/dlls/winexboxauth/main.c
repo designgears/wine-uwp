@@ -190,10 +190,12 @@ done:
 
 /* Does the signed-in account own Store product ARG outright? collections.mp.microsoft.com's v7.0 query with the
  * account as beneficiary: S_OK owned, S_FALSE not (subscription access is not ownership; gameplatform checks that
- * from the content access data). */
+ * from the content access data). It takes the same tickets as the licensing service: the device's in Authorization
+ * (a WLID1.0 user ticket there is refused, InvalidDeviceToken) and the account's www.microsoft.com one as the
+ * beneficiary (the collections-scoped one is MalformedParameter). */
 HRESULT collections_owns( const char *product )
 {
-    char *ticket = NULL, *puid, *t, *p, *pr, *body, *headers;
+    char *ticket = NULL, *device_ticket = NULL, *puid, *t, *p, *pr, *body, *headers;
     struct buf resp = {0};
     struct json *j;
     const struct json *items;
@@ -203,19 +205,20 @@ HRESULT collections_owns( const char *product )
 
     account_init();
     load_refresh_token();
+    if (FAILED(hr = windev_device_ticket( &device_ticket ))) return hr;
+    EnterCriticalSection( &account.signin_cs );
+    hr = msa_refresh( "service::www.microsoft.com::MBI_SSL", &ticket );
+    LeaveCriticalSection( &account.signin_cs );
+    if (FAILED(hr))
+    {
+        str_wipe_free( device_ticket );
+        return hr;
+    }
     puid = account_field( &account.puid );
     if (!*puid)
     {
         free( puid );
         puid = store_get( "puid" );
-    }
-    EnterCriticalSection( &account.signin_cs );
-    hr = msa_refresh( "service::collections.mp.microsoft.com::MBI_SSL", &ticket );
-    LeaveCriticalSection( &account.signin_cs );
-    if (FAILED(hr))
-    {
-        free( puid );
-        return hr;
     }
     t = json_escape( ticket );
     p = json_escape( S(puid) );
@@ -223,7 +226,7 @@ HRESULT collections_owns( const char *product )
     body = strf( "{\"beneficiaries\":[{\"identityType\":\"msa\",\"identityValue\":\"%s\",\"localTicketReference\":\"%s\"}],"
                  "\"maxPageSize\":25,\"market\":\"US\",\"productSkuIds\":[{\"productId\":\"%s\"}],\"validityType\":\"Valid\"}",
                  t, p, pr );
-    headers = strf( "Content-Type: application/json\r\nAuthorization: WLID1.0=\"t=%s\"\r\n", ticket );
+    headers = strf( "Content-Type: application/json\r\nAuthorization: %s\r\n", device_ticket );
     status = http_request( L"POST", "https://collections.mp.microsoft.com/v7.0/collections/query", headers, body,
                            strlen( body ), &resp );
     str_wipe_free( headers );
@@ -233,13 +236,17 @@ HRESULT collections_owns( const char *product )
     free( pr );
     free( puid );
     str_wipe_free( ticket );
+    str_wipe_free( device_ticket );
+    j = json_parse( resp.p, resp.n );
     if (status != 200)
     {
-        TRACE( "collections query for %s: HTTP %lu\n", debugstr_a(product), status );
+        /* only the error code: the answer quotes the request's ticket */
+        TRACE( "collections query for %s: HTTP %lu, %s\n", debugstr_a(product), status,
+               json_str( json_get( json_get( j, "innererror" ), "code" ) ) );
+        json_free( j );
         buf_free( &resp );
         return XA_E_NETWORK;
     }
-    j = json_parse( resp.p, resp.n );
     items = json_get( j, "items" );
     owned = items->type == JSON_ARRAY && items->count;
     json_free( j );
@@ -258,20 +265,25 @@ HRESULT WINAPI XboxAuthOwnsProduct( const char *product )
 HRESULT WINAPI XboxAuthSignIn( void )
 {
     HRESULT hr = sign_in_silently();
+    BOOL saved = SUCCEEDED(hr);
 
-    if (hr == XA_E_NO_ACCOUNT)
+    if (hr == XA_E_NO_ACCOUNT) hr = sign_in_with_device_code( NULL );
+    if (SUCCEEDED(hr))
     {
-        hr = sign_in_with_device_code( NULL );
-        if (SUCCEEDED(hr))
-        {
-            char *gamertag = account_field( &account.gtg );
-            if (*gamertag) printf( "Signed in as %s.\n", gamertag );
-            else printf( "Signed in.\n" );
-            fflush( stdout );
-            free( gamertag );
-        }
+        /* a saved sign-in is used without a word otherwise, and it may be another account than the one meant */
+        char *gamertag = account_field( &account.gtg );
+        if (*gamertag) printf( "Signed in as %s%s.\n", gamertag, saved ? " (the saved sign-in)" : "" );
+        else printf( saved ? "Signed in (the saved sign-in).\n" : "Signed in.\n" );
+        fflush( stdout );
+        free( gamertag );
     }
     return hr;
+}
+
+/* Why the licensing service refused the last XboxAuthContentKeys: "HTTP 400, code ..., message ..." ("" if none). */
+void WINAPI XboxAuthLicenceError( char *out, UINT32 size )
+{
+    licence_error_text( out, size );
 }
 
 /* The content keys of an encrypted Store package (content id from the catalogue), as "keyid:key;..." in hex for the

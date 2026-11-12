@@ -1138,6 +1138,31 @@ HRESULT windev_service_ticket( const char *scope, const char *policy, char **tic
 
 /* ---- licensing.mp.microsoft.com: the content keys of a package this account is entitled to ---- */
 
+/* Why the licensing service last refused a licence, for the installer to show: the HTTP status and the fault's
+ * fields (the inner error's when there is one: {"code":"BadRequest", "innererror":{"faultcode":3043, "code":
+ * "DeviceNameNotHexBinary", "message":...}}). Nothing from the request. */
+static char last_licence_error[512];
+
+static void licence_error_fields( const struct json *j, struct buf *out )
+{
+    static const char *const names[] = { "faultcode", "code", "message" };
+    const struct json *e = json_get( j, "innererror" );
+    unsigned int k;
+
+    if (e->type != JSON_OBJECT) e = j;
+    for (k = 0; k < ARRAY_SIZE(names); k++)
+        if (*json_str( json_get( e, names[k] ) ))
+            buf_printf( out, ", %s %.200s", names[k], json_str( json_get( e, names[k] ) ) );
+}
+
+void licence_error_text( char *out, UINT32 size )
+{
+    windev_init();
+    EnterCriticalSection( &windev_cs );
+    if (size) lstrcpynA( out, last_licence_error, size );
+    LeaveCriticalSection( &windev_cs );
+}
+
 HRESULT content_keys( const char *content_id, const char *market, struct content_key **keys, unsigned *count,
                       char **package_full_name )
 {
@@ -1200,7 +1225,16 @@ HRESULT content_keys( const char *content_id, const char *market, struct content
     value = json_str( json_get( json_at( json_get( json_get( j, "license" ), "keys" ), 0 ), "value" ) );
     if (status != 200 || !*value)
     {
+        struct buf why = {0};
+
         TRACE( "windev: licence for %s: HTTP %lu: %.500s\n", content_id, status, buf_str( &resp ) );
+        if (status) buf_printf( &why, "HTTP %lu", status );
+        else buf_printf( &why, "no answer" );
+        licence_error_fields( j, &why );
+        EnterCriticalSection( &windev_cs );
+        lstrcpynA( last_licence_error, buf_str( &why ), sizeof(last_licence_error) );
+        LeaveCriticalSection( &windev_cs );
+        buf_free( &why );
         json_free( j );
         buf_free( &resp );
         return status == 200 || status == 403 || status == 400 ? XA_E_MSA : XA_E_NETWORK;
