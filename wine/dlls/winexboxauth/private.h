@@ -237,6 +237,7 @@ HRESULT windev_device_ticket( char **ticket );
 HRESULT windev_service_ticket( const char *scope, const char *policy, char **ticket );
 HRESULT content_keys( const char *content_id, const char *market, struct content_key **keys, unsigned *count,
                       char **package_full_name );
+void licence_error_text( char *out, UINT32 size );
 
 /* ---- COM objects: up to five untyped vtables ---- */
 

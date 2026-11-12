@@ -299,6 +299,45 @@ static struct store_candidate *store_candidates( const struct json *product, con
     return list;
 }
 
+/* What the licensing service said when it refused (winexboxauth keeps it), as a line of the output. */
+static void refusal_reason( const char *full_name )
+{
+    typedef void (WINAPI *error_fn)( char *, UINT32 );
+    HMODULE auth = GetModuleHandleW( L"winexboxauth.dll" );
+    error_fn get_error = auth ? (void *)GetProcAddress( auth, "XboxAuthLicenceError" ) : NULL;
+    char why[512] = "";
+
+    if (get_error) get_error( why, sizeof(why) );
+    if (why[0]) out( "licensing service, %s: %s", full_name, why );
+}
+
+/* Does the signed-in account own the Store product? S_OK yes, S_FALSE no, an error if nobody can tell. */
+static HRESULT owns_product( const char *product_id )
+{
+    typedef HRESULT (WINAPI *owns_fn)( const char * );
+    HMODULE auth = GetModuleHandleW( L"winexboxauth.dll" );
+    owns_fn owns = auth ? (void *)GetProcAddress( auth, "XboxAuthOwnsProduct" ) : NULL;
+
+    if (!owns || !*product_id) return E_NOTIMPL;
+    return owns( product_id );
+}
+
+/* The signed-in account doesn't own it: get it with that account, or sign in with another one. */
+static void not_owned( const char *product_id )
+{
+    static char *(CDECL *unix_name)( const WCHAR * );
+    WCHAR store[MAX_PATH];
+    char *path = NULL;
+
+    if (!unix_name) unix_name = (void *)GetProcAddress( GetModuleHandleW( L"kernel32.dll" ), "wine_get_unix_file_name" );
+    if (ExpandEnvironmentStringsW( L"%LOCALAPPDATA%\\wineuwp\\xboxauth.bin", store, ARRAY_SIZE(store) ) && unix_name)
+        path = unix_name( store );
+    fail( "The signed-in account doesn't own this product. \"Get\" it once with that account "
+          "(https://apps.microsoft.com/detail/%s; free apps too), or, to sign in with the account that owns it, delete "
+          "%s and run this again.", product_id, path ? path : "%LOCALAPPDATA%\\wineuwp\\xboxauth.bin in the prefix" );
+    HeapFree( GetProcessHeap(), 0, path );
+}
+
 /* The Store's newest package of a product (a Store id) or package family, through the catalogue and the delivery
  * service: what an install from the Store would fetch. *url_ret receives its download address, and keys (keys_size
  * bytes) its content keys if it is encrypted. With url_ret NULL it only reports what it found.
@@ -312,7 +351,7 @@ static int store_package( const WCHAR *arg, BOOL allow_older, WCHAR **url_ret, c
     struct store_candidate *list = NULL, *chosen = NULL, newest;
     const struct json *product;
     struct json *root;
-    char *body, *url, category[64], family_a[256];
+    char *body, *url, category[64], family_a[256], product_id[64];
     unsigned int count, i;
     WCHAR path[512], family[256], id[64];
     content_keys_fn get_keys = NULL;
@@ -341,6 +380,8 @@ static int store_package( const WCHAR *arg, BOOL allow_older, WCHAR **url_ret, c
     appx_free( body );
     product = catalogue_product( root );
     lstrcpynA( family_a, json_str( json_get( json_get( product, "Properties" ), "PackageFamilyName" ) ), sizeof(family_a) );
+    lstrcpynA( product_id, json_str( json_get( product, "ProductId" ) ), sizeof(product_id) );
+    if (!product_id[0] && !by_family) WideCharToMultiByte( CP_UTF8, 0, id, -1, product_id, sizeof(product_id), NULL, NULL );
     list = store_candidates( product, family_a, &count );
     lstrcpynA( category, catalogue_wu_category( product, ~0u ), sizeof(category) );
     if (!category[0] || !family_a[0])
@@ -408,22 +449,32 @@ static int store_package( const WCHAR *arg, BOOL allow_older, WCHAR **url_ret, c
             fail( "--store: licence error %#lx", hr );
             goto done;
         }
+        refusal_reason( c->full_name );
         if (!allow_older)
         {
-            fail( "The Store's licensing service refused the licence for %s. Older versions of this product may still "
-                  "be licensed: --allow-older (wine-uwp install-store ID --allow-older) installs the newest one that "
-                  "is, which the Store no longer offers.", c->full_name );
+            if (owns_product( product_id ) == S_FALSE) not_owned( product_id );
+            else
+                fail( "The Store's licensing service refused the licence for %s. Older versions of this product may "
+                      "still be licensed: --allow-older (wine-uwp install-store ID --allow-older) installs the newest "
+                      "one that is, which the Store no longer offers.", c->full_name );
             goto done;
         }
         out( "the licensing service refused %s; trying an older version (--allow-older)", c->full_name );
     }
     if (!chosen)
     {
-        if (by_family)
-            fail( "The Store gave no licence for any version of this package. Does the signed-in account own it?" );
+        hr = owns_product( product_id );
+        if (hr == S_FALSE) not_owned( product_id );
+        else if (hr == S_OK)
+            fail( "The Store gave no licence for any version of this package, although the signed-in account owns it. "
+                  "The Store refuses new devices once an account has 10 that download Store apps and games, and every "
+                  "wine-uwp setup (each prefix, Flatpak or reinstall) is a new device, shown as \"PC\". Remove the ones "
+                  "you no longer use at https://account.microsoft.com/devices/content and run this again." );
         else
-            fail( "The Store gave no licence for any version of this package. Does the signed-in account own it? "
-                  "(A free app needs \"Get\" once: https://apps.microsoft.com/detail/%ls)", id );
+            fail( "The Store gave no licence for any version of this package. Either the signed-in account doesn't own "
+                  "it (a free app needs \"Get\" once: https://apps.microsoft.com/detail/%s), or it has reached the "
+                  "Store's limit of 10 download devices (remove old ones at https://account.microsoft.com/devices/content).",
+                  *product_id ? product_id : "STOREID" );
         goto done;
     }
     if (chosen != list && chosen != &newest &&
