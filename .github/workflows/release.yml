@@ -1,0 +1,113 @@
+# Builds the wine-uwp runtime (packaging/build-dist.sh) and, for a tag, publishes it as a release:
+#
+#   git tag v2026.11.12 && git push origin v2026.11.12
+#
+# The release gets wine-uwp-x86_64.tar.xz (the tree build-dist.sh makes, as wine-uwp/) and its .sha256, so
+# https://github.com/OWNER/wine-uwp/releases/latest/download/wine-uwp-x86_64.tar.xz is always the newest one.
+# Run by hand (Actions > Release > Run workflow) or for a pull request that changes the build, it only builds and
+# keeps the tarball as a workflow artifact.
+#
+# Wine is built as README.md says: the Wine release in WINE_VERSION, wine/'s files (wine/FILES) copied over it,
+# autoreconf, --enable-archs=x86_64. Nothing Microsoft's goes in; the setup harvests that on the user's machine.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'packaging/build-dist.sh'
+      - 'wine/FILES'
+
+permissions:
+  contents: write
+
+env:
+  WINE_VERSION: '11.20'
+
+jobs:
+  build:
+    # the result needs glibc 2.38 (Ubuntu 24.04, Debian 13, Fedora 39, Arch and newer); its mingw-w64 GCC 13 builds
+    # Wine 11 (g++ too: without a PE C++17 compiler icu.dll and dmsynth.dll are left out)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            autoconf bison flex gettext gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 ccache xz-utils \
+            libasound2-dev libpulse-dev libdbus-1-dev libfontconfig-dev libfreetype-dev libgnutls28-dev \
+            libgl-dev libegl-dev libvulkan-dev libwayland-dev wayland-protocols libxkbcommon-dev libxkbregistry-dev \
+            libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxfixes-dev libxi-dev libxinerama-dev \
+            libxrandr-dev libxrender-dev libxxf86vm-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libavcodec-dev libavformat-dev libavutil-dev \
+            libudev-dev libusb-1.0-0-dev libsdl2-dev libpcap-dev libpcsclite-dev libkrb5-dev libunwind-dev \
+            libv4l-dev libcups2-dev
+
+      - name: Restore the compiler cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ env.WINE_VERSION }}-${{ github.sha }}
+          restore-keys: ccache-${{ env.WINE_VERSION }}-
+
+      - name: Wine source with wine-uwp's files
+        run: |
+          major=${WINE_VERSION%%.*}
+          curl -fsSL -o wine.tar.xz "https://dl.winehq.org/wine/source/${major}.x/wine-${WINE_VERSION}.tar.xz"
+          mkdir -p "$RUNNER_TEMP/wine-src"
+          tar -xf wine.tar.xz -C "$RUNNER_TEMP/wine-src" --strip-components=1
+          rm wine.tar.xz
+          # exactly the files listed in wine/FILES (not wine/README.md, BASE.txt or FILES itself)
+          grep -v '^\s*#' wine/FILES | grep -v '^\s*$' | while read -r f; do
+            mkdir -p "$RUNNER_TEMP/wine-src/$(dirname "$f")"
+            cp -f "wine/$f" "$RUNNER_TEMP/wine-src/$f"
+          done
+          cd "$RUNNER_TEMP/wine-src" && autoreconf -f
+
+      - name: Build Wine
+        run: |
+          export CCACHE_DIR=~/.cache/ccache CCACHE_MAXSIZE=2G
+          mkdir -p "$RUNNER_TEMP/wine-build" && cd "$RUNNER_TEMP/wine-build"
+          "$RUNNER_TEMP/wine-src/configure" --enable-archs=x86_64 \
+            CC="ccache gcc" CXX="ccache g++" x86_64_CC="ccache x86_64-w64-mingw32-gcc" \
+            x86_64_CXX="ccache x86_64-w64-mingw32-g++" > configure.out
+          tail -n 30 configure.out
+          make -j"$(nproc)" > make.out 2>&1 || { tail -n 80 make.out; exit 1; }
+          ccache -s
+
+      - name: Package
+        run: |
+          WINE_BUILD="$RUNNER_TEMP/wine-build" packaging/build-dist.sh "$RUNNER_TEMP/dist/wine-uwp"
+          cd "$RUNNER_TEMP/dist"
+          tar --owner=0 --group=0 --numeric-owner -cf - wine-uwp | xz -T0 -9 > wine-uwp-x86_64.tar.xz
+          sha256sum wine-uwp-x86_64.tar.xz > wine-uwp-x86_64.tar.xz.sha256
+          cat wine-uwp-x86_64.tar.xz.sha256
+          echo "glibc needed: $(objdump -T wine-uwp/bin/wine wine-uwp/lib/wine/x86_64-unix/*.so | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+
+      - name: Keep the tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: wine-uwp-x86_64
+          path: |
+            ${{ runner.temp }}/dist/wine-uwp-x86_64.tar.xz
+            ${{ runner.temp }}/dist/wine-uwp-x86_64.tar.xz.sha256
+          retention-days: 14
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$RUNNER_TEMP/dist"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --latest \
+            --title "wine-uwp $GITHUB_REF_NAME" \
+            --notes "wine-uwp runtime built from $(git -C "$GITHUB_WORKSPACE" rev-parse --short HEAD) (Wine $WINE_VERSION + this repository's changes), x86_64 Linux. Unpack with \`tar -xf wine-uwp-x86_64.tar.xz -C ~/.local/opt\`, then see README.md (\"Using it\"). No Microsoft files are included." \
+            wine-uwp-x86_64.tar.xz wine-uwp-x86_64.tar.xz.sha256
