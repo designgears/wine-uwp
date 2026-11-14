@@ -299,10 +299,27 @@ static int __cdecl compare_names( const void *a, const void *b )
     return wcscmp( *(const WCHAR **)a, *(const WCHAR **)b );
 }
 
+/* Name_Version_Arch_ResourceId_PublisherId: whether a and b are versions of one framework (same name, arch and
+ * publisher), and if so whether a is the older. */
+static BOOL older_of_same_family( const WCHAR *a, const WCHAR *b )
+{
+    const WCHAR *va = wcschr( a, '_' ), *vb = wcschr( b, '_' ), *ra, *rb;
+    unsigned int x[4] = {0}, y[4] = {0}, i;
+
+    if (!va || !vb || va - a != vb - b || wcsnicmp( a, b, va - a )) return FALSE;
+    if (!(ra = wcschr( va + 1, '_' )) || !(rb = wcschr( vb + 1, '_' )) || wcsicmp( ra, rb )) return FALSE;
+    swscanf( va + 1, L"%u.%u.%u.%u", &x[0], &x[1], &x[2], &x[3] );
+    swscanf( vb + 1, L"%u.%u.%u.%u", &y[0], &y[1], &y[2], &y[3] );
+    for (i = 0; i < 4; i++) if (x[i] != y[i]) return x[i] < y[i];
+    return FALSE;
+}
+
 /* What the installer writes into launch.env for an installed app, for a stage beside a frameworks directory:
  * WINE_UWP_PACKAGE_DEPENDENCIES ("fullname|family|path;" each, which GetCurrentPackageInfo returns after the main
  * package) unless set, and every framework root appended to WINEPATH, as Windows adds the package graph to the
- * search path. In the order of the host's sorted directory listing, as run.sh's glob gave them. */
+ * search path. In the order of the host's sorted directory listing, as run.sh's glob gave them. Of several versions
+ * of one framework only the newest, as Windows resolves the package graph: listing them all loaded WinUI 8.2310 and
+ * 8.2501 side by side into the Microsoft Store. */
 static void add_frameworks(void)
 {
     WCHAR pattern[MAX_PATH], root[MAX_PATH], item[1024], *deps = NULL, *path, *slash, **names = NULL, **grown;
@@ -330,7 +347,11 @@ static void add_frameworks(void)
     path = env( L"WINEPATH" );
     for (i = 0; i < count; i++)
     {
+        unsigned int j;
+
         name = names[i];
+        for (j = 0; j < count; j++) if (j != i && names[j] && older_of_same_family( name, names[j] )) break;
+        if (j < count) continue;
         publisher = wcsstr( name, L"__" );
         swprintf( item, ARRAY_SIZE(item), L"%s|%.*s_%s|%s\\%s;", name, (int)wcscspn( name, L"_" ), name,
                   publisher ? publisher + 2 : L"", root, name );
@@ -341,8 +362,8 @@ static void add_frameworks(void)
         if ((slash = wcsstr( item, L"Z:/" )) || (slash = wcsstr( item, L"z:/" )))
             memmove( slash, slash + 2, (wcslen( slash + 2 ) + 1) * sizeof(WCHAR) );
         append( &path, item );
-        free( names[i] );
     }
+    for (i = 0; i < count; i++) free( names[i] );
     free( names );
     if (deps && !have_deps) SetEnvironmentVariableW( L"WINE_UWP_PACKAGE_DEPENDENCIES", deps );
     if (path) SetEnvironmentVariableW( L"WINEPATH", path );
