@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     21dd12eb7b292ec3308faeb9aafda6d7c29fbde6
-                 wineuwp-launch: Of several versions of one framework, depend only on the newest.
+  wine HEAD:     8ee3b46094e4eb07c87ec9877f38fc93628007dd
+                 ntdll: Map a large image's unaligned sections from a page-aligned cache file.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-14T16:14:00Z
+  captured:      2026-11-14T16:23:42Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

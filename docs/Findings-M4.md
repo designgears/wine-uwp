@@ -14459,3 +14459,22 @@ is `uwp-bin/wine-build-store` (a reflink of `~/src/wine-build`, which is from 11
 combase's `prepare_native_views_once` fails with E_NOTIMPL, which the Store turns into a `NotImplementedException`
 fail-fast at start-up. `packaging/harvest/resolve_symbols.py <prefix>/drive_c/windows/system32 <table>` (12 entries)
 fixed it. Every existing prefix will hit this once the shared build is rebuilt.
+
+### Two WinUIs in one process, and 100 MB of image read into private memory (2026-11-14)
+
+- **`wineuwp-launch --defaults` (every `run.sh` launch) declared every directory in `frameworks/` a dependency**, so
+  with 8.2310 and 8.2501 side by side the Store loaded both `Microsoft.UI.Xaml.dll`. It now takes only the newest of a
+  family, as Windows resolves the package graph. Installed apps read `launch.env` and were never affected.
+- **Calculator, Solitaire and Feedback Hub ask for WinUI 8.2501 and VCLibs 33519 as well** and have been running on the
+  ISO's 8.2310/30704. Not changed here: putting 8.2501 into the shared `uwp-bin/stage/frameworks` changes every
+  baseline. The Store's install lives in `uwp-bin/store-data` (`UWP_STAGE=../store-data/stage/store`) with its own
+  frameworks directory. Feedback Hub's open blank-with-16-fail-fasts is worth retrying on 8.2501.
+- **Wine read unaligned PE sections eagerly into private memory.** `map_file_into_view` falls back to `pread` when a
+  section's file offset is not page-aligned, which is every section of an image linked with FileAlignment 0x200 (.NET
+  Native's `WinStore.App.dll`, 102 MB: 48 MB `.text` with no relocations, 41 MB `.rdata` of which 59% of pages have
+  relocations). `/tmp/relocpages.py` in the session counts relocated pages per section. ntdll now lays such sections
+  out once at their RVAs in `<prefix>/image-cache/` (images with >= 1 MB unaligned; keyed on dev, inode, size, mtime,
+  ctime; temp file + rename) and maps them from there. Measured at 40 s on Home: WinStore.App.dll private 102 -> 5 MB,
+  process Pss_Anon 501 -> 413 MB; Home unchanged. calc (AE 4120.98 on this prefix), mp 2835, sol and kb identical with
+  `WINE_IMAGE_CACHE=0` and with the cache. Shapr3D has ~250 MB of such DLLs (pskernel 71, Shapr.Native 56,
+  Shapr3D 46), Media Player 30 MB. Old cache files are not cleaned up when an app updates.

@@ -2662,6 +2662,152 @@ static IMAGE_BASE_RELOCATION *process_relocation_block( char *page, IMAGE_BASE_R
 
 
 /***********************************************************************
+ *           Image cache
+ *
+ * A section whose data does not start on a page boundary in the file cannot be mmapped, so map_file_into_view
+ * reads it, eagerly and whole, into private memory, in every process that loads the image. Linkers align raw data
+ * to 512 bytes by default; .NET Native apps are linked that way, and the Microsoft Store's WinStore.App.dll is
+ * 100 MB of it: 48 MB of code without a single relocation, read in full at start-up and never shared. Windows keeps
+ * one copy of an image section for every process.
+ *
+ * So the unaligned sections of a large image are laid out once at their virtual addresses in a file under the
+ * configuration directory, and mapped from there as an aligned image would be: paged in as used, clean until a
+ * relocation writes to a page, reclaimable, and shared by every process of the prefix. The file is named after
+ * the image's device, inode, size and times, and is written under a temporary name and renamed, so a file under
+ * its final name is complete. WINE_IMAGE_CACHE=0 turns it off.
+ */
+struct image_cache
+{
+    int   fd;         /* the cache file, or -1 */
+    BOOL  building;   /* fd is a new file being written, still under its temporary name */
+    BOOL  failed;     /* writing it failed; it is removed */
+    char *path;
+    char *tmp;
+};
+
+static const SIZE_T image_cache_min = 1024 * 1024;  /* unaligned bytes below which reading them is cheaper */
+
+static BOOL image_cache_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled == -1)
+    {
+        const char *env = getenv( "WINE_IMAGE_CACHE" );
+        enabled = !env || atoi( env ) != 0;
+    }
+    return enabled;
+}
+
+static void image_cache_open( struct image_cache *cache, int fd, const struct stat *st, const IMAGE_SECTION_HEADER *sec,
+                              unsigned int count, SIZE_T total_size, BOOL removable )
+{
+    SIZE_T unaligned = 0;
+    struct stat cst;
+    unsigned int i;
+    char *dir;
+
+    cache->fd = -1;
+    cache->building = cache->failed = FALSE;
+    cache->path = cache->tmp = NULL;
+    if (removable || !config_dir || !image_cache_enabled()) return;
+    for (i = 0; i < count; i++)
+    {
+        if ((sec[i].Characteristics & IMAGE_SCN_MEM_SHARED) && (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+        if (sec[i].PointerToRawData & page_mask) unaligned += sec[i].SizeOfRawData;
+    }
+    if (unaligned < image_cache_min) return;
+
+    if (asprintf( &dir, "%s/image-cache", config_dir ) == -1) return;
+    if (asprintf( &cache->path, "%s/%llx-%llx-%llx-%llx.%09lu-%llx.%09lu", dir, (unsigned long long)st->st_dev,
+                  (unsigned long long)st->st_ino, (unsigned long long)st->st_size,
+                  (unsigned long long)st->st_mtim.tv_sec, (unsigned long)st->st_mtim.tv_nsec,
+                  (unsigned long long)st->st_ctim.tv_sec, (unsigned long)st->st_ctim.tv_nsec ) == -1)
+    {
+        cache->path = NULL;
+        free( dir );
+        return;
+    }
+    if ((cache->fd = open( cache->path, O_RDONLY | O_CLOEXEC )) != -1)
+    {
+        if (!fstat( cache->fd, &cst ) && cst.st_size == total_size)
+        {
+            TRACE_(module)( "using %s\n", debugstr_a(cache->path) );
+            free( dir );
+            return;
+        }
+        WARN_(module)( "%s has the wrong size, rebuilding it\n", debugstr_a(cache->path) );
+        close( cache->fd );
+        cache->fd = -1;
+    }
+    mkdir( dir, 0777 );
+    free( dir );
+    if (asprintf( &cache->tmp, "%s.tmp.%d.%u", cache->path, getpid(), (unsigned int)GetCurrentThreadId() ) == -1)
+    {
+        cache->tmp = NULL;
+        return;
+    }
+    if ((cache->fd = open( cache->tmp, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0666 )) == -1)
+    {
+        WARN_(module)( "cannot create %s: %s\n", debugstr_a(cache->tmp), strerror(errno) );
+        return;
+    }
+    if (ftruncate( cache->fd, total_size ) == -1)
+    {
+        cache->failed = TRUE;
+        return;
+    }
+    cache->building = TRUE;
+    TRACE_(module)( "building %s\n", debugstr_a(cache->path) );
+}
+
+/* The file to map an unaligned section from (copying it there first while building), or -1 to read it. */
+static int image_cache_section( struct image_cache *cache, int fd, off_t file_start, SIZE_T file_size, SIZE_T rva )
+{
+    static const SIZE_T chunk = 1024 * 1024;
+    SIZE_T done = 0;
+    char *buffer;
+
+    if (cache->fd == -1 || cache->failed) return -1;
+    if (!cache->building) return cache->fd;
+    if (!(buffer = malloc( chunk )))
+    {
+        cache->failed = TRUE;
+        return -1;
+    }
+    while (done < file_size)
+    {
+        ssize_t len = pread( fd, buffer, min( chunk, file_size - done ), file_start + done );
+        if (len <= 0 || pwrite( cache->fd, buffer, len, rva + done ) != len) break;
+        done += len;
+    }
+    free( buffer );
+    if (done < file_size)
+    {
+        WARN_(module)( "writing %s failed\n", debugstr_a(cache->tmp) );
+        cache->failed = TRUE;
+        return -1;
+    }
+    return cache->fd;
+}
+
+static void image_cache_close( struct image_cache *cache )
+{
+    if (cache->building && !cache->failed && rename( cache->tmp, cache->path ) == -1)
+    {
+        WARN_(module)( "cannot rename %s: %s\n", debugstr_a(cache->tmp), strerror(errno) );
+        cache->failed = TRUE;
+    }
+    if (cache->tmp && (cache->failed || !cache->building)) unlink( cache->tmp );
+    if (cache->fd != -1) close( cache->fd );
+    free( cache->path );
+    free( cache->tmp );
+    cache->fd = -1;
+    cache->building = FALSE;
+    cache->path = cache->tmp = NULL;
+}
+
+
+/***********************************************************************
  *           map_image_into_view
  *
  * Map an executable (PE format) image into an existing view.
@@ -2683,6 +2829,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     char *ptr = view->base;
     SIZE_T header_size, header_map_size, total_size = view->size;
     SIZE_T align_mask = max( image_info->alignment - 1, page_mask );
+    struct image_cache cache = { -1 };
     INT_PTR delta;
 
     TRACE_(module)( "mapping PE file %s at %p-%p\n", debugstr_us(nt_name), ptr, ptr + total_size );
@@ -2743,10 +2890,12 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 
     /* map all the sections */
 
+    image_cache_open( &cache, fd, &st, sec, nt->FileHeader.NumberOfSections, total_size, removable );
     for (i = pos = 0; i < nt->FileHeader.NumberOfSections; i++)
     {
         static const SIZE_T sector_align = 0x1ff;
         SIZE_T map_size, file_start, file_size, end;
+        int cache_fd;
 
         if (!sec[i].Misc.VirtualSize)
             map_size = ROUND_SIZE( 0, sec[i].SizeOfRawData, align_mask );
@@ -2814,15 +2963,28 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         if (!sec[i].PointerToRawData || !file_size) continue;
 
         /* Note: if the section is not aligned properly map_file_into_view will magically
-         *       fall back to read(), so we don't need to check anything here.
+         *       fall back to read(), so we don't need to check anything here; but a large image's
+         *       unaligned sections are mapped from the image cache instead.
          */
         end = file_start + file_size;
         if (sec[i].PointerToRawData >= st.st_size ||
             end > ((st.st_size + sector_align) & ~sector_align) ||
-            end < file_start ||
-            map_file_into_view( view, fd, sec[i].VirtualAddress, file_size, file_start,
-                                VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY,
-                                removable ) != STATUS_SUCCESS)
+            end < file_start)
+        {
+            ERR_(module)( "Could not map %s section %.8s, file probably truncated\n",
+                          debugstr_us(nt_name), sec[i].Name );
+            goto done;
+        }
+        if ((file_start & page_mask) &&
+            (cache_fd = image_cache_section( &cache, fd, file_start, file_size, sec[i].VirtualAddress )) != -1 &&
+            map_file_into_view( view, cache_fd, sec[i].VirtualAddress, file_size, sec[i].VirtualAddress,
+                                VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY, FALSE ) == STATUS_SUCCESS)
+        {
+            TRACE_(module)( "%s section %.8s mapped from the image cache\n", debugstr_us(nt_name), sec[i].Name );
+        }
+        else if (map_file_into_view( view, fd, sec[i].VirtualAddress, file_size, file_start,
+                                     VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY,
+                                     removable ) != STATUS_SUCCESS)
         {
             ERR_(module)( "Could not map %s section %.8s, file probably truncated\n",
                           debugstr_us(nt_name), sec[i].Name );
@@ -2839,6 +3001,8 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
             memset( ptr + sec[i].VirtualAddress + file_size, 0, end - file_size );
         }
     }
+
+    image_cache_close( &cache );
 
 #ifdef __aarch64__
     if ((dir = get_data_dir( nt, total_size, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG )))
@@ -2912,6 +3076,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     status = STATUS_SUCCESS;
 
 done:
+    image_cache_close( &cache );
     free( sections );
     return status;
 }
