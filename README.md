@@ -69,8 +69,10 @@ Data lives in `$WINE_UWP_DATA`, by default `~/.local/share/wine-uwp`. See
 ## Building
 
 1. **Wine.** Unpack the [Wine 11.20](https://dl.winehq.org/wine/source/11.x/wine-11.20.tar.xz) source, copy
-   `wine/` over it (whole files, not patches; leave out its `FILES` and `BASE.txt`), then `autoreconf -f`, `./configure --enable-archs=x86_64`
-   and `make`. Point `WINE_BIN_DIR` at the build directory.
+   `wine/` over it (whole files, not patches; leave out its `FILES` and `BASE.txt`), then `autoreconf -f`,
+   `./configure --enable-archs=i386,x86_64` and `make` (WoW64: 32-bit Windows programs such as Halo's EAC/EOS bootstrapper
+   need it; it takes both mingw-w64 cross compilers, and with GCC 13 on i386 also
+   `i386_CFLAGS='-g -O2 -mpreferred-stack-boundary=4 -mincoming-stack-boundary=2'`). Point `WINE_BIN_DIR` at the build directory.
 2. **Shims.** `./build.sh` builds them with clang-cl and lld-link against the Windows SDK headers from
    [xwin](https://github.com/Jake-Shadle/xwin) in `~/xwin`.
 3. **Runtime.** `packaging/build-dist.sh OUT`, then the steps under *Using it*.
