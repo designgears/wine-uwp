@@ -50,6 +50,7 @@
 
 static volatile LONG paused, cancelled;
 static char store_keys[8192];   /* --store: the licence's content keys, wiped after the install */
+static char store_category[64]; /* --store: the product's Windows Update category, where its frameworks are too */
 static const WCHAR *pause_file;
 
 /* writes a line as UTF-8 to stdout, which a host process reads */
@@ -401,6 +402,7 @@ static int store_package( const WCHAR *arg, BOOL allow_older, WCHAR **url_ret, c
     }
     MultiByteToWideChar( CP_UTF8, 0, family_a, -1, family, ARRAY_SIZE(family) );
     out( "family %s, category %s", family_a, category );
+    lstrcpynA( store_category, category, sizeof(store_category) );
     if (FAILED(hr = appx_store_find_package( category, family, &package )))
     {
         fail( "--store: no package, error %#lx", hr );
@@ -591,6 +593,7 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
         free( package );
         package = url;
         if (store_keys[0]) params.content_keys = store_keys;
+        params.store_category = store_category;
     }
     else if (keys) params.content_keys = read_keys( keys, keys_once );
     else if ((env = _wgetenv( L"WINE_UWP_CONTENT_KEYS" )))

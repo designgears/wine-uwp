@@ -204,6 +204,101 @@ static BOOL find_framework( const WCHAR *dirs[2], const struct dependency *dep, 
     return any && *found;
 }
 
+static void remove_tree( const WCHAR *path );
+static WCHAR *with_suffix( const WCHAR *path, const WCHAR *suffix );
+static BOOL exists( const WCHAR *path );
+static HRESULT extract( const struct package *pkg, const WCHAR *dest, const struct appx_install_params *params );
+
+/* A framework the Windows tree does not have at the version the package asks for, from the delivery service, into
+ * FW_ROOT\Name_Version_x64__PublisherId (the name find_framework looks for). An older framework is not a safe
+ * stand-in: the Microsoft Store 22609 asks for WinUI 2.8 8.2501, and on 8.2310 (the ISO's) its Home page waits for good
+ * on Microsoft.UI.Xaml.Controls.ElementFactory, which 8.2310 does not register. */
+static BOOL fetch_framework( const struct appx_install_params *params, const struct dependency *dep,
+                             const WCHAR *fw_root, const WCHAR *temp, WCHAR **found )
+{
+    WCHAR pid[14], *family = NULL, *url = NULL, *name = NULL, *dest = NULL, *partial = NULL, version_str[64];
+    struct appx_store_package sp;
+    struct package *pkg = NULL;
+    UINT64 want = 0, have = 0;
+    size_t name_len = wcslen( dep->name ), len;
+    const WCHAR *v, *end;
+    char *url_a = NULL;
+    BOOL ok = FALSE;
+    HRESULT hr;
+
+    *found = NULL;
+    if (!params->store_category || !*dep->publisher || FAILED(publisher_id( dep->publisher, pid ))) return FALSE;
+    if (!(family = malloc( (name_len + 16) * sizeof(WCHAR) ))) return FALSE;
+    swprintf( family, name_len + 16, L"%s_%s", dep->name, pid );
+    if (FAILED(hr = appx_store_find_package( params->store_category, family, &sp )))
+    {
+        WARN( "no %s in category %s: %#lx\n", debugstr_w(family), debugstr_a(params->store_category), hr );
+        goto done;
+    }
+    len = MultiByteToWideChar( CP_UTF8, 0, sp.moniker, -1, NULL, 0 );
+    if (!(name = malloc( len * sizeof(WCHAR) ))) goto done;
+    MultiByteToWideChar( CP_UTF8, 0, sp.moniker, -1, name, len );
+    /* Name_Version_x64__PublisherId: a framework is never neutral or a bundle */
+    v = name + name_len + 1;
+    if (wcsnicmp( name, dep->name, name_len ) || name[name_len] != '_' || !(end = wcschr( v, '_' )) ||
+        end - v >= ARRAY_SIZE(version_str) || wcsnicmp( end, L"_" ARCH L"__", 6 ))
+    {
+        WARN( "not an x64 framework package: %s\n", debugstr_w(name) );
+        goto done;
+    }
+    memcpy( version_str, v, (end - v) * sizeof(WCHAR) );
+    version_str[end - v] = 0;
+    parse_version( dep->min_version, &want );
+    if (!parse_version( version_str, &have ) || have < want)
+    {
+        WARN( "the Store's %s is older than %s\n", debugstr_w(name), debugstr_w(dep->min_version) );
+        goto done;
+    }
+    if (!(dest = path_join( fw_root, name )) || !(partial = with_suffix( dest, L".new" ))) goto done;
+    if (exists( dest ))
+    {
+        ok = TRUE;
+        goto done;
+    }
+    if (FAILED(hr = appx_store_package_url( &sp, &url_a )))
+    {
+        WARN( "no download address for %s: %#lx\n", debugstr_a(sp.moniker), hr );
+        goto done;
+    }
+    len = MultiByteToWideChar( CP_UTF8, 0, url_a, -1, NULL, 0 );
+    if (!(url = malloc( len * sizeof(WCHAR) ))) goto done;
+    MultiByteToWideChar( CP_UTF8, 0, url_a, -1, url, len );
+    report( params, APPX_EVENT_STAGE, 0, 0, L"Downloading framework %s", name );
+    remove_tree( partial );
+    if (!create_directories( fw_root ) || !create_directories( partial )) goto done;
+    if (FAILED(hr = package_open( url, params, temp, &pkg )) || FAILED(hr = extract( pkg, partial, params )))
+    {
+        WARN( "framework %s: %#lx\n", debugstr_w(name), hr );
+        remove_tree( partial );
+        goto done;
+    }
+    package_close( pkg );
+    pkg = NULL;
+    if (!MoveFileW( partial, dest ))
+    {
+        WARN( "framework %s: rename failed, %lu\n", debugstr_w(name), GetLastError() );
+        remove_tree( partial );
+        goto done;
+    }
+    ok = TRUE;
+
+done:
+    if (pkg) package_close( pkg );
+    if (ok) *found = name;
+    else free( name );
+    free( family );
+    free( url );
+    free( dest );
+    free( partial );
+    appx_free( url_a );
+    return ok;
+}
+
 /* ---- files ---- */
 
 /* removes a file or a directory tree; a symlink or junction is removed, not followed */
@@ -1033,6 +1128,8 @@ HRESULT CDECL appx_install( const struct appx_install_params *params )
     for (i = 0; i < m->dep_count; i++)
     {
         if (find_framework( dirs, &m->deps[i], FALSE, &fw_names[fw_count], &fw_parents[fw_count] )) fw_count++;
+        else if (fetch_framework( params, &m->deps[i], fw_root, temp, &fw_names[fw_count] ))
+            fw_parents[fw_count++] = fw_root;
         else if (find_framework( dirs, &m->deps[i], TRUE, &fw_names[fw_count], &fw_parents[fw_count] ))
         {
             report( params, APPX_EVENT_MESSAGE, 0, 0, L"framework %s: wants %s, using %s", m->deps[i].name,

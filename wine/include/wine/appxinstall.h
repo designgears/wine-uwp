@@ -47,6 +47,9 @@ struct appx_install_params
     const WCHAR *launch_defaults; /* launch-defaults.env, copied into each app's launch.env; NULL if none */
     const WCHAR *launcher;      /* wineuwp-launch.exe, copied into the stage; NULL: Wine's, from system32 */
     const WCHAR *d3d_runtime;   /* GDK games: DXVK's dxgi/d3d11 and vkd3d-proton's d3d12/d3d12core; NULL if none */
+    const char *store_category; /* a Store install's Windows Update category: a framework the Windows tree lacks at the
+                                 * version the package asks for is downloaded from it (the Store lists an app's
+                                 * frameworks in the app's category); NULL: an older one from the tree is used */
     volatile LONG *pause;       /* non-zero: wait between chunks */
     volatile LONG *cancel;      /* non-zero: stop, leave the installed copy as it was */
     appx_callback callback;

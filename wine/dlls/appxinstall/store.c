@@ -428,6 +428,7 @@ HRESULT CDECL appx_store_find_package_moniker( const char *category, const WCHAR
                 !copy_between( p, "PackageMoniker=\"", "\"", moniker, sizeof(moniker) ) ||
                 !copy_between( p, "<UpdateIdentity UpdateID=\"", "\"", update_id, sizeof(update_id) ))
                 continue;
+            TRACE( "leaf %s\n", debugstr_a( moniker ) );
             if (!copy_between( strstr( p, "<UpdateIdentity UpdateID=\"" ), "RevisionNumber=\"", "\"", revision,
                                sizeof(revision) ))
                 strcpy( revision, "1" );

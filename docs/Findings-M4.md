@@ -14430,3 +14430,32 @@ The user took over the running game for further play. Automated input, restart,
 save replacement, runtime replacement and Steam routing changes are stopped for
 that session. No installer edit, runtime promotion, push or hosted PR update was
 performed during this integration step.
+
+## 2026-11-14: Microsoft Store 22609 - the right WinUI, and where its memory goes
+
+Set up from nothing on this machine (no `stage/store` here): `prefix-store` is a reflink of `prefix-test`, the build
+is `uwp-bin/wine-build-store` (a reflink of `~/src/wine-build`, which is from 11-09 and older than the source; its
+`srcdir` is `../wine`, so `uwp-bin/wine` is a symlink to `~/src/wine`). Display `:97`, 1600x1000.
+
+- **The ISO's 22401** reaches Home with an empty hero and grey tiles; WinStore.App.exe 1.06 GB RSS.
+- **`wineuwp-install 9WZDNCRFJBMP --store`** installs 22609.1401.13.0, the catalogue's current Store. It asks for
+  WinUI 2.8 8.2501 and VCLibs 14.0.33519; the installer used the ISO's 8.2310 and 30704 ("wants ..., using ...").
+  On 8.2310 Home stayed on its loading skeletons drawn over half-loaded rows, every icon empty, and the window
+  ignored clicks for good, with ~1 s of CPU in 3 minutes. The log has the cause: `Failed to find library for
+  Microsoft.UI.Xaml.Controls.ElementFactory` and then `Failed to assign to property
+  'WinStore.UX.Controls.ScrollingPreviewListView.ItemTemplate'` (0x802b000a). 8.2310 registers only
+  `ElementFactoryGetArgs`/`RecycleArgs`.
+- **FE3 lists an app's frameworks in the app's own category** (a `leaf` TRACE in `appx_store_find_package_moniker`
+  printed them: UI.Xaml 2.4/2.8, VCLibs, .NET Native, every architecture). `appx_install` now downloads a framework the
+  Windows tree lacks at the asked-for version from `params->store_category` into `stage/frameworks` before falling back
+  to an older one. Set by `wineuwp-install --store` and by AppInstallManager's update and install items; not yet by
+  `winegameplatform` (its installer call does not carry the category).
+- Result: Home complete **15 s** after launch (hero, side cards, Trending games/apps with icons,
+  `docs/screenshots/msstore-22609-home-winui-8.2501.png`), and Apps loads on a click. The 10-19 notes said 2-3 minutes
+  to start; that was on older frameworks too.
+
+**A prefix's `C:\windows\wineuwp-symbols.txt` goes stale when wineuwp learns a new symbol.** prefix-test's table
+(11-09) had 9 entries; today's wineuwp also wants `CoreApplicationViewAgileContainer::WaitForViewReady`, and without it
+combase's `prepare_native_views_once` fails with E_NOTIMPL, which the Store turns into a `NotImplementedException`
+fail-fast at start-up. `packaging/harvest/resolve_symbols.py <prefix>/drive_c/windows/system32 <table>` (12 entries)
+fixed it. Every existing prefix will hit this once the shared build is rebuilt.

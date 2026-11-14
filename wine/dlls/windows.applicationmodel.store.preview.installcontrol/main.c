@@ -620,6 +620,7 @@ struct install_item
     WCHAR *stage;               /* the running package's stage directory, a Unix path */
     char *url;
     char version[32];
+    char category[64];          /* the Windows Update category, where the package's frameworks are too */
     struct handlers completed, status_changed;
 
     SRWLOCK lock;               /* guards the rest */
@@ -948,6 +949,7 @@ static DWORD WINAPI install_thread( void *param )
         params.data_dir = data;
         params.windows_tree = tree_dos;
         params.launch_defaults = defaults;
+        if (impl->category[0]) params.store_category = impl->category;
         params.cancel = &impl->cancel;
         params.callback = install_event;
         params.context = &progress;
@@ -1387,6 +1389,7 @@ static struct install_item *search_update( BOOL auto_install )
         product_id = NULL;
         family = stage = NULL;
         url = NULL;
+        lstrcpynA( item->category, category, sizeof(item->category) );
         if (auto_install) item_start( item );
     }
 
@@ -1478,6 +1481,7 @@ static struct install_item *product_install( const WCHAR *id, BOOL launch_after 
     {
         product_id = family = stage = NULL;
         url = NULL;
+        lstrcpynA( item->category, category, sizeof(item->category) );
         item->launch_after = launch_after;
         item_start( item );
     }
