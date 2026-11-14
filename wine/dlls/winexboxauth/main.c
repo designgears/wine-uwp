@@ -193,6 +193,51 @@ done:
  * from the content access data). It takes the same tickets as the licensing service: the device's in Authorization
  * (a WLID1.0 user ticket there is refused, InvalidDeviceToken) and the account's www.microsoft.com one as the
  * beneficiary (the collections-scoped one is MalformedParameter). */
+struct owns_answer
+{
+    char product[64], puid[32];
+    HRESULT hr;
+    ULONGLONG time;
+};
+
+/* the answers of the last few minutes: gameplatform asks once per store id of every feature it lists */
+static struct owns_answer owns_answers[16];
+static unsigned int owns_next;
+static SRWLOCK owns_lock = SRWLOCK_INIT;
+
+static BOOL owns_cached( const char *product, const char *puid, HRESULT *hr )
+{
+    ULONGLONG now = GetTickCount64();
+    BOOL found = FALSE;
+    unsigned int i;
+
+    AcquireSRWLockShared( &owns_lock );
+    for (i = 0; i < ARRAY_SIZE(owns_answers) && !found; i++)
+    {
+        const struct owns_answer *a = &owns_answers[i];
+        if (!a->time || now - a->time > 5 * 60 * 1000) continue;
+        if (strcmp( a->product, product ) || strcmp( a->puid, puid )) continue;
+        *hr = a->hr;
+        found = TRUE;
+    }
+    ReleaseSRWLockShared( &owns_lock );
+    return found;
+}
+
+static void owns_remember( const char *product, const char *puid, HRESULT hr )
+{
+    struct owns_answer *a;
+
+    if (strlen( product ) >= sizeof(a->product) || strlen( puid ) >= sizeof(a->puid)) return;
+    AcquireSRWLockExclusive( &owns_lock );
+    a = &owns_answers[owns_next++ % ARRAY_SIZE(owns_answers)];
+    strcpy( a->product, product );
+    strcpy( a->puid, puid );
+    a->hr = hr;
+    a->time = GetTickCount64();
+    ReleaseSRWLockExclusive( &owns_lock );
+}
+
 HRESULT collections_owns( const char *product )
 {
     char *ticket = NULL, *device_ticket = NULL, *puid, *t, *p, *pr, *body, *headers;
@@ -205,20 +250,37 @@ HRESULT collections_owns( const char *product )
 
     account_init();
     load_refresh_token();
-    if (FAILED(hr = windev_device_ticket( &device_ticket ))) return hr;
-    EnterCriticalSection( &account.signin_cs );
-    hr = msa_refresh( "service::www.microsoft.com::MBI_SSL", &ticket );
-    LeaveCriticalSection( &account.signin_cs );
-    if (FAILED(hr))
+    /* the query needs the device's ticket, but registering a device takes one of the account's ten Store device
+     * slots: only a licence request may do that, never a question about ownership */
+    if (!windev_registered())
     {
-        str_wipe_free( device_ticket );
-        return hr;
+        TRACE( "collections: %s: no Store device registered in this prefix yet\n", debugstr_a(product) );
+        return E_NOTIMPL;
     }
     puid = account_field( &account.puid );
     if (!*puid)
     {
         free( puid );
         puid = store_get( "puid" );
+    }
+    if (owns_cached( product, S(puid), &hr ))
+    {
+        free( puid );
+        return hr;
+    }
+    if (FAILED(hr = windev_device_ticket( &device_ticket )))
+    {
+        free( puid );
+        return hr;
+    }
+    EnterCriticalSection( &account.signin_cs );
+    hr = msa_refresh( "service::www.microsoft.com::MBI_SSL", &ticket );
+    LeaveCriticalSection( &account.signin_cs );
+    if (FAILED(hr))
+    {
+        str_wipe_free( device_ticket );
+        free( puid );
+        return hr;
     }
     t = json_escape( ticket );
     p = json_escape( S(puid) );
@@ -234,7 +296,6 @@ HRESULT collections_owns( const char *product )
     str_wipe_free( t );
     free( p );
     free( pr );
-    free( puid );
     str_wipe_free( ticket );
     str_wipe_free( device_ticket );
     j = json_parse( resp.p, resp.n );
@@ -245,6 +306,7 @@ HRESULT collections_owns( const char *product )
                json_str( json_get( json_get( j, "innererror" ), "code" ) ) );
         json_free( j );
         buf_free( &resp );
+        free( puid );
         return XA_E_NETWORK;
     }
     items = json_get( j, "items" );
@@ -252,6 +314,8 @@ HRESULT collections_owns( const char *product )
     json_free( j );
     buf_free( &resp );
     TRACE( "collections: %s %s\n", debugstr_a(product), owned ? "owned" : "not owned" );
+    owns_remember( product, S(puid), owned ? S_OK : S_FALSE );
+    free( puid );
     return owned ? S_OK : S_FALSE;
 }
 
@@ -280,7 +344,15 @@ HRESULT WINAPI XboxAuthSignIn( void )
     return hr;
 }
 
-/* Why the licensing service refused the last XboxAuthContentKeys: "HTTP 400, code ..., message ..." ("" if none). */
+/* Forget the signed-in account, so the next XboxAuthSignIn asks for one. The prefix's Store device registration and
+ * the device's proof key stay: they belong to the machine, and a new one would take another of the account's ten
+ * Store device slots. */
+void WINAPI XboxAuthSignOut( void )
+{
+    sign_out();
+}
+
+/* Why the licensing service refused the last XboxAuthContentKeys: "HTTP 400, faultcode ..., code ..." ("" if none). */
 void WINAPI XboxAuthLicenceError( char *out, UINT32 size )
 {
     licence_error_text( out, size );

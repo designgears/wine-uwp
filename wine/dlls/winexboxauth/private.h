@@ -233,6 +233,7 @@ struct content_key
 };
 
 HRESULT windev_ready( void );
+BOOL windev_registered( void );
 HRESULT windev_device_ticket( char **ticket );
 HRESULT windev_service_ticket( const char *scope, const char *policy, char **ticket );
 HRESULT content_keys( const char *content_id, const char *market, struct content_key **keys, unsigned *count,
