@@ -14505,5 +14505,39 @@ the tour, mostly dcomp's CPU copies of surfaces and the app's own heaps, not loo
 
 Seen on the way, not yet looked at: Gaming's lower panel still a skeleton, Home's "Best selling games" posters still
 missing (10-25), the AI Hub nav icon blank after scrolling Home, and the hero carousel did not advance in 45 s.
-`dlls/dcomp/composition.c` has `-Wsequence-point` warnings at COM macro calls (`GetMany` loops at ~21176 and ~21222,
-`*result`, `*value`), the bug class of 10-19's `stop_collection_Clear`.
+`dlls/dcomp/composition.c`'s `-Wsequence-point` warnings at COM macro calls were checked: all are
+`IUnknown_AddRef( (x = y) )`, an assignment evaluated twice, which is harmless (unlike 10-19's `--`).
+
+### Microsoft Store: half a core on AI Hub - a carousel paging every frame (2026-11-14)
+
+On AI Hub the Store used ~55% of a core for as long as the page was open (Home ~0%), with nothing changing on screen
+(`trace+dcompperf`: 60 commits a second, 0 damaged pixels). The chain, each step measured:
+
+- `WINE_UWP_PROFILE` + `profdiff.py`/`profsym.py`: the UI thread in CoreMessaging's loop, Wine-side (our
+  `NtAssociateWaitCompletionPacket` re-arming through `RtlRegisterWait`, drains, `NtSetTimer`).
+- Temporary counters: 10,600 drains and 5,300 re-arms a second on AI Hub (Home ~200 and ~100). A stack of each
+  zero-due `SetWaitableTimer`, named with CoreMessaging's PDB: XAML's `CXcpDispatcher::MessageTimerCallbackStatic`
+  pops one message of its own queue per timer expiry and re-arms with `SetRelative(0)` while more are queued.
+- `WINE_UWP_BP` on that dispatch: 99% message 0x403, posted by `CXcpBrowserHost::PostAsyncScriptCallbackRequest`,
+  event 0x24 = RequestBringIntoView, from WinUI's `PipsPager::ScrollToCenterOfViewport`: the carousel's pips.
+  `SelectedPageIndex` flipped 0/1 continuously, written by the Store itself.
+- `trace+dcompanim` (new: every tracker callback and landing position): one InteractionTracker took ~70 animated
+  requests a second, each a page further (position 2.3e6 after a minute), each from a **scoped batch's Completed**
+  handler (the stack ends in `batch_fire_completed`). The batch was "ended, 0 animations": the Store starts each page's
+  timeline as key-frame Opacity animations on visuals inside it, and `visual_obj_StartAnimation` applies key frames
+  at once without telling the batch. A batch with nothing counted completed on the next tick.
+
+Fix: `batch_note_keyframes` makes the thread's active scoped batches wait until delay + duration x iterations of
+every finite key-frame animation started on a visual or dcomp visual (object views, i.e. Lottie shapes driven by a
+controller's Progress, are left out). Result: AI Hub idles at 0.7% of a core, Home 0.8%; both hero carousels now
+request a page every 10.0 s (Home's had not moved at all); the four-page tour takes 11.8 s of CPU instead of 19 s;
+pictures identical; calc AE 4120.98 and mp 2835 twice, as before.
+
+Tried and not the cause (reverted): `GetFrameStatistics` returned `nextEstimatedFrameTime = now` (dcomp/device.c and
+composition.c), a natural suspect for a timer due at once; a real vblank grid changed nothing. Delivering the tracker's
+CustomAnimation/ValuesChanged callbacks after `TryUpdatePositionWithAnimation` returns (Windows does) changed nothing
+either. Both are still differences from Windows.
+
+Still open: the carousel pages are requested every 10 s but the hero on screen does not change (Home and AI Hub;
+also before today). The AI Hub rail icon goes blank once AI Hub has been visited. AGENTS.md's
+`ScrollViewer::ChangeViewInternal` RVA (+406ac8) is another XAML build's; in the ISO's it is +3a6058: look it up.

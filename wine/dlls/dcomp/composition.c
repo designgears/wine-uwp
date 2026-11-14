@@ -2111,6 +2111,7 @@ struct shape_transform
  * fetched for it (an AnimatedIcon drives the animation's progress through the controller's
  * "Progress", an expression over the icon's property set). */
 struct kf_animation;
+static void batch_note_keyframes( void *animation );
 struct anim_controller;
 struct anim_binding
 {
@@ -6718,6 +6719,7 @@ static HRESULT WINAPI dcv_object_StartAnimation( void *iface, HSTRING name, void
 
     TRACE( "%p, %s, %p.\n", iface, debugstr_w( prop ), animation );
     TRACE_(dcompanim)( "dcomp visual %p %s <- %s\n", v, debugstr_w( prop ), debugstr_animation( animation ) );
+    batch_note_keyframes( animation );
     if (kf && kf->has_value && kf->value_kind == KF_SCALAR && prop && !wcsicmp( prop, L"Opacity" )) v->opacity = kf->scalar;
     /* XAML's storyboards drive an element's opacity through a property set: the visual's Opacity follows
      * "PS.Opacity", which XAML sets to the target before starting the animation. NavigationView item selection
@@ -12694,6 +12696,7 @@ static HRESULT WINAPI visual_obj_StartAnimation( ICompositionObject *iface, HSTR
 
     TRACE( "visual %p, name %s, animation %p.\n", impl, debugstr_hstring(name), animation );
     TRACE_(dcompanim)( "visual %p %s <- %s\n", impl, debugstr_hstring( name ), debugstr_animation( animation ) );
+    batch_note_keyframes( animation );
     if (!kf || !kf->has_value || !prop) return S_OK;
     anim_bind( impl->bindings, &impl->binding_count, prop, kf );
     lstrcpynW( impl->animated_prop, prop, ARRAY_SIZE(impl->animated_prop) );
@@ -15163,6 +15166,7 @@ struct comp_batch
     DWORD thread;               /* that created it; animations it starts while active are its own */
     LONG anims[16];             /* live animations started while it was active, see live_anim_running */
     unsigned int anim_count;
+    ULONGLONG anims_until;      /* when the key-frame animations started while it was active would have ended */
     ULONGLONG ended_at;
     struct comp_batch *next_active;
 };
@@ -15291,6 +15295,7 @@ static int batch_due( struct comp_batch *batch )
 
     /* a bound expression runs until it is stopped, however long that is */
     for (i = 0; i < batch->anim_count; i++) if (expr_running( batch->anims[i] )) return 2;
+    if (GetTickCount64() < batch->anims_until) return 1;
     if (GetTickCount64() - batch->ended_at > 10000) return 0;   /* Forever animations, a lost tick */
     for (i = 0; i < batch->anim_count; i++) if (live_anim_running( batch->anims[i] )) return 1;
     return 0;
@@ -15391,6 +15396,33 @@ static void batch_note_animation( LONG id )
     for (batch = active_batches; batch; batch = batch->next_active)
         if (batch->thread == tid && batch->anim_count < ARRAY_SIZE(batch->anims))
             batch->anims[batch->anim_count++] = id;
+    LeaveCriticalSection( &batch_cs );
+}
+/* A key-frame animation started on a visual is applied at once here, but a scoped batch it was started in completes
+ * when it would have ended, as on Windows. The Microsoft Store times each carousel page with such an animation in a
+ * batch and moves on at Completed: completing on the next tick moved its AI Hub carousel on a page every frame (half
+ * a core for as long as the page was open), while Home's moved on every 10 s once this held. */
+static void batch_note_keyframes( void *animation )
+{
+    struct kf_animation *kf = kf_animation_from( animation );
+    DWORD tid = GetCurrentThreadId();
+    IUnknown *identity = NULL;
+    struct comp_batch *batch;
+    ULONGLONG until;
+    LONGLONG ms;
+
+    if (!kf && animation && SUCCEEDED( IUnknown_QueryInterface( (IUnknown *)animation, &IID_IUnknown, (void **)&identity ) ))
+    {
+        kf = kf_animation_from( identity );
+        IUnknown_Release( identity );
+    }
+    if (!kf || kf->iteration_behavior == 1 /* Forever */) return;
+    ms = (kf->delay_time + kf->duration * max( kf->iterations, 1 )) / 10000;
+    if (ms <= 0) return;
+    until = GetTickCount64() + ms;
+    EnterCriticalSection( &batch_cs );
+    for (batch = active_batches; batch; batch = batch->next_active)
+        if (batch->thread == tid && batch->anims_until < until) batch->anims_until = until;
     LeaveCriticalSection( &batch_cs );
 }
 static HRESULT WINAPI batch_End( void *iface )
@@ -24137,6 +24169,8 @@ static void tracker_raise( struct interactions_object *tracker, unsigned int slo
     args->position = tracker->position;
     args->scale = tracker->scale;
     args->request_id = request;
+    TRACE_(dcompanim)( "tracker %p: %s, request %d, position %g,%g.\n", tracker, kind, request,
+                       tracker->position.X, tracker->position.Y );
     ((callback_t)owner_vtbl[slot])( tracker->owner, &tracker->vtbl, &args->vtbl );
     interactions_Release( &args->vtbl );
 }
@@ -24353,13 +24387,14 @@ static HRESULT WINAPI tracker_TryUpdatePositionWithAnimation( void *iface, void 
     if (kf && kf->value_kind == KF_VECTOR3 && kf->key_count && kf_sample( kf, 1.0f, &key ) &&
         !kf->keys[min( kf->key_count, KF_KEYS ) - 1].expr)
     {
-        TRACE( "%p animation %p: lands at %g,%g,%g.\n", tracker, animation, key.u.vector3.X, key.u.vector3.Y, key.u.vector3.Z );
+        TRACE_(dcompanim)( "tracker %p animation %p: lands at %g,%g,%g.\n", tracker, animation, key.u.vector3.X,
+                           key.u.vector3.Y, key.u.vector3.Z );
         tracker_set_position( tracker, key.u.vector3 );
     }
     else if (kf && kf->value_kind == KF_VECTOR3 && kf_vector3_from_this( kf, &key.u.vector3 ))
     {
-        TRACE( "%p animation %p: lands at %s = %g,%g,%g.\n", tracker, animation, debugstr_w( kf->last_expr ),
-               key.u.vector3.X, key.u.vector3.Y, key.u.vector3.Z );
+        TRACE_(dcompanim)( "tracker %p animation %p: lands at %s = %g,%g,%g.\n", tracker, animation,
+                           debugstr_w( kf->last_expr ), key.u.vector3.X, key.u.vector3.Y, key.u.vector3.Z );
         tracker_set_position( tracker, key.u.vector3 );
     }
     else
