@@ -8,7 +8,8 @@
 # keeps the tarball as a workflow artifact.
 #
 # Wine is built as README.md says: the Wine release in WINE_VERSION, wine/'s files (wine/FILES) copied over it,
-# autoreconf, --enable-archs=x86_64. Nothing Microsoft's goes in; the setup harvests that on the user's machine.
+# autoreconf, --enable-archs=i386,x86_64 (WoW64: 32-bit Windows
+# programs such as Halo's EAC/EOS bootstrapper run too, with no 32-bit Linux libraries). Nothing Microsoft's goes in; the setup harvests that on the user's machine.
 name: Release
 
 on:
@@ -33,7 +34,7 @@ env:
 jobs:
   build:
     # the result needs glibc 2.38 (Ubuntu 24.04, Debian 13, Fedora 39, Arch and newer); its mingw-w64 GCC 13 builds
-    # Wine 11 (g++ too: without a PE C++17 compiler icu.dll and dmsynth.dll are left out)
+    # Wine 11, for both PE architectures (g++ too: without a PE C++17 compiler icu.dll and dmsynth.dll are left out)
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
@@ -45,7 +46,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            autoconf bison flex gettext gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 ccache xz-utils \
+            autoconf bison flex gettext gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 gcc-mingw-w64-i686 g++-mingw-w64-i686 \
+            ccache xz-utils \
             libasound2-dev libpulse-dev libdbus-1-dev libfontconfig-dev libfreetype-dev libgnutls28-dev \
             libgl-dev libegl-dev libvulkan-dev libwayland-dev wayland-protocols libxkbcommon-dev libxkbregistry-dev \
             libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxfixes-dev libxi-dev libxinerama-dev \
@@ -58,8 +60,8 @@ jobs:
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.cache/ccache
-          key: ccache-${{ env.WINE_VERSION }}-${{ github.sha }}
-          restore-keys: ccache-${{ env.WINE_VERSION }}-
+          key: ccache-wow64-${{ env.WINE_VERSION }}-${{ github.sha }}
+          restore-keys: ccache-wow64-${{ env.WINE_VERSION }}-
 
       - name: Wine source with wine-uwp's files
         run: |
@@ -78,11 +80,15 @@ jobs:
 
       - name: Build Wine
         run: |
-          export CCACHE_DIR=~/.cache/ccache CCACHE_MAXSIZE=2G
+          export CCACHE_DIR=~/.cache/ccache CCACHE_MAXSIZE=4G
           mkdir -p "$RUNNER_TEMP/wine-build" && cd "$RUNNER_TEMP/wine-build"
-          "$RUNNER_TEMP/wine-src/configure" --enable-archs=x86_64 \
-            CC="ccache gcc" CXX="ccache g++" x86_64_CC="ccache x86_64-w64-mingw32-gcc" \
-            x86_64_CXX="ccache x86_64-w64-mingw32-g++" > configure.out
+          # i386_CFLAGS: the stack-alignment flags that keep mingw GCC 13 from an internal compiler error on i386
+          # (GCC PR109276, hit in mfplat); see AGENTS.md, "Preserve compiler environment flags"
+          "$RUNNER_TEMP/wine-src/configure" --enable-archs=i386,x86_64 \
+            CC="ccache gcc" CXX="ccache g++" \
+            x86_64_CC="ccache x86_64-w64-mingw32-gcc" x86_64_CXX="ccache x86_64-w64-mingw32-g++" \
+            i386_CC="ccache i686-w64-mingw32-gcc" i386_CXX="ccache i686-w64-mingw32-g++" \
+            i386_CFLAGS="-g -O2 -mpreferred-stack-boundary=4 -mincoming-stack-boundary=2" > configure.out
           tail -n 30 configure.out
           make -j"$(nproc)" > make.out 2>&1 || { tail -n 80 make.out; exit 1; }
           ccache -s
@@ -95,6 +101,9 @@ jobs:
           sha256sum wine-uwp-x86_64.tar.xz > wine-uwp-x86_64.tar.xz.sha256
           cat wine-uwp-x86_64.tar.xz.sha256
           git -C "$GITHUB_WORKSPACE" rev-parse --short HEAD > commit.txt
+          for a in x86_64 i386; do
+            [ -f "wine-uwp/lib/wine/$a-windows/kernel32.dll" ] || { echo "no $a-windows modules in the tree"; exit 1; }
+          done
           echo "glibc needed: $(objdump -T wine-uwp/bin/wine wine-uwp/lib/wine/x86_64-unix/*.so | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
 
       - name: Keep the tarball
@@ -127,5 +136,5 @@ jobs:
           sha256sum -c wine-uwp-x86_64.tar.xz.sha256
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --latest \
             --title "wine-uwp $GITHUB_REF_NAME" \
-            --notes "wine-uwp runtime built from $(cat commit.txt) (Wine $WINE_VERSION + this repository's changes), x86_64 Linux, 64-bit Windows programs only (no WoW64: 32-bit helpers such as Easy Anti-Cheat's EOS bootstrapper do not run). Unpack with \`tar -xf wine-uwp-x86_64.tar.xz -C ~/.local/opt\`, then see README.md (\"Using it\"). No Microsoft files are included." \
+            --notes "wine-uwp runtime built from $(cat commit.txt) (Wine $WINE_VERSION + this repository's changes), x86_64 Linux, 32- and 64-bit Windows programs (WoW64; no 32-bit Linux libraries needed). Unpack with \`tar -xf wine-uwp-x86_64.tar.xz -C ~/.local/opt\`, then see README.md (\"Using it\"). No Microsoft files are included." \
             wine-uwp-x86_64.tar.xz wine-uwp-x86_64.tar.xz.sha256
