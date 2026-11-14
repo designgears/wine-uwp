@@ -5,13 +5,14 @@
  *                   [--tags 'a;b'] [--languages 'en-US;en'] [--keys FILE|-] [--keys-once FILE]
  *   wineuwp-install PACKAGE [DATADIR] --info [--windows TREE] [--icon OUT]
  *   wineuwp-install APPINSTALLER --latest
- *   wineuwp-install STOREID|FAMILY [DATADIR --windows TREE [--stage NAME]] --store [--allow-older]
+ *   wineuwp-install STOREID|FAMILY [DATADIR --windows TREE [--stage NAME]] --store [--allow-older] [--sign-out]
  *
  * --store installs the Store's newest package of a product (its Store id) or package family, downloaded from the
  * Store's delivery service; an encrypted one (EAppx/EMsix) is opened with the signed-in account's licence, after a
  * browser sign-in if nobody is signed in. Without DATADIR it only reports what it would install. When the licensing
  * service refuses the newest package's licence, --allow-older installs the newest older version the catalogue still
- * lists that it does license.
+ * lists that it does license. --sign-out forgets the signed-in account first, so the browser sign-in asks for one;
+ * the prefix keeps its Store device (a new one would take another of the account's ten Store device slots).
  * PACKAGE is a file, an http(s) URL, or an installed package's directory (Program Files\WindowsApps\<full name> of a
  * Windows installation, as stage-app.sh staged them); paths may be Unix paths. Progress goes to stdout as lines:
  * "PID <pid>", "STAGE <what>", "PROGRESS <done> <total>", other messages as they are, and "INSTALLED <stage>" last on
@@ -311,6 +312,23 @@ static void refusal_reason( const char *full_name )
     if (why[0]) out( "licensing service, %s: %s", full_name, why );
 }
 
+/* --sign-out: forget the saved account (winexboxauth keeps the prefix's Store device), so the sign-in asks again. */
+static BOOL store_sign_out(void)
+{
+    typedef void (WINAPI *signout_fn)( void );
+    HMODULE auth = LoadLibraryW( L"winexboxauth.dll" );
+    signout_fn sign_out = auth ? (void *)GetProcAddress( auth, "XboxAuthSignOut" ) : NULL;
+
+    if (!sign_out)
+    {
+        fail( "--sign-out: this winexboxauth.dll cannot sign out" );
+        return FALSE;
+    }
+    sign_out();
+    out( "Signed out of the saved account." );
+    return TRUE;
+}
+
 /* Does the signed-in account own the Store product? S_OK yes, S_FALSE no, an error if nobody can tell. */
 static HRESULT owns_product( const char *product_id )
 {
@@ -325,17 +343,9 @@ static HRESULT owns_product( const char *product_id )
 /* The signed-in account doesn't own it: get it with that account, or sign in with another one. */
 static void not_owned( const char *product_id )
 {
-    static char *(CDECL *unix_name)( const WCHAR * );
-    WCHAR store[MAX_PATH];
-    char *path = NULL;
-
-    if (!unix_name) unix_name = (void *)GetProcAddress( GetModuleHandleW( L"kernel32.dll" ), "wine_get_unix_file_name" );
-    if (ExpandEnvironmentStringsW( L"%LOCALAPPDATA%\\wineuwp\\xboxauth.bin", store, ARRAY_SIZE(store) ) && unix_name)
-        path = unix_name( store );
     fail( "The signed-in account doesn't own this product. \"Get\" it once with that account "
-          "(https://apps.microsoft.com/detail/%s; free apps too), or, to sign in with the account that owns it, delete "
-          "%s and run this again.", product_id, path ? path : "%LOCALAPPDATA%\\wineuwp\\xboxauth.bin in the prefix" );
-    HeapFree( GetProcessHeap(), 0, path );
+          "(https://apps.microsoft.com/detail/%s; free apps too), or sign in with the account that owns it: "
+          "wine-uwp install-store %s --sign-out", product_id, product_id );
 }
 
 /* The Store's newest package of a product (a Store id) or package family, through the catalogue and the delivery
@@ -516,7 +526,8 @@ static void usage(void)
           "[--tags T] [--languages L] [--keys FILE|-] [--keys-once FILE]\n"
           "       wineuwp-install PACKAGE [DATADIR] --info [--windows TREE] [--icon OUT]\n"
           "       wineuwp-install APPINSTALLER --latest\n"
-          "       wineuwp-install STOREID|FAMILY [DATADIR --windows TREE [--stage NAME]] --store [--allow-older]" );
+          "       wineuwp-install STOREID|FAMILY [DATADIR --windows TREE [--stage NAME]] --store [--allow-older] "
+          "[--sign-out]" );
 }
 
 int __cdecl wmain( int argc, WCHAR *argv[] )
@@ -524,7 +535,7 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
     struct appx_install_params params = { 0 };
     const WCHAR *positional[2] = { NULL }, *keys = NULL, *icon = NULL;
     WCHAR *package = NULL, *data_dir = NULL, *windows = NULL, *launch_defaults = NULL, *d3d = NULL, *env;
-    BOOL info = FALSE, latest = FALSE, store = FALSE, keys_once = FALSE, allow_older = FALSE;
+    BOOL info = FALSE, latest = FALSE, store = FALSE, keys_once = FALSE, allow_older = FALSE, sign_out = FALSE;
     unsigned int npos = 0;
     HRESULT hr;
     int i;
@@ -538,6 +549,7 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
         else if (!wcscmp( a, L"--latest" )) latest = TRUE;
         else if (!wcscmp( a, L"--store" )) store = TRUE;
         else if (!wcscmp( a, L"--allow-older" )) allow_older = TRUE;
+        else if (!wcscmp( a, L"--sign-out" )) sign_out = TRUE;
         else if (!wcscmp( a, L"--windows" ) && has_value) windows = path_arg( argv[++i] );
         else if (!wcscmp( a, L"--stage" ) && has_value) params.stage = argv[++i];
         else if (!wcscmp( a, L"--pause-file" ) && has_value) pause_file = path_arg( argv[++i] );
@@ -565,11 +577,13 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
         appx_free( version );
         return 0;
     }
+    if (sign_out && !store) { fail( "--sign-out goes with --store" ); return 2; }
     if (store)
     {
         WCHAR *url = NULL;
         int ret;
 
+        if (sign_out && !store_sign_out()) return 1;
         if (!data_dir) return store_package( positional[0], allow_older, NULL, NULL, 0 );
         if (!windows) { fail( "DATADIR and --windows TREE are needed to install" ); return 2; }
         ret = store_package( positional[0], allow_older, &url, store_keys, sizeof(store_keys) );

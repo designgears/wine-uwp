@@ -9,3 +9,4 @@
 @ stdcall XboxAuthSelfTest(str str)
 @ stdcall XboxAuthSetTitleContext(str long)
 @ stdcall XboxAuthSignIn()
+@ stdcall XboxAuthSignOut()

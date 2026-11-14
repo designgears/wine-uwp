@@ -1112,6 +1112,19 @@ done:
     return hr;
 }
 
+/* Has this prefix registered its Store device yet? (Without registering one.) */
+BOOL windev_registered( void )
+{
+    BOOL ret;
+
+    windev_init();
+    EnterCriticalSection( &windev_cs );
+    if (!windev.license.n) windev_load();
+    ret = windev.license.n != 0;
+    LeaveCriticalSection( &windev_cs );
+    return ret;
+}
+
 /* the compact device ticket for www.microsoft.com, as the licensing service's Authorization header takes it */
 HRESULT windev_device_ticket( char **ticket )
 {
@@ -1139,20 +1152,21 @@ HRESULT windev_service_ticket( const char *scope, const char *policy, char **tic
 /* ---- licensing.mp.microsoft.com: the content keys of a package this account is entitled to ---- */
 
 /* Why the licensing service last refused a licence, for the installer to show: the HTTP status and the fault's
- * fields (the inner error's when there is one: {"code":"BadRequest", "innererror":{"faultcode":3043, "code":
- * "DeviceNameNotHexBinary", "message":...}}). Nothing from the request. */
+ * codes (the inner error's when there is one: {"code":"BadRequest", "innererror":{"faultcode":3043, "code":
+ * "DeviceNameNotHexBinary", "message":...}}). Not the message: a fault's text may quote the request, tickets included,
+ * and this goes to the user's terminal and from there into bug reports. The TRACE below has the whole answer. */
 static char last_licence_error[512];
 
 static void licence_error_fields( const struct json *j, struct buf *out )
 {
-    static const char *const names[] = { "faultcode", "code", "message" };
+    static const char *const names[] = { "faultcode", "code" };
     const struct json *e = json_get( j, "innererror" );
     unsigned int k;
 
     if (e->type != JSON_OBJECT) e = j;
     for (k = 0; k < ARRAY_SIZE(names); k++)
         if (*json_str( json_get( e, names[k] ) ))
-            buf_printf( out, ", %s %.200s", names[k], json_str( json_get( e, names[k] ) ) );
+            buf_printf( out, ", %s %.100s", names[k], json_str( json_get( e, names[k] ) ) );
 }
 
 void licence_error_text( char *out, UINT32 size )
@@ -1180,6 +1194,11 @@ HRESULT content_keys( const char *content_id, const char *market, struct content
 
     *keys = NULL;
     *count = 0;
+    /* a reason belongs to one request: a failure before the service answers must not show the last one's */
+    windev_init();
+    EnterCriticalSection( &windev_cs );
+    last_licence_error[0] = 0;
+    LeaveCriticalSection( &windev_cs );
     if (FAILED(hr = windev_device_ticket( &device_ticket ))) return hr;
     EnterCriticalSection( &account.signin_cs );
     hr = msa_refresh( "service::www.microsoft.com::MBI_SSL", &user_ticket );
