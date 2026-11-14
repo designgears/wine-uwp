@@ -26,6 +26,7 @@
 #include "wined3d_vk.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(d3d);
+WINE_DECLARE_DEBUG_CHANNEL(d3dperf);
 
 VkCompareOp vk_compare_op_from_wined3d(enum wined3d_cmp_func op)
 {
@@ -340,7 +341,7 @@ void *wined3d_allocator_chunk_vk_map(struct wined3d_allocator_chunk_vk *chunk_vk
             return NULL;
         }
 
-        adapter_adjust_mapped_memory(device_vk->d.adapter, WINED3D_ALLOCATOR_CHUNK_SIZE);
+        adapter_adjust_mapped_memory(device_vk->d.adapter, chunk_vk->c.size);
     }
 
     ++chunk_vk->c.map_count;
@@ -372,7 +373,7 @@ void wined3d_allocator_chunk_vk_unmap(struct wined3d_allocator_chunk_vk *chunk_v
 
     wined3d_allocator_chunk_vk_unlock(chunk_vk);
 
-    adapter_adjust_mapped_memory(device_vk->d.adapter, -WINED3D_ALLOCATOR_CHUNK_SIZE);
+    adapter_adjust_mapped_memory(device_vk->d.adapter, -(SSIZE_T)chunk_vk->c.size);
 }
 
 VkDeviceMemory wined3d_context_vk_allocate_vram_chunk_memory(struct wined3d_context_vk *context_vk,
@@ -406,6 +407,9 @@ struct wined3d_allocator_block *wined3d_context_vk_allocate_memory(struct wined3
 
     wined3d_device_vk_allocator_lock(device_vk);
 
+    TRACE_(d3dperf)("device %p memory type %u (flags %#x), %s bytes, from %p.\n", device_vk, memory_type,
+            wined3d_adapter_vk(device_vk->d.adapter)->memory_properties.memoryTypes[memory_type].propertyFlags,
+            wine_dbgstr_longlong(size), __builtin_return_address(0));
     if (size > WINED3D_ALLOCATOR_CHUNK_SIZE / 2)
     {
         *vk_memory = wined3d_context_vk_allocate_vram_chunk_memory(context_vk, memory_type, size);

@@ -14478,3 +14478,32 @@ fixed it. Every existing prefix will hit this once the shared build is rebuilt.
   process Pss_Anon 501 -> 413 MB; Home unchanged. calc (AE 4120.98 on this prefix), mp 2835, sol and kb identical with
   `WINE_IMAGE_CACHE=0` and with the cache. Shapr3D has ~250 MB of such DLLs (pskernel 71, Shapr.Native 56,
   Shapr3D 46), Media Player 30 MB. Old cache files are not cleaned up when an app updates.
+
+### Microsoft Store: where the rest of its memory went - GPU staging (2026-11-14)
+
+`/dev/nvidiactl` mappings were 290-350 MB of the Store's RSS at Home and 726 MB after a four-page tour
+(`/tmp/store-tour.sh`: Home, Apps, Gaming, AI Hub, 15 wheel clicks down and up; `smaps` per mapping name). Host-visible
+Vulkan memory is system memory, committed in full when a chunk is mapped. Two causes, both ours to fix:
+
+- **wined3d gave every host-visible pool 64 MB chunks.** A new `trace+d3dperf` line per allocation (device, memory
+  type and flags, size, caller) showed three devices; two of them put under 3 MB into their upload pool and still held
+  a whole chunk. Host-visible pools now start at 4 MB and double (a small chunk is a buddy tree rooted at a deeper
+  order, so the allocator is otherwise unchanged).
+- **dcomp kept a staging texture per surface forever** (`surface->staging`, "kept across frames") on top of the CPU
+  copy it paints from; the readback pool (cached host memory) saw 331 MB of allocations in one tour. Only a surface
+  read back twice within a second keeps one now.
+
+| Store, RSS (GPU-mapped) | Home, 25 s | after the tour |
+| --- | --- | --- |
+| before | 930 MB (332) | 1676 MB (726) |
+| wined3d chunks | 777 MB (180) | 1431 MB (478) |
+| + dcomp staging | 745 MB (148) | 1204 MB (254) |
+
+Same pictures (AE 0 on Home, Apps, Gaming, scrolled Home; AI Hub's lower banner rotates), same CPU time (19 s for the
+tour), no allocation errors; calc AE 4120.98 and mp 2835 twice, as before. What is left: ~760 MB private memory after
+the tour, mostly dcomp's CPU copies of surfaces and the app's own heaps, not looked at yet.
+
+Seen on the way, not yet looked at: Gaming's lower panel still a skeleton, Home's "Best selling games" posters still
+missing (10-25), the AI Hub nav icon blank after scrolling Home, and the hero carousel did not advance in 45 s.
+`dlls/dcomp/composition.c` has `-Wsequence-point` warnings at COM macro calls (`GetMany` loops at ~21176 and ~21222,
+`*result`, `*value`), the bug class of 10-19's `stop_collection_Clear`.

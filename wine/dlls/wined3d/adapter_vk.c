@@ -267,7 +267,7 @@ static struct wined3d_allocator_chunk *wined3d_allocator_vk_create_chunk(struct 
     if (!(chunk_vk = malloc(sizeof(*chunk_vk))))
         return NULL;
 
-    if (!wined3d_allocator_chunk_init(&chunk_vk->c, allocator))
+    if (!wined3d_allocator_chunk_init(&chunk_vk->c, allocator, chunk_size))
     {
         free(chunk_vk);
         return NULL;
@@ -298,7 +298,7 @@ static void wined3d_allocator_vk_destroy_chunk(struct wined3d_allocator_chunk *c
     if (chunk_vk->c.map_ptr)
     {
         VK_CALL(vkUnmapMemory(device_vk->vk_device, chunk_vk->vk_memory));
-        adapter_adjust_mapped_memory(device_vk->d.adapter, -WINED3D_ALLOCATOR_CHUNK_SIZE);
+        adapter_adjust_mapped_memory(device_vk->d.adapter, -(SSIZE_T)chunk_vk->c.size);
     }
     VK_CALL(vkFreeMemory(device_vk->vk_device, chunk_vk->vk_memory, NULL));
     TRACE("Freed memory 0x%s.\n", wine_dbgstr_longlong(chunk_vk->vk_memory));
@@ -471,6 +471,13 @@ static HRESULT adapter_vk_create_device(struct wined3d *wined3d, const struct wi
         WARN("Failed to initialise allocator.\n");
         hr = E_FAIL;
         goto fail;
+    }
+    /* Host-visible memory is system memory, committed for a whole chunk once it is mapped: a device that stages a
+     * few uploads took 64 MB of it. Such pools start at 4 MB and grow. */
+    for (uint32_t type = 0; type < adapter_vk->memory_properties.memoryTypeCount; ++type)
+    {
+        if (adapter_vk->memory_properties.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+            device_vk->allocator.pools[type].first_order = 4;
     }
 
     if (FAILED(hr = wined3d_device_init(&device_vk->d, wined3d, adapter->ordinal, device_type, focus_window,

@@ -4125,7 +4125,8 @@ struct drawing_surface
      * whenever the present count moves (the app renders on its own device). */
     IDXGISwapChain *swapchain;
     UINT presented;
-    ID3D11Texture2D *staging;   /* readback copy of the texture, kept across frames (surface_cached_pixels) */
+    ID3D11Texture2D *staging;   /* readback copy of the texture, kept for a surface read back again and again */
+    ULONGLONG staging_used;     /* tick of the last single read-back */
     /* Swap chains are read back on a worker thread: CopyResource + Map wait for the app's GPU work
      * (5 ms of a drag frame on the UI thread). The worker fills back_cache and the UI thread swaps
      * it in at its next sync; the painter never waits, at the cost of one frame of latency. */
@@ -5840,6 +5841,18 @@ static const BYTE *surface_cached_pixels( struct drawing_surface *surface, D3D11
         if (surface->upload_retries) perf.retries++;
     }
     ID3D11DeviceContext_Release( context );
+    /* A staging texture is host-visible memory as large as the surface, and most surfaces (a picture, a glyph
+     * run) are read back once: keeping one for each held hundreds of MB of the Microsoft Store's memory after
+     * a few pages. Only a surface read back again within a second keeps its own. */
+    {
+        ULONGLONG now = GetTickCount64();
+        if (!surface->staging_used || now - surface->staging_used >= 1000)
+        {
+            ID3D11Texture2D_Release( surface->staging );
+            surface->staging = NULL;
+        }
+        surface->staging_used = now;
+    }
     if (!copied) return NULL;
     surface->opaque = bpp == 4 && bits_opaque( surface->cache, desc->Width, desc->Height );
     surface->cache_valid = TRUE;

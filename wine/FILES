@@ -261,13 +261,16 @@ dlls/windows.web/json_value.c
 dlls/windows.web/private.h
 dlls/wined3d/adapter_vk.c
 dlls/wined3d/context_vk.c
+dlls/wined3d/device.c
 dlls/wined3d/cs.c
 dlls/wined3d/directx.c
 dlls/wined3d/surface.c
 dlls/wined3d/swapchain.c
 dlls/wined3d/texture.c
 dlls/wined3d/texture_vk.c
+dlls/wined3d/utils.c
 dlls/wined3d/wined3d_vk.h
+dlls/wined3d/wined3d_private.h
 dlls/wineuwp/main.c
 dlls/wineuwp/Makefile.in
 dlls/wineuwp/wineuwp.spec

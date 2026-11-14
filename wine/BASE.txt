@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     8ee3b46094e4eb07c87ec9877f38fc93628007dd
-                 ntdll: Map a large image's unaligned sections from a page-aligned cache file.
+  wine HEAD:     d0df19bfa3246c9f033ee6bdedc12acf345c0e14
+                 dcomp: Keep a surface's staging texture only while it is read back repeatedly.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-14T16:23:42Z
+  captured:      2026-11-14T16:43:39Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
