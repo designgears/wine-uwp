@@ -1645,8 +1645,10 @@ static HRESULT do_activate(struct registrar *reg)
         TRACE("Activate returned %#lx\n", hr);
         EnumWindows( show_core_window, (LPARAM)&core_window );
         if (!core_window) WARN("no core window in this process to show\n");
-        drive_view_startup( args );
+        /* before the view startup: with WINE_UWP_DRIVE_VIEW=run that runs the view and does not come back, and the
+         * Microsoft Store never received an ms-windows-store: link */
         start_activation_inbox( reg );
+        drive_view_startup( args );
         if (exit_with_window())
         {
             watch_app_exit();
@@ -3187,6 +3189,8 @@ static DWORD WINAPI activation_thread( void *arg )
              view_startup_done ? "claimed" : "not taken", tries, GetTickCount() - start );
         if (view_startup_done)
         {
+            /* later links (ms-windows-store:) go to this instance too */
+            start_activation_inbox( reg );
             registrar_Release( reg );
             if (SUCCEEDED(hr)) CoUninitialize();
             return 0;
