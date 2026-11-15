@@ -14678,3 +14678,19 @@ The d2d1 test suite flakes here in tests this change does not reach (`test_fill_
 Open: long titles (Call of Duty, Minecraft, Club Vegas) wrap to 3-4 lines and run above the fade, which is fixed at
 y = 250 of 368 for every tile; no `MaxLines` for the card's title was found in the Store's XBF, so whether Windows
 wraps them the same is not known.
+
+### Microsoft Store: rail icons after a visit - a layer's static value before its first key (2026-11-15, fixed)
+
+Continues "the AI Hub rail icon" above. The icons are AnimatedIcons whose states are `NormalOff`, `PointerOverOn`, ...
+(54 marker names in `WinStore.App.dll`, `NormalOnToNormalOff_Start/_End` among them). Per-set `trace+dcompshape`
+over a visit to AI Hub and back: AI Hub's progress set was *inserted* at 0.0207692 at start-up (its NormalOff rest,
+outline shown), animated 0.59 -> 0.79 when selected, and on deselection played `NormalOnToNormalOff`, settling at
+**0.0207692 again** - same progress, blank icon. So the sampling was not stateless. `kf_sample` returns "no value"
+ahead of a binding's first key so that the static value stays (Lottie layers start hidden that way), but
+`visual_apply_controlled`/`shape_apply_controlled` had overwritten that static value at 0.79 and nothing put it back.
+Each binding now records the property's value before it first writes it and restores it ahead of the first key - what
+Windows does too: before the first key an animation holds the value the property had when it started.
+
+Verified: after AI Hub -> Home the AI Hub outline is back (`docs/screenshots/msstore-22609-rail-icons-after-aihub.png`:
+start, AI Hub selected, back on Home); after the whole tour Apps, Gaming and AI Hub are outlines again (they stayed
+filled before). calc AE 4120.98 and mp 2835 twice; tour 1192 MB / 11.7 s CPU at "scrolled", unchanged.

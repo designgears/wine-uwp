@@ -2135,6 +2135,12 @@ struct anim_binding
     WCHAR prop[32];
     struct kf_animation *kf;
     struct anim_controller *controller;
+    /* The property's value before the binding first wrote it. Before the first key an animation holds the value the
+     * property had when it started (Lottie layers start hidden that way), and progress can go back there: an
+     * AnimatedIcon deselected returns to a rest point ahead of a layer's first key, which then has to show its
+     * static value again, not the last sampled one. */
+    enum { BASE_UNREAD, BASE_READ, BASE_NONE } base_state;
+    union { float scalar; boolean flag; Vector2 vector2; Vector3 vector3; } base;
 };
 #define ANIM_BINDINGS 8
 static struct anim_controller *anim_controller_from_any( void *object );
@@ -11869,6 +11875,25 @@ static const void *visual_interop_vtbl[] =
  * visual down to the 16px icon. */
 /* Apply the bindings whose controller has a progress: the animation's value at that progress replaces the
  * property (an AnimatedIcon's layers at the icon's current state). */
+/* Read (write FALSE) or write a visual property a binding drives, as a kf_key of the binding's kind. */
+static BOOL visual_controlled_value( struct visual *impl, const struct anim_binding *b, struct kf_key *v, BOOL write )
+{
+#define CONTROLLED(kind_, name_, field_, member_) \
+    if (b->kf->value_kind == kind_ && !wcsicmp( b->prop, name_ )) \
+    { if (write) field_ = v->u.member_; else v->u.member_ = field_; return TRUE; }
+    CONTROLLED( KF_BOOLEAN, L"IsVisible", impl->visible, flag )
+    CONTROLLED( KF_SCALAR, L"Opacity", impl->opacity, scalar )
+    CONTROLLED( KF_VECTOR3, L"Offset", impl->offset, vector3 )
+    CONTROLLED( KF_VECTOR3, L"Scale", impl->scale, vector3 )
+    CONTROLLED( KF_VECTOR3, L"CenterPoint", impl->center, vector3 )
+    CONTROLLED( KF_VECTOR2, L"Size", impl->size, vector2 )
+    CONTROLLED( KF_SCALAR, L"Offset.X", impl->offset.X, scalar )
+    CONTROLLED( KF_SCALAR, L"Offset.Y", impl->offset.Y, scalar )
+    CONTROLLED( KF_SCALAR, L"Scale.X", impl->scale.X, scalar )
+    CONTROLLED( KF_SCALAR, L"Scale.Y", impl->scale.Y, scalar )
+#undef CONTROLLED
+    return FALSE;
+}
 static void visual_apply_controlled( struct visual *impl )
 {
     unsigned int i;
@@ -11883,7 +11908,17 @@ static void visual_apply_controlled( struct visual *impl )
                                 b->kf, b->kf ? b->kf->key_count : 0, b->controller );
             continue;
         }
-        if (!kf_sample( b->kf, progress, &v )) continue;
+        if (b->base_state == BASE_UNREAD)
+        {
+            memset( &v, 0, sizeof(v) );
+            b->base_state = visual_controlled_value( impl, b, &v, FALSE ) ? BASE_READ : BASE_NONE;
+            memcpy( &b->base, &v.u, sizeof(b->base) );
+        }
+        if (!kf_sample( b->kf, progress, &v ))
+        {
+            if (b->base_state != BASE_READ) continue;
+            memcpy( &v.u, &b->base, sizeof(b->base) );
+        }
         TRACE_(dcompshape)( "visual %p %s kind %d at %g -> %g / %g,%g.\n", impl, debugstr_w( b->prop ), b->kf->value_kind,
                             progress, v.u.scalar, v.u.vector2.X, v.u.vector2.Y );
         if (TRACE_ON(dcompshape) && !b->kf->sampled_once)
@@ -11895,17 +11930,38 @@ static void visual_apply_controlled( struct visual *impl )
                                     b->kf->keys[k].ease.type, b->kf->keys[k].ease.a, b->kf->keys[k].ease.b,
                                     b->kf->keys[k].ease.c, b->kf->keys[k].ease.d );
         }
-        if (b->kf->value_kind == KF_BOOLEAN && !wcsicmp( b->prop, L"IsVisible" )) impl->visible = v.u.flag;
-        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Opacity" )) impl->opacity = v.u.scalar;
-        else if (b->kf->value_kind == KF_VECTOR3 && !wcsicmp( b->prop, L"Offset" )) impl->offset = v.u.vector3;
-        else if (b->kf->value_kind == KF_VECTOR3 && !wcsicmp( b->prop, L"Scale" )) impl->scale = v.u.vector3;
-        else if (b->kf->value_kind == KF_VECTOR3 && !wcsicmp( b->prop, L"CenterPoint" )) impl->center = v.u.vector3;
-        else if (b->kf->value_kind == KF_VECTOR2 && !wcsicmp( b->prop, L"Size" )) impl->size = v.u.vector2;
-        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Offset.X" )) impl->offset.X = v.u.scalar;
-        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Offset.Y" )) impl->offset.Y = v.u.scalar;
-        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Scale.X" )) impl->scale.X = v.u.scalar;
-        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Scale.Y" )) impl->scale.Y = v.u.scalar;
+        visual_controlled_value( impl, b, &v, TRUE );
     }
+}
+/* As visual_controlled_value, for a shape's transform; rotation is kept in radians. */
+static BOOL shape_controlled_value( struct comp_shape *shape, const struct anim_binding *b, struct kf_key *v, BOOL write )
+{
+#define CONTROLLED(kind_, name_, field_, member_) \
+    if (b->kf->value_kind == kind_ && !wcsicmp( b->prop, name_ )) \
+    { if (write) field_ = v->u.member_; else v->u.member_ = field_; return TRUE; }
+    CONTROLLED( KF_VECTOR2, L"Offset", shape->xf.offset, vector2 )
+    CONTROLLED( KF_VECTOR2, L"Scale", shape->xf.scale, vector2 )
+    CONTROLLED( KF_VECTOR2, L"CenterPoint", shape->xf.center, vector2 )
+    CONTROLLED( KF_SCALAR, L"Offset.X", shape->xf.offset.X, scalar )
+    CONTROLLED( KF_SCALAR, L"Offset.Y", shape->xf.offset.Y, scalar )
+    CONTROLLED( KF_SCALAR, L"Scale.X", shape->xf.scale.X, scalar )
+    CONTROLLED( KF_SCALAR, L"Scale.Y", shape->xf.scale.Y, scalar )
+    CONTROLLED( KF_SCALAR, L"CenterPoint.X", shape->xf.center.X, scalar )
+    CONTROLLED( KF_SCALAR, L"CenterPoint.Y", shape->xf.center.Y, scalar )
+#undef CONTROLLED
+    if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"RotationAngleInDegrees" ))
+    {
+        if (write) shape->xf.rotation = v->u.scalar * 3.14159265f / 180.0f;
+        else v->u.scalar = shape->xf.rotation * 180.0f / 3.14159265f;
+        return TRUE;
+    }
+    if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"RotationAngle" ))
+    {
+        if (write) shape->xf.rotation = v->u.scalar;
+        else v->u.scalar = shape->xf.rotation;
+        return TRUE;
+    }
+    return FALSE;
 }
 static void shape_apply_controlled( struct comp_shape *shape )
 {
@@ -11922,7 +11978,17 @@ static void shape_apply_controlled( struct comp_shape *shape )
                                 b->kf, b->kf ? b->kf->key_count : 0, b->controller );
             continue;
         }
-        if (!kf_sample( b->kf, progress, &v )) continue;
+        if (b->base_state == BASE_UNREAD)
+        {
+            memset( &v, 0, sizeof(v) );
+            b->base_state = shape_controlled_value( shape, b, &v, FALSE ) ? BASE_READ : BASE_NONE;
+            memcpy( &b->base, &v.u, sizeof(b->base) );
+        }
+        if (!kf_sample( b->kf, progress, &v ))
+        {
+            if (b->base_state != BASE_READ) continue;
+            memcpy( &v.u, &b->base, sizeof(b->base) );
+        }
         TRACE_(dcompshape)( "shape %p %s kind %d at %g -> %g / %g,%g.\n", shape, debugstr_w( b->prop ), b->kf->value_kind,
                             progress, v.u.scalar, v.u.vector2.X, v.u.vector2.Y );
         if (b->kf->last_sampled != progress || !b->kf->sampled_once)
@@ -11932,17 +11998,7 @@ static void shape_apply_controlled( struct comp_shape *shape )
                    v.u.scalar, v.u.vector2.X, v.u.vector2.Y, b->kf->key_count );
             b->kf->last_sampled = progress;
         }
-        if (b->kf->value_kind == KF_VECTOR2 && !wcsicmp( b->prop, L"Offset" )) shape->xf.offset = v.u.vector2;
-        else if (b->kf->value_kind == KF_VECTOR2 && !wcsicmp( b->prop, L"Scale" )) shape->xf.scale = v.u.vector2;
-        else if (b->kf->value_kind == KF_VECTOR2 && !wcsicmp( b->prop, L"CenterPoint" )) shape->xf.center = v.u.vector2;
-        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"RotationAngleInDegrees" )) shape->xf.rotation = v.u.scalar * 3.14159265f / 180.0f;
-        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"RotationAngle" )) shape->xf.rotation = v.u.scalar;
-        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Offset.X" )) shape->xf.offset.X = v.u.scalar;
-        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Offset.Y" )) shape->xf.offset.Y = v.u.scalar;
-        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Scale.X" )) shape->xf.scale.X = v.u.scalar;
-        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"Scale.Y" )) shape->xf.scale.Y = v.u.scalar;
-        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"CenterPoint.X" )) shape->xf.center.X = v.u.scalar;
-        else if (b->kf->value_kind == KF_SCALAR && !wcsicmp( b->prop, L"CenterPoint.Y" )) shape->xf.center.Y = v.u.scalar;
+        shape_controlled_value( shape, b, &v, TRUE );
     }
 }
 static const struct IContainerVisualVtbl container_vtbl;
