@@ -14779,3 +14779,18 @@ a frozen string loaded just before; `/tmp/nstr_at.py` in the session reads it).
 
 Wine's `onlineid` test fails four factory refcount checks with the old DLL as well (combase caches factories here); calc
 AE 4120.98 and mp 2835 twice after all five.
+
+## 2026-11-15 - Store: the hover card's icon (a CompositionVisualSurface behind a plain surface brush)
+
+Hovering a Trending games row (Roblox) opens the Store's expanded card: title, rating, description and Get were drawn,
+the app icon was an empty square. `trace+dcomptree` on `sprite_put_Brush` (now logged as `public sprite %p brush %s`)
+showed the icon sprite's brush is a surface brush whose surface is a `CompositionVisualSurface` - the card shows a live
+copy of the row's icon visual. Dumping the snapshot `visual_surface_render` makes (a temporary `vs_N.raw` dump) gave the
+Roblox icon, correct, so the snapshot was right and the painter dropped it: `blit_surface_rect` refused any surface
+with neither a texture nor a swap chain, and a visual surface's snapshot is a `cpu_only` drawing surface with only its
+CPU copy. Effect and mask brushes over visual surfaces (Gaming's tiles) took other paths and never hit the check.
+
+Fixed by letting `cpu_only` surfaces through. The card now has its icon (`docs/screenshots/msstore-22609-hover-card-icon.png`).
+`visual_surface_render`/`visual_surface_resolve` also say under `trace+dcompops` why they rendered nothing (no source
+visual, a source that is not a visual, an empty size). Home/Apps/Gaming identical to the run before (AE 0), AI Hub
+differs only by its rotating banner; rss 740 MB at Home, 1023 MB scrolled. Calc AE 4120.98 and mp 2835, twice.

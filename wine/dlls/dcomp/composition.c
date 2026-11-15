@@ -5999,7 +5999,9 @@ static BOOL blit_surface_rect( HDC hdc, struct drawing_surface *surface, int x, 
     BOOL done = FALSE;
 
     surface_sync_swapchain( surface );
-    if (!surface->texture && !surface->swapchain) return FALSE;
+    /* a CompositionVisualSurface's snapshot has no texture, only its CPU copy: refusing it left the Microsoft Store's
+     * hover cards without their icon (a plain surface brush over a visual surface) */
+    if (!surface->texture && !surface->swapchain && !surface->cpu_only) return FALSE;
     if (!surface_cached_pixels( surface, &desc ) || !surface->cache_dib) return FALSE;   /* masks are not a picture */
     if (dest_w <= 0) dest_w = desc.Width;
     if (dest_h <= 0) dest_h = desc.Height;
@@ -11207,10 +11209,19 @@ static void visual_surface_render( struct visual_surface *impl )
     BOOL same;
     unsigned int i;
 
-    if (!dv && !pv) return;
+    if (!dv && !pv)
+    {
+        TRACE_(dcompops)( "visual surface %p: source %p is not a visual.\n", impl, impl->source );
+        return;
+    }
     w = impl->size.X >= 0.5f ? (unsigned int)(impl->size.X + 0.5f) : pv ? (unsigned int)(pv->size.X + 0.5f) : (unsigned int)dv->width;
     h = impl->size.Y >= 0.5f ? (unsigned int)(impl->size.Y + 0.5f) : pv ? (unsigned int)(pv->size.Y + 0.5f) : (unsigned int)dv->height;
-    if (!w || !h || w > 4096 || h > 4096) return;
+    if (!w || !h || w > 4096 || h > 4096)
+    {
+        TRACE_(dcompops)( "visual surface %p: %s source %p, size %ux%u (SourceSize %gx%g): not rendered.\n", impl,
+                          dv ? "dcomp" : "public", impl->source, w, h, impl->size.X, impl->size.Y );
+        return;
+    }
     if (impl->surface && (impl->surface->width != w || impl->surface->height != h))
     {
         IUnknown_Release( (IUnknown *)&impl->surface->vtbl );
@@ -11338,7 +11349,11 @@ static struct drawing_surface *visual_surface_resolve( IUnknown *facade, BOOL *i
     if (*(void ***)facade != (void **)visual_surface_vtbl) return NULL;
     *is_visual_surface = TRUE;
     impl = impl_from_visual_surface( facade );
-    if (!impl->source) return NULL;
+    if (!impl->source)
+    {
+        TRACE_(dcompops)( "visual surface %p: no source visual.\n", impl );
+        return NULL;
+    }
     /* only inside a frame's walk, and not inside a capture (which uses the third list) */
     if (walk_owner == GetCurrentThreadId() && paint_current != 2 &&
         (!impl->rendered || impl->rendered_generation != generation))
@@ -12668,11 +12683,12 @@ static HRESULT WINAPI sprite_get_Brush( ISpriteVisual *iface, ICompositionBrush 
     if ((*value = impl->brush)) ICompositionBrush_AddRef( *value );
     return S_OK;
 }
+static const char *debugstr_brush( void *brush );
 static HRESULT WINAPI sprite_put_Brush( ISpriteVisual *iface, ICompositionBrush *value )
 {
     scene_changed();
     struct visual *impl = impl_from_sprite( iface );
-    TRACE( "public sprite %p brush %p.\n", impl, value );
+    TRACE_(dcomptree)( "public sprite %p brush %s.\n", impl, debugstr_brush( value ) );
     if (value) ICompositionBrush_AddRef( value );
     if (impl->brush) ICompositionBrush_Release( impl->brush );
     impl->brush = value;

@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     fb82bb178b1615bd835df6897c8671a85d67b6ef
-                 windows.media.playback.mediaplayer: Hand out a MediaPlayerSurface over an empty drawing surface.
+  wine HEAD:     bf76306299179bfda33ba32e9108c0c1c9b2b3d2
+                 dcomp: Blit CompositionVisualSurface snapshots, which have only a CPU copy.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-15T08:16:33Z
+  captured:      2026-11-15T08:39:31Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
