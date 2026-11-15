@@ -37,6 +37,9 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(wineuwp);
 
+/* the thread drive_view_startup runs on, the first view's UI thread (WINE_UWP_WATCH=tls:SLOT:ui+OFF) */
+static volatile DWORD view_startup_tid;
+
 static void mark_psm_registered( void );
 HRESULT WINAPI __wine_uwp_prepare_dxgi( void );
 
@@ -2774,6 +2777,7 @@ static HRESULT drive_view_startup( IInspectable *args )
 
         /* Tell the view an activation is coming first, the way the shell does. Nothing on this
          * path had done it, and it is the documented precondition for the calls that follow. */
+        view_startup_tid = GetCurrentThreadId();
         ERR( "STEP tid %lu: PrepareToActivateAsync\n", GetCurrentThreadId() );
         prepare_view_for_activation();
         ERR( "STEP tid %lu: creating the window factory\n", GetCurrentThreadId() );
@@ -6008,8 +6012,11 @@ static DWORD WINAPI code_bp_thread( void *arg )
 
 /* WINE_UWP_WATCH=module+rva: a hardware write watchpoint on the 8 bytes at that address, on every thread (new
  * ones are picked up every 20 ms). Each write is logged with the new value and the writer's caller chain, which
- * finds who clears a static the app itself writes only once. Uses DR0; the target's own debug registers lose. */
+ * finds who clears a static the app itself writes only once. Uses DR0; the target's own debug registers lose.
+ * WINE_UWP_WATCH=tls:SLOT:TID+OFF watches thread TID's implicit TLS block of slot SLOT at OFF, from every thread
+ * but TID itself: what writes into another thread's TLS (a NativeAOT thread's allocation context lives there). */
 static ULONG_PTR watch_addr;
+static DWORD watch_skip_tid;
 static LONG watch_hits;
 
 static LONG CALLBACK watch_handler( EXCEPTION_POINTERS *info )
@@ -6041,9 +6048,38 @@ static DWORD WINAPI watch_thread( void *arg )
 
     if (!plus) return 0;
     *plus = 0;
-    for (tries = 0; tries < 2400 && !(mod = GetModuleHandleA( spec )); tries++) Sleep( 50 );
-    if (!mod) return 0;
-    watch_addr = (ULONG_PTR)mod + strtoull( plus + 1, NULL, 16 );
+    if (!strncmp( spec, "tls:", 4 ))
+    {
+        ULONG slot = strtoul( spec + 4, NULL, 10 );
+        const char *colon = strchr( spec + 4, ':' );
+        HANDLE target;
+        THREAD_BASIC_INFORMATION tbi;
+
+        if (!colon) return 0;
+        if (!strcmp( colon + 1, "ui" ))
+        {
+            for (tries = 0; tries < 2400 && !view_startup_tid; tries++) Sleep( 5 );
+            watch_skip_tid = view_startup_tid;
+        }
+        else watch_skip_tid = strtoul( colon + 1, NULL, 16 );
+        for (tries = 0; tries < 2400; tries++, Sleep( 5 ))
+        {
+            void **vector;
+            if (!(target = OpenThread( THREAD_QUERY_INFORMATION, FALSE, watch_skip_tid ))) continue;
+            if (!NtQueryInformationThread( target, ThreadBasicInformation, &tbi, sizeof(tbi), NULL ) &&
+                (vector = ((TEB *)tbi.TebBaseAddress)->ThreadLocalStoragePointer) && vector[slot])
+                watch_addr = (ULONG_PTR)vector[slot] + strtoull( plus + 1, NULL, 16 );
+            CloseHandle( target );
+            if (watch_addr) break;
+        }
+        if (!watch_addr) { ERR( "WATCH: no TLS slot %lu for thread %04lx\n", slot, watch_skip_tid ); return 0; }
+    }
+    else
+    {
+        for (tries = 0; tries < 2400 && !(mod = GetModuleHandleA( spec )); tries++) Sleep( 50 );
+        if (!mod) return 0;
+        watch_addr = (ULONG_PTR)mod + strtoull( plus + 1, NULL, 16 );
+    }
     AddVectoredExceptionHandler( 1, watch_handler );
     ERR( "WATCH armed on %s+%s at %p, now %Ix\n", spec, plus + 1, (void *)watch_addr, *(ULONG_PTR *)watch_addr );
     for (;;)
@@ -6057,7 +6093,8 @@ static DWORD WINAPI watch_thread( void *arg )
             CONTEXT ctx;
             DWORD i;
 
-            if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == self) continue;
+            if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == self ||
+                te.th32ThreadID == watch_skip_tid) continue;
             for (i = 0; i < narmed && armed[i] != te.th32ThreadID; i++) ;
             if (i < narmed || narmed == ARRAY_SIZE(armed)) continue;
             if (!(thread = OpenThread( THREAD_ALL_ACCESS, FALSE, te.th32ThreadID ))) continue;

@@ -14978,3 +14978,29 @@ after a scroll. Home, Apps, Gaming and AI Hub unchanged. Tour: Home 718 MB RSS (
 
 Seen in passing: a rare start-up fail-fast in managed code (`WinStore.App.dll+2f609e1`, a NULL read, unwinding through
 `+16bbcaa`/`+16cd866`), in 3 of today's runs including two at 00:39 and 00:52 before any of this. Not yet looked at.
+
+## 2026-11-15 - Store: the rare start-up fail-fast (`WinStore.App.dll+2f609e1`), not yet found
+
+Three runs today died the same way on the first view's UI thread, ~0.5 s after the window appeared, inside a
+property-changed callback (`DependencyObject::SetValue` -> `NotifyPropertyChanged` -> a WinUI control -> the Store's
+handler). `+2f609e1` is NativeAOT's `RhpNewFast` (22609 is NativeAOT: `DotNetRuntimeDebugHeader`, `DOTNET_*` knobs): it
+reads the thread's allocation context through `gs:0x58` -> `ThreadLocalStoragePointer[_tls_index]` + 0x30 and wrote the
+new object to address 0. The context it read had `alloc_ptr` 0 and a "combined limit" of 0x2d969800 / 0x2d9ab7f0 /
+0x2dc95c40 - process-heap or stack addresses, not the GC heap (a healthy UI thread's `alloc_ptr` is 0x2_xxxx_xxxx). So
+those 16 bytes held something else's data.
+
+Ruled out, with measurements:
+- **GC suspension.** No `SuspendThread`, `QueueUserAPC2`, `GetThreadContext` or `FlushProcessWriteBuffers` call in
+  40 s of start-up (breakpoints, with a control). `DOTNET_GCgen0size=20000` brings 3 GCs in, and still no suspension
+  call: the other threads were preemptive. Note for later: Wine queues a *special* user APC (`QueueUserAPC2`, which
+  NativeAOT finds and prefers) as an ordinary one (`call_user_apc_dispatcher` FIXMEs the flag), so a GC that needed to
+  interrupt a running managed thread would wait for that thread's next alertable wait.
+- **TLS slots.** `WinStore.App.dll` is slot 0 (0x129 bytes, an all-zero template); slots 1-3 are windows.ui.xaml,
+  twinapi.appcore, msftedit. `alloc_tls_slot`/`alloc_thread_tls` run under the loader lock, old vectors are never
+  freed, and a template re-copy would give zeros (the slow path), not this.
+- **FLS.** Two `FlsAlloc`, no `FlsFree`; each of the 21 `RtlProcessFlsData` calls processes its own thread's data.
+- **A use-after-free write** caught by `warn+heap`'s delayed frees: none in two start-ups.
+
+Not reproduced in 12 traced plus ~20 plain start-ups since. `WINE_UWP_WATCH=tls:0:ui+38` (new: watch the UI thread's
+TLS block from every other thread) is armed and quiet in a clean run; the next step is to keep it on in runs until one
+crashes, then watch +0x30 as well. Logs of runs ended by `UWP_TIMEOUT` lose Wine's buffered tail; a fail-fast flushes.
