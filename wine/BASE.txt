@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     651652435db82269b6e7c0c487b94977a8a77b3c
-                 WinUI 3 desktop apps: through the Windows App SDK bootstrap.
+  wine HEAD:     935523dd6441d333c0fef3fb16fa96bc33dce039
+                 d2d1: Answer ID2D1PrivateFactory, which the Windows App SDK's DWM requires at load.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-15T23:43:43Z
+  captured:      2026-11-15T23:48:56Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

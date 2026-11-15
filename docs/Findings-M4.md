@@ -15144,6 +15144,16 @@ vtable `D2DFactoryLocking<MultiThreadedTrait>::vftable{for ID2D1PrivateFactory}`
 `ControlOfferReclaim(BOOL)`, which Startup calls, slot 15 `CreatePrivateDevice`). The lifted compositor (dcompi + dwmcorei)
 renders through d2d1's private device interfaces, so WinUI 3 rendering is the next project, not a stub.
 
+Followed one step further: d2d1 now answers `ID2D1PrivateFactory` (setters accepted, the lock methods on the factory's
+lock, `CreatePrivateDevice`/geometry/gradient creators E_NOTIMPL with a FIXME), and dwmcorei loads. Then dcompi faults in
+`DirectComposition::CDxDevice::Initialize` (+0x49c, a NULL member at `+0x30`) and the process fail-fasts. That member comes
+from `Microsoft.Internal.FrameworkUdk.dll`'s `DxPrivates_PartnerDeviceFromDevice(d3d11 device, &out)`, a call through a
+private-function table which `SetupFunctionTables` fills from `Microsoft.Internal.FrameworkUdk.System.dll` (the OS half of
+the "undocked" kit, in neither of our Windows images) or, failing that, from built-in tables chosen by OS version, below a
+level answering E_NOTIMPL; dcompi does not check. So the lifted compositor wants a D3D11 *partner device* and D2D private
+devices - what Windows gives DWM. Two ways on: implement those private interfaces in d3d11/d2d1, or serve
+`Microsoft.UI.Composition` from our own dcomp, as `Windows.UI.Composition` already is.
+
 Also: WhatsApp polls `NetworkInformation.GetHostNames` (a Wine stub, E_NOTIMPL) every 1.5 s forever; its push channel and
 StartupTask fail cleanly.
 

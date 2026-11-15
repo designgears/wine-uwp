@@ -536,3 +536,4 @@ include/powersetting.h
 include/windows.applicationmodel.background.idl
 include/windows.applicationmodel.idl
 include/windowscontracts.idl
+dlls/d2d1/factory.c
