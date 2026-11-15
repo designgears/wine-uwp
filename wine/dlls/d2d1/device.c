@@ -5185,7 +5185,7 @@ static const char shape_ps_code[] =
     "        c_high = gradient.Load(i * 2 + 1);\n"
     "\n"
     "        if (position >= p_low && position <= p_high)\n"
-    "            return lerp(c_low, c_high, (position - p_low) / (p_high - p_low));\n"
+    "            return p_high > p_low ? lerp(c_low, c_high, (position - p_low) / (p_high - p_low)) : c_high;\n"
     "\n"
     "        p_low = p_high;\n"
     "        c_low = c_high;\n"

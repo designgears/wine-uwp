@@ -292,6 +292,13 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
 static BOOL brush_solid_color( ICompositionBrush *brush, Color *color );
 static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int width, int height, float opacity );
 static BOOL paint_gradient_sprite( HDC hdc, void *brush_iface, int x, int y, int width, int height, float opacity );
+static ID2D1Brush *shape_gradient_brush( ID2D1RenderTarget *target, IUnknown *brush_iface, ID2D1Geometry *geometry, float opacity );
+static ICompositionPropertySet *shared_properties( void *iface, BOOL create );
+struct kf_animation;
+struct anim_binding;
+static BOOL gradient_bind( void *owner, const WCHAR *prop, struct kf_animation *kf );
+static struct anim_binding *gradient_binding( void *owner, const WCHAR *prop );
+static BOOL shape_gradient_hash( IUnknown *brush_iface, ULONGLONG *hash );
 static BOOL paint_effect_sprite( HDC hdc, void *brush_iface, int x, int y, int width, int height );
 struct drawing_surface;
 static BOOL paint_mapped_surface( HDC hdc, void *brush_iface, struct drawing_surface *surface, int x, int y,
@@ -1634,6 +1641,7 @@ struct compositor
     const void **compositor6_vtbl; /* ICompositor6, see compositor6_vtbl */
     const void **compositor4_vtbl; /* ICompositor4, see compositor4_vtbl */
     const void **compositor7_vtbl; /* ICompositor7, see compositor7_vtbl */
+    const void **compositor8_vtbl; /* ICompositor8, see compositor8_vtbl */
     const void **shadow_vtbl;      /* ICompositorWithProjectedShadow, see compositor_shadow_vtbl */
     const void **radial_vtbl;      /* ICompositorWithRadialGradient, see compositor_radial_vtbl */
     const void **visual_surface_vtbl; /* ICompositorWithVisualSurface, see compositor_visual_surface_vtbl */
@@ -2248,6 +2256,8 @@ static BOOL expr_evaluate_scalar_product( struct expr_animation *expr, float *ou
 static const char *debugstr_animation( void *animation );
 static const WCHAR *debug_bound_opacity( struct expr_animation *expr );
 static BOOL expr_resolve_colorrgb( void *animation, Color *color );
+struct expr_animation;
+static BOOL expr_colorrgb_full( struct expr_animation *expr, Color *color );
 static HRESULT create_matrix_transform( void **out );
 struct visual;
 static struct visual *impl_from_visual_interop( void *iface );
@@ -2494,6 +2504,46 @@ static const void *object4_view_vtbl[] =
     object4_view_GetIids, object4_view_GetRuntimeClassName, object4_view_GetTrustLevel,
     object4_view_TryGetAnimationController,
 };
+
+/* ICompositionObject5 {1d7f391b-a130-5265-a62b-60b8e668965a}: slot 6 StartAnimation(name, animation, controller). Lottie
+ * code generated for a shared AnimationController (ICompositor8::CreateAnimationController) starts every key frame
+ * animation this way, with the controller's Progress bound to the player's "_.Progress": the animation starts as usual
+ * and its binding takes the controller, as one fetched with TryGetAnimationController would. */
+static const GUID IID_ICompositionObject5_local = {0x1d7f391b,0xa130,0x5265,{0xa6,0x2b,0x60,0xb8,0xe6,0x68,0x96,0x5a}};
+static struct anim_binding *anim_binding_lookup( IUnknown *owner, const WCHAR *prop );
+static HRESULT WINAPI object5_view_StartAnimation( void *iface, HSTRING name, IUnknown *animation, IUnknown *controller )
+{
+    struct object4_view *view = CONTAINING_RECORD( iface, struct object4_view, vtbl );
+    const WCHAR *prop = WindowsGetStringRawBuffer( name, NULL );
+    struct anim_binding *binding;
+    ICompositionObject *object;
+    HRESULT hr;
+
+    TRACE_(dcompanim)( "%p %s <- %s with controller %p\n", view->owner, debugstr_w( prop ), debugstr_animation( animation ),
+                       controller );
+    if (FAILED( hr = IUnknown_QueryInterface( view->owner, &IID_ICompositionObject, (void **)&object ) )) return hr;
+    hr = ICompositionObject_StartAnimation( object, name, (ICompositionAnimation *)animation );
+    ICompositionObject_Release( object );
+    if (SUCCEEDED( hr ) && controller && prop && anim_controller_from_any( controller ) &&
+        (binding = anim_binding_lookup( view->owner, prop )))
+        anim_binding_set_controller( binding, controller );
+    return hr;
+}
+static const void *object5_view_vtbl[] =
+{
+    object4_view_QueryInterface, object4_view_AddRef, object4_view_Release,
+    object4_view_GetIids, object4_view_GetRuntimeClassName, object4_view_GetTrustLevel,
+    object5_view_StartAnimation,
+};
+static HRESULT create_object4_view( IUnknown *owner, void **out );
+/* the ICompositionObject4 or ICompositionObject5 view, whichever was asked for */
+static HRESULT create_object45_view( IUnknown *owner, REFIID iid, void **out )
+{
+    HRESULT hr = create_object4_view( owner, out );
+    if (SUCCEEDED( hr ) && IsEqualGUID( iid, &IID_ICompositionObject5_local ))
+        CONTAINING_RECORD( *out, struct object4_view, vtbl )->vtbl = object5_view_vtbl;
+    return hr;
+}
 
 static HRESULT create_object4_view( IUnknown *owner, void **out )
 {
@@ -2926,16 +2976,23 @@ static HRESULT create_closable_view( IUnknown *owner, void **out )
 static void *drop_shadow_vtbl[];
 static HRESULT WINAPI comp_object_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    /* ICompositionNineGridBrush: only a nine-grid brush answers it (nine_grid_QueryInterface). XAML's
+     * WUCBrushManager::GetNineGridBrush asks the brush it has for it and creates a nine-grid brush only when that
+     * fails; answered by a surface brush, its put_LeftInset (slot 13) ran put_Surface with a garbage pointer and the
+     * Microsoft Store crashed at start-up now and then. */
+    static const GUID IID_ICompositionNineGridBrush_generic =
+        { 0xf25154e4, 0xbc8c, 0x4be7, { 0xb8, 0x0f, 0x86, 0x85, 0xb8, 0x3c, 0x01, 0x86 } };
     struct comp_object *object = CONTAINING_RECORD( iface, struct comp_object, vtbl );
-    if (is_reference_tracker_iid( iid ) || is_animation_group_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
+    if (is_reference_tracker_iid( iid ) || is_animation_group_iid( iid ) ||
+        IsEqualGUID( iid, &IID_ICompositionNineGridBrush_generic )) { *out = NULL; return E_NOINTERFACE; }
 
     TRACE( "%s %p, iid %s.\n", object->kind, object, debugstr_guid(iid) );
 
     /* Generic recording objects keep answering ICompositionObject with themselves: XAML's expression conversion
      * (WinRTExpressionConversionContext::CreateExpression) depends on that, and a separate view there made its next
      * step fail with E_NOINTERFACE. The typed brush, factory and easing objects hand out a view instead. */
-    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
-        return create_object4_view( (IUnknown *)&object->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ) || IsEqualGUID( iid, &IID_ICompositionObject5_local ))
+        return create_object45_view( (IUnknown *)&object->vtbl, iid, out );
     /* Composition lights are the exception: XAML's reveal lights (Windows.UI.Xaml.Controls'
      * RevealHoverLight) take the light's ICompositionObject, ask it for the compositor and build
      * their animations from that; the recording view answered nothing and the light code then
@@ -5413,6 +5470,11 @@ static HRESULT WINAPI surface_brush_QueryInterface( void *iface, REFIID iid, voi
         *out = &brush->vtbl2;
         return S_OK;
     }
+    /* ICompositionObject is a view: the catch-all answered with this table, whose slot 8 (get_Properties there) is
+     * get_HorizontalAlignmentRatio. XAML's connected animation (CConnectedAnimation::StartSpriteAnimations) read 0.5
+     * as the brush's property set and the Microsoft Store crashed opening a search result now and then. */
+    if (IsEqualGUID( iid, &IID_ICompositionObject ))
+        return create_composition_object_view( (IUnknown *)&brush->vtbl, out );
     return comp_object_QueryInterface( iface, iid, out );
 }
 
@@ -10605,6 +10667,11 @@ static const void *compositor4_vtbl[];
 static const void *compositor7_vtbl[];
 static const GUID IID_ICompositor7_local =
     { 0xd3483fad, 0x9a12, 0x53ba, { 0xbf, 0xc8, 0x88, 0xb7, 0xff, 0x79, 0x77, 0xc6 } };
+/* ICompositor8 {9a0bdee2-fe7b-5f62-a366-9cf8effe2112}: slot 6 CreateAnimationController. Refused, the Microsoft Store's
+ * cast threw and its "Built for Copilot+ PC" badge icon (Lottie code sharing one controller) was never built. */
+static const void *compositor8_vtbl[];
+static const GUID IID_ICompositor8_local =
+    { 0x9a0bdee2, 0xfe7b, 0x5f62, { 0xa3, 0x66, 0x9c, 0xf8, 0xef, 0xfe, 0x21, 0x12 } };
 static const void *compositor_shadow_vtbl[];
 static const GUID IID_ICompositorWithProjectedShadow_local =
     { 0xa2e6330e, 0x8a60, 0x5a38, { 0xbb, 0x85, 0xb4, 0x4e, 0xa9, 0x01, 0x67, 0x7c } };
@@ -10839,6 +10906,13 @@ static HRESULT WINAPI compositor_QueryInterface( ICompositor *iface, REFIID iid,
         *out = &impl->compositor7_vtbl;
         return S_OK;
     }
+    if (IsEqualGUID( iid, &IID_ICompositor8_local ))
+    {
+        InterlockedIncrement( &impl->ref );
+        impl->compositor8_vtbl = compositor8_vtbl;
+        *out = &impl->compositor8_vtbl;
+        return S_OK;
+    }
 
     /* WinUI 2's RadialGradientBrush asks for this and uses the answer without checking it:
      * E_NOINTERFACE left it calling through NULL (Microsoft.UI.Xaml.dll+0x143a48, in
@@ -11070,7 +11144,14 @@ struct property_set
     struct { WCHAR name[48]; struct expr_animation *expr; LONG id; float last[16]; BOOL notified; } bindings[PROPSET_BINDINGS];
     unsigned int binding_count;
     IUnknown *listener;         /* XAML's PropertySetListener for a facade set, see notify_facade_listeners */
+    /* scalar key-frame animations started on a property; one given an AnimationController (LottieGen's
+     * StartAnimation(name, animation, controller), the Store's "my.Opacity0" colour alphas) is sampled at the
+     * controller's progress when an expression reads the property */
+    struct anim_binding kf_bindings[ANIM_BINDINGS];
+    unsigned int kf_binding_count;
 };
+static void anim_bindings_release( struct anim_binding *bindings, unsigned int count );
+static const struct ICompositionPropertySetVtbl propset_vtbl;
 
 static HRESULT create_property_set( ICompositionPropertySet **out );
 static HRESULT create_visual( ICompositor *compositor, enum visual_kind kind, void **out );
@@ -12760,8 +12841,8 @@ static HRESULT visual_qi( struct visual *impl, REFIID iid, void **out )
         *out = &impl->sprite2_vtbl;
     else if (IsEqualGUID( iid, &IID_ILayerVisual_local ) && impl->layer)
         *out = &impl->layer_vtbl;
-    else if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
-        return create_object4_view( (IUnknown *)&impl->IVisual_iface, out );
+    else if (IsEqualGUID( iid, &IID_ICompositionObject4_local ) || IsEqualGUID( iid, &IID_ICompositionObject5_local ))
+        return create_object45_view( (IUnknown *)&impl->IVisual_iface, iid, out );
     else if (IsEqualGUID( iid, &IID_IShapeVisual_local ) && impl->shape_vtbl)
         *out = &impl->shape_vtbl;
     else if (IsEqualGUID( iid, &IID_IVisual ))
@@ -13230,17 +13311,20 @@ static void visual_undo_animation( struct visual *impl, const WCHAR *prop )
 /* The controller for an object's animated property: a real one bound to the recorded animation when the
  * object is a visual or shape with such a binding (its progress then drives the property), a plain one
  * otherwise. A visual's end value is undone first: the controller decides the resting state. */
-static HRESULT anim_controller_for( IUnknown *owner, const WCHAR *prop, void **out )
+static struct anim_binding *anim_binding_lookup( IUnknown *owner, const WCHAR *prop )
 {
     void *interop = NULL;
     struct anim_binding *binding = NULL;
     struct comp_shape *shape = owner ? comp_shape_from_any( (IInspectable *)owner ) : NULL;
-    HRESULT hr;
-
-    if (!out) return E_POINTER;
     struct path_geometry *pg = !shape && owner ? path_geometry_from_any( owner ) : NULL;
     if (shape && prop) binding = anim_find( shape->bindings, shape->binding_count, prop );
     else if (pg && prop) binding = anim_find( pg->bindings, pg->binding_count, prop );
+    else if ((binding = gradient_binding( owner, prop ))) ;
+    else if (owner && prop && *(void ***)owner == (void **)&propset_vtbl)
+    {
+        struct property_set *set = CONTAINING_RECORD( owner, struct property_set, ICompositionPropertySet_iface );
+        binding = anim_find( set->kf_bindings, set->kf_binding_count, prop );
+    }
     else if (owner && prop && SUCCEEDED( IUnknown_QueryInterface( owner, &IID_IInteropVisual_private, &interop ) ))
     {
         struct visual *impl = visual_from_interop( interop );
@@ -13251,6 +13335,15 @@ static HRESULT anim_controller_for( IUnknown *owner, const WCHAR *prop, void **o
         }
         IUnknown_Release( (IUnknown *)interop );
     }
+    return binding;
+}
+static HRESULT anim_controller_for( IUnknown *owner, const WCHAR *prop, void **out )
+{
+    struct anim_binding *binding;
+    HRESULT hr;
+
+    if (!out) return E_POINTER;
+    binding = anim_binding_lookup( owner, prop );
     if (FAILED( hr = create_anim_controller( out ) )) return hr;
     if (binding) anim_binding_set_controller( binding, *out );
     return S_OK;
@@ -14136,8 +14229,8 @@ static HRESULT WINAPI propset_QueryInterface( ICompositionPropertySet *iface, RE
         *out = &impl->set2_vtbl;
         return S_OK;
     }
-    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
-        return create_object4_view( (IUnknown *)&impl->ICompositionPropertySet_iface, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ) || IsEqualGUID( iid, &IID_ICompositionObject5_local ))
+        return create_object45_view( (IUnknown *)&impl->ICompositionPropertySet_iface, iid, out );
     /* XAML's expression conversion walks an expression's Properties into its private partner and
      * fail-fasts on E_NOINTERFACE; a recording object takes the calls. */
     if (IsEqualGUID( iid, &IID_ICompositionObjectPartner_local ))
@@ -14172,6 +14265,7 @@ static ULONG WINAPI propset_Release( ICompositionPropertySet *iface )
             listened_remove( impl );
             IUnknown_Release( impl->listener );
         }
+        anim_bindings_release( impl->kf_bindings, impl->kf_binding_count );
         free( impl );
     }
     return ref;
@@ -14549,6 +14643,7 @@ static HRESULT brush_start_animation( struct color_brush *impl, const WCHAR *pro
 
     scene_changed();
     TRACE( "brush %p, %s, animation %p.\n", impl, debugstr_w( prop ), animation );
+    TRACE_(dcompanim)( "colour brush %p %s <- %s\n", impl, debugstr_w( prop ), debugstr_animation( animation ) );
     if (kf && kf->has_value && kf->value_kind == KF_COLOR && prop && !wcsicmp( prop, L"Color" ))
         impl->color = kf->color;
     else if (prop && !wcsicmp( prop, L"Color" ))
@@ -14557,9 +14652,18 @@ static HRESULT brush_start_animation( struct color_brush *impl, const WCHAR *pro
         Color color;
         if (v) impl->color = v->u.color;
         else if (expr_resolve_colorrgb( animation, &color )) impl->color = color;
-        else return S_OK;
-        /* keep the expression: the theme's property set changes later (app theme switch) */
-        if (animation) IUnknown_AddRef( (IUnknown *)animation );
+        else
+        {
+            TRACE_(dcompanim)( "colour brush %p: %s not resolved\n", impl, debugstr_animation( animation ) );
+            return S_OK;
+        }
+        /* keep the expression: the theme's property set changes later (app theme switch). A snapshot: LottieGen
+         * rewrites one ExpressionAnimation for every brush, so all of them followed the last one's text. */
+        {
+            struct expr_animation *expr = expr_animation_from_any( animation ), *snap;
+            if (expr && (snap = expr_snapshot( expr ))) animation = (ICompositionAnimation *)&snap->vtbl;
+            else if (animation) IUnknown_AddRef( (IUnknown *)animation );
+        }
         if (impl->color_expr) IUnknown_Release( (IUnknown *)impl->color_expr );
         impl->color_expr = animation;
         TRACE( "brush %p colour from expression: %02x%02x%02x%02x\n", impl, impl->color.A, impl->color.R, impl->color.G, impl->color.B );
@@ -15087,8 +15191,8 @@ static HRESULT WINAPI kf_animation_QueryInterface( void *iface, REFIID iid, void
     if (is_animation_group_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     if (IsEqualGUID( iid, &IID_ICompositionObject ))
         return create_composition_object_view( (IUnknown *)&impl->vtbl, out );
-    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
-        return create_object4_view( (IUnknown *)&impl->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ) || IsEqualGUID( iid, &IID_ICompositionObject5_local ))
+        return create_object45_view( (IUnknown *)&impl->vtbl, iid, out );
     InterlockedIncrement( &impl->ref );
     if (IsEqualGUID( iid, &IID_ICompositionAnimation2_local ))
     {
@@ -15443,8 +15547,8 @@ static HRESULT WINAPI clip_QueryInterface( void *iface, REFIID iid, void **out )
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
     if (IsEqualGUID( iid, &IID_ICompositionObject ))
         return create_composition_object_view( (IUnknown *)&impl->vtbl, out );
-    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
-        return create_object4_view( (IUnknown *)&impl->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ) || IsEqualGUID( iid, &IID_ICompositionObject5_local ))
+        return create_object45_view( (IUnknown *)&impl->vtbl, iid, out );
     InterlockedIncrement( &impl->ref );
     if (IsEqualGUID( iid, impl->inset ? &IID_IInsetClip_local : &IID_IRectangleClip_local )) *out = &impl->typed_vtbl;
     else if (IsEqualGUID( iid, &IID_ICompositionClip2_local )) *out = &impl->clip2_vtbl;
@@ -15777,8 +15881,8 @@ static HRESULT WINAPI comp_batch_QueryInterface( void *iface, REFIID iid, void *
     TRACE( "%s %p, iid %s.\n", batch->kind, batch, debugstr_guid( iid ) );
     if (IsEqualGUID( iid, &IID_ICompositionObject ))
         return create_composition_object_view( (IUnknown *)&batch->vtbl, out );
-    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
-        return create_object4_view( (IUnknown *)&batch->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ) || IsEqualGUID( iid, &IID_ICompositionObject5_local ))
+        return create_object45_view( (IUnknown *)&batch->vtbl, iid, out );
     InterlockedIncrement( &batch->ref );
     if ((batch->scoped && IsEqualGUID( iid, &IID_ICompositionScopedBatch_local )) ||
         (!batch->scoped && IsEqualGUID( iid, &IID_ICompositionCommitBatch_local )))
@@ -16168,8 +16272,8 @@ static HRESULT WINAPI anim_controller_QueryInterface( void *iface, REFIID iid, v
     TRACE( "%p, iid %s.\n", ctrl, debugstr_guid( iid ) );
     if (IsEqualGUID( iid, &IID_ICompositionObject ))
         return create_composition_object_view( (IUnknown *)&ctrl->vtbl, out );
-    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
-        return create_object4_view( (IUnknown *)&ctrl->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ) || IsEqualGUID( iid, &IID_ICompositionObject5_local ))
+        return create_object45_view( (IUnknown *)&ctrl->vtbl, iid, out );
     InterlockedIncrement( &ctrl->ref );
     *out = IsEqualGUID( iid, &IID_IAnimationController_local ) ? (void *)&ctrl->typed_vtbl : (void *)&ctrl->vtbl;
     return S_OK;
@@ -16346,6 +16450,29 @@ static struct anim_binding *anim_find( struct anim_binding *bindings, unsigned i
     for (i = 0; i < count; i++) if (!wcsicmp( bindings[i].prop, prop )) return &bindings[i];
     return NULL;
 }
+static void anim_bindings_release( struct anim_binding *bindings, unsigned int count )
+{
+    unsigned int i;
+    for (i = 0; i < count; i++)
+    {
+        if (bindings[i].kf) comp_object_Release( &bindings[i].kf->vtbl );
+        if (bindings[i].controller) anim_controller_Release( &bindings[i].controller->vtbl );
+        bindings[i].kf = NULL;
+        bindings[i].controller = NULL;
+    }
+}
+/* A property set's scalar at its controlled key-frame animation's progress, see property_set.kf_bindings */
+static BOOL propset_controlled_scalar( struct property_set *set, const WCHAR *prop, float *out )
+{
+    struct anim_binding *b = anim_find( set->kf_bindings, set->kf_binding_count, prop );
+    struct kf_key v;
+    float progress;
+
+    if (!b || !b->kf || !b->controller || b->kf->value_kind != KF_SCALAR || !b->kf->key_count) return FALSE;
+    if (!anim_controller_progress( b->controller, &progress ) || !kf_sample( b->kf, progress, &v )) return FALSE;
+    *out = v.u.scalar;
+    return TRUE;
+}
 
 /* The animation handed to StartAnimation is the generic view: that is what CreateXxxKeyFrameAnimation
  * returned and what the object's QI answers for ICompositionAnimation. */
@@ -16461,8 +16588,8 @@ static HRESULT WINAPI manip_transform_QueryInterface( void *iface, REFIID iid, v
     if (is_reference_tracker_iid( iid )) { *out = NULL; return E_NOINTERFACE; }
     struct manip_transform *impl = CONTAINING_RECORD( iface, struct manip_transform, vtbl );
     TRACE( "%p, iid %s.\n", impl, debugstr_guid( iid ) );
-    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
-        return create_object4_view( (IUnknown *)&impl->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ) || IsEqualGUID( iid, &IID_ICompositionObject5_local ))
+        return create_object45_view( (IUnknown *)&impl->vtbl, iid, out );
     InterlockedIncrement( &impl->ref );
     *out = &impl->vtbl;
     return S_OK;
@@ -16571,8 +16698,8 @@ static HRESULT WINAPI expr_animation_QueryInterface( void *iface, REFIID iid, vo
     if (IsEqualGUID( iid, &IID_ICompositionAnimation2_early ))
         return expr_anim2_create( (IUnknown *)&impl->vtbl, out );
     if (IsEqualGUID( iid, &IID_ICompositionAnimation4_local )) return expr_anim4_create( impl, out );
-    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
-        return create_object4_view( (IUnknown *)&impl->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ) || IsEqualGUID( iid, &IID_ICompositionObject5_local ))
+        return create_object45_view( (IUnknown *)&impl->vtbl, iid, out );
     /* A real ICompositionObject view: WinUI calls get_Compositor on it, which on this table would be
      * get_Expression. Its Properties are a recording object (see object_view_get_Properties). */
     if (IsEqualGUID( iid, &IID_ICompositionObject ))
@@ -17070,6 +17197,7 @@ static BOOL expr_bound_scalar( struct expr_ctx *c, const WCHAR *ref, const WCHAR
         if (!set && !wcsicmp( ref, L"LOCAL" )) set = c->local;
     }
     if (!set) return FALSE;
+    if (propset_controlled_scalar( set, prop, out )) return TRUE;
     for (i = 0; i < set->binding_count; i++)
     {
         struct expr_animation *bound = set->bindings[i].expr;
@@ -17357,6 +17485,29 @@ static BOOL expr_evaluate_scalar_full( struct expr_animation *expr, float *out )
     expr_skip_space( &c );
     return !*c.p;
 }
+/* "ColorRGB(a, r, g, b)" with four scalar expressions: LottieGen's animated colours read their alpha from a property
+ * set, "ColorRGB(my.Opacity0,255,199,0)" (the Microsoft Store's "Built for Copilot+ PC" badge) */
+static BOOL expr_colorrgb_full( struct expr_animation *expr, Color *color )
+{
+    struct expr_ctx c;
+    float v[4];
+    BYTE b[4];
+    unsigned int i;
+
+    c.expr = expr; c.local = NULL; c.dmanip = NULL; c.p = expr->expression; c.depth = 1;
+    if (!expr_accept( &c, L"ColorRGB(" )) return FALSE;
+    for (i = 0; i < 4; i++)
+    {
+        if (i && !expr_accept( &c, L"," )) return FALSE;
+        if (!expr_scalar( &c, &v[i] )) return FALSE;
+        b[i] = (BYTE)(min( max( v[i], 0.0f ), 255.0f ) + 0.5f);
+    }
+    if (!expr_accept( &c, L")" )) return FALSE;
+    expr_skip_space( &c );
+    if (*c.p) return FALSE;
+    color->A = b[0]; color->R = b[1]; color->G = b[2]; color->B = b[3];
+    return TRUE;
+}
 static BOOL expr_matrix_product( struct expr_ctx *c, D2D_MATRIX_3X2_F *out );
 static BOOL expr_matrix_term( struct expr_ctx *c, D2D_MATRIX_3X2_F *out )
 {
@@ -17582,16 +17733,22 @@ static IUnknown *anim_object_unwrap( IUnknown *object )
 static struct property_set *propset_from_object( IUnknown *object )
 {
     void **vtbl = object ? *(void ***)object : NULL;
+    ICompositionPropertySet *props;
     void *interop = NULL;
     struct property_set *set = NULL;
 
     if (!object) return NULL;
     if (vtbl == (void **)&propset_vtbl) return CONTAINING_RECORD( object, struct property_set, ICompositionPropertySet_iface );
+    if ((props = shared_properties( object, FALSE )))
+        return CONTAINING_RECORD( props, struct property_set, ICompositionPropertySet_iface );
     /* transforms and animations are no visuals: their tables answer unknown interfaces with recording objects */
     if (vtbl == (void **)manip_transform_vtbl || vtbl == (void **)matrix_transform_vtbl ||
         vtbl == (void **)expr_animation_vtbl || vtbl == (void **)expr_anim_view_vtbl || vtbl == (void **)kf_animation_vtbl)
         return NULL;
     if (vtbl == (void **)object_view_vtbl) return propset_from_object( impl_from_object_view( object )->owner );
+    /* a reference passed as an object's ICompositionObject4/5 view */
+    if (vtbl == (void **)object4_view_vtbl || vtbl == (void **)object5_view_vtbl)
+        return propset_from_object( CONTAINING_RECORD( object, struct object4_view, vtbl )->owner );
     /* a reference set through its IAnimationObject (ICompositionAnimation4::SetExpressionReferenceParameter) */
     if (vtbl == (void **)anim_object_view_vtbl) return propset_from_object( ((struct anim_object_view *)object)->owner );
     /* "_interactionTracker.Position.X": a tracker's values and the app's own properties are in its property set */
@@ -17622,6 +17779,7 @@ static BOOL expr_resolve_colorrgb( void *animation, Color *color )
     else if (vtbl == (void **)expr_anim_view_vtbl) expr = CONTAINING_RECORD( animation, struct expr_animation, anim_vtbl );
     else return FALSE;
     if (!expr->expression || wcsncmp( expr->expression, L"ColorRGB(", 9 )) return FALSE;
+    if (expr_colorrgb_full( expr, color )) return TRUE;
     e = expr->expression + 9;
     if (!(dot = wcschr( e, '.' )) || !(dot2 = wcschr( dot + 1, '.' ))) return FALSE;
     if ((n = dot - e) >= ARRAY_SIZE(ref) || dot2 - dot - 1 >= ARRAY_SIZE(prop)) return FALSE;
@@ -17817,8 +17975,8 @@ static HRESULT WINAPI comp_shape_QueryInterface( void *iface, REFIID iid, void *
     /* The main table is the sprite/container interface, so ICompositionObject needs a real view. */
     if (IsEqualGUID( iid, &IID_ICompositionObject ))
         return create_composition_object_view( (IUnknown *)&shape->vtbl, out );
-    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
-        return create_object4_view( (IUnknown *)&shape->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ) || IsEqualGUID( iid, &IID_ICompositionObject5_local ))
+        return create_object45_view( (IUnknown *)&shape->vtbl, iid, out );
     InterlockedIncrement( &shape->ref );
     if (IsEqualGUID( iid, &IID_ICompositionShape_ )) *out = &shape->shape_vtbl;
     else if (IsEqualGUID( iid, &IID_comp_shape_private )) *out = shape;
@@ -18133,8 +18291,8 @@ static HRESULT WINAPI path_geometry_QueryInterface( void *iface, REFIID iid, voi
     TRACE( "%p, iid %s.\n", geometry, debugstr_guid( iid ) );
     if (IsEqualGUID( iid, &IID_ICompositionObject ))
         return create_composition_object_view( (IUnknown *)&geometry->vtbl, out );
-    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
-        return create_object4_view( (IUnknown *)&geometry->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ) || IsEqualGUID( iid, &IID_ICompositionObject5_local ))
+        return create_object45_view( (IUnknown *)&geometry->vtbl, iid, out );
     InterlockedIncrement( &geometry->ref );
     if (IsEqualGUID( iid, &IID_ICompositionGeometry_ )) *out = &geometry->geometry_vtbl;
     else if (IsEqualGUID( iid, &IID_path_geometry_private )) *out = geometry;
@@ -18462,6 +18620,7 @@ static void shape_signature( struct comp_shape *shape, const D2D1_MATRIX_3X2_F *
     have = shape->fill && brush_solid_color( (ICompositionBrush *)shape->fill, &color );
     hash_bytes( hash, &have, sizeof(have) );
     if (have) hash_bytes( hash, &color, sizeof(color) );
+    else if (shape->fill) shape_gradient_hash( shape->fill, hash );
     have = shape->stroke && brush_solid_color( (ICompositionBrush *)shape->stroke, &color );
     hash_bytes( hash, &have, sizeof(have) );
     if (have) hash_bytes( hash, &color, sizeof(color) );
@@ -18514,6 +18673,15 @@ static void paint_shape( ID2D1RenderTarget *target, struct comp_shape *shape, co
             {
                 ID2D1RenderTarget_FillGeometry( target, geometry, (ID2D1Brush *)brush, NULL );
                 ID2D1SolidColorBrush_Release( brush );
+            }
+        }
+        else if (shape->fill)
+        {
+            ID2D1Brush *gradient = shape_gradient_brush( target, shape->fill, geometry, opacity );
+            if (gradient)
+            {
+                ID2D1RenderTarget_FillGeometry( target, geometry, gradient, NULL );
+                ID2D1Brush_Release( gradient );
             }
         }
         if (shape->stroke && shape->stroke_thickness > 0.0f && brush_solid_color( (ICompositionBrush *)shape->stroke, &color ) && color.A)
@@ -21696,14 +21864,45 @@ struct color_stop
     Color color;
     float offset;
     const void **closable_vtbl; /* IClosable, see color_stop_closable_vtbl */
+    /* an expression animating Color, read when the gradient is drawn: LottieGen's gradient fills fade their stops
+     * with "ColorRGB(my.Opacity0,139,71,255)" (the Microsoft Store's "Built for Copilot+ PC" badge, which was
+     * transparent while the stops kept their initial colour). Kept for the stop's lifetime. */
+    struct expr_animation *color_expr;
+    ICompositionPropertySet *properties; /* see shared_properties */
 };
 static void *color_stop_vtbl[COMP_OBJECT_SLOTS];
 static LONG gradient_generation;
+/* the stop's colour now: its Color expression's value where it evaluates */
+static void color_stop_refresh( struct color_stop *stop )
+{
+    struct expr_animation *expr = stop->color_expr;
+    struct propset_value *v;
+    Color c;
+
+    if (!expr) return;
+    if ((v = expr_resolve_value( &expr->vtbl, PROP_COLOR ))) stop->color = v->u.color;
+    else if (expr_resolve_colorrgb( &expr->vtbl, &c )) stop->color = c;
+}
 
 static struct color_stop *color_stop_from( void *iface )
 {
     if (!iface || *(void ***)iface != (void **)color_stop_vtbl) return NULL;
     return CONTAINING_RECORD( iface, struct color_stop, vtbl );
+}
+static ULONG WINAPI color_stop_Release( void *iface )
+{
+    struct color_stop *stop = CONTAINING_RECORD( iface, struct color_stop, vtbl );
+    ULONG ref = InterlockedDecrement( &stop->ref );
+
+    if (!ref)
+    {
+        if (stop->color_expr) IUnknown_Release( (IUnknown *)&stop->color_expr->vtbl );
+        if (stop->properties) ICompositionPropertySet_Release( stop->properties );
+        comp_map_owner_gone( &stop->vtbl );
+        expr_anim_target_gone( &stop->vtbl );
+        free( stop );
+    }
+    return ref;
 }
 static HRESULT WINAPI color_stop_get_Color( void *iface, Color *value )
 {
@@ -21738,7 +21937,7 @@ static HRESULT WINAPI color_stop_put_Offset( void *iface, float value )
 static struct color_stop *color_stop_from_closable( void *iface ) { return CONTAINING_RECORD( iface, struct color_stop, closable_vtbl ); }
 static HRESULT WINAPI color_stop_closable_QueryInterface( void *iface, REFIID iid, void **out );
 static ULONG WINAPI color_stop_closable_AddRef( void *iface ) { return comp_object_AddRef( &color_stop_from_closable( iface )->vtbl ); }
-static ULONG WINAPI color_stop_closable_Release( void *iface ) { return comp_object_Release( &color_stop_from_closable( iface )->vtbl ); }
+static ULONG WINAPI color_stop_closable_Release( void *iface ) { return color_stop_Release( &color_stop_from_closable( iface )->vtbl ); }
 static HRESULT WINAPI color_stop_closable_GetIids( void *iface, ULONG *count, IID **iids )
 {
     if (!count || !iids) return E_POINTER;
@@ -21776,8 +21975,8 @@ static HRESULT WINAPI color_stop_QueryInterface( void *iface, REFIID iid, void *
     }
     if (IsEqualGUID( iid, &IID_ICompositionObject ))
         return create_composition_object_view( (IUnknown *)&stop->vtbl, out );
-    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
-        return create_object4_view( (IUnknown *)&stop->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ) || IsEqualGUID( iid, &IID_ICompositionObject5_local ))
+        return create_object45_view( (IUnknown *)&stop->vtbl, iid, out );
     return comp_object_QueryInterface( iface, iid, out );
 }
 static HRESULT WINAPI color_stop_closable_QueryInterface( void *iface, REFIID iid, void **out )
@@ -21794,7 +21993,7 @@ static HRESULT create_color_stop( float offset, Color color, void **out )
     if (!color_stop_vtbl[0])
     {
         color_stop_vtbl[1] = comp_object_AddRef;
-        color_stop_vtbl[2] = comp_object_Release;
+        color_stop_vtbl[2] = color_stop_Release;
         for (i = 3; i < COMP_OBJECT_SLOTS; i++) color_stop_vtbl[i] = comp_object_slot_fn( i );
         comp_object_set_inspectable( color_stop_vtbl );
         color_stop_vtbl[6] = color_stop_get_Color;
@@ -22036,6 +22235,11 @@ struct gradient_brush
         UINT64 sig;             /* what the pixels were rendered from: gradient_signature() */
         ULONG used;             /* when last painted, for replacing the least recently used */
     } cache[4];
+    ICompositionPropertySet *properties; /* see shared_properties */
+    /* key-frame animations of its geometry, sampled at their controller's progress when drawn (LottieGen moves a
+     * gradient's StartPoint and EndPoint through the animated visual's controller); see gradient_apply_controlled */
+    struct anim_binding bindings[ANIM_BINDINGS];
+    unsigned int binding_count;
 };
 static void *gradient_brush_vtbl[COMP_OBJECT_SLOTS];
 static void *gradient_radial_vtbl[COMP_OBJECT_SLOTS];
@@ -22048,6 +22252,88 @@ static struct gradient_brush *gradient_brush_from( void *iface )
     if (!iface || (*(void ***)iface != (void **)gradient_brush_vtbl && *(void ***)iface != (void **)gradient_radial_vtbl))
         return NULL;
     return CONTAINING_RECORD( iface, struct gradient_brush, vtbl );
+}
+/* CompositionObject.Properties of a gradient brush or stop, one set for every view of it. LottieGen keeps a gradient's
+ * alpha there and its stops read it ("ColorRGB(my.Opacity0,139,71,255)", "my" being the brush); every view used to
+ * answer a set of its own, so the stops never saw the value (the Microsoft Store's "Built for Copilot+ PC" badge). */
+static ICompositionPropertySet *shared_properties( void *iface, BOOL create )
+{
+    struct gradient_brush *brush = gradient_brush_from( iface );
+    struct color_stop *stop = brush ? NULL : color_stop_from( iface );
+    ICompositionPropertySet **slot = brush ? &brush->properties : stop ? &stop->properties : NULL, *set;
+
+    if (!slot) return NULL;
+    if (!*slot && create && SUCCEEDED( create_property_set( &set ) ) &&
+        InterlockedCompareExchangePointer( (void **)slot, set, NULL ))
+        ICompositionPropertySet_Release( set );
+    return *slot;
+}
+/* Read (write FALSE) or write a gradient brush property a binding drives. */
+static BOOL gradient_controlled_value( struct gradient_brush *brush, const struct anim_binding *b, struct kf_key *v, BOOL write )
+{
+#define CONTROLLED(kind_, name_, field_, member_) \
+    if (b->kf->value_kind == kind_ && !wcsicmp( b->prop, name_ )) \
+    { if (write) field_ = v->u.member_; else v->u.member_ = field_; return TRUE; }
+    CONTROLLED( KF_VECTOR2, L"StartPoint", brush->start, vector2 )
+    CONTROLLED( KF_VECTOR2, L"EndPoint", brush->end, vector2 )
+    CONTROLLED( KF_VECTOR2, L"EllipseCenter", brush->ellipse_center, vector2 )
+    CONTROLLED( KF_VECTOR2, L"EllipseRadius", brush->ellipse_radius, vector2 )
+    CONTROLLED( KF_VECTOR2, L"GradientOriginOffset", brush->origin_offset, vector2 )
+    CONTROLLED( KF_VECTOR2, L"Offset", brush->offset, vector2 )
+    CONTROLLED( KF_VECTOR2, L"Scale", brush->scale, vector2 )
+    CONTROLLED( KF_VECTOR2, L"CenterPoint", brush->center, vector2 )
+    CONTROLLED( KF_VECTOR2, L"AnchorPoint", brush->anchor, vector2 )
+#undef CONTROLLED
+    return FALSE;
+}
+/* As visual_apply_controlled: each bound animation's value at its controller's progress, or the value the property
+ * had before it ahead of the first key; one with no controller settles at its end (gradient_bind) */
+static void gradient_apply_controlled( struct gradient_brush *brush )
+{
+    unsigned int i;
+    for (i = 0; i < brush->binding_count; i++)
+    {
+        struct anim_binding *b = &brush->bindings[i];
+        struct kf_key v;
+        float progress;
+        if (!b->kf || !b->kf->key_count || !anim_controller_progress( b->controller, &progress )) continue;
+        if (b->base_state == BASE_UNREAD)
+        {
+            memset( &v, 0, sizeof(v) );
+            b->base_state = gradient_controlled_value( brush, b, &v, FALSE ) ? BASE_READ : BASE_NONE;
+            memcpy( &b->base, &v.u, sizeof(b->base) );
+        }
+        if (!kf_sample( b->kf, progress, &v ))
+        {
+            if (b->base_state != BASE_READ) continue;
+            memcpy( &v.u, &b->base, sizeof(b->base) );
+        }
+        gradient_controlled_value( brush, b, &v, TRUE );
+    }
+}
+/* StartAnimation on a gradient brush property: bound for a controller (object5_view_StartAnimation), else settles */
+static BOOL gradient_bind( void *owner, const WCHAR *prop, struct kf_animation *kf )
+{
+    struct gradient_brush *brush = gradient_brush_from( owner );
+    struct anim_binding *b;
+    struct kf_key v;
+
+    if (!brush || !prop) return FALSE;
+    if (!(b = anim_bind( brush->bindings, &brush->binding_count, prop, kf && kf->has_value ? kf : NULL ))) return TRUE;
+    if (!kf || !kf->has_value) return TRUE;
+    memset( &v, 0, sizeof(v) );
+    if (!gradient_controlled_value( brush, b, &v, FALSE )) return TRUE;
+    b->base_state = BASE_READ;
+    memcpy( &b->base, &v.u, sizeof(b->base) );
+    if (kf->value_kind == KF_VECTOR2) v.u.vector2 = kf->vector2;
+    gradient_controlled_value( brush, b, &v, TRUE );
+    InterlockedIncrement( &gradient_generation );
+    return TRUE;
+}
+static struct anim_binding *gradient_binding( void *owner, const WCHAR *prop )
+{
+    struct gradient_brush *brush = gradient_brush_from( owner );
+    return brush && prop ? anim_find( brush->bindings, brush->binding_count, prop ) : NULL;
 }
 static struct gradient_brush *gradient_from_grad( void *iface )
 {
@@ -22072,6 +22358,8 @@ static ULONG WINAPI gradient_brush_Release( void *iface )
         unsigned int i;
         if (impl->stops) stop_collection_Release( &impl->stops->vtbl );
         for (i = 0; i < ARRAY_SIZE(impl->cache); i++) retire_bitmap( impl->cache[i].bmp );
+        if (impl->properties) ICompositionPropertySet_Release( impl->properties );
+        anim_bindings_release( impl->bindings, impl->binding_count );
         free( impl );
     }
     return ref;
@@ -22101,8 +22389,8 @@ static HRESULT WINAPI gradient_brush_QueryInterface( void *iface, REFIID iid, vo
      * Microsoft Store's shadows ask a gradient brush for its Compositor). */
     if (IsEqualGUID( iid, &IID_ICompositionObject ))
         return create_composition_object_view( (IUnknown *)&impl->vtbl, out );
-    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ))
-        return create_object4_view( (IUnknown *)&impl->vtbl, out );
+    if (IsEqualGUID( iid, &IID_ICompositionObject4_local ) || IsEqualGUID( iid, &IID_ICompositionObject5_local ))
+        return create_object45_view( (IUnknown *)&impl->vtbl, iid, out );
     /* WinUI closes the brushes it drops; the catch-all below would hand it the primary vtable, whose slot 6
      * is a getter (get_EllipseCenter on a radial brush) that writes through Close's missing argument. */
     if (IsEqualGUID( iid, &IID_IClosable ))
@@ -22401,7 +22689,7 @@ static void gradient_render( struct gradient_brush *brush, BYTE *out, unsigned i
     const Matrix3x2 *tm = &brush->transform;
 
     for (i = 0; i < brush->stops->count && count < ARRAY_SIZE(stops); i++)
-        if ((stops[count] = color_stop_from( brush->stops->stops[i] ))) count++;
+        if ((stops[count] = color_stop_from( brush->stops->stops[i] ))) color_stop_refresh( stops[count++] );
     if (!count)
     {
         memset( out, 0, (size_t)w * h * 4 );
@@ -22526,12 +22814,112 @@ static UINT64 gradient_signature( struct gradient_brush *brush, unsigned int w, 
         struct color_stop *stop = color_stop_from( brush->stops->stops[i] );
         UINT32 bits[5] = { 0 };
         if (!stop) continue;
+        color_stop_refresh( stop );
         memcpy( &bits[0], &stop->offset, 4 );
         memcpy( &bits[1], &stop->color, sizeof(stop->color) < 16 ? sizeof(stop->color) : 16 );
         SIG_MIX( bits[0] ); SIG_MIX( bits[1] ); SIG_MIX( bits[2] ); SIG_MIX( bits[3] ); SIG_MIX( bits[4] );
     }
 #undef SIG_MIX
     return sig;
+}
+
+/* A shape filled with a gradient brush (LottieGen's gradient fills: the Microsoft Store's "Built for Copilot+ PC"
+ * badge), as a Direct2D brush in the shape's own space. A relative brush maps onto the geometry's bounds. */
+static ID2D1Brush *shape_gradient_brush( ID2D1RenderTarget *target, IUnknown *brush_iface, ID2D1Geometry *geometry, float opacity )
+{
+    struct gradient_brush *brush = gradient_brush_from( brush_iface );
+    D2D1_GRADIENT_STOP d2d_stops[32];
+    struct color_stop *stops[32];
+    ID2D1GradientStopCollection *collection;
+    D2D1_RECT_F bounds = { 0 };
+    D2D1_MATRIX_3X2_F f;
+    const Matrix3x2 *tm;
+    ID2D1Brush *result = NULL;
+    unsigned int count = 0, i;
+    float w, h, ox, oy, c, sn, g[6];
+
+    if (!brush || !brush->stops) return NULL;
+    gradient_apply_controlled( brush );
+    for (i = 0; i < brush->stops->count && count < ARRAY_SIZE(stops); i++)
+        if ((stops[count] = color_stop_from( brush->stops->stops[i] ))) color_stop_refresh( stops[count++] );
+    if (!count) return NULL;
+    qsort( stops, count, sizeof(*stops), stop_compare );
+    for (i = 0; i < count; i++)
+    {
+        d2d_stops[i].position = stops[i]->offset;
+        d2d_stops[i].color.r = stops[i]->color.R / 255.0f;
+        d2d_stops[i].color.g = stops[i]->color.G / 255.0f;
+        d2d_stops[i].color.b = stops[i]->color.B / 255.0f;
+        d2d_stops[i].color.a = stops[i]->color.A / 255.0f * opacity;
+    }
+    if (TRACE_ON(dcompshape))
+    {
+        char buf[400]; int n = 0;
+        for (i = 0; i < count && n < 360; i++)
+            n += snprintf( buf + n, sizeof(buf) - n, " %02x%02x%02x%02x@%g%s", stops[i]->color.A, stops[i]->color.R,
+                           stops[i]->color.G, stops[i]->color.B, stops[i]->offset,
+                           stops[i]->color_expr ? "*" : "" );
+        TRACE_(dcompshape)( "%s brush %p mapping %d extend %d start %g,%g end %g,%g centre %g,%g radius %g,%g stops%s\n",
+                            brush->radial ? "radial" : "linear", brush, brush->mapping, brush->extend, brush->start.X,
+                            brush->start.Y, brush->end.X, brush->end.Y, brush->ellipse_center.X, brush->ellipse_center.Y,
+                            brush->ellipse_radius.X, brush->ellipse_radius.Y, buf );
+    }
+    if (FAILED( ID2D1RenderTarget_CreateGradientStopCollection( target, d2d_stops, count, D2D1_GAMMA_2_2,
+                                                                brush->extend == 1 ? D2D1_EXTEND_MODE_WRAP :
+                                                                brush->extend == 2 ? D2D1_EXTEND_MODE_MIRROR :
+                                                                D2D1_EXTEND_MODE_CLAMP, &collection ) ))
+        return NULL;
+    ID2D1Geometry_GetBounds( geometry, NULL, &bounds );
+    w = bounds.right - bounds.left; h = bounds.bottom - bounds.top;
+    if (brush->mapping == 1) { ox = bounds.left; oy = bounds.top; }
+    else { ox = oy = 0.0f; }
+    if (brush->radial)
+    {
+        D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES props;
+        float sx = brush->mapping == 1 ? w : 1.0f, sy = brush->mapping == 1 ? h : 1.0f;
+        props.center.x = brush->ellipse_center.X * sx; props.center.y = brush->ellipse_center.Y * sy;
+        props.gradientOriginOffset.x = brush->origin_offset.X * sx; props.gradientOriginOffset.y = brush->origin_offset.Y * sy;
+        props.radiusX = brush->ellipse_radius.X * sx; props.radiusY = brush->ellipse_radius.Y * sy;
+        ID2D1RenderTarget_CreateRadialGradientBrush( target, &props, NULL, collection,
+                                                     (ID2D1RadialGradientBrush **)&result );
+    }
+    else
+    {
+        D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES props;
+        float sx = brush->mapping == 1 ? w : 1.0f, sy = brush->mapping == 1 ? h : 1.0f;
+        props.startPoint.x = brush->start.X * sx; props.startPoint.y = brush->start.Y * sy;
+        props.endPoint.x = brush->end.X * sx; props.endPoint.y = brush->end.Y * sy;
+        ID2D1RenderTarget_CreateLinearGradientBrush( target, &props, NULL, collection,
+                                                     (ID2D1LinearGradientBrush **)&result );
+    }
+    ID2D1GradientStopCollection_Release( collection );
+    if (!result) return NULL;
+    /* the brush transform, as gradient_render applies it, then the mapping's origin */
+    tm = &brush->transform;
+    c = cosf( brush->rotation ); sn = sinf( brush->rotation );
+    f._11 = brush->scale.X * c;  f._12 = brush->scale.X * sn;
+    f._21 = -brush->scale.Y * sn; f._22 = brush->scale.Y * c;
+    f._31 = brush->center.X - (f._11 * brush->center.X + f._21 * brush->center.Y);
+    f._32 = brush->center.Y - (f._12 * brush->center.X + f._22 * brush->center.Y);
+    g[0] = f._11 * tm->M11 + f._12 * tm->M21; g[1] = f._11 * tm->M12 + f._12 * tm->M22;
+    g[2] = f._21 * tm->M11 + f._22 * tm->M21; g[3] = f._21 * tm->M12 + f._22 * tm->M22;
+    g[4] = f._31 * tm->M11 + f._32 * tm->M21 + tm->M31; g[5] = f._31 * tm->M12 + f._32 * tm->M22 + tm->M32;
+    f._11 = g[0]; f._12 = g[1]; f._21 = g[2]; f._22 = g[3];
+    f._31 = g[4] + brush->offset.X - brush->anchor.X * w + ox;
+    f._32 = g[5] + brush->offset.Y - brush->anchor.Y * h + oy;
+    ID2D1Brush_SetTransform( result, &f );
+    return result;
+}
+static BOOL shape_gradient_hash( IUnknown *brush_iface, ULONGLONG *hash )
+{
+    struct gradient_brush *brush = gradient_brush_from( brush_iface );
+    UINT64 sig;
+
+    if (!brush) return FALSE;
+    gradient_apply_controlled( brush );
+    sig = gradient_signature( brush, 0, 0 );
+    hash_bytes( hash, &sig, sizeof(sig) );
+    return TRUE;
 }
 
 /* A sprite painted with a gradient brush. */
@@ -23773,6 +24161,11 @@ static HRESULT WINAPI object_view_get_Properties( void *iface, ICompositionPrope
         ICompositionPropertySet_AddRef( (*value = kf->properties) );
         return S_OK;
     }
+    if ((set = shared_properties( view->owner, TRUE )))
+    {
+        ICompositionPropertySet_AddRef( (*value = set) );
+        return S_OK;
+    }
     if (!view->properties)
     {
         if (FAILED(hr = create_property_set( &set ))) return hr;
@@ -23812,6 +24205,20 @@ static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, voi
         struct expr_animation *expr = expr_animation_from_any( animation );
         const WCHAR *prop = WindowsGetStringRawBuffer( name, NULL );
         struct path_geometry *pg = !shape && view->owner ? path_geometry_from_any( view->owner ) : NULL;
+        struct color_stop *stop = view->owner ? color_stop_from( view->owner ) : NULL;
+        if (view->owner && kf && gradient_bind( view->owner, prop, kf ))
+            TRACE_(dcompanim)( "gradient %p %s bound to %p\n", view->owner, debugstr_w( prop ), kf );
+        if (stop && prop && !wcsicmp( prop, L"Color" ))
+        {
+            struct expr_animation *snap = expr ? expr_snapshot( expr ) : NULL;
+            if (stop->color_expr) IUnknown_Release( (IUnknown *)&stop->color_expr->vtbl );
+            stop->color_expr = snap;
+            if (kf && kf->has_value && kf->value_kind == KF_COLOR) stop->color = kf->color;
+            color_stop_refresh( stop );
+            InterlockedIncrement( &gradient_generation );
+            TRACE_(dcompanim)( "stop %p colour %02x%02x%02x%02x%s\n", stop, stop->color.A, stop->color.R, stop->color.G,
+                               stop->color.B, snap ? " (expression)" : "" );
+        }
         if (shape && kf && prop)
         {
             anim_bind( shape->bindings, &shape->binding_count, prop, kf );
@@ -23870,11 +24277,13 @@ static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, voi
         else if (!shape && !ctrl && kf && prop)
             TRACE( "owner %p (%s): %s key-frame animation not bound.\n", view->owner,
                    view->owner && *(void ***)view->owner == (void **)kf_animation_vtbl ? "kf" : "?", debugstr_w( prop ) );
-        if (ctrl && prop && !wcsicmp( prop, L"Progress" ) && expr)
+        /* a snapshot: LottieGen reuses one ExpressionAnimation, rewriting it for every later binding ("ColorRGB(...)"
+         * on a brush), and the Store's "Built for Copilot+ PC" badge then had no progress at all */
+        struct expr_animation *snap;
+        if (ctrl && prop && !wcsicmp( prop, L"Progress" ) && expr && (snap = expr_snapshot( expr )))
         {
-            IUnknown_AddRef( (IUnknown *)&expr->vtbl );
             if (ctrl->progress_expr) IUnknown_Release( (IUnknown *)&ctrl->progress_expr->vtbl );
-            ctrl->progress_expr = expr;
+            ctrl->progress_expr = expr = snap;
             TRACE( "controller %p progress follows %s.\n", ctrl, debugstr_w( expr->expression ) );
         }
         if (ctrl && prop && !wcsicmp( prop, L"Progress" ) && kf && kf->has_value && kf->value_kind == KF_SCALAR)
@@ -23914,6 +24323,11 @@ static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, voi
         struct property_set *set = CONTAINING_RECORD( view->owner, struct property_set, ICompositionPropertySet_iface );
         struct kf_animation *pkf = kf_animation_from( animation );
         const WCHAR *pprop = WindowsGetStringRawBuffer( name, NULL );
+        /* remembered for a controller to drive (object5_view_StartAnimation); a later start of anything else on
+         * the property ends it */
+        if (pprop && (pkf || anim_find( set->kf_bindings, set->kf_binding_count, pprop )))
+            anim_bind( set->kf_bindings, &set->kf_binding_count, pprop,
+                       pkf && pkf->value_kind == KF_SCALAR ? pkf : NULL );
         /* a scalar key-frame animation on a property (an AnimatedIcon's "Progress" to a new state) settles
          * at its end value */
         if (pkf && pkf->has_value && pkf->value_kind == KF_SCALAR && pprop)
@@ -24099,6 +24513,44 @@ static const void *compositor7_vtbl[] =
     compositor2_GetIids, compositor2_GetRuntimeClassName, compositor2_GetTrustLevel,
     compositor7_get_DispatcherQueue, compositor7_CreateAnimationPropertyInfo, compositor7_CreateRectangleClip,
     compositor7_CreateRectangleClipWithSides, compositor7_CreateRectangleClipWithSidesAndRadius,
+};
+
+static struct compositor *impl_from_compositor8( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct compositor, compositor8_vtbl );
+}
+static HRESULT WINAPI compositor8_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return compositor_QueryInterface( &impl_from_compositor8( iface )->ICompositor_iface, iid, out );
+}
+static ULONG WINAPI compositor8_AddRef( void *iface )
+{
+    return compositor_AddRef( &impl_from_compositor8( iface )->ICompositor_iface );
+}
+static ULONG WINAPI compositor8_Release( void *iface )
+{
+    return compositor_Release( &impl_from_compositor8( iface )->ICompositor_iface );
+}
+static HRESULT WINAPI compositor8_CreateAnimationController( void *iface, void **result )
+{
+    struct anim_controller *ctrl;
+    HRESULT hr;
+
+    TRACE( "iface %p.\n", iface );
+    if (!result) return E_POINTER;
+    if (FAILED( hr = create_anim_controller( result ) )) return hr;
+    /* a new controller is at progress 0 until something moves it; read before its "Progress" expression could be
+     * evaluated, the Store's badge took every key frame's end value and drew its gradient stops transparent */
+    ctrl = ctrl_from_typed( *result );
+    ctrl->has_progress = TRUE;
+    ctrl->progress = 0.0f;
+    return S_OK;
+}
+static const void *compositor8_vtbl[] =
+{
+    compositor8_QueryInterface, compositor8_AddRef, compositor8_Release,
+    compositor2_GetIids, compositor2_GetRuntimeClassName, compositor2_GetTrustLevel,
+    compositor8_CreateAnimationController,
 };
 
 /* ICompositorWithProjectedShadow ({a2e6330e-...}): 6 CreateProjectedShadowCaster, 7 CreateProjectedShadowReceiver,

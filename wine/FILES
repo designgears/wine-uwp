@@ -522,3 +522,4 @@ dlls/windows.security.authentication.onlineid/authenticator.c
 dlls/windows.security.authentication.onlineid/private.h
 dlls/windows.security.authentication.onlineid/ticket.c
 dlls/windows.media/adaptive.c
+dlls/d2d1/brush.c

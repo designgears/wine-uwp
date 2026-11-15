@@ -14932,3 +14932,49 @@ themes). The same groups fade out a scrim over every carousel page: before, all 
 Football Manager 27, LUCI), now the art is at full brightness (`msstore-22609-hero-scrims-before-after.png`, left
 before, right after; the pages differ only by carousel position). Scrolled Home identical (AE 0). Calc AE 4120.98,
 mp 2835 twice.
+
+## 2026-11-15 - Store: product-page badges (LottieGen controllers, gradient shapes, d2d1 gradients)
+
+The grey squares where a product page's badge icons belong (CapCut: "Built for Copilot+ PC", "Uses AI features") were
+two problems in one Lottie and one in Direct2D.
+
+- **Two crashes on the way, both the catch-all.** A traced run died in `WUCBrushManager::GetNineGridBrush`: XAML QIs a
+  brush for `ICompositionNineGridBrush` `{f25154e4}`, the generic table answered, and `put_Surface` landed on another
+  slot. `comp_object_QueryInterface` now refuses it. A connected animation read 0.5 as a property set because a surface
+  brush's `ICompositionObject` was its own table; it gets a real composition object view.
+- **The badge control (`AnimIconBadgeControl`, chosen by the badges JSON's IconId) threw `InvalidCastException`** at
+  `WinStore.App.dll+2f9f4d`: its LottieGen code casts the compositor to `ICompositor8` `{9a0bdee2}` for
+  `CreateAnimationController` (slot 6) and every object to `ICompositionObject5` `{1d7f391b}` for
+  `StartAnimation(name, animation, controller)` (slot 6). Both exist now; one controller drives all 229 bindings of the
+  Copilot logo, and its `Progress` follows `_.Progress` of the root visual, which the player moves to 0.1827.
+- **LottieGen reuses one ExpressionAnimation for every binding.** It sets `Expression`, the references, starts it, and
+  rewrites it for the next object. We kept the live object, so the controller ended up following
+  `ColorRGB(my.Opacity0,255,199,0)` and could not evaluate it. A controller's Progress, a colour brush's and a gradient
+  stop's Color now take `expr_snapshot()` at StartAnimation, as Windows does.
+- **The logo is gradient fills on shapes**, and shapes painted solid colour brushes only. `shape_gradient_brush` builds
+  a Direct2D linear or radial brush from the gradient brush (stops, extend mode, mapping, the brush transform).
+- **The stops' colours are expressions**, `ColorRGB(my.Opacity0,139,71,255)`: `expr_colorrgb_full` evaluates four
+  scalar arguments. `my` is the *gradient brush*, passed as an object view; `Opacity0` is in its Properties, which
+  every view answered with a set of its own. Gradient brushes and stops now share one set (`shared_properties`), and
+  `propset_from_object` follows ICompositionObject4/5 views. `Opacity0` is a key-frame animation bound to the
+  controller: property sets keep scalar key-frame bindings now (`kf_bindings`), and an expression reading one gets it
+  at the controller's progress (`propset_controlled_scalar`). Before, the set held the animation's end value (0).
+- **The gradients' StartPoint and EndPoint move with the controller too** (10-key EndPoint on the logo's left half).
+  Gradient brushes keep controlled bindings (`gradient_apply_controlled`); without them the left half was flat cyan.
+- **A controller made by CreateAnimationController starts at progress 0.** Painted before the player bound its
+  progress, every controlled value fell back to its end key, and the stops were transparent in that first paint.
+- **Wine's d2d1 uploaded gradient stops straight** while it blends premultiplied (and premultiplies solid colours), so
+  a stop fading to transparent added its colour: the AI sparkle's cyan and purple glows came out white with coloured
+  specks. Stops are premultiplied now, and two stops at one position (Lottie's banded glows) no longer divide by zero
+  in `sample_gradient`. An A/B with radial fills switched off showed the plain blue star, which isolated it.
+
+Measured, not inferred: the root layer's step-eased opacity (`1@0 0@0.037 1@0.185 ...`) looked like it hid the whole
+logo during the played segment, and I spent a while on step semantics. A forced progress (0, 0.1, 0.5) showed the
+icon blank at every value, so timing was never the blocker; the stops were.
+
+Both badges draw (`docs/screenshots/msstore-22609-copilot-badges.png`, `-zoom.png`), the same in captures before and
+after a scroll. Home, Apps, Gaming and AI Hub unchanged. Tour: Home 718 MB RSS (737 before), 974 MB after the tour,
+19.8 s CPU. Calc AE 4120.98, mp 2835 twice.
+
+Seen in passing: a rare start-up fail-fast in managed code (`WinStore.App.dll+2f609e1`, a NULL read, unwinding through
+`+16bbcaa`/`+16cd866`), in 3 of today's runs including two at 00:39 and 00:52 before any of this. Not yet looked at.
