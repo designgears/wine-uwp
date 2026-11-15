@@ -6627,6 +6627,8 @@ static HRESULT create_change_notifier( IUnknown *owner, void **out );
 
 static HRESULT create_property_set( ICompositionPropertySet **out );
 static void dcv_translation( struct dcomp_visual *v, float *x, float *y );
+struct expr_animation;
+static BOOL dcv_evaluate_scalar( struct dcomp_visual *v, struct expr_animation *expr, float *out );
 
 static const void *dcomp_visual_vtbl[];
 static const void *visual_interop_vtbl[];
@@ -9363,6 +9365,7 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
         BOOL ok = TRUE;
         if (expr_evaluate_scalar_product( v->opacity_expr, &opacity )) v->opacity = opacity;
         else if ((value = expr_resolve_value( &v->opacity_expr->vtbl, PROP_SCALAR ))) v->opacity = value->u.scalar;
+        else if (dcv_evaluate_scalar( v, v->opacity_expr, &opacity )) v->opacity = opacity;
         else ok = FALSE;
         if (TRACE_ON(dcompanim) && (!ok || before != v->opacity))
             TRACE_(dcompanim)( "dcomp visual %p opacity %g -> %g from %s%s, bound %s\n", v, before, v->opacity,
@@ -16893,6 +16896,33 @@ static struct propset_value *expr_property( struct expr_ctx *c, const WCHAR *ref
 static BOOL expr_scalar( struct expr_ctx *c, float *out );
 /* "V.Offset", "primaryVisual.Translation": a referenced visual's own vector properties. Translation not
  * in its property set is zero. */
+static BOOL expr_visual_scalar( struct expr_ctx *c, const WCHAR *ref, const WCHAR *prop, float *out )
+{
+    void *interop = NULL;
+    unsigned int i;
+    BOOL ret = FALSE;
+
+    if (!*ref || wcsicmp( prop, L"Opacity" )) return FALSE;
+    for (i = 0; i < c->expr->ref_count; i++)
+        if (!wcsicmp( c->expr->ref_names[i], ref )) break;
+    if (i == c->expr->ref_count || !c->expr->refs[i]) return FALSE;
+    {
+        void **vtbl = *(void ***)c->expr->refs[i];
+        if (vtbl == (void **)&propset_vtbl || vtbl == (void **)manip_transform_vtbl || vtbl == (void **)matrix_transform_vtbl ||
+            vtbl == (void **)expr_animation_vtbl || vtbl == (void **)expr_anim_view_vtbl || vtbl == (void **)kf_animation_vtbl ||
+            vtbl == (void **)object_view_vtbl)
+            return FALSE;
+    }
+    if (FAILED( IUnknown_QueryInterface( c->expr->refs[i], &IID_IInteropVisual_private, &interop ) )) return FALSE;
+    {
+        struct dcomp_visual *dcv = dcv_from_any( interop );
+        struct visual *pub = dcv ? NULL : visual_from_interop( interop );
+        if (dcv) { *out = dcv->opacity; ret = TRUE; }
+        else if (pub) { *out = pub->opacity; ret = TRUE; }
+    }
+    IUnknown_Release( (IUnknown *)interop );
+    return ret;
+}
 static BOOL expr_interop_vector( struct expr_ctx *c, void *interop, const WCHAR *prop, float *x, float *y );
 static BOOL expr_visual_vector( struct expr_ctx *c, const WCHAR *ref, const WCHAR *prop, float *x, float *y )
 {
@@ -17200,9 +17230,10 @@ static BOOL expr_scalar_factor( struct expr_ctx *c, float *out )
     }
     if (expr_bound_scalar( c, ref, prop, out )) return TRUE;
     v = expr_property( c, ref, prop );
-    if (!v || v->type != PROP_SCALAR) return FALSE;
-    *out = v->u.scalar;
-    return TRUE;
+    if (v && v->type == PROP_SCALAR) { *out = v->u.scalar; return TRUE; }
+    /* "_animatedVisual.Opacity": a referenced visual's own opacity (the Microsoft Store follows one visual's fade
+     * with another) */
+    return expr_visual_scalar( c, ref, prop, out );
 }
 static BOOL expr_scalar_product( struct expr_ctx *c, float *out )
 {
@@ -17616,6 +17647,26 @@ static const char *debugstr_animation( void *animation )
 
 /* A visual's Translation: each bound expression's value where it evaluates, the stopped or key-frame value otherwise.
  * The expressions read their target's own property set as "this.Target" (AnimationTranslation, above). */
+/* any scalar expression bound on a visual, with its Properties as LOCAL and itself as "this.Target"
+ * ("Lerp(this.Target.ExpandedOpacity, this.Target.CollapsedOpacity, Abs(rootProperties.CollapsedLerp))", the Store's
+ * carousel pages fading as they collapse) */
+static BOOL dcv_evaluate_scalar( struct dcomp_visual *v, struct expr_animation *expr, float *out )
+{
+    struct dcomp_visual *saved_this = expr_this_visual;
+    struct expr_ctx c;
+    BOOL ok;
+
+    c.expr = expr;
+    c.local = v->properties ? propset_from_object( (IUnknown *)v->properties ) : NULL;
+    c.dmanip = NULL;
+    c.p = expr->expression;
+    c.depth = 0;
+    expr_this_visual = v;
+    ok = expr_scalar( &c, out );
+    if (ok) expr_skip_space( &c );
+    expr_this_visual = saved_this;
+    return ok && !*c.p;
+}
 static void dcv_translation( struct dcomp_visual *v, float *x, float *y )
 {
     struct expr_ctx c;

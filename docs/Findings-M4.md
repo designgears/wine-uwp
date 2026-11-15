@@ -14867,3 +14867,20 @@ three turns opens Game Pass's plans and after five Football Manager 27's page (`
 the hero, then the page it opened); before today's carousel work the static first page opened its own product, and with
 the strip moving but nothing reported, a tap opened the first page's product whatever was shown. The carousel still
 turns through every page; calc AE 4120.98 and mp 2835 twice.
+
+## 2026-11-15 - Store: carousel pages' Opacity expressions (collapsed-state layers)
+
+`warn+dcomp`/`trace+dcompanim` on scrolled Home listed two expressions that never evaluated: every carousel page's
+`Opacity <- Lerp(this.Target.ExpandedOpacity, this.Target.CollapsedOpacity, Abs(rootProperties.CollapsedLerp))`
+(3573 paints) and `Opacity <- _animatedVisual.Opacity` (256). A dcomp visual's Opacity went through
+`expr_evaluate_scalar_product`/`expr_resolve_value`, which know neither the visual's own Properties as `this.Target` nor
+a referenced visual's opacity. Now `dcv_evaluate_scalar` evaluates it with the visual's Properties as LOCAL and the visual
+as `expr_this_visual`, and `ref.Opacity` reads a referenced visual's opacity (`expr_visual_scalar`).
+
+The Store inserts per layer ExpandedOpacity/CollapsedOpacity of 1/0, 0/1 and 0.7/...: each page has a full-size layer
+shown only while collapsed (a tint of the page's accent colour), which was drawn over the expanded page as well. The
+hero's own art is the picture plus a gradient overlay; dumping both blends for each page
+(`docs/screenshots/msstore-22609-hero-art-layers.png`) shows Microsoft 365's art is its icons on a dark background and
+Spotify's its logo on black, so the expanded Microsoft 365 page is now blue on the left fading to dark
+(`msstore-22609-hero-expanded-m365.png`) where it used to be blue throughout. Scrolled Home is otherwise identical
+(AE 0). Calc AE 4120.98, mp 2835 twice.
