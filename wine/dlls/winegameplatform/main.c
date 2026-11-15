@@ -48,6 +48,18 @@ enum { K_COUNT = ARRAY_SIZE(gp_classes), SLOTS = 40 };
 static const void *factory_vtbl[K_COUNT][SLOTS];
 static struct factory factories[K_COUNT];
 
+/* Older revisions of a statics interface, under their own IIDs: the same methods with one slot the newer revision
+ * inserted missing. The table is generated from the Xbox app's Microsoft.GamePlatform.Services.winmd; the Microsoft
+ * Store 22609 ships one from before QueryInstallationContext (slot 21) was added to IPackageQueueStatics. Its
+ * {a0145f87-...} was refused, the PackageQueue factory never activated, and game product pages had no Get button. */
+static const struct { const WCHAR *cls; GUID iid; int missing_slot; } old_statics[] =
+{
+    { L"Microsoft.GamePlatform.Services.PackageQueue",
+      {0xa0145f87,0xfdd7,0x579c,{0xa1,0x6f,0x61,0x76,0x47,0x37,0x34,0x4f}}, 21 },
+};
+static const void *old_statics_vtbl[ARRAY_SIZE(old_statics)][SLOTS];
+static struct factory old_statics_factories[ARRAY_SIZE(old_statics)];
+
 static const struct gp_slot *slot_info( int kind, int n )
 {
     unsigned i;
@@ -90,6 +102,18 @@ static HRESULT WINAPI factory_QueryInterface( struct factory *f, REFIID iid, voi
         InterlockedIncrement( &f->ref );
         *out = f;
         return S_OK;
+    }
+    if (!f->heap)
+    {
+        unsigned i;
+        for (i = 0; i < ARRAY_SIZE(old_statics); i++)
+        {
+            if (old_statics_factories[i].kind != f->kind || !IsEqualGUID( iid, &old_statics[i].iid )) continue;
+            TRACE( "%s: older statics %s\n", class_name( f->kind ), debugstr_guid( iid ) );
+            InterlockedIncrement( &old_statics_factories[i].ref );
+            *out = &old_statics_factories[i];
+            return S_OK;
+        }
     }
     TRACE( "%s: QueryInterface refused %s\n", class_name( f->kind ), debugstr_guid( iid ) );
     *out = NULL;
@@ -1019,6 +1043,19 @@ static BOOL WINAPI init_factories( INIT_ONCE *once, void *param, void **context 
     }
     for (i = 0; i < ARRAY_SIZE(specials); i++)
         if ((k = kind_of( specials[i].cls )) >= 0) factory_vtbl[k][specials[i].slot] = specials[i].fn;
+    for (i = 0; i < ARRAY_SIZE(old_statics); i++)
+    {
+        unsigned n;
+        old_statics_factories[i].kind = -1;
+        if ((k = kind_of( old_statics[i].cls )) < 0) continue;
+        for (n = 0; n < SLOTS; n++)
+        {
+            if (n < old_statics[i].missing_slot) old_statics_vtbl[i][n] = factory_vtbl[k][n];
+            else old_statics_vtbl[i][n] = n + 1 < SLOTS ? factory_vtbl[k][n + 1] : NULL;
+        }
+        old_statics_factories[i] = factories[k];
+        old_statics_factories[i].vtbl = old_statics_vtbl[i];
+    }
     return TRUE;
 }
 

@@ -286,8 +286,15 @@ static HRESULT WINAPI media_device_statics_GetAudioRenderSelector(IMediaDeviceSt
 static HRESULT WINAPI media_device_statics_GetVideoCaptureSelector(IMediaDeviceStatics *iface,
         HSTRING *value)
 {
-    FIXME("iface %p, value %p stub!\n", iface, value);
-    return E_NOTIMPL;
+    /* KSCATEGORY_VIDEO_CAMERA. The Microsoft Store asks at start-up and keeps the answer in a task its product pages
+     * await: E_NOTIMPL here came back as a NotImplementedException on every click on a product. */
+    static const WCHAR selector[] =
+        L"System.Devices.InterfaceClassGuid:=\"{E5323777-F976-4F5B-9B55-B94699C46E44}\""
+        L" AND System.Devices.InterfaceEnabled:=System.StructuredQueryType.Boolean#True";
+
+    TRACE("iface %p, value %p\n", iface, value);
+    if (!value) return E_POINTER;
+    return WindowsCreateString(selector, ARRAY_SIZE(selector) - 1, value);
 }
 
 static HRESULT WINAPI media_device_statics_GetDefaultAudioCaptureId(IMediaDeviceStatics *iface,

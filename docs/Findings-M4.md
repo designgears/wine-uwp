@@ -14726,3 +14726,47 @@ the Store's `VirtualizingScrollingPreviewListViewLayout` / `ScrollingPreviewList
 ItemsRepeater is told. Next: breakpoint WinUI's `ViewportManagerWithPlatformFeatures::GetLayoutRealizationWindow`
 (`+33ea0`) and the layout's `MeasureOverride` at a turn, and see whether the Store calls `ItemsRepeater`
 `GetOrCreateElement`/`TryGetElement` for the next index. Main keeps the static first page; the branch is not merged.
+
+### Microsoft Store: product pages open (2026-11-15)
+
+Clicking a product (Home > Trending games > Roblox) used to leave the row half-highlighted, with overlapping text,
+and open nothing. With `WINE_UWP_TRACE_ORIGINATE=1` the click logged a `NotImplementedException`, then, with each fix,
+the next refusal. Five of them, each found from the throwing managed frame back to the native call:
+
+1. `MediaDevice.GetVideoCaptureSelector` (our `windows.media.devices`) was E_NOTIMPL. The Store calls it **at
+   start-up** and awaits that task when a product page opens, so the exception surfaced 13 s after the call, at the
+   click. Found by breaking on the generic RCW stub's call (`WinStore.App.dll+d793f`, target in `rax`) and the
+   instruction after it (`+d7945`, the HRESULT) over the whole run: the one failing hit was before the click. Now the
+   AQS selector for `KSCATEGORY_VIDEO_CAMERA`.
+2. `ProximityDevice` (NFC): Windows' `Windows.Networking.Proximity.dll` cannot load (ProximityRtapiPal.dll,
+   ProximityCommon.dll), `ERROR_MOD_NOT_FOUND`. With it answering, the same start-up probe went on to
+   `MobileBroadbandModem`, whose native `GetDefault` delay-loads the WWAN API and **killed the process** (exception
+   0x505 from the delay-load failure). Both are now builtins in `windows.networking` (`absentdevices.c`) answering
+   `GetDefault` null, as a PC without the radio does; `wineuwp-setup` points the classes there. Smart-card emulation
+   (`Windows.Devices.SmartCards.Phone.dll` needs BiWinrt.dll) fails to activate too, but the Store handles that one.
+3. `MediaPlaybackItem.MetadataTracks`: our list answered `IVectorView<TimedMetadataTrack>` under a wrong IID. The real
+   one, over the class's default interface `ITimedMetadataTrack`, is `{0313ae7a-2803-5d45-b5a1-a0fc5cd55e7c}`
+   (`piid.py --signature`; audio and video lists were already right). The same wrong IIDs were used for
+   `TimedTextSource` Resolved tracks, which Shapr3D's tutorial subtitles read - possibly why those are not drawn.
+4. `Microsoft.GamePlatform.Services.PackageQueue`: the Store 22609 ships GamePlatform metadata from **before**
+   `QueryInstallationContext` was inserted at slot 21 of `IPackageQueueStatics`, under its own IID `{a0145f87-...}`;
+   our table is generated from the Xbox app's newer winmd. `winegameplatform` now answers the older IID with the same
+   slots minus that one (`old_statics`). The other 20 classes' statics IIDs match.
+5. `OnlineIdSystemAuthenticator.GetForUser`, `GetTicketAsync` and the ticket-request factory were stubs. Tickets now
+   complete at once with `Status = Error` (no Microsoft account is connected to the Windows user here).
+
+Result (`docs/screenshots/msstore-22609-product-page-opens.png`): the product page opens with icon, title, publisher,
+rating, categories and the full description; managed throws after the click went from 29 to 14 (the rest are
+rethrows, the trailer, and XAML's `GetElementVisual` handed a null element). **Still missing: the buy box (Get/price)
+and the media gallery**, although the product JSON and ~15 screenshot images download (`trace+wininet`). The trailer is
+DASH (`.mpd`): `AdaptiveMediaSource` has no implementation and `MediaPlayer.GetSurface` is E_NOTIMPL; the player
+retried the manifest ~100 times in 25 s.
+
+How the managed throws were counted: this Store has **no `mrt100_app.dll`** - its runtime is linked into
+`WinStore.App.dll` (NativeAOT-style, `__managed__Main`), so the old `mrt100_app.dll+45be0` breakpoint never arms. Its
+throw helper is the call before every `int3` at a throw site: `WINE_UWP_BP=WinStore.App.dll+2f61340@stk:10`. Its
+callers name the shape: `+b49892` throws from a failed HRESULT, `+b421d1` from a failed activation (the class name is
+a frozen string loaded just before; `/tmp/nstr_at.py` in the session reads it).
+
+Wine's `onlineid` test fails four factory refcount checks with the old DLL as well (combase caches factories here); calc
+AE 4120.98 and mp 2835 twice after all five.

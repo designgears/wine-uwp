@@ -41,6 +41,12 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
     if (!wcscmp( buffer, RuntimeClass_Windows_Networking_Sockets_MessageWebSocket ))
         IActivationFactory_QueryInterface( message_websocket_factory, &IID_IActivationFactory, (void **)factory );
 
+    if (!wcscmp( buffer, L"Windows.Networking.Proximity.ProximityDevice" ))
+        IActivationFactory_QueryInterface( proximity_device_factory, &IID_IActivationFactory, (void **)factory );
+
+    if (!wcscmp( buffer, L"Windows.Networking.NetworkOperators.MobileBroadbandModem" ))
+        IActivationFactory_QueryInterface( mobile_broadband_modem_factory, &IID_IActivationFactory, (void **)factory );
+
     if (*factory) return S_OK;
     return CLASS_E_CLASSNOTAVAILABLE;
 }

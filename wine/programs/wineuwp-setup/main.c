@@ -1617,6 +1617,9 @@ static void register_wine_classes(void)
     }
 
     set_class_dll( L"Windows.Networking.Connectivity.NetworkInformation", L"windows.networking.connectivity.dll" );
+    /* Windows' need the NFC and WWAN driver stacks; the builtins are a PC with neither radio (absentdevices.c) */
+    set_class( L"Windows.Networking.Proximity.ProximityDevice", L"windows.networking.dll", 0 );
+    set_class( L"Windows.Networking.NetworkOperators.MobileBroadbandModem", L"windows.networking.dll", 0 );
     set_class_dll( L"Windows.Media.Audio.SpatialAudioDeviceConfiguration", L"windows.media.devices.dll" );
     set_class_dll( L"Windows.Media.Audio.SpatialAudioFormatSubtype", L"windows.media.devices.dll" );
     if (in_sys32( L"windows.applicationmodel.useractivities.dll" ))
@@ -1928,6 +1931,11 @@ static void collect_checked_classes( BOOL write )
     }
     if (in_sys32( L"windows.networking.connectivity.dll" ))
         check_class( L"Windows.Networking.Connectivity.NetworkInformation", L"windows.networking.connectivity.dll", 1 );
+    if (in_sys32( L"windows.networking.dll" ))
+    {
+        check_class( L"Windows.Networking.Proximity.ProximityDevice", L"windows.networking.dll", 0 );
+        check_class( L"Windows.Networking.NetworkOperators.MobileBroadbandModem", L"windows.networking.dll", 0 );
+    }
     if (in_sys32( L"windows.applicationmodel.useractivities.dll" ))
         check_class( L"Windows.ApplicationModel.UserActivities.UserActivityChannel",
                      L"windows.applicationmodel.useractivities.dll", 1 );

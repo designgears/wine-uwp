@@ -43,6 +43,8 @@
 
 extern IActivationFactory *stream_socket_factory;
 extern IActivationFactory *message_websocket_factory;
+extern IActivationFactory *proximity_device_factory;
+extern IActivationFactory *mobile_broadband_modem_factory;
 
 extern HRESULT hstring_vector_create( IVector_HSTRING **out );
 

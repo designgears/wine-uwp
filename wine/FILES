@@ -516,3 +516,8 @@ dlls/shell32/shellpath.c
 # 2026-11-15: the Store's Best selling covers (d2d1 effect rendering)
 dlls/d2d1/tests/d2d1.c
 include/d2d1effects.idl
+# 2026-11-15: the Store's product pages (absent radios, OnlineId)
+dlls/windows.networking/absentdevices.c
+dlls/windows.security.authentication.onlineid/authenticator.c
+dlls/windows.security.authentication.onlineid/private.h
+dlls/windows.security.authentication.onlineid/ticket.c
