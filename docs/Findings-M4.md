@@ -14814,3 +14814,45 @@ Result: the banner shows the Copilot artwork (`docs/screenshots/msstore-22609-ai
 Gaming identical to before (AE 0); scrolled Home differs only by a horizontal list's position. RSS 721 MB at Home,
 1202 MB after the tour (1023-1244 before, run to run), CPU 12.9 s for the tour. Calc AE 4120.98 and mp 2835, twice.
 Every other `BeginDraw` with a rectangle in the run started at (0,0), so nothing else changed on these pages.
+
+## 2026-11-15 - Store: the hero carousel turns (merged; `store-carousel-wip` is gone)
+
+The hero carousels now turn through all their pages every 10 s (`docs/screenshots/msstore-22609-hero-carousel-cycle.png`:
+Call of Duty, Microsoft 365, Game Pass, Spotify, Football Manager 27, WhatsApp, 18 captures 2.5 s apart;
+`msstore-22609-hero-carousel-home.png`). The branch's two commits were merged into `uwp-main` with the fixes below;
+the entries above ("parked") describe the state before. How it was found, measured each step:
+
+1. **The Store's layout is never re-measured after start-up.** Breakpoints on WinUI 8.2501 (`Microsoft.UI.Xaml.pdb`):
+   `ItemsRepeater::MeasureOverride` (`+12850`) and the layout context's ABI `GetOrCreateElementAt` (`+2decf0`, index in
+   `rdx`). The hero's context asks for 5..11 at start and nothing after; at each turn only the pips repeater is measured.
+   Its layout reads `context.RealizationRect` (`get_RealizationRect` `+3e170`, from `WinStore.App.dll+1540588`).
+2. **Measuring property-change listeners first was a dead end, kept here so it is not walked again:** XAML registers
+   on hand-off visuals for properties 1, 2, 4, 7, 8, 10, 12, 13, but no listened visual is written statically during
+   a turn (logged `put_*`/`StartAnimation` on visuals with a listener: the last write is 15 s before the first turn).
+3. **What the Store does at a turn:** breakpoints on our own `tracker_get_Position`/`TryUpdatePosition`
+   (`dcomp.dll+<rva>` works for builtins) show its Idle handler re-asserting the landed position (a snap, not a wrap),
+   and its ValuesChanged handler (`WinStore.App.dll+1465480`) computing an index from the position (`+1464270`) and,
+   when the index changes, calling slot 6 of the repeater's interface: `IFrameworkElementProtected7::InvalidateViewport`
+   (`windows.ui.xaml.dll+63c220`). XAML runs `CUIElement::InvalidateViewport` each turn, but WinUI's
+   `OnEffectiveViewportChanged` (`+2b180`) never follows: `ComputeEffectiveViewportChangedEventArgsAndNotifyLayoutManager`
+   compares the new viewport (and max viewport, bring-into-view distances) with the stored one and raises nothing when
+   equal. On Windows the viewport changes because XAML's transform for the repeater includes the hand-off visual's
+   movement, reported by the compositor through the listener: `NotifyVector3PropertyChanged(sender, 2, &value)` ->
+   `CUIElement::SetHandOffVisualOffset`, a TranslateTransform added to the element's hand-off transform group.
+4. **Fix:** dcomp visuals answer `{fa92376b}` from each of their views with that view as the sender (XAML compares the
+   pointer it holds), keep the property-2 listener, and after each tracker step tell it the visual's Translation if it
+   changed (`dcv_notify_handoff_translations`, on the listener's thread). Viewports then follow the strip
+   (342 -> 2407 -> 2718 -> 3060 -> 3740 ...) and the layout realizes the pages it reaches.
+5. **Three bugs the turns exposed.** (a) The strip's Translation sometimes evaluated to 0 for ~200 ms: `expr_this_clip`
+   was a process global, and a painter thread evaluating a clip edge sent the UI thread's
+   `this.Target.AnimationTranslation` into the clip branch. Now `__thread`. (b) The pages' title expressions
+   (`_subtitleVisual.Offset.Y - this.Target.Offset.Y - this.Target.Size.Y ...`) never evaluated: references set through
+   `ICompositionAnimation4::SetExpressionReferenceParameter` were kept as our IAnimationObject view (now the object
+   itself), and `this.Target.<vector>.X/Y` in a visual's own expression was unknown (now Offset, Size, Scale and
+   Translation of `expr_this_visual`, cleared inside property-set bindings). (c) A page now and then stayed half turned
+   for the whole 10 s: a tracker step only called `scene_dirty()`, and when its last step was the last change nothing
+   painted it. It requests a repaint now. Two untraced series showed it before, three after did not.
+
+Cost: Home idles at 1.3-2.1% of a core with the carousel turning (0.8% with the static page); tour RSS 774 MB at Home
+(swap was in use on the machine, so later figures in that run are low and not comparable). Calc AE 4120.98 and mp 2835,
+twice. Earlier the same session: AI Hub's lower banner (BeginDraw's update offset) and the hover-card icon, above.

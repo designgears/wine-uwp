@@ -6608,9 +6608,25 @@ struct dcomp_visual
     /* the origin and scale this visual last handed its children, for visuals using it as transform parent */
     float local_x, local_y, local_sx, local_sy;
     BOOL has_local;
+    /* expressions bound to "Translation.X", "Translation.Y" and "Translation", and where they stopped: Translation
+     * applies after the transform, as one more offset */
+    struct expr_animation *translation_expr[3];
+    float translation_x, translation_y;
+    /* XAML's listener for the hand-off visual's Offset (ICompositionPropertyChangedNotifier, property 2), the view
+     * it registered through (its identity for the sender check), its thread, and the Translation it was last told */
+    IUnknown *handoff_listener;
+    void *handoff_sender;
+    DWORD handoff_thread;
+    float handoff_x, handoff_y;
+    BOOL handoff_told;
 };
 
+/* {fa92376b-164b-432a-bf53-c7fe2d51cabc}, ICompositionPropertyChangedNotifier: see change_notifier below */
+static const GUID IID_dcv_change_notifier = { 0xfa92376b, 0x164b, 0x432a, { 0xbf, 0x53, 0xc7, 0xfe, 0x2d, 0x51, 0xca, 0xbc } };
+static HRESULT create_change_notifier( IUnknown *owner, void **out );
+
 static HRESULT create_property_set( ICompositionPropertySet **out );
+static void dcv_translation( struct dcomp_visual *v, float *x, float *y );
 
 static const void *dcomp_visual_vtbl[];
 static const void *visual_interop_vtbl[];
@@ -6766,6 +6782,8 @@ static HRESULT WINAPI dcv_QueryInterface( void *iface, REFIID iid, void **out )
         *out = &v->internal_vtbl;
         return S_OK;
     }
+    /* XAML attaches a property-changed listener to every hand-off visual (CUIElement's DCompPropertyChangedListener) */
+    if (IsEqualGUID( iid, &IID_dcv_change_notifier )) return create_change_notifier( (IUnknown *)iface, out );
     /* Accept any other IID: the old recording stub did this, and rejecting partner IIDs
      * (e.g. {92179cc0}) fail-fasts with E_NOINTERFACE from CalculatorApp. */
     (void)IID_visual; (void)IID_visual2; (void)IID_partner_a; (void)IID_partner_b;
@@ -6834,6 +6852,93 @@ static void transform_parent_unlink( struct dcomp_visual *v )
     LeaveCriticalSection( &transform_parent_cs );
 }
 
+/* Hand-off visuals whose Translation XAML is listening to. On Windows the compositor reports a hand-off visual's
+ * changes to XAML's DCompPropertyChangedListener, which keeps them as an extra transform of the element
+ * (CUIElement::SetHandOffVisualOffset): hit testing and effective viewports go through it. The Microsoft Store's hero
+ * carousel moves its ItemsRepeater with an expression on the hand-off visual's Translation, and at each page calls
+ * InvalidateViewport for the repeater to realize the next pages; XAML raises EffectiveViewportChanged only when the
+ * viewport it computes changed, so without the report no page past the third was ever realized (a blank hero). */
+static struct dcomp_visual **handoff_visuals;
+static unsigned int handoff_count, handoff_capacity;
+static CRITICAL_SECTION handoff_cs = { NULL, -1, 0, 0, 0, 0 };
+
+static ULONG WINAPI dcv_Release( void *iface );
+static void dcv_set_handoff_listener( struct dcomp_visual *v, void *sender, IUnknown *listener )
+{
+    IUnknown *old;
+    unsigned int i;
+
+    EnterCriticalSection( &handoff_cs );
+    if (listener) IUnknown_AddRef( listener );
+    old = v->handoff_listener;
+    v->handoff_listener = listener;
+    v->handoff_sender = sender;
+    v->handoff_thread = GetCurrentThreadId();
+    v->handoff_told = FALSE;
+    for (i = 0; i < handoff_count; i++) if (handoff_visuals[i] == v) break;
+    if (listener && i == handoff_count)
+    {
+        if (handoff_count == handoff_capacity)
+        {
+            unsigned int cap = handoff_capacity ? handoff_capacity * 2 : 64;
+            struct dcomp_visual **list = (realloc)( handoff_visuals, cap * sizeof(*list) );
+            if (list) { handoff_visuals = list; handoff_capacity = cap; }
+        }
+        if (handoff_count < handoff_capacity) handoff_visuals[handoff_count++] = v;
+    }
+    else if (!listener && i < handoff_count) handoff_visuals[i] = handoff_visuals[--handoff_count];
+    LeaveCriticalSection( &handoff_cs );
+    if (old) IUnknown_Release( old );
+}
+
+/* Tell listeners on this thread about Translations that changed (D2D_VECTOR_3F by value is passed by reference).
+ * Listener slots: 3 Boolean, 4 Matrix3x2, 5 Matrix4x4, 6 Reference, 7 Single, 8 Vector2, 9 Vector3, 10 Vector4, 11 Color
+ * (windows.ui.xaml.pdb, DCompPropertyChangedListener). */
+static void dcv_notify_handoff_translations( void )
+{
+    typedef HRESULT (WINAPI *notify_vector3_t)( IUnknown *listener, void *sender, UINT32 property, const Vector3 *value );
+    struct { struct dcomp_visual *v; IUnknown *listener; void *sender; Vector3 value; } told[16];
+    static __thread BOOL notifying;
+    DWORD tid = GetCurrentThreadId();
+    unsigned int i, n = 0;
+
+    if (notifying || !handoff_count) return;
+    EnterCriticalSection( &handoff_cs );
+    for (i = 0; i < handoff_count && n < ARRAY_SIZE(told); i++)
+    {
+        struct dcomp_visual *v = handoff_visuals[i];
+        float x, y;
+
+        if (v->handoff_thread != tid || !v->handoff_listener) continue;
+        if (!v->translation_expr[0] && !v->translation_expr[1] && !v->translation_expr[2] && !v->handoff_told) continue;
+        dcv_translation( v, &x, &y );
+        if (v->handoff_told ? x == v->handoff_x && y == v->handoff_y : !x && !y) continue;
+        v->handoff_x = x;
+        v->handoff_y = y;
+        v->handoff_told = TRUE;
+        told[n].v = v;
+        told[n].listener = v->handoff_listener;
+        IUnknown_AddRef( told[n].listener );
+        told[n].sender = v->handoff_sender;
+        told[n].value.X = x;
+        told[n].value.Y = y;
+        told[n].value.Z = 0.0f;
+        dcv_AddRef( &v->vtbl );
+        n++;
+    }
+    LeaveCriticalSection( &handoff_cs );
+    notifying = TRUE;
+    for (i = 0; i < n; i++)
+    {
+        HRESULT hr = ((notify_vector3_t)(*(void ***)told[i].listener)[9])( told[i].listener, told[i].sender, 2, &told[i].value );
+        TRACE_(dcompanim)( "hand-off visual %p: told Translation %g,%g, hr %#lx.\n", told[i].v, told[i].value.X,
+                           told[i].value.Y, hr );
+        IUnknown_Release( told[i].listener );
+        dcv_Release( &told[i].v->vtbl );
+    }
+    notifying = FALSE;
+}
+
 static ULONG WINAPI dcv_Release( void *iface )
 {
     struct dcomp_visual *v = dcomp_visual_from( iface );
@@ -6842,10 +6947,13 @@ static ULONG WINAPI dcv_Release( void *iface )
     {
         unsigned i;
         transform_parent_unlink( v );
+        if (v->handoff_listener) dcv_set_handoff_listener( v, NULL, NULL );
         if (v->content) IUnknown_Release( v->content );
         if (v->manip) comp_object_Release( &v->manip->vtbl );
         if (v->clip_object) IUnknown_Release( v->clip_object );
         if (v->transform_expr) IUnknown_Release( (IUnknown *)&v->transform_expr->vtbl );
+        for (i = 0; i < ARRAY_SIZE(v->translation_expr); i++)
+            if (v->translation_expr[i]) IUnknown_Release( (IUnknown *)&v->translation_expr[i]->vtbl );
         WindowsDeleteString( v->comment );
         if (v->properties) ICompositionPropertySet_Release( v->properties );
         if (v->compositor) ICompositor_Release( v->compositor );
@@ -6865,6 +6973,8 @@ static struct dcomp_visual *dcomp_visual_from_object( void *iface )
 }
 static HRESULT WINAPI dcv_object_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    /* the listener's sender is the pointer XAML holds, this view */
+    if (IsEqualGUID( iid, &IID_dcv_change_notifier )) return create_change_notifier( (IUnknown *)iface, out );
     return dcv_QueryInterface( &dcomp_visual_from_object( iface )->vtbl, iid, out );
 }
 static ULONG WINAPI dcv_object_AddRef( void *iface )
@@ -6956,6 +7066,31 @@ static HRESULT WINAPI dcv_object_StartAnimation( void *iface, HSTRING name, void
     }
     if (kf && kf->has_value && kf->value_kind == KF_SCALAR && prop && !wcsicmp( prop, L"Offset.X" )) v->offset_x = kf->scalar;
     if (kf && kf->has_value && kf->value_kind == KF_SCALAR && prop && !wcsicmp( prop, L"Offset.Y" )) v->offset_y = kf->scalar;
+    /* The Microsoft Store's hero carousels slide their pages with "-_interactionTracker.Position.X +
+     * this.Target.AnimationTranslation" on Translation.X: ignored, every page turn left the first page on screen. */
+    if (prop && !wcsnicmp( prop, L"Translation", 11 ) &&
+        (!prop[11] || !wcsicmp( prop + 11, L".X" ) || !wcsicmp( prop + 11, L".Y" )))
+    {
+        unsigned int axis = !prop[11] ? 2 : towupper( prop[12] ) == 'Y';
+        struct expr_animation *expr = expr_animation_from_any( animation );
+        if (expr && (expr = expr_snapshot( expr )))
+        {
+            EnterCriticalSection( &dcomp_visual_cs );
+            if (v->translation_expr[axis]) IUnknown_Release( (IUnknown *)&v->translation_expr[axis]->vtbl );
+            v->translation_expr[axis] = expr;
+            LeaveCriticalSection( &dcomp_visual_cs );
+        }
+        else if (kf && kf->has_value && kf->value_kind == KF_SCALAR && axis < 2)
+        {
+            if (axis) v->translation_y = kf->scalar;
+            else v->translation_x = kf->scalar;
+        }
+        else if (kf && kf->has_value && kf->value_kind == KF_VECTOR3 && axis == 2)
+        {
+            v->translation_x = kf->vector3.X;
+            v->translation_y = kf->vector3.Y;
+        }
+    }
     if (prop && !wcsicmp( prop, L"TransformMatrix" ))
     {
         struct matrix_transform *m = manip_matrix_from_animation( animation );
@@ -6989,6 +7124,20 @@ static HRESULT WINAPI dcv_object_StopAnimation( void *iface, HSTRING name )
 
     scene_changed();
     TRACE_(dcompanim)( "dcomp visual %p stop %s\n", v, debugstr_w( prop ) );
+    if (prop && !wcsnicmp( prop, L"Translation", 11 ))
+    {
+        /* the animation stops at its current value */
+        unsigned int i;
+        EnterCriticalSection( &dcomp_visual_cs );
+        dcv_translation( v, &v->translation_x, &v->translation_y );
+        for (i = 0; i < ARRAY_SIZE(v->translation_expr); i++)
+        {
+            if (!v->translation_expr[i]) continue;
+            IUnknown_Release( (IUnknown *)&v->translation_expr[i]->vtbl );
+            v->translation_expr[i] = NULL;
+        }
+        LeaveCriticalSection( &dcomp_visual_cs );
+    }
     if (prop && !wcsicmp( prop, L"Opacity" ) && v->opacity_expr)
     {
         /* the animation stops at its current value */
@@ -7769,6 +7918,8 @@ static struct dcomp_visual *impl_from_dcv_object2( void *iface )
 }
 static HRESULT WINAPI dcv_object2_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    /* the listener's sender is the pointer XAML holds, this view */
+    if (IsEqualGUID( iid, &IID_dcv_change_notifier )) return create_change_notifier( (IUnknown *)iface, out );
     return dcv_QueryInterface( &impl_from_dcv_object2( iface )->vtbl, iid, out );
 }
 static ULONG WINAPI dcv_object2_AddRef( void *iface )
@@ -8711,6 +8862,8 @@ static struct dcomp_visual *impl_from_dcv_ivisual( void *iface )
 }
 static HRESULT WINAPI dcv_ivisual_QueryInterface( void *iface, REFIID iid, void **out )
 {
+    /* the listener's sender is the pointer XAML holds, this view */
+    if (IsEqualGUID( iid, &IID_dcv_change_notifier )) return create_change_notifier( (IUnknown *)iface, out );
     return dcv_QueryInterface( &impl_from_dcv_ivisual( iface )->vtbl, iid, out );
 }
 static ULONG WINAPI dcv_ivisual_AddRef( void *iface )
@@ -9156,8 +9309,12 @@ static void paint_dcomp_visual( HDC hdc, struct dcomp_visual *v, float ox, float
         t11 = v->transform4.M11; t12 = v->transform4.M12; t21 = v->transform4.M21; t22 = v->transform4.M22;
         t41 = v->transform4.M41; t42 = v->transform4.M42;
     }
-    x = ox + (v->offset_x + v->transform_x + t41) * sx;
-    y = oy + (v->offset_y + v->transform_y + t42) * sy;
+    {
+        float tx, ty;
+        dcv_translation( v, &tx, &ty );
+        x = ox + (v->offset_x + v->transform_x + t41 + tx) * sx;
+        y = oy + (v->offset_y + v->transform_y + t42 + ty) * sy;
+    }
     /* a rotating TransformMatrix (XAML's RotateTransform of a chevron): scale by its magnitude, turn the subtree
      * below by its angle */
     if (t12 != 0.0f || t21 != 0.0f || t11 < 0.0f || t22 < 0.0f)
@@ -10823,7 +10980,11 @@ struct visual
     BOOL layer;
     const void **layer_vtbl;
     IUnknown *effect;
+    struct live_anim *live_opacity;     /* an Opacity key-frame animation the painter runs, see visual_live_opacity */
 };
+static void visual_live_opacity_sample( struct visual *impl );
+static BOOL kf_runs_live( struct kf_animation *kf );
+static void visual_live_opacity_set( struct visual *impl, struct kf_animation *kf, float current );
 
 struct color_brush
 {
@@ -11188,9 +11349,11 @@ static HRESULT create_visual_surface( void **out )
 static void dcv_own_translation( struct dcomp_visual *v, float *x, float *y )
 {
     D2D_MATRIX_3X2_F em;
+    float tx, ty;
 
-    *x = v->offset_x + v->transform_x;
-    *y = v->offset_y + v->transform_y;
+    dcv_translation( v, &tx, &ty );
+    *x = v->offset_x + v->transform_x + tx;
+    *y = v->offset_y + v->transform_y + ty;
     if (v->transform_expr && expr_evaluate_matrix( v->transform_expr, v->properties,
                                                     v->manip && v->manip->has_matrix ? &v->manip->matrix : NULL, &em ))
     {
@@ -12119,6 +12282,7 @@ static void paint_public_visual( HDC hdc, void *iface, float ox, float oy, float
      * the bottom again) over the whole UI. Only containers without a size still pass their parent's size
      * on to children, since XAML sizes those through relative size or not at all. */
     perf.visits++;
+    if (impl->live_opacity) visual_live_opacity_sample( impl );
     TRACE( "visit public %s %p size %gx%g rel %gx%g visible %d opacity %g children %u\n",
            impl->kind == VISUAL_SPRITE ? "sprite" : "container", impl, width, height,
            impl->relative_size.X, impl->relative_size.Y, impl->visible, impl->opacity, impl->collection.count );
@@ -12617,6 +12781,7 @@ static ULONG visual_release( struct visual *impl )
         if (impl->effect) IUnknown_Release( impl->effect );
         if (impl->clip) ICompositionClip_Release( impl->clip );
         if (impl->properties) ICompositionPropertySet_Release( impl->properties );
+        visual_live_opacity_set( impl, NULL, 0.0f );
         ICompositor_Release( impl->compositor );
         TRACE( "freed visual %p.\n", impl );
         free( impl );
@@ -12984,7 +13149,11 @@ static HRESULT WINAPI visual_obj_StartAnimation( ICompositionObject *iface, HSTR
     impl->saved_offset = impl->offset; impl->saved_scale = impl->scale; impl->saved_center = impl->center;
     impl->saved_size = impl->size; impl->saved_opacity = impl->opacity; impl->saved_visible = impl->visible;
     /* the end value of the animation is applied at once (no animation clock runs here) */
-    if (kf->value_kind == KF_SCALAR && !wcsicmp( prop, L"Opacity" )) impl->opacity = kf->scalar;
+    if (kf->value_kind == KF_SCALAR && !wcsicmp( prop, L"Opacity" ))
+    {
+        visual_live_opacity_set( impl, kf, impl->opacity );
+        if (!impl->live_opacity) impl->opacity = kf->scalar;
+    }
     /* A single-key boolean is XAML's Visibility change (Collapsed elements stay in the tree, hidden);
      * multi-key ones are Lottie layer switches driven by an AnimatedIcon's Progress and are left alone,
      * since which key applies depends on the icon's state. */
@@ -13478,6 +13647,62 @@ static BOOL live_anim_progress( struct live_anim *a, float *progress )
     return t < duration;
 }
 
+/* A visual's Opacity key frames run here, sampled when the visual is painted, instead of jumping to their last value.
+ * The Microsoft Store shows each carousel page's content with "0, 0, 1, 1, 0" over the page's ten seconds: the last
+ * value at once hid every page from the third on for its whole time. */
+static void visual_live_opacity_free( struct live_anim *a )
+{
+    if (!a) return;
+    if (a->kf->timeline) IUnknown_Release( (IUnknown *)a->kf->timeline );
+    free( a->kf );
+    free( a );
+}
+static void visual_live_opacity_set( struct visual *impl, struct kf_animation *kf, float current )
+{
+    struct live_anim *a = NULL, *old;
+    unsigned int i;
+
+    if (kf && kf->value_kind == KF_SCALAR && kf_runs_live( kf ) && (a = calloc( 1, sizeof(*a) )))
+    {
+        if (!(a->kf = malloc( sizeof(*a->kf) )))
+        {
+            free( a );
+            a = NULL;
+        }
+        else
+        {
+            *a->kf = *kf;
+            for (i = 0; i < min( a->kf->key_count, KF_KEYS ); i++)
+                if (a->kf->keys[i].expr == KF_EXPR_STARTING) a->kf->keys[i].u.scalar = current;
+            if (a->kf->timeline) IUnknown_AddRef( (IUnknown *)a->kf->timeline );
+            lstrcpynW( a->name, L"Opacity", ARRAY_SIZE(a->name) );
+            QueryPerformanceCounter( &a->start );
+        }
+    }
+    old = InterlockedExchangePointer( (void **)&impl->live_opacity, a );
+    visual_live_opacity_free( old );   /* free() waits out a walk that may be sampling it */
+    if (a)
+    {
+        visual_live_opacity_sample( impl );
+        scene_dirty();
+        request_repaint( 1 );
+    }
+}
+static void visual_live_opacity_sample( struct visual *impl )
+{
+    struct live_anim *a = impl->live_opacity;
+    struct kf_key key;
+    float progress;
+    BOOL running;
+
+    if (!a) return;
+    running = live_anim_progress( a, &progress );
+    if (progress <= 0.0f && a->kf->delay_time > 0 && a->kf->delay_behavior != 1) return;   /* the value until the delay */
+    if (kf_sample( a->kf, running ? progress : 1.0f, &key )) impl->opacity = key.u.scalar;
+    if (running) request_repaint( paint_interval() );
+    else if (InterlockedCompareExchangePointer( (void **)&impl->live_opacity, NULL, a ) == a)
+        visual_live_opacity_free( a );
+}
 static void live_anim_apply( struct live_anim *a, float progress )
 {
     struct kf_key key;
@@ -13780,7 +14005,13 @@ static HRESULT WINAPI change_notifier_SetPropertyChangedListener( void *iface, U
     unsigned int i;
 
     TRACE_(dcompanim)( "owner %p, property %u, listener %p.\n", impl->owner, property, listener );
-    if (!set) return S_OK;
+    if (!set)
+    {
+        struct dcomp_visual *v = dcv_from_any( impl->owner );
+        /* Offset (2) is where XAML takes a hand-off visual's own movement; the others are not reported */
+        if (v && property == 2) dcv_set_handoff_listener( v, impl->owner, listener );
+        return S_OK;
+    }
     EnterCriticalSection( &listened_cs );
     if (listener) IUnknown_AddRef( listener );
     old = set->listener;
@@ -14004,6 +14235,8 @@ static HRESULT WINAPI propset_TryGetScalar( ICompositionPropertySet *iface, HSTR
 {
     struct property_set *set = CONTAINING_RECORD( iface, struct property_set, ICompositionPropertySet_iface );
     struct propset_value *v = propset_find( set, name, FALSE );
+    TRACE_(dcompanim)( "set %p: get %s -> %s%g\n", set, debugstr_hstring( name ), v && v->type == PROP_SCALAR ? "" : "(none) ",
+                       v && v->type == PROP_SCALAR ? v->u.scalar : 0.0f );
     if (!v || v->type != PROP_SCALAR) return propset_not_found( result );
     if (value) *value = v->u.scalar;
     if (result) *result = CompositionGetValueStatus_Succeeded;
@@ -15348,7 +15581,9 @@ static const void *clip2_vtbl[] =
  * "Left = (visual.Size.X - Min(visual.Size.X, rootProperties.ActualWidth)) / 2" and
  * "Right = this.Target.Left + Min(...)": unevaluated, the clip stayed 0,0,0,0 and hid the page (the Microsoft Store's
  * big hero picture). Evaluated in edge order, so "this.Target.Left" sees the new Left. */
-static struct comp_clip *expr_this_clip;
+static __thread struct comp_clip *expr_this_clip;
+/* the visual whose own property an expression is bound to, for "this.Target.Offset.Y" (per thread, as above) */
+static __thread struct dcomp_visual *expr_this_visual;   /* per thread: the painter evaluates clips while the UI thread evaluates others */
 static BOOL expr_evaluate_scalar_full( struct expr_animation *expr, float *out );
 static void clip_eval_edges( struct comp_clip *clip )
 {
@@ -16245,11 +16480,14 @@ static HRESULT WINAPI expr_anim4_GetRuntimeClassName( void *iface, HSTRING *name
     return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
 }
 static HRESULT WINAPI expr_anim4_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
+static IUnknown *anim_object_unwrap( IUnknown *object );
 static HRESULT WINAPI expr_anim4_SetExpressionReferenceParameter( void *iface, HSTRING key, IUnknown *object )
 {
     struct expr_anim4_view *view = iface;
     TRACE( "%p, %s, %p.\n", view->owner, debugstr_w( WindowsGetStringRawBuffer( key, NULL ) ), object );
-    return expr_view_SetReferenceParameter( &view->owner->anim_vtbl, key, object );
+    /* keep the object itself, not its IAnimationObject view: expressions look visuals up by their own tables, and
+     * "_subtitleVisual.Offset.Y" (the Store's carousel page titles) never evaluated through the view */
+    return expr_view_SetReferenceParameter( &view->owner->anim_vtbl, key, anim_object_unwrap( object ) );
 }
 static const void *expr_anim4_vtbl[] =
 {
@@ -16581,7 +16819,9 @@ struct expr_ctx
     unsigned int depth;
 };
 
-static void expr_skip_space( struct expr_ctx *c ) { while (*c->p == ' ') c->p++; }
+/* any white space: the Microsoft Store writes its longer expressions over several indented lines, and stopping at the
+ * first line break left them unevaluated (its collapsing headers, "a > b ?\r\n            (...) :") */
+static void expr_skip_space( struct expr_ctx *c ) { while (*c->p && iswspace( *c->p )) c->p++; }
 static BOOL expr_accept( struct expr_ctx *c, const WCHAR *tok )
 {
     size_t n = wcslen( tok );
@@ -16635,6 +16875,7 @@ static struct propset_value *expr_property( struct expr_ctx *c, const WCHAR *ref
 static BOOL expr_scalar( struct expr_ctx *c, float *out );
 /* "V.Offset", "primaryVisual.Translation": a referenced visual's own vector properties. Translation not
  * in its property set is zero. */
+static BOOL expr_interop_vector( struct expr_ctx *c, void *interop, const WCHAR *prop, float *x, float *y );
 static BOOL expr_visual_vector( struct expr_ctx *c, const WCHAR *ref, const WCHAR *prop, float *x, float *y )
 {
     void *interop = NULL;
@@ -16652,6 +16893,15 @@ static BOOL expr_visual_vector( struct expr_ctx *c, const WCHAR *ref, const WCHA
             return FALSE;
     }
     if (FAILED( IUnknown_QueryInterface( c->expr->refs[i], &IID_IInteropVisual_private, &interop ) )) return FALSE;
+    ret = expr_interop_vector( c, interop, prop, x, y );
+    IUnknown_Release( (IUnknown *)interop );
+    return ret;
+}
+/* a vector property of a visual, given its private interop view */
+static BOOL expr_interop_vector( struct expr_ctx *c, void *interop, const WCHAR *prop, float *x, float *y )
+{
+    BOOL ret = FALSE;
+
     if (!wcsicmp( prop, L"Offset" ))
     {
         struct dcomp_visual *dcv = dcv_from_any( interop );
@@ -16661,8 +16911,19 @@ static BOOL expr_visual_vector( struct expr_ctx *c, const WCHAR *ref, const WCHA
     }
     else if (!wcsicmp( prop, L"Translation" ))
     {
+        /* a dcomp visual's bound or stopped Translation (the Store's carousel pages read "_repeaterVisual.Translation.X"
+         * to size themselves); otherwise none */
+        struct dcomp_visual *dcv = dcv_from_any( interop );
         *x = *y = 0.0f;
+        if (dcv && c->depth < 6) dcv_translation( dcv, x, y );
         ret = TRUE;
+    }
+    else if (!wcsicmp( prop, L"Scale" ))
+    {
+        struct dcomp_visual *dcv = dcv_from_any( interop );
+        struct visual *pub = dcv ? NULL : visual_from_interop( interop );
+        if (dcv) { *x = dcv->scale_x ? dcv->scale_x : 1.0f; *y = dcv->scale_y ? dcv->scale_y : 1.0f; ret = TRUE; }
+        else if (pub) { *x = pub->scale.X; *y = pub->scale.Y; ret = TRUE; }
     }
     else if (!wcsicmp( prop, L"Size" ))
     {
@@ -16671,7 +16932,6 @@ static BOOL expr_visual_vector( struct expr_ctx *c, const WCHAR *ref, const WCHA
         if (dcv) { *x = dcv->width; *y = dcv->height; ret = TRUE; }
         else if (pub) { *x = pub->size.X; *y = pub->size.Y; ret = TRUE; }
     }
-    IUnknown_Release( (IUnknown *)interop );
     return ret;
 }
 static BOOL expr_vector( struct expr_ctx *c, float *x, float *y )
@@ -16723,6 +16983,7 @@ static BOOL expr_scalar_sum( struct expr_ctx *c, float *out );
  * "ValuePropSet.v + ValuePropSet.o" and animates v; the static value is only where the property started. */
 static BOOL expr_bound_scalar( struct expr_ctx *c, const WCHAR *ref, const WCHAR *prop, float *out )
 {
+    struct dcomp_visual *saved_visual;
     struct comp_clip *saved_clip;
     BOOL ok;
     struct property_set *set = NULL;
@@ -16750,9 +17011,12 @@ static BOOL expr_bound_scalar( struct expr_ctx *c, const WCHAR *ref, const WCHAR
          * "this.Target" is the set (the Microsoft Store's Apps hero: "Lerp(visual.Size.X, this.Target.CollapsedWidth,
          * ...)" failed on the clip's Left/Top/Right/Bottom, and the page got a zero-width clip) */
         saved_clip = expr_this_clip;
+        saved_visual = expr_this_visual;
         expr_this_clip = NULL;
+        expr_this_visual = NULL;
         ok = expr_scalar( &sub, out );
         expr_this_clip = saved_clip;
+        expr_this_visual = saved_visual;
         if (!ok)
         {
             TRACE_(dcompanim)( "set %p %s: %s not evaluated, stopped at %s\n", set, debugstr_w( prop ),
@@ -16850,6 +17114,25 @@ static BOOL expr_scalar_factor( struct expr_ctx *c, float *out )
             if (!wcsnicmp( prop, names[i], wcslen( names[i] ) )) { *out = values[i]; return TRUE; }
         return FALSE;
     }
+    /* "this.Target.Offset.Y" in an expression bound on a visual: that visual's own Offset, Size, Scale or Translation
+     * (the Microsoft Store's carousel pages place their titles with "_subtitleVisual.Offset.Y - this.Target.Offset.Y
+     * - this.Target.Size.Y ..."); anything else is the visual's property set, below */
+    if (expr_this_visual && !wcsnicmp( c->p, L"this.Target.", 12 ))
+    {
+        const WCHAR *save = c->p;
+        float vx, vy;
+
+        c->p += 12;
+        if (expr_ident( c, prop, ARRAY_SIZE(prop) ) && *c->p == '.' &&
+            (towupper( c->p[1] ) == 'X' || towupper( c->p[1] ) == 'Y') && !iswalnum( c->p[2] ) && c->p[2] != '_' &&
+            expr_interop_vector( c, &expr_this_visual->vtbl, prop, &vx, &vy ))
+        {
+            *out = towupper( c->p[1] ) == 'Y' ? vy : vx;
+            c->p += 2;
+            return TRUE;
+        }
+        c->p = save;
+    }
     /* "this.Target.CollapsedWidth" in an expression bound on a property set: that set's own property */
     if (c->local && !wcsnicmp( c->p, L"this.Target.", 12 ))
     {
@@ -16862,6 +17145,29 @@ static BOOL expr_scalar_factor( struct expr_ctx *c, float *out )
         return TRUE;
     }
     if (!expr_name( c, ref, ARRAY_SIZE(ref), prop, ARRAY_SIZE(prop) )) return FALSE;
+    /* "clip.Left": an edge of a referenced clip, through its own bound edges ("-clip.Left" on the Translation.X of
+     * the Microsoft Store's carousel pages, whose clips centre them) */
+    if (*ref)
+    {
+        for (i = 0; i < c->expr->ref_count; i++)
+        {
+            static const WCHAR *const edges[4] = { L"Left", L"Top", L"Right", L"Bottom" };
+            struct comp_clip *clip;
+            unsigned int e;
+
+            if (wcsicmp( c->expr->ref_names[i], ref ) || !c->expr->refs[i] || !(clip = clip_from_any( c->expr->refs[i] )))
+                continue;
+            for (e = 0; e < 4; e++)
+                if (!wcsicmp( prop, edges[e] ))
+                {
+                    const float *values[4] = { &clip->left, &clip->top, &clip->right, &clip->bottom };
+                    if (c->depth < 6) clip_eval_edges( clip );
+                    *out = *values[e];
+                    return TRUE;
+                }
+            return FALSE;
+        }
+    }
     /* "visual.Size.X": one component of a vector */
     if (*c->p == '.' && (towupper( c->p[1] ) == 'X' || towupper( c->p[1] ) == 'Y') && !iswalnum( c->p[2] ) && c->p[2] != '_')
     {
@@ -17194,6 +17500,11 @@ struct anim_object_view
     IUnknown *owner;
 };
 static const void *anim_object_view_vtbl[];
+static IUnknown *anim_object_unwrap( IUnknown *object )
+{
+    if (object && *(void ***)object == (void **)anim_object_view_vtbl) return ((struct anim_object_view *)object)->owner;
+    return object;
+}
 static struct property_set *propset_from_object( IUnknown *object )
 {
     void **vtbl = object ? *(void ***)object : NULL;
@@ -17285,6 +17596,55 @@ static const char *debugstr_animation( void *animation )
     }
 }
 
+/* A visual's Translation: each bound expression's value where it evaluates, the stopped or key-frame value otherwise.
+ * The expressions read their target's own property set as "this.Target" (AnimationTranslation, above). */
+static void dcv_translation( struct dcomp_visual *v, float *x, float *y )
+{
+    struct expr_ctx c;
+    float value, vx, vy;
+    unsigned int axis;
+
+    static __thread unsigned int nesting;   /* one visual's Translation may read another's */
+    struct dcomp_visual *saved_this;
+
+    *x = v->translation_x;
+    *y = v->translation_y;
+    if (!v->translation_expr[0] && !v->translation_expr[1] && !v->translation_expr[2]) return;
+    if (nesting >= 4) return;
+    nesting++;
+    saved_this = expr_this_visual;
+    expr_this_visual = v;
+    for (axis = 0; axis < 3; axis++)
+    {
+        struct expr_animation *expr = v->translation_expr[axis];
+        BOOL ok;
+
+        if (!expr) continue;
+        c.expr = expr;
+        c.local = v->properties ? propset_from_object( (IUnknown *)v->properties ) : NULL;
+        c.dmanip = NULL;
+        c.p = expr->expression;
+        c.depth = 0;
+        if (axis < 2) ok = expr_scalar( &c, &value );
+        else ok = expr_vector( &c, &vx, &vy );
+        if (ok) expr_skip_space( &c );
+        if (!ok || *c.p)
+        {
+            if (!expr->warned_eval)
+            {
+                expr->warned_eval = TRUE;
+                WARN( "visual %p: cannot evaluate Translation %s: stopped at %s\n", v, debugstr_w( expr->expression ),
+                      debugstr_w( c.p ) );
+            }
+            continue;
+        }
+        if (axis == 0) *x = value;
+        else if (axis == 1) *y = value;
+        else { *x = vx; *y = vy; }
+    }
+    expr_this_visual = saved_this;
+    nesting--;
+}
 /* A scalar expression: a product of numbers and scalar properties. XAML binds a popup's Opacity to
  * "PS.POpacity * PS.TTOpacity" (its own opacity times the transition's); expr_resolve_value only knows a
  * single "Ref.Prop", so the product was never read and the visual kept whatever static opacity it had. */
@@ -24484,25 +24844,67 @@ static void tracker_raise( struct interactions_object *tracker, unsigned int slo
     interactions_Release( &args->vtbl );
 }
 static void tracker_notify( struct interactions_object *tracker, INT32 request, int how );
+static void tracker_set_position( struct interactions_object *tracker, Vector3 value );
 
 /* An animated request leaves Idle for CustomAnimation at once and comes back when the animation would have ended.
  * Raising Idle straight away made the Microsoft Store 22608's hero carousel, which moves to the next page from its
  * IdleStateEntered, request ~40 times a second, and its UI thread did nothing else. The timer runs on the requesting
  * (UI) thread, as the owner's callbacks must. */
-struct tracker_idle { struct interactions_object *tracker; INT32 request; ULONGLONG due; };
+/* An animated request moves the tracker from where it was to where the animation lands, along the last key's easing,
+ * raising ValuesChanged on the way, as the compositor does on Windows. Landing at once, the Microsoft Store's hero
+ * carousel slid its strip but its layout re-placed the pages for the jump, and from the third page on the slot was empty. */
+struct tracker_idle
+{
+    struct interactions_object *tracker;
+    INT32 request;
+    ULONGLONG due;
+    BOOL moving;
+    Vector3 from, to;
+    ULONGLONG start, delay, duration;   /* ms */
+    struct kf_ease ease;
+};
 static __thread struct tracker_idle *tracker_idles;
 static __thread unsigned int tracker_idle_count;
 static __thread UINT_PTR tracker_idle_timer;
 static void CALLBACK tracker_idle_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD time )
 {
     ULONGLONG now = GetTickCount64();
-    unsigned int i = 0;
+    struct { struct interactions_object *tracker; INT32 request; } moved[16];
+    unsigned int i = 0, j, n = 0;
+
+    /* positions first, callbacks after: a callback may make a new request, which changes tracker_idles */
+    for (j = 0; j < tracker_idle_count && n < ARRAY_SIZE(moved); j++)
+    {
+        struct tracker_idle *idle = &tracker_idles[j];
+        float p, t;
+        Vector3 v;
+
+        if (!idle->moving || idle->due <= now) continue;
+        if (now < idle->start + idle->delay) continue;
+        p = idle->duration ? (float)(now - idle->start - idle->delay) / idle->duration : 1.0f;
+        if (p > 1.0f) p = 1.0f;
+        t = ease_apply( &idle->ease, p );
+        v.X = idle->from.X + t * (idle->to.X - idle->from.X);
+        v.Y = idle->from.Y + t * (idle->to.Y - idle->from.Y);
+        v.Z = idle->from.Z + t * (idle->to.Z - idle->from.Z);
+        tracker_set_position( idle->tracker, v );
+        interactions_AddRef( &idle->tracker->vtbl );
+        moved[n].tracker = idle->tracker;
+        moved[n].request = idle->request;
+        n++;
+    }
+    for (j = 0; j < n; j++)
+    {
+        tracker_notify( moved[j].tracker, moved[j].request, TRACKER_IMMEDIATE );
+        interactions_Release( &moved[j].tracker->vtbl );
+    }
 
     while (i < tracker_idle_count)
     {
         struct tracker_idle idle = tracker_idles[i];
         if (idle.due > now) { i++; continue; }
         tracker_idles[i] = tracker_idles[--tracker_idle_count];
+        if (idle.moving) tracker_set_position( idle.tracker, idle.to );
         tracker_notify( idle.tracker, idle.request, TRACKER_SETTLED );
         interactions_Release( &idle.tracker->vtbl );
     }
@@ -24512,7 +24914,8 @@ static void CALLBACK tracker_idle_proc( HWND hwnd, UINT msg, UINT_PTR id, DWORD 
         tracker_idle_timer = 0;
     }
 }
-static void tracker_notify_animated( struct interactions_object *tracker, INT32 request, LONGLONG ms )
+static void tracker_notify_animated( struct interactions_object *tracker, INT32 request, LONGLONG ms,
+                                     const Vector3 *to, const struct kf_animation *kf )
 {
     struct tracker_idle *idles;
     unsigned int i;
@@ -24525,6 +24928,7 @@ static void tracker_notify_animated( struct interactions_object *tracker, INT32 
     {
         if (!(idles = realloc( tracker_idles, (tracker_idle_count + 1) * sizeof(*idles) )))
         {
+            if (to) tracker_set_position( tracker, *to );
             tracker_notify( tracker, request, TRACKER_SETTLED );
             return;
         }
@@ -24535,6 +24939,17 @@ static void tracker_notify_animated( struct interactions_object *tracker, INT32 
     }
     tracker_idles[i].request = request;
     tracker_idles[i].due = GetTickCount64() + ms;
+    tracker_idles[i].moving = FALSE;
+    if (to && kf && kf->key_count)
+    {
+        tracker_idles[i].moving = TRUE;
+        tracker_idles[i].from = tracker->position;
+        tracker_idles[i].to = *to;
+        tracker_idles[i].start = GetTickCount64();
+        tracker_idles[i].delay = kf->delay_time / 10000;
+        tracker_idles[i].duration = kf->duration / 10000;
+        tracker_idles[i].ease = kf->keys[min( kf->key_count, KF_KEYS ) - 1].ease;
+    }
     TRACE_(dcompanim)( "tracker %p: request %d settles in %lld ms.\n", tracker, request, ms );
     if (!tracker_idle_timer) tracker_idle_timer = SetTimer( NULL, 0, 16, tracker_idle_proc );
 }
@@ -24545,6 +24960,9 @@ static void tracker_notify( struct interactions_object *tracker, INT32 request, 
 
     tracker_sync_properties( tracker );
     scene_dirty();
+    /* nothing else may paint the tracker's last step: the Store's hero carousel stopped half a page short now and then,
+     * for the ten seconds until its next turn, when no other animation or commit followed the last step */
+    request_repaint( 1 );
     if (!tracker->owner || tracker->in_callback) return;
     changed = !tracker->notified || memcmp( &tracker->notified_position, &tracker->position, sizeof(Vector3) ) ||
               tracker->notified_scale != tracker->scale;
@@ -24567,6 +24985,7 @@ static void tracker_notify( struct interactions_object *tracker, INT32 request, 
                        L"Windows.UI.Composition.Interactions.InteractionTrackerIdleStateEnteredArgs",
                        &IID_IInteractionTrackerIdleStateEnteredArgs_, idle_args_vtbl, request );
     tracker->in_callback = FALSE;
+    dcv_notify_handoff_translations();
 }
 
 static float clampf( float v, float lo, float hi )
@@ -24683,6 +25102,8 @@ static HRESULT WINAPI tracker_TryUpdatePositionWithAnimation( void *iface, void 
     struct kf_animation *kf = kf_animation_from( animation );
     struct kf_key key;
     IUnknown *identity = NULL;
+    BOOL have_target = FALSE;
+    Vector3 target;
 
     /* the parameter is a CompositionAnimation, which for a key-frame animation is one of its other tables */
     if (!kf && animation && SUCCEEDED( IUnknown_QueryInterface( (IUnknown *)animation, &IID_IUnknown, (void **)&identity ) ))
@@ -24698,13 +25119,15 @@ static HRESULT WINAPI tracker_TryUpdatePositionWithAnimation( void *iface, void 
     {
         TRACE_(dcompanim)( "tracker %p animation %p: lands at %g,%g,%g.\n", tracker, animation, key.u.vector3.X,
                            key.u.vector3.Y, key.u.vector3.Z );
-        tracker_set_position( tracker, key.u.vector3 );
+        target = key.u.vector3;
+        have_target = TRUE;
     }
     else if (kf && kf->value_kind == KF_VECTOR3 && kf_vector3_from_this( kf, &key.u.vector3 ))
     {
         TRACE_(dcompanim)( "tracker %p animation %p: lands at %s = %g,%g,%g.\n", tracker, animation,
                            debugstr_w( kf->last_expr ), key.u.vector3.X, key.u.vector3.Y, key.u.vector3.Z );
-        tracker_set_position( tracker, key.u.vector3 );
+        target = key.u.vector3;
+        have_target = TRUE;
     }
     else
     {
@@ -24716,7 +25139,9 @@ static HRESULT WINAPI tracker_TryUpdatePositionWithAnimation( void *iface, void 
         WindowsDeleteString( name );
     }
     if (request) *request = id;
-    tracker_notify_animated( tracker, id, kf ? (kf->delay_time + kf->duration) / 10000 : 0 );
+    if (have_target && (kf->delay_time + kf->duration) / 10000 < 16) tracker_set_position( tracker, target );   /* instant */
+    tracker_notify_animated( tracker, id, kf ? (kf->delay_time + kf->duration) / 10000 : 0,
+                             have_target ? &target : NULL, kf );
     return S_OK;
 }
 static HRESULT WINAPI tracker_TryUpdatePositionWithAdditionalVelocity( void *iface, Vector3 velocity, INT32 *request )

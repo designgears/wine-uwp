@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     7ed938627f684618b83670836c41fe1272389118
-                 dcomp: Return the update rectangle's offset from BeginDraw.
+  wine HEAD:     6a08425a235fbf1c64b3cd687da30b65567e0a16
+                 dcomp: Report hand-off visuals' Translation to XAML, and fix carousel expressions.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-15T08:51:25Z
+  captured:      2026-11-15T10:03:08Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
