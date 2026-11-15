@@ -183,7 +183,7 @@ LONG WINAPI AppPolicyGetWindowingModel(HANDLE token, AppPolicyWindowingModel *po
         FIXME("%p, %p\n", token, policy);
 
     if(policy)
-        *policy = GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", NULL, 0 )
+        *policy = GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", NULL, 0 ) && !is_packaged_desktop_app()
                   ? AppPolicyWindowingModel_Universal : AppPolicyWindowingModel_ClassicDesktop;
 
     return ERROR_SUCCESS;
@@ -706,4 +706,38 @@ HRESULT WINAPI GetIntegratedDisplaySize( double *sz_inches )
 {
     FIXME( "%p stub.\n", sz_inches );
     return E_NOTIMPL;
+}
+
+/* HKLM\...\AppModelUnlock: where Settings' "Developer Mode" and its group policy are stored */
+static BOOL appmodel_unlock_value( const WCHAR *name )
+{
+    DWORD value = 0, size = sizeof(value);
+
+    if (RegGetValueW( HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock", name,
+                      RRF_RT_REG_DWORD, NULL, &value, &size ))
+        return FALSE;
+    return value != 0;
+}
+
+/***********************************************************************
+ *          IsDeveloperModeEnabled (KERNELBASE.@)
+ *
+ * The Windows App SDK's compositor (dcompi.dll) imports it, through api-ms-win-appmodel-unlock-l1-1-0.
+ */
+HRESULT WINAPI IsDeveloperModeEnabled( BOOL *enabled )
+{
+    if (!enabled) return E_POINTER;
+    *enabled = appmodel_unlock_value( L"AllowDevelopmentWithoutDevLicense" );
+    TRACE( "%d\n", *enabled );
+    return S_OK;
+}
+
+/***********************************************************************
+ *          IsDeveloperModePolicyApplied (KERNELBASE.@)
+ */
+HRESULT WINAPI IsDeveloperModePolicyApplied( BOOL *applied )
+{
+    if (!applied) return E_POINTER;
+    *applied = FALSE;  /* no group policy here */
+    return S_OK;
 }

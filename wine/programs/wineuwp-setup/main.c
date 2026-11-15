@@ -1625,6 +1625,13 @@ static void register_wine_classes(void)
     if (in_sys32( L"windows.applicationmodel.useractivities.dll" ))
         set_class( L"Windows.ApplicationModel.UserActivities.UserActivityChannel",
                    L"windows.applicationmodel.useractivities.dll", 1 );
+    /* Windows' is biwinrt.dll's, a client of the Background Infrastructure service; WhatsApp threw without it */
+    if (in_sys32( L"wineappmodel.dll" ))
+    {
+        set_class( L"Windows.ApplicationModel.Background.BackgroundExecutionManager", L"wineappmodel.dll", 0 );
+        /* Windows' is execmodelclient.dll's, a client of the process lifetime manager */
+        set_class( L"Windows.ApplicationModel.AppInstance", L"wineappmodel.dll", 0 );
+    }
     /* only the manager: Windows' other notification classes (ScheduledToastNotification) stay Windows' */
     if (in_sys32( L"windows.ui.notifications.dll" ))
         set_class_dll( L"Windows.UI.Notifications.ToastNotificationManager", L"windows.ui.notifications.dll" );
@@ -1944,6 +1951,11 @@ static void collect_checked_classes( BOOL write )
     if (in_sys32( L"windows.applicationmodel.useractivities.dll" ))
         check_class( L"Windows.ApplicationModel.UserActivities.UserActivityChannel",
                      L"windows.applicationmodel.useractivities.dll", 1 );
+    if (in_sys32( L"wineappmodel.dll" ))
+    {
+        check_class( L"Windows.ApplicationModel.Background.BackgroundExecutionManager", L"wineappmodel.dll", 0 );
+        check_class( L"Windows.ApplicationModel.AppInstance", L"wineappmodel.dll", 0 );
+    }
     if (in_sys32( L"windows.system.profile.integritypolicy.dll" ))
         check_class( L"Windows.System.Profile.WindowsIntegrityPolicy", L"windows.system.profile.integritypolicy.dll", 1 );
     if (in_sys32( L"windows.ui.notifications.dll" ))

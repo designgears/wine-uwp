@@ -15091,3 +15091,70 @@ are `piid.py --signature` values (`IVector<WebAccountProviderCommand>` d376abf3,
 
 Also seen: the start-up fail-fast at `WinStore.App.dll+2f609e1` once more (a run with `trace+xboxauth` and
 `WINE_UWP_TRACE_ORIGINATE=1`), then 0 in 11 repeats with the same settings.
+
+## 2026-11-15 - WinUI 3 desktop apps: WhatsApp through the Windows App SDK bootstrap, to the lifted compositor
+
+WhatsApp 2.2644 (installed from the Store on 11-15) is a packaged *desktop* app (`EntryPoint="Windows.FullTrustApplication"`)
+on .NET 8, WinUI 3 and the Windows App SDK 2.6.5 framework. It died in `DeploymentManager.Initialize` (SEHException).
+Started the way the Store's Open starts it (`wine <stage>\wineuwp-launch.exe`, i.e. its `launch.env`), it now gets
+through the SDK's bootstrap, `Application.Start`, its own start-up and `OnLaunched` to WinUI creating its main window, and
+stops in the window's `WM_CREATE`: the SDK's in-process DWM (`dwmcorei.dll`) fails its `DllMain`. In order:
+
+1. **`OpenPackageInfoByFullName` was a `@ stub`** (kernel32 did not even export it; the loader's raising thunk). Now
+   kernelbase has `OpenPackageInfoByFullName[ForUser]`, `GetPackageInfo[2]` and `ClosePackageInfo`: the app's own package
+   answers with its graph (`GetCurrentPackageInfo2`, the flags DeploymentManager passes are `0x200f0`), any other with
+   itself. `GetPackagesByPackageFamily` (a stub returning nothing) and `FindPackagesByPackageFamily` (the graph only)
+   share one lookup that also reads `InstalledPackages`/`StandInPackages`; `find_package_path` does too, so
+   `GetPackagePathByFullName` knows registered packages.
+2. **The runtime's Main and Singleton packages.** DeploymentManager looks for `MicrosoftCorporationII.WinAppRuntime.Main.2`
+   and `...Singleton` (ERROR_NOT_FOUND without them). The framework carries them as `MSIX\Main.msix`/`Singleton.msix`;
+   `appxinstall` now unpacks each into `STAGE\runtime\<full name>` when it installs a `Microsoft.WindowsAppRuntime.*`
+   framework and registers it under `InstalledPackages` (tested: a `wineuwp-install` of the installed WhatsApp into a
+   scratch stage wrote both). Not `stage\frameworks`: `wineuwp-launch` puts every directory there in an app's graph.
+3. **Missing exports** the SDK imports: kernel32 `PackageFamilyNameFromFullName`/`FromId`, `SetThreadpoolWaitEx`,
+   `VerifyPackageFamilyName`/`FullName`/`Id`/`RelativeApplicationId`; powrprof
+   `PowerUnregisterFromEffectivePowerModeNotifications` (and Register now reports Balanced instead of E_NOTIMPL);
+   `IsDeveloperModeEnabled`/`IsDeveloperModePolicyApplied` (kernelbase, `api-ms-win-appmodel-unlock-l1-1-0`, which the
+   SDK's compositor `dcompi.dll` imports - without it dcompi did not load and `Microsoft.UI.Composition.Compositor`
+   could not be activated, which WinUI's `CompositionHelper::Initialize` fail-fasts on, ignored here, then faults).
+4. **The package graph is searched under `LOAD_LIBRARY_SEARCH_*` flags and for imports.** .NET loads
+   `Microsoft.ui.xaml.dll` with search flags, and when the Store starts an app its `WINEPATH` comes from `launch.env`,
+   too late to become `PATH`: `MRM.dll` (an import of the SDK's resources DLL) was not found. ntdll now reads
+   `WINE_UWP_PACKAGE_DEPENDENCIES` into the search path: before the application directory under search flags, after
+   `PATH` in the default path (so UWP apps, which had the graph on `PATH` already, keep their order).
+5. **`AppPolicyGetWindowingModel` answered Universal for every packaged process**, so WinUI 3's `Application.Start` took
+   the UWP path (`CoreApplication.Run`, RPC_E_WRONG_THREAD). A full-trust app (`EntryPoint="Windows.FullTrustApplication"`
+   or `uap10:RuntimeBehavior` `packagedClassicApp`/`win32App` on its `<Application>`) is ClassicDesktop now
+   (`is_packaged_desktop_app` reads the manifest).
+6. **`wineappmodel.dll`**, new: `Windows.ApplicationModel.Background.BackgroundExecutionManager` (Windows' is
+   biwinrt.dll's, a client of the Background Infrastructure service; every request completes at once with
+   DeniedBySystemPolicy, which WhatsApp logs as `Background access denied` instead of a FATAL) and
+   `Windows.ApplicationModel.AppInstance` (Windows' is execmodelclient.dll's, the process lifetime manager's client):
+   every instance is the current one, and `GetActivatedEventArgs` is a `LaunchActivatedEventArgs` (kind Launch, the
+   command line's arguments, the app's tile id). NULL there - what I tried first - was a NullReferenceException in
+   WhatsApp: null is not neutral. Registered by wineuwp-setup; `include/windowscontracts.idl`'s UniversalApiContract
+   goes to 19 for `IBackgroundExecutionManagerStatics3`.
+
+Where it stops: WinUI's window (`WinUIDesktopWin32WindowClass`) is created visible; in its `WM_CREATE` the SDK's
+`dwmcorei.dll` is delay-loaded and its `DllMain` fails (`user_callback_handler ignoring exception c06d007e`, the window is
+destroyed, then WhatsApp's `InitializeMainWindowAsync` throws NullReferenceException). dwmcorei's `Startup()` creates a
+D2D factory and asks it for **`ID2D1PrivateFactory` `{6f72c0a2-6db7-46e9-9b62-b58a23f4928b}`**, a private interface
+Wine's d2d1 does not have (named from Windows' d2d1.pdb, `QueryInterfaceHelperImpl<D2DFactoryLocking<...>>`; its 22-slot
+vtable `D2DFactoryLocking<MultiThreadedTrait>::vftable{for ID2D1PrivateFactory}` at d2d1.dll `+338d10`: slot 6 is
+`ControlOfferReclaim(BOOL)`, which Startup calls, slot 15 `CreatePrivateDevice`). The lifted compositor (dcompi + dwmcorei)
+renders through d2d1's private device interfaces, so WinUI 3 rendering is the next project, not a stub.
+
+Also: WhatsApp polls `NetworkInformation.GetHostNames` (a Wine stub, E_NOTIMPL) every 1.5 s forever; its push channel and
+StartupTask fail cleanly.
+
+How this was found, for the next WinUI 3 app:
+- **.NET's own exception stream**: `DOTNET_EnableEventPipe=1 DOTNET_EventPipeOutputStreaming=1
+  DOTNET_EventPipeOutputPath=Z:\tmp\x.nettrace DOTNET_EventPipeConfig=Microsoft-Windows-DotNETRuntime:0x8000:4`, then
+  `strings -el x.nettrace`: every first-chance exception's type, message and managed frames, with no SDK installed.
+  Without Streaming the file is only flushed at a clean exit.
+- **ILSpy** without an SDK: the `ilspycmd` nupkg unpacked into `uwp-bin/tools/ilspycmd-9.1`, run with
+  `DOTNET_ROLL_FORWARD=Major dotnet .../tools/net8.0/any/ilspycmd.dll -t Type Assembly.dll -r <app dir>` on the host's
+  .NET 10 runtime. `InitializeMainWindowAsync` read straight off it.
+- `user_callback_handler ignoring exception c06d007e` is a failed delay load inside a window procedure, which Wine
+  swallows: the window just disappears. `warn+module` names the DLL (`Initialization of L"dwmcorei.dll" failed`).
+- `pdbsyms.py` cached PDBs by file name only; it now keeps a second build of the same name under `pdb/<signature>/`.

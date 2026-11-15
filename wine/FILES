@@ -525,3 +525,14 @@ dlls/windows.media/adaptive.c
 dlls/d2d1/brush.c
 dlls/wtsapi32/wtsapi32.c
 dlls/wtsapi32/wtsapi32.spec
+dlls/kernelbase/kernelbase.h
+dlls/powrprof/powrprof.c
+dlls/powrprof/powrprof.spec
+dlls/wineappmodel/Makefile.in
+dlls/wineappmodel/classes.idl
+dlls/wineappmodel/main.c
+dlls/wineappmodel/wineappmodel.spec
+include/powersetting.h
+include/windows.applicationmodel.background.idl
+include/windows.applicationmodel.idl
+include/windowscontracts.idl

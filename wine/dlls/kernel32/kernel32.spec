@@ -225,6 +225,7 @@
 @ stdcall -import ClearCommError(long ptr ptr)
 @ stdcall CloseConsoleHandle(long)
 @ stdcall -import CloseHandle(long)
+@ stdcall ClosePackageInfo(ptr) kernelbase.ClosePackageInfo
 # @ stub ClosePrivateNamespace
 @ stdcall CloseProfileUserMapping()
 @ stdcall -import ClosePseudoConsole(ptr)
@@ -513,6 +514,7 @@
 @ stub FindNextVolumeMountPointW
 @ stdcall -import FindNextVolumeW(long ptr long)
 @ stdcall -import FindNLSString(long long wstr long wstr long ptr)
+@ stdcall FindPackagesByPackageFamily(wstr long ptr ptr ptr ptr ptr) kernelbase.FindPackagesByPackageFamily
 @ stdcall -import FindNLSStringEx(wstr long wstr long wstr long ptr ptr ptr long)
 @ stdcall FindResourceA(long str str)
 @ stdcall FindResourceExA(long str str long)
@@ -783,6 +785,8 @@
 @ stdcall -import GetUserPreferredUILanguages(long ptr ptr ptr)
 @ stdcall GetPackageFamilyName(long ptr ptr) kernelbase.GetPackageFamilyName
 @ stdcall GetPackageFullName(long ptr ptr) kernelbase.GetPackageFullName
+@ stdcall GetPackageInfo(ptr long ptr ptr ptr) kernelbase.GetPackageInfo
+@ stdcall GetPackageInfo2(ptr long long ptr ptr ptr) kernelbase.GetPackageInfo2
 @ stdcall GetPackagesByPackageFamily(wstr ptr ptr ptr ptr) kernelbase.GetPackagesByPackageFamily
 @ stdcall GetPackagePathByFullName(wstr ptr wstr) kernelbase.GetPackagePathByFullName
 @ stdcall -import GetPhysicallyInstalledSystemMemory(ptr)
@@ -1157,6 +1161,8 @@
 @ stdcall OpenJobObjectW(long long wstr)
 @ stdcall OpenMutexA(long long str)
 @ stdcall -import OpenMutexW(long long wstr)
+@ stdcall OpenPackageInfoByFullName(wstr long ptr) kernelbase.OpenPackageInfoByFullName
+@ stdcall OpenPackageInfoByFullNameForUser(ptr wstr long ptr) kernelbase.OpenPackageInfoByFullNameForUser
 # @ stub OpenPrivateNamespaceA
 # @ stub OpenPrivateNamespaceW
 @ stdcall -import OpenProcess(long long long)
@@ -1175,6 +1181,8 @@
 @ stdcall -import PeekConsoleInputW(ptr ptr long ptr)
 @ stdcall -import PeekNamedPipe(long ptr long ptr ptr ptr)
 @ stdcall -import PostQueuedCompletionStatus(long long ptr ptr)
+@ stdcall PackageFamilyNameFromFullName(wstr ptr ptr) kernelbase.PackageFamilyNameFromFullName
+@ stdcall PackageFamilyNameFromId(ptr ptr ptr) kernelbase.PackageFamilyNameFromId
 @ stdcall -import PackageIdFromFullName(wstr long ptr ptr)
 @ stdcall -import PackageFullNameFromId(ptr ptr ptr)
 @ stdcall PowerClearRequest(long long)
@@ -1515,6 +1523,7 @@
 @ stdcall SetThreadpoolTimer(ptr ptr long long) NTDLL.TpSetTimer
 @ stdcall SetThreadpoolTimerEx(ptr ptr long long) NTDLL.TpSetTimerEx
 @ stdcall SetThreadpoolWait(ptr long ptr) NTDLL.TpSetWait
+@ stdcall SetThreadpoolWaitEx(ptr long ptr ptr) NTDLL.TpSetWaitEx
 @ stdcall -import SetTimeZoneInformation(ptr)
 @ stub SetTimerQueueTimer
 @ stdcall -arch=win64 SetUmsThreadInformation(ptr long ptr long)
@@ -1609,6 +1618,10 @@
 @ stdcall VerifyConsoleIoHandle(long)
 # @ stub VerifyScripts
 @ stdcall VerifyVersionInfoA(ptr long int64)
+@ stdcall VerifyPackageFamilyName(wstr) kernelbase.VerifyPackageFamilyName
+@ stdcall VerifyPackageFullName(wstr) kernelbase.VerifyPackageFullName
+@ stdcall VerifyPackageId(ptr) kernelbase.VerifyPackageId
+@ stdcall VerifyPackageRelativeApplicationId(wstr) kernelbase.VerifyPackageRelativeApplicationId
 @ stdcall VerifyVersionInfoW(ptr long int64)
 @ stdcall -import VirtualAlloc(ptr long long long)
 @ stdcall -import VirtualAllocEx(long ptr long long long)

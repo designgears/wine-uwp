@@ -2634,14 +2634,61 @@ static inline WCHAR *append_path( WCHAR *p, const WCHAR *str, int len )
 
 
 /******************************************************************
+ *		get_package_graph_path
+ *
+ * The directories of a hosted packaged app's framework dependencies, as a load path ("dir;dir;" without the final
+ * separator removed), from WINE_UWP_PACKAGE_DEPENDENCIES ("fullname|family|path;..."). Windows searches the package
+ * graph of a packaged process even under LOAD_LIBRARY_SEARCH_* flags: .NET loads WinUI 3's Microsoft.ui.xaml.dll
+ * from the Windows App Runtime framework that way.
+ */
+static WCHAR *get_package_graph_path(void)
+{
+    UNICODE_STRING name = RTL_CONSTANT_STRING( L"WINE_UWP_PACKAGE_DEPENDENCIES" ), value;
+    WCHAR *deps, *ret, *p, *q, *end, *bar;
+
+    value.Length = value.MaximumLength = 0;
+    value.Buffer = NULL;
+    if (RtlQueryEnvironmentVariable_U( NULL, &name, &value ) != STATUS_BUFFER_TOO_SMALL || !value.Length) return NULL;
+    if (!(deps = RtlAllocateHeap( GetProcessHeap(), 0, value.Length + sizeof(WCHAR) ))) return NULL;
+    value.Buffer = deps;
+    value.MaximumLength = value.Length + sizeof(WCHAR);
+    if (RtlQueryEnvironmentVariable_U( NULL, &name, &value ) ||
+        !(ret = RtlAllocateHeap( GetProcessHeap(), 0, value.Length + sizeof(WCHAR) )))
+    {
+        RtlFreeHeap( GetProcessHeap(), 0, deps );
+        return NULL;
+    }
+    deps[value.Length / sizeof(WCHAR)] = 0;
+    for (p = deps, q = ret; *p; p = end)
+    {
+        if ((end = wcschr( p, ';' ))) *end++ = 0;
+        else end = p + wcslen( p );
+        if ((bar = wcschr( p, '|' )) && (bar = wcschr( bar + 1, '|' )) && bar[1])
+            q = append_path( q, bar + 1, -1 );
+    }
+    *q = 0;
+    RtlFreeHeap( GetProcessHeap(), 0, deps );
+    if (q == ret)
+    {
+        RtlFreeHeap( GetProcessHeap(), 0, ret );
+        return NULL;
+    }
+    return ret;
+}
+
+
+/******************************************************************
  *           get_dll_load_path
  */
 static NTSTATUS get_dll_load_path( LPCWSTR module, LPCWSTR dll_dir, ULONG safe_mode, WCHAR **path )
 {
     const WCHAR *mod_end = module;
     UNICODE_STRING name = RTL_CONSTANT_STRING( L"PATH" ), value;
-    WCHAR *p, *ret;
+    WCHAR *p, *ret, *graph = get_package_graph_path();
     int len = ARRAY_SIZE(system_path) + 1, path_len = 0;
+
+    /* after PATH, as WINEPATH puts the graph there when the launcher's environment has it from the start */
+    if (graph) len += wcslen( graph ) + 1;
 
     if (module)
     {
@@ -2658,7 +2705,10 @@ static NTSTATUS get_dll_load_path( LPCWSTR module, LPCWSTR dll_dir, ULONG safe_m
     if (dll_dir) len += wcslen( dll_dir ) + 1;
     else len += 2;  /* current directory */
     if (!(p = ret = RtlAllocateHeap( GetProcessHeap(), 0, path_len + len * sizeof(WCHAR) )))
+    {
+        RtlFreeHeap( GetProcessHeap(), 0, graph );
         return STATUS_NO_MEMORY;
+    }
 
     p = append_path( p, module, mod_end - module );
     if (dll_dir) p = append_path( p, dll_dir, -1 );
@@ -2678,13 +2728,23 @@ static NTSTATUS get_dll_load_path( LPCWSTR module, LPCWSTR dll_dir, ULONG safe_m
         if (!(new_ptr = RtlReAllocateHeap( GetProcessHeap(), 0, ret, path_len + len * sizeof(WCHAR) )))
         {
             RtlFreeHeap( GetProcessHeap(), 0, ret );
+            RtlFreeHeap( GetProcessHeap(), 0, graph );
             return STATUS_NO_MEMORY;
         }
         value.Buffer = new_ptr + (value.Buffer - ret);
         value.MaximumLength = path_len;
         ret = new_ptr;
     }
-    value.Buffer[value.Length / sizeof(WCHAR)] = 0;
+    p = value.Buffer + value.Length / sizeof(WCHAR);
+    if (graph)
+    {
+        if (value.Length) *p++ = ';';
+        wcscpy( p, graph );
+        p += wcslen( graph );
+        if (p[-1] == ';') p--;  /* the graph's own trailing separator */
+        RtlFreeHeap( GetProcessHeap(), 0, graph );
+    }
+    *p = 0;
     *path = ret;
     return STATUS_SUCCESS;
 }
@@ -2697,7 +2757,7 @@ static NTSTATUS get_dll_load_path_search_flags( LPCWSTR module, DWORD flags, WCH
 {
     const WCHAR *image = NULL, *mod_end, *image_end;
     struct dll_dir_entry *dir;
-    WCHAR *p, *ret;
+    WCHAR *p, *ret, *graph = NULL;
     int len = 1;
 
     if (flags & LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
@@ -2720,6 +2780,7 @@ static NTSTATUS get_dll_load_path_search_flags( LPCWSTR module, DWORD flags, WCH
         image = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
         image_end = get_module_path_end( image );
         len += (image_end - image) + 1;
+        if ((graph = get_package_graph_path())) len += wcslen( graph );
     }
 
     if (flags & LOAD_LIBRARY_SEARCH_USER_DIRS)
@@ -2734,6 +2795,11 @@ static NTSTATUS get_dll_load_path_search_flags( LPCWSTR module, DWORD flags, WCH
     if ((p = ret = RtlAllocateHeap( GetProcessHeap(), 0, len * sizeof(WCHAR) )))
     {
         if (module) p = append_path( p, module, mod_end - module );
+        if (graph)
+        {
+            wcscpy( p, graph );
+            p += wcslen( graph );
+        }
         if (image) p = append_path( p, image, image_end - image );
         if (flags & LOAD_LIBRARY_SEARCH_USER_DIRS)
         {
@@ -2748,6 +2814,7 @@ static NTSTATUS get_dll_load_path_search_flags( LPCWSTR module, DWORD flags, WCH
             *p = 0;
         }
     }
+    RtlFreeHeap( GetProcessHeap(), 0, graph );
     *path = ret;
     return STATUS_SUCCESS;
 }

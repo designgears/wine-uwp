@@ -11,6 +11,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import uwppaths
 import sys, os, re, subprocess, bisect, pefile
 CACHE = uwppaths.PDB
+def pdb_signature(pdb):
+    """GUID and age as the CodeView record writes them (GUID hex without dashes, then the age in hex)."""
+    txt = subprocess.run(["llvm-pdbutil", "dump", "--summary", pdb], capture_output=True, text=True).stdout
+    guid = re.search(r"GUID: \{([0-9A-Fa-f-]+)\}", txt); age = re.search(r"Age: (\d+)", txt)
+    return (guid.group(1).replace("-", "").upper() + format(int(age.group(1)), "X")) if guid and age else None
 def pdb_for(dll):
     p = pefile.PE(dll, fast_load=True)
     p.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_DEBUG']])
@@ -19,7 +24,12 @@ def pdb_for(dll):
             name = e.entry.PdbFileName.decode().strip("\0").replace("\\", "/").rsplit("/", 1)[-1]
             sig = e.entry.Signature_String.upper()
             os.makedirs(CACHE, exist_ok=True)
+            # Two binaries can share a PDB name (WinUI 2's and WinUI 3's Microsoft.UI.Xaml.pdb): a flat cache entry
+            # counts only if its GUID and age are this DLL's; any other build goes under CACHE/<signature>/.
             out = os.path.join(CACHE, name)
+            if os.path.exists(out) and pdb_signature(out) != sig:
+                out = os.path.join(CACHE, sig, name)
+                os.makedirs(os.path.dirname(out), exist_ok=True)
             if not (os.path.exists(out) and os.path.getsize(out) > 0):
                 url = f"https://msdl.microsoft.com/download/symbols/{name}/{sig}/{name}"
                 subprocess.run(["curl", "-sSL", "-A", "Microsoft-Symbol-Server/10.0.0.0", "-o", out, url], check=True)

@@ -1771,53 +1771,16 @@ static BOOL get_package_manifest_element( const WCHAR *package_path, const char 
     return ret;
 }
 
-/***********************************************************************
- *         GetCurrentPackageInfo2   (kernelbase.@)
- *
- * Package graph for hosted UWP apps: the main package from WINE_UWP_PACKAGE_*, plus framework
- * dependencies listed in WINE_UWP_PACKAGE_DEPENDENCIES as "fullname|family|path;fullname|family|path".
- */
-LONG WINAPI GetCurrentPackageInfo2( UINT32 flags, UINT32 path_type, UINT32 *buffer_size, BYTE *buffer, UINT32 *count )
+struct package_entry { const WCHAR *full, *family, *path; UINT32 flags; };
+
+/* PACKAGE_INFO records for PKGS, strings and ids after the array, as GetCurrentPackageInfo and GetPackageInfo
+ * return them. */
+static LONG fill_package_infos( const struct package_entry *pkgs, UINT32 n, UINT32 *buffer_size, BYTE *buffer,
+                                UINT32 *count )
 {
-    WCHAR full[1024], family[1024], path[1024], deps[4096], publisher[512];
-    struct { const WCHAR *full, *family, *path; UINT32 flags; } pkgs[16];
-    UINT32 n = 0, i, needed, offset, ids_size, want_head, want_deps;
     struct package_info *infos = (struct package_info *)buffer;
-    WCHAR *p;
-
-    TRACE( "(%#x %u %p %p %p)\n", flags, path_type, buffer_size, buffer, count );
-
-    if (!buffer_size) return ERROR_INVALID_PARAMETER;
-    if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", full, ARRAY_SIZE(full) ))
-        return APPMODEL_ERROR_NO_PACKAGE;
-    if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FAMILY_NAME", family, ARRAY_SIZE(family) )) family[0] = 0;
-    if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_PATH", path, ARRAY_SIZE(path) )) path[0] = 0;
-
-    want_head = !(flags & (PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT)) || (flags & PACKAGE_FILTER_HEAD);
-    want_deps = !(flags & (PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT)) || (flags & PACKAGE_FILTER_DIRECT);
-
-    if (want_head)
-    {
-        pkgs[n].full = full; pkgs[n].family = family; pkgs[n].path = path;
-        pkgs[n].flags = PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT | PACKAGE_FILTER_STATIC;
-        n++;
-    }
-    if (want_deps && GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_DEPENDENCIES", deps, ARRAY_SIZE(deps) ))
-    {
-        for (p = deps; *p && n < ARRAY_SIZE(pkgs); )
-        {
-            WCHAR *end = wcschr( p, ';' ), *f, *pa;
-            if (end) *end++ = 0;
-            if ((f = wcschr( p, '|' )) && (pa = wcschr( f + 1, '|' )))
-            {
-                *f++ = 0; *pa++ = 0;
-                pkgs[n].full = p; pkgs[n].family = f; pkgs[n].path = pa;
-                pkgs[n].flags = PACKAGE_FILTER_DIRECT | PACKAGE_FILTER_STATIC;
-                n++;
-            }
-            p = end ? end : p + lstrlenW( p );
-        }
-    }
+    UINT32 i, needed, offset, ids_size;
+    WCHAR publisher[512];
 
     /* size pass; it must count everything the fill pass below writes, including the publisher
      * string read from each package's manifest. Undercounting it made the last package's
@@ -1866,6 +1829,56 @@ LONG WINAPI GetCurrentPackageInfo2( UINT32 flags, UINT32 path_type, UINT32 *buff
 }
 
 /***********************************************************************
+ *         GetCurrentPackageInfo2   (kernelbase.@)
+ *
+ * Package graph for hosted UWP apps: the main package from WINE_UWP_PACKAGE_*, plus framework
+ * dependencies listed in WINE_UWP_PACKAGE_DEPENDENCIES as "fullname|family|path;fullname|family|path".
+ */
+LONG WINAPI GetCurrentPackageInfo2( UINT32 flags, UINT32 path_type, UINT32 *buffer_size, BYTE *buffer, UINT32 *count )
+{
+    WCHAR full[1024], family[1024], path[1024], deps[4096];
+    struct package_entry pkgs[16];
+    UINT32 n = 0, want_head, want_deps;
+    WCHAR *p;
+
+    TRACE( "(%#x %u %p %p %p)\n", flags, path_type, buffer_size, buffer, count );
+
+    if (!buffer_size) return ERROR_INVALID_PARAMETER;
+    if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", full, ARRAY_SIZE(full) ))
+        return APPMODEL_ERROR_NO_PACKAGE;
+    if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FAMILY_NAME", family, ARRAY_SIZE(family) )) family[0] = 0;
+    if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_PATH", path, ARRAY_SIZE(path) )) path[0] = 0;
+
+    want_head = !(flags & (PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT)) || (flags & PACKAGE_FILTER_HEAD);
+    want_deps = !(flags & (PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT)) || (flags & PACKAGE_FILTER_DIRECT);
+
+    if (want_head)
+    {
+        pkgs[n].full = full; pkgs[n].family = family; pkgs[n].path = path;
+        pkgs[n].flags = PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT | PACKAGE_FILTER_STATIC;
+        n++;
+    }
+    if (want_deps && GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_DEPENDENCIES", deps, ARRAY_SIZE(deps) ))
+    {
+        for (p = deps; *p && n < ARRAY_SIZE(pkgs); )
+        {
+            WCHAR *end = wcschr( p, ';' ), *f, *pa;
+            if (end) *end++ = 0;
+            if ((f = wcschr( p, '|' )) && (pa = wcschr( f + 1, '|' )))
+            {
+                *f++ = 0; *pa++ = 0;
+                pkgs[n].full = p; pkgs[n].family = f; pkgs[n].path = pa;
+                pkgs[n].flags = PACKAGE_FILTER_DIRECT | PACKAGE_FILTER_STATIC;
+                n++;
+            }
+            p = end ? end : p + lstrlenW( p );
+        }
+    }
+
+    return fill_package_infos( pkgs, n, buffer_size, buffer, count );
+}
+
+/***********************************************************************
  *         GetCurrentPackageInfo   (kernelbase.@)
  */
 LONG WINAPI GetCurrentPackageInfo( const UINT32 flags, UINT32 *buffer_size, BYTE *buffer, UINT32 *count )
@@ -1906,23 +1919,6 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetPackageFamilyName( HANDLE process, UINT32
     return get_package_string( L"WINE_UWP_PACKAGE_FAMILY_NAME", length, name, APPMODEL_ERROR_NO_PACKAGE );
 }
 
-/***********************************************************************
- *         GetPackagesByPackageFamily   (kernelbase.@)
- */
-LONG WINAPI DECLSPEC_HOTPATCH GetPackagesByPackageFamily(const WCHAR *family_name, UINT32 *count,
-                                                         WCHAR *full_names, UINT32 *buffer_len, WCHAR *buffer)
-{
-    FIXME( "(%s %p %p %p %p): stub\n", debugstr_w(family_name), count, full_names, buffer_len, buffer );
-
-    if (!count || !buffer_len)
-        return ERROR_INVALID_PARAMETER;
-
-    *count = 0;
-    *buffer_len = 0;
-    return ERROR_SUCCESS;
-}
-
-
 static const struct
 {
     UINT32 code;
@@ -1938,31 +1934,252 @@ arch_names[] =
     {PROCESSOR_ARCHITECTURE_UNKNOWN,       L"unknown"},
 };
 
-/* path of a package in the hosted package graph (main package or WINE_UWP_PACKAGE_DEPENDENCIES) */
-static BOOL find_package_path( const WCHAR *name, WCHAR *path, DWORD size )
-{
-    WCHAR full[1024], deps[4096], *p;
+LONG WINAPI PackageFamilyNameFromFullName( const WCHAR *full_name, UINT32 *len, WCHAR *family );
 
-    if (!is_packaged_process()) return FALSE;
-    if (GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", full, ARRAY_SIZE(full) ) && !wcsicmp( full, name ))
-        return GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_PATH", path, size ) != 0;
-    if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_DEPENDENCIES", deps, ARRAY_SIZE(deps) )) return FALSE;
-    for (p = deps; *p; )
+/* A package the installer registered, HKLM\Software\Wine\WineUWP\InstalledPackages\<family> (installs by the Store
+ * and the Windows App Runtime's own packages) or StandInPackages\<family>: FullName and Location. */
+static BOOL registered_package( const WCHAR *family, WCHAR *full, DWORD full_size, WCHAR *path, DWORD path_size )
+{
+    static const WCHAR *roots[] = { L"Software\\Wine\\WineUWP\\InstalledPackages\\",
+                                    L"Software\\Wine\\WineUWP\\StandInPackages\\" };
+    WCHAR key[512];
+    DWORD size;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(roots); i++)
     {
-        WCHAR *end = wcschr( p, ';' ), *f, *pa;
-        if (end) *end++ = 0;
-        if ((f = wcschr( p, '|' )) && (pa = wcschr( f + 1, '|' )))
-        {
-            *f = 0;
-            if (!wcsicmp( p, name ))
-            {
-                lstrcpynW( path, pa + 1, size );
-                return TRUE;
-            }
-        }
-        p = end ? end : p + lstrlenW( p );
+        if (lstrlenW( roots[i] ) + lstrlenW( family ) >= ARRAY_SIZE(key)) return FALSE;
+        lstrcpyW( key, roots[i] );
+        lstrcatW( key, family );
+        size = full_size * sizeof(WCHAR);
+        if (RegGetValueW( HKEY_LOCAL_MACHINE, key, L"FullName", RRF_RT_REG_SZ, NULL, full, &size )) continue;
+        size = path_size * sizeof(WCHAR);
+        if (RegGetValueW( HKEY_LOCAL_MACHINE, key, L"Location", RRF_RT_REG_SZ, NULL, path, &size )) path[0] = 0;
+        return TRUE;
     }
     return FALSE;
+}
+
+/* path of a package in the hosted package graph (main package or WINE_UWP_PACKAGE_DEPENDENCIES), or of one the
+ * installer registered */
+static BOOL find_package_path( const WCHAR *name, WCHAR *path, DWORD size )
+{
+    WCHAR full[1024], deps[4096], family[256], *p;
+    UINT32 len = ARRAY_SIZE(family);
+
+    if (is_packaged_process())
+    {
+        if (GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", full, ARRAY_SIZE(full) ) && !wcsicmp( full, name ))
+            return GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_PATH", path, size ) != 0;
+        if (GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_DEPENDENCIES", deps, ARRAY_SIZE(deps) ))
+        {
+            for (p = deps; *p; )
+            {
+                WCHAR *end = wcschr( p, ';' ), *f, *pa;
+                if (end) *end++ = 0;
+                if ((f = wcschr( p, '|' )) && (pa = wcschr( f + 1, '|' )))
+                {
+                    *f = 0;
+                    if (!wcsicmp( p, name ))
+                    {
+                        lstrcpynW( path, pa + 1, size );
+                        return TRUE;
+                    }
+                }
+                p = end ? end : p + lstrlenW( p );
+            }
+        }
+    }
+    if (PackageFamilyNameFromFullName( name, &len, family )) return FALSE;
+    return registered_package( family, full, ARRAY_SIZE(full), path, size ) && !wcsicmp( full, name ) && path[0];
+}
+
+/* the family of a package in the hosted package graph, by full name */
+static BOOL graph_package_family( const WCHAR *name, WCHAR *family, UINT32 size )
+{
+    return !PackageFamilyNameFromFullName( name, &size, family );
+}
+
+/* The packages of a family: those in the hosted package graph and the one the installer registered. */
+static LONG find_family_packages( const WCHAR *family_name, UINT32 *count, WCHAR *full_names[], UINT32 *buffer_len,
+                                  WCHAR *buffer, UINT32 *properties )
+{
+    WCHAR found[4][256], full[1024], deps[4096], path[1024], family[256], value[16], *p;
+    UINT32 n = 0, needed = 0, i, j;
+
+    if (!count || !buffer_len || !family_name) return ERROR_INVALID_PARAMETER;
+
+    if (is_packaged_process())
+    {
+        if (GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FAMILY_NAME", family, ARRAY_SIZE(family) ) &&
+            !wcsicmp( family, family_name ) &&
+            GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", full, ARRAY_SIZE(full) ) &&
+            lstrlenW( full ) < ARRAY_SIZE(found[0]))
+            lstrcpyW( found[n++], full );
+        if (GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_DEPENDENCIES", deps, ARRAY_SIZE(deps) ))
+        {
+            for (p = deps; *p && n < ARRAY_SIZE(found); )
+            {
+                WCHAR *end = wcschr( p, ';' ), *f;
+                if (end) *end++ = 0;
+                if ((f = wcschr( p, '|' )))
+                {
+                    *f = 0;
+                    if (lstrlenW( p ) < ARRAY_SIZE(found[0]) &&
+                        graph_package_family( p, family, ARRAY_SIZE(family) ) && !wcsicmp( family, family_name ))
+                        lstrcpyW( found[n++], p );
+                }
+                p = end ? end : p + lstrlenW( p );
+            }
+        }
+    }
+    if (n < ARRAY_SIZE(found) && registered_package( family_name, full, ARRAY_SIZE(full), path, ARRAY_SIZE(path) ) &&
+        lstrlenW( full ) < ARRAY_SIZE(found[0]))
+    {
+        for (i = 0; i < n; i++) if (!wcsicmp( found[i], full )) break;
+        if (i == n) lstrcpyW( found[n++], full );
+    }
+
+    for (i = 0; i < n; i++) needed += lstrlenW( found[i] ) + 1;
+    if (*count < n || *buffer_len < needed || (n && (!full_names || !buffer)))
+    {
+        *count = n;
+        *buffer_len = needed;
+        return n ? ERROR_INSUFFICIENT_BUFFER : ERROR_SUCCESS;
+    }
+    for (i = j = 0; i < n; i++)
+    {
+        full_names[i] = buffer + j;
+        lstrcpyW( buffer + j, found[i] );
+        j += lstrlenW( found[i] ) + 1;
+        if (properties)
+            properties[i] = find_package_path( found[i], path, ARRAY_SIZE(path) ) &&
+                            get_package_manifest_element( path, "Framework", value, ARRAY_SIZE(value) ) &&
+                            !wcsicmp( value, L"true" ) ? PACKAGE_PROPERTY_FRAMEWORK : 0;
+    }
+    *count = n;
+    *buffer_len = needed;
+    TRACE( "%s: %u packages\n", debugstr_w(family_name), n );
+    return ERROR_SUCCESS;
+}
+
+/***********************************************************************
+ *         GetPackagesByPackageFamily   (kernelbase.@)
+ */
+LONG WINAPI DECLSPEC_HOTPATCH GetPackagesByPackageFamily(const WCHAR *family_name, UINT32 *count,
+                                                         WCHAR *full_names[], UINT32 *buffer_len, WCHAR *buffer)
+{
+    TRACE( "(%s %p %p %p %p)\n", debugstr_w(family_name), count, full_names, buffer_len, buffer );
+    return find_family_packages( family_name, count, full_names, buffer_len, buffer, NULL );
+}
+
+/***********************************************************************
+ *         FindPackagesByPackageFamily   (kernelbase.@)
+ *
+ * Every package here is installed for the user, so the filter (PACKAGE_FILTER_*) does not narrow anything.
+ */
+LONG WINAPI FindPackagesByPackageFamily( const WCHAR *family_name, UINT32 filters, UINT32 *count, WCHAR *full_names[],
+                                         UINT32 *buffer_len, WCHAR *buffer, UINT32 *properties )
+{
+    TRACE( "(%s %#x %p %p %p %p %p)\n", debugstr_w(family_name), filters, count, full_names, buffer_len, buffer,
+           properties );
+    return find_family_packages( family_name, count, full_names, buffer_len, buffer, properties );
+}
+
+/* PACKAGE_INFO_REFERENCE: what OpenPackageInfoByFullName opened */
+struct package_info_reference
+{
+    WCHAR full[256], family[256], path[1024];
+    BOOL framework;
+};
+
+/***********************************************************************
+ *         OpenPackageInfoByFullName   (kernelbase.@)
+ */
+LONG WINAPI OpenPackageInfoByFullName( const WCHAR *full_name, const UINT32 reserved, void **reference )
+{
+    struct package_info_reference *ref;
+    WCHAR current[1024];
+    UINT32 len;
+
+    TRACE( "(%s %#x %p)\n", debugstr_w(full_name), reserved, reference );
+    if (!full_name || !reference || reserved) return ERROR_INVALID_PARAMETER;
+    if (lstrlenW( full_name ) >= ARRAY_SIZE(ref->full)) return ERROR_NOT_FOUND;
+    if (!(ref = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*ref) ))) return ERROR_OUTOFMEMORY;
+    len = ARRAY_SIZE(ref->family);
+    if (!find_package_path( full_name, ref->path, ARRAY_SIZE(ref->path) ) ||
+        PackageFamilyNameFromFullName( full_name, &len, ref->family ))
+    {
+        WARN( "unknown package %s\n", debugstr_w(full_name) );
+        HeapFree( GetProcessHeap(), 0, ref );
+        return ERROR_NOT_FOUND;
+    }
+    lstrcpyW( ref->full, full_name );
+    /* everything in the graph but the main package is a framework the app depends on */
+    ref->framework = !(GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", current, ARRAY_SIZE(current) ) &&
+                       !wcsicmp( current, full_name )) && get_package_manifest_element( ref->path, "Framework",
+                       current, ARRAY_SIZE(current) ) && !wcsicmp( current, L"true" );
+    *reference = ref;
+    return ERROR_SUCCESS;
+}
+
+/***********************************************************************
+ *         OpenPackageInfoByFullNameForUser   (kernelbase.@)
+ */
+LONG WINAPI OpenPackageInfoByFullNameForUser( PSID sid, const WCHAR *full_name, const UINT32 reserved, void **reference )
+{
+    return OpenPackageInfoByFullName( full_name, reserved, reference );
+}
+
+/***********************************************************************
+ *         GetPackageInfo2   (kernelbase.@)
+ *
+ * The running app's package with its dependencies; any other package only itself.
+ */
+LONG WINAPI GetPackageInfo2( void *reference, const UINT32 flags, UINT32 path_type, UINT32 *buffer_size, BYTE *buffer,
+                             UINT32 *count )
+{
+    struct package_info_reference *ref = reference;
+    struct package_entry pkg;
+    WCHAR current[1024];
+
+    TRACE( "(%p %#x %u %p %p %p)\n", reference, flags, path_type, buffer_size, buffer, count );
+    if (!ref || !buffer_size) return ERROR_INVALID_PARAMETER;
+    /* the running app's own package: its dependencies are the hosted graph (DeploymentManager finds the Windows
+     * App Runtime framework this way) */
+    if (!ref->framework && GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", current, ARRAY_SIZE(current) ) &&
+        !wcsicmp( current, ref->full ))
+        return GetCurrentPackageInfo2( flags, path_type, buffer_size, buffer, count );
+    if ((flags & (PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT)) == PACKAGE_FILTER_DIRECT)
+    {
+        *buffer_size = 0;
+        if (count) *count = 0;
+        return ERROR_SUCCESS;
+    }
+    pkg.full = ref->full;
+    pkg.family = ref->family;
+    pkg.path = ref->path;
+    pkg.flags = PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT | PACKAGE_FILTER_STATIC |
+                (ref->framework ? PACKAGE_PROPERTY_FRAMEWORK : 0);
+    return fill_package_infos( &pkg, 1, buffer_size, buffer, count );
+}
+
+/***********************************************************************
+ *         GetPackageInfo   (kernelbase.@)
+ */
+LONG WINAPI GetPackageInfo( void *reference, const UINT32 flags, UINT32 *buffer_size, BYTE *buffer, UINT32 *count )
+{
+    return GetPackageInfo2( reference, flags, 0, buffer_size, buffer, count );
+}
+
+/***********************************************************************
+ *         ClosePackageInfo   (kernelbase.@)
+ */
+LONG WINAPI ClosePackageInfo( void *reference )
+{
+    TRACE( "(%p)\n", reference );
+    HeapFree( GetProcessHeap(), 0, reference );
+    return ERROR_SUCCESS;
 }
 
 static LONG return_package_string( const WCHAR *value, UINT32 *len, WCHAR *buffer )
@@ -2594,62 +2811,6 @@ LONG WINAPI GetCurrentPackageInfo3( UINT32 flags, UINT32 type, UINT32 *buffer_si
 }
 
 /***********************************************************************
- *         FindPackagesByPackageFamily   (kernelbase.@)
- *
- * Packages of a family in the current package graph. Only the graph is visible here: there is no
- * deployment database listing packages the process does not depend on.
- */
-LONG WINAPI FindPackagesByPackageFamily( const WCHAR *family, UINT32 filters, UINT32 *count, WCHAR **full_names,
-                                         UINT32 *buffer_len, WCHAR *buffer, UINT32 *properties )
-{
-    WCHAR full[1024], fam[1024], deps[4096], *p;
-    const WCHAR *matches[16];
-    UINT32 n = 0, i, needed = 0, offset = 0;
-
-    TRACE( "%s %#x %p %p %p %p %p\n", debugstr_w(family), filters, count, full_names, buffer_len, buffer, properties );
-
-    if (!family || !count || !buffer_len) return ERROR_INVALID_PARAMETER;
-
-    if (GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FAMILY_NAME", fam, ARRAY_SIZE(fam) ) && !wcsicmp( fam, family )
-        && GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FULL_NAME", full, ARRAY_SIZE(full) ))
-        matches[n++] = full;
-
-    if (GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_DEPENDENCIES", deps, ARRAY_SIZE(deps) ))
-    {
-        for (p = deps; *p && n < ARRAY_SIZE(matches); )
-        {
-            WCHAR *end = wcschr( p, ';' ), *f, *pa;
-            if (end) *end++ = 0;
-            if ((f = wcschr( p, '|' )) && (pa = wcschr( f + 1, '|' )))
-            {
-                *f++ = 0; *pa = 0;
-                if (!wcsicmp( f, family )) matches[n++] = p;
-            }
-            p = end ? end : p + lstrlenW( p );
-        }
-    }
-
-    for (i = 0; i < n; i++) needed += lstrlenW( matches[i] ) + 1;
-    if (!full_names || !buffer || *count < n || *buffer_len < needed)
-    {
-        *count = n;
-        *buffer_len = needed;
-        return n ? ERROR_INSUFFICIENT_BUFFER : ERROR_SUCCESS;
-    }
-
-    for (i = 0; i < n; i++)
-    {
-        full_names[i] = buffer + offset;
-        lstrcpyW( buffer + offset, matches[i] );
-        offset += lstrlenW( matches[i] ) + 1;
-        if (properties) properties[i] = 0;
-    }
-    *count = n;
-    *buffer_len = needed;
-    return ERROR_SUCCESS;
-}
-
-/***********************************************************************
  *         GetPackageApplicationPropertyString   (kernelbase.@)
  */
 LONG WINAPI GetPackageApplicationPropertyString( void *context, UINT32 property, UINT32 *length, WCHAR *buffer )
@@ -2874,3 +3035,90 @@ BOOL WINAPI GetSystemAppDataKey( HANDLE handle, DWORD flags, HKEY *key )
     return FALSE;
 }
 
+
+/***********************************************************************
+ *         VerifyPackageFullName   (kernelbase.@)
+ */
+LONG WINAPI VerifyPackageFullName( const WCHAR *full_name )
+{
+    UINT32 size = 0;
+
+    TRACE( "(%s)\n", debugstr_w(full_name) );
+    if (!full_name || !*full_name) return ERROR_INVALID_PARAMETER;
+    return PackageIdFromFullName( full_name, 0, &size, NULL ) == ERROR_INSUFFICIENT_BUFFER ? ERROR_SUCCESS
+                                                                                         : ERROR_INVALID_PARAMETER;
+}
+
+/***********************************************************************
+ *         VerifyPackageFamilyName   (kernelbase.@)
+ *
+ * Name_PublisherId: a name of 3 to 50 characters and a 13-character publisher id.
+ */
+LONG WINAPI VerifyPackageFamilyName( const WCHAR *family )
+{
+    const WCHAR *sep;
+    size_t name_len;
+
+    TRACE( "(%s)\n", debugstr_w(family) );
+    if (!family || !(sep = wcsrchr( family, '_' ))) return ERROR_INVALID_PARAMETER;
+    name_len = sep - family;
+    if (name_len < 3 || name_len > 50 || wcschr( family, '_' ) != sep || lstrlenW( sep + 1 ) != 13)
+        return ERROR_INVALID_PARAMETER;
+    return ERROR_SUCCESS;
+}
+
+/***********************************************************************
+ *         VerifyPackageId   (kernelbase.@)
+ */
+LONG WINAPI VerifyPackageId( const PACKAGE_ID *id )
+{
+    TRACE( "(%p)\n", id );
+    if (!id || !id->name || !*id->name || !id->publisher || !*id->publisher) return ERROR_INVALID_PARAMETER;
+    return ERROR_SUCCESS;
+}
+
+/***********************************************************************
+ *         VerifyPackageRelativeApplicationId   (kernelbase.@)
+ */
+LONG WINAPI VerifyPackageRelativeApplicationId( const WCHAR *id )
+{
+    const WCHAR *p;
+
+    TRACE( "(%s)\n", debugstr_w(id) );
+    if (!id || !*id || lstrlenW( id ) > 64) return ERROR_INVALID_PARAMETER;
+    for (p = id; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '.'))
+            return ERROR_INVALID_PARAMETER;
+    return ERROR_SUCCESS;
+}
+
+/* Whether the hosted packaged app is a desktop (full trust) app rather than a UWP one: its <Application> has
+ * EntryPoint="Windows.FullTrustApplication" or a uap10:RuntimeBehavior of packagedClassicApp or win32App. Those
+ * get the ClassicDesktop windowing model; WinUI 3 takes the UWP path (CoreApplication.Run) under Universal. */
+BOOL is_packaged_desktop_app(void)
+{
+    static LONG cached = -1;
+    WCHAR path[1024], aumid[512], *bang;
+    char id_attr[600], *data, *p, *end;
+    LONG ret = 0;
+
+    if (cached != -1) return cached;
+    if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_PATH", path, ARRAY_SIZE(path) ) ||
+        !GetEnvironmentVariableW( L"WINE_UWP_AUMID", aumid, ARRAY_SIZE(aumid) ) || !(bang = wcschr( aumid, '!' )))
+        return FALSE;
+    snprintf( id_attr, sizeof(id_attr), "Id=\"%ls\"", bang + 1 );
+    if (!(data = read_package_manifest( path ))) return FALSE;
+    for (p = data; (p = strstr( p, "<Application " )); p = end)
+    {
+        if (!(end = strchr( p, '>' ))) break;
+        *end++ = 0;
+        if (!strstr( p, id_attr )) continue;
+        ret = strstr( p, "EntryPoint=\"Windows.FullTrustApplication\"" ) ||
+              strstr( p, "RuntimeBehavior=\"packagedClassicApp\"" ) || strstr( p, "RuntimeBehavior=\"win32App\"" );
+        break;
+    }
+    HeapFree( GetProcessHeap(), 0, data );
+    TRACE( "%s: %s app\n", debugstr_w(aumid), ret ? "desktop" : "UWP" );
+    InterlockedExchange( &cached, ret );
+    return ret;
+}

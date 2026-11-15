@@ -29,6 +29,7 @@
 #include <string.h>
 
 #include "appxinstall_private.h"
+#include "winreg.h"
 #include "unixlib.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(appxinstall);
@@ -1028,6 +1029,78 @@ static HRESULT publish( const WCHAR *dest, const WCHAR *final )
     return hr;
 }
 
+/* The Windows App Runtime framework carries its Main and Singleton packages as MSIX\*.msix. On Windows its
+ * DeploymentManager installs them, and DeploymentManager.Initialize (which a WinUI 3 app runs before anything else)
+ * fails with ERROR_NOT_FOUND while they are missing. Each is unpacked into STAGE\runtime\<full name>, beside the
+ * frameworks rather than in them (every directory there is put in an app's package graph), and registered under
+ * InstalledPackages, where kernelbase's FindPackagesByPackageFamily finds it. */
+static void install_runtime_packages( const struct appx_install_params *params, const WCHAR *stage_root,
+                                      const WCHAR *framework, const WCHAR *temp )
+{
+    WCHAR *msix_dir = path_join( framework, L"MSIX" ), *pattern = msix_dir ? path_join( msix_dir, L"*.msix" ) : NULL;
+    WCHAR *runtime_root = path_join( stage_root, L"runtime" );
+    WIN32_FIND_DATAW fd;
+    HANDLE find;
+
+    if (!pattern || !runtime_root || (find = FindFirstFileW( pattern, &fd )) == INVALID_HANDLE_VALUE) goto done;
+    do
+    {
+        WCHAR *path = path_join( msix_dir, fd.cFileName ), *dest = NULL, *staging = NULL, full[512], family[256], key[512];
+        struct package *pkg = NULL;
+        struct manifest *m = NULL;
+        WCHAR pid[14];
+        DWORD arch = 9;  /* x64 */
+        HKEY hkey;
+
+        if (!path || FAILED(package_open( path, params, temp, &pkg )) || FAILED(manifest_read( pkg, &m )) ||
+            FAILED(publisher_id( m->publisher, pid )))
+        {
+            WARN( "cannot read %s\n", debugstr_w(path) );
+            goto next;
+        }
+        swprintf( full, ARRAY_SIZE(full), L"%s_%s_%s_%s_%s", m->name, m->version, m->arch, m->resource_id, pid );
+        swprintf( family, ARRAY_SIZE(family), L"%s_%s", m->name, pid );
+        if (!(dest = path_join( runtime_root, full ))) goto next;
+        if (!exists( dest ))
+        {
+            if (!(staging = with_suffix( dest, L".new" ))) goto next;
+            remove_tree( staging );
+            if (!create_directories( staging ) || FAILED(extract( pkg, staging, params )) || !MoveFileW( staging, dest ))
+            {
+                WARN( "cannot unpack %s into %s\n", debugstr_w(path), debugstr_w(dest) );
+                remove_tree( staging );
+                goto next;
+            }
+        }
+        swprintf( key, ARRAY_SIZE(key), L"Software\\Wine\\WineUWP\\InstalledPackages\\%s", family );
+        if (!RegCreateKeyExW( HKEY_LOCAL_MACHINE, key, 0, NULL, 0, KEY_SET_VALUE, NULL, &hkey, NULL ))
+        {
+#define SET_STRING(n, v) RegSetValueExW( hkey, n, 0, REG_SZ, (const BYTE *)(v), (wcslen( v ) + 1) * sizeof(WCHAR) )
+            SET_STRING( L"Name", m->name );
+            SET_STRING( L"Publisher", m->publisher );
+            SET_STRING( L"PublisherId", pid );
+            SET_STRING( L"Version", m->version );
+            SET_STRING( L"FullName", full );
+            SET_STRING( L"Location", dest );
+#undef SET_STRING
+            RegSetValueExW( hkey, L"Architecture", 0, REG_DWORD, (const BYTE *)&arch, sizeof(arch) );
+            RegCloseKey( hkey );
+        }
+        report( params, APPX_EVENT_MESSAGE, 0, 0, L"runtime package %s", full );
+    next:
+        if (m) manifest_free( m );
+        if (pkg) package_close( pkg );
+        free( staging );
+        free( dest );
+        free( path );
+    } while (FindNextFileW( find, &fd ));
+    FindClose( find );
+done:
+    free( runtime_root );
+    free( pattern );
+    free( msix_dir );
+}
+
 static BOOL valid_stage_name( const WCHAR *stage )
 {
     return *stage && wcscmp( stage, L"." ) && wcscmp( stage, L".." ) && !wcspbrk( stage, L"\\/:*?\"<>|" );
@@ -1181,6 +1254,13 @@ HRESULT CDECL appx_install( const struct appx_install_params *params )
         free( src );
         if (!ok) { hr = HRESULT_FROM_WIN32( GetLastError() ); goto done; }
         report( params, APPX_EVENT_MESSAGE, 0, 0, L"framework %s", fw_names[i] );
+    }
+    for (i = 0; i < fw_count; i++)
+    {
+        WCHAR *framework;
+        if (wcsnicmp( fw_names[i], L"Microsoft.WindowsAppRuntime.", 28 )) continue;
+        if ((framework = path_join( fw_root, fw_names[i] ))) install_runtime_packages( params, stage_root, framework, temp );
+        free( framework );
     }
     /* the DLLs an app loads by bare name, next to it (stage-app.sh does the same) */
     for (i = 0; i < fw_count; i++)

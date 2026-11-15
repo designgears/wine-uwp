@@ -1,7 +1,7 @@
 MODULE    = appxinstall.dll
 UNIXLIB   = appxinstall.so
 IMPORTLIB = appxinstall
-IMPORTS   = bcrypt winhttp xmllite shlwapi ole32 $(ZLIB_PE_LIBS)
+IMPORTS   = bcrypt winhttp xmllite shlwapi ole32 advapi32 $(ZLIB_PE_LIBS)
 EXTRAINCL = $(ZLIB_PE_CFLAGS)
 
 SOURCES = \

@@ -4,6 +4,7 @@ apiset ext-ms-win-devmgmt-policy-l1-1-1 = policymanager.dll
 apiset api-ms-win-appmodel-runtime-internal-l1-1-1 = kernelbase.dll
 apiset api-ms-win-appmodel-runtime-l1-1-2 = kernelbase.dll
 apiset api-ms-win-appmodel-state-l1-2-0 = kernelbase.dll
+apiset api-ms-win-appmodel-unlock-l1-1-0 = kernelbase.dll
 apiset ext-ms-win-appmodel-state-ext-l1-2-0 = kernelbase.dll
 apiset ext-ms-onecore-appmodel-staterepository-cache-l1-1-0 = windows.staterepositorycore.dll
 apiset ext-ms-win-resources-deployment-l1-1-0 = mrmdeploy.dll

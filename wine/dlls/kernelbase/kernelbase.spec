@@ -138,7 +138,7 @@
 @ stdcall ClearCommError(long ptr ptr)
 # @ stub CloseGlobalizationUserSettingsKey
 @ stdcall CloseHandle(long)
-# @ stub ClosePackageInfo
+@ stdcall ClosePackageInfo(ptr)
 # @ stub ClosePrivateNamespace
 @ stdcall ClosePseudoConsole(ptr)
 @ stdcall CloseState(ptr)
@@ -639,7 +639,8 @@
 @ stdcall GetPackageFullName(long ptr ptr)
 @ stdcall GetPackageFullNameFromToken(ptr ptr ptr)
 # @ stub GetPackageId
-# @ stub GetPackageInfo
+@ stdcall GetPackageInfo(ptr long ptr ptr ptr)
+@ stdcall GetPackageInfo2(ptr long long ptr ptr ptr)
 # @ stub GetPackageInstallTime
 @ stdcall GetPackageGlobalizationProperty(ptr long ptr ptr)
 @ stdcall GetPackageOSMaxVersionTested(wstr ptr)
@@ -908,8 +909,8 @@
 @ stdcall IsDBCSLeadByte(long)
 @ stdcall IsDBCSLeadByteEx(long long)
 @ stdcall IsDebuggerPresent()
-# @ stub IsDeveloperModeEnabled
-# @ stub IsDeveloperModePolicyApplied
+@ stdcall IsDeveloperModeEnabled(ptr)
+@ stdcall IsDeveloperModePolicyApplied(ptr)
 # @ stub IsEnclaveTypeSupported
 # @ stub IsGlobalizationUserSettingsKeyRedirected
 @ stdcall IsInternetESCEnabled()
@@ -1040,8 +1041,8 @@
 @ stdcall OpenFileMappingW(long long wstr)
 @ stdcall OpenGlobalizationUserSettingsKey(long ptr ptr)
 @ stdcall OpenMutexW(long long wstr)
-# @ stub OpenPackageInfoByFullName
-# @ stub OpenPackageInfoByFullNameForUser
+@ stdcall OpenPackageInfoByFullName(wstr long ptr)
+@ stdcall OpenPackageInfoByFullNameForUser(ptr wstr long ptr)
 # @ stub OpenPrivateNamespaceW
 @ stdcall OpenProcess(long long long)
 @ stdcall OpenProcessToken(long long ptr)
@@ -1562,7 +1563,7 @@
 @ stdcall SetThreadpoolTimer(ptr ptr long long) ntdll.TpSetTimer
 @ stdcall SetThreadpoolTimerEx(ptr ptr long long) ntdll.TpSetTimerEx
 @ stdcall SetThreadpoolWait(ptr long ptr) ntdll.TpSetWait
-# @ stub SetThreadpoolWaitEx
+@ stdcall SetThreadpoolWaitEx(ptr long ptr ptr) ntdll.TpSetWaitEx
 @ stdcall SetTimeZoneInformation(ptr)
 @ stdcall SetTokenInformation(long long ptr long)
 @ stdcall SetUnhandledExceptionFilter(ptr)
@@ -1728,10 +1729,10 @@
 @ stdcall VerQueryValueW(ptr wstr ptr ptr)
 @ stdcall -ret64 VerSetConditionMask(long long long long) ntdll.VerSetConditionMask
 # @ stub VerifyApplicationUserModelId
-# @ stub VerifyPackageFamilyName
-# @ stub VerifyPackageFullName
-# @ stub VerifyPackageId
-# @ stub VerifyPackageRelativeApplicationId
+@ stdcall VerifyPackageFamilyName(wstr)
+@ stdcall VerifyPackageFullName(wstr)
+@ stdcall VerifyPackageId(ptr)
+@ stdcall VerifyPackageRelativeApplicationId(wstr)
 # @ stub VerifyScripts
 @ stdcall VirtualAlloc2(long ptr long long long ptr long)
 @ stdcall VirtualAlloc2FromApp(long ptr long long long ptr long)
