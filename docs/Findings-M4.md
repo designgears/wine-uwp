@@ -15004,3 +15004,15 @@ Ruled out, with measurements:
 Not reproduced in 12 traced plus ~20 plain start-ups since. `WINE_UWP_WATCH=tls:0:ui+38` (new: watch the UI thread's
 TLS block from every other thread) is armed and quiet in a clean run; the next step is to keep it on in runs until one
 crashes, then watch +0x30 as well. Logs of runs ended by `UWP_TIMEOUT` lose Wine's buffered tail; a fail-fast flushes.
+
+## 2026-11-15 - Store: start-up is ~3 s; shape visuals reach the screen a frame late
+
+A capture every second from launch (`/tmp/store-startup.sh`) has Home complete at t+3 s; the "15 s" in AGENTS.md was
+from before the 11-14 WinUI 8.2501 install. The CPU plateaus that follow are the page idling (carousels turn at t+11,
+t+21). One real defect showed: the rail's Gaming icon was drawn filled from t+4 to t+10 and switched to its outline at
+t+11. `dcompshape`/`dcomptree`: the icon's second layer got its shapes ~4.7 s in and was rasterised in that frame, but
+`paint_shape_visual` rasterises during the walk while read-backs run at the frame's start, and nothing asked for
+another frame; the first damaged frame after it was the carousel's at +11 s. It now does `scene_dirty()` +
+`request_repaint(1)` after rasterising, and the outline is there at t+6 s, when the Store has built it
+(`docs/screenshots/msstore-22609-rail-icon-repaint.png`). Idle CPU on Home unchanged in an old/new A/B (327 vs 327-331
+ticks in 40 s; the absolute number varies with what the carousels show). Calc AE 4120.98, mp 2835 twice.

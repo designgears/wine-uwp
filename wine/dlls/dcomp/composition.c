@@ -18757,6 +18757,11 @@ static void paint_shape_visual( HDC hdc, struct visual *impl, float x, float y, 
     }
     hr = ID2D1DeviceContext_EndDraw( surface->context, NULL, NULL );
     surface_invalidate_cache( surface );
+    /* The read-back that brings these pixels to the screen runs at the start of a frame, and this one is past it:
+     * ask for the next. Nothing else did, so new shapes waited for an unrelated repaint (the Microsoft Store's
+     * Gaming rail icon stayed filled for six seconds after start-up, until its hero carousel turned). */
+    scene_dirty();
+    request_repaint( 1 );
     TRACE( "shape visual %p: %u shapes into %ux%u at %g,%g, hr %#lx.\n", impl, impl->shape_count, w, h, x, y, hr );
     TRACE_(dcompshape)( "shape visual %p: %u shapes into %ux%u at %g,%g dest %gx%g.\n", impl, impl->shape_count, w, h, x, y, dest_w, dest_h );
     blit_surface_rect( hdc, surface, (int)x, (int)y, dest_w > 0.5f ? (int)(dest_w + 0.5f) : w, dest_h > 0.5f ? (int)(dest_h + 0.5f) : h );
