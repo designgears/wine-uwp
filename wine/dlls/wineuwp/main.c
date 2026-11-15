@@ -5824,7 +5824,7 @@ struct code_bp
     BOOL dump_deref;
     LONG_PTR dump_off2;
 };
-static struct code_bp code_bps[32];
+static struct code_bp code_bps[256];
 static unsigned int code_bp_count;
 static LONG code_bp_max = 20;
 static DWORD code_bp_step_tls = TLS_OUT_OF_INDEXES;
@@ -6107,7 +6107,8 @@ static void maybe_start_test_crash(void)
 
 static void maybe_start_code_bps(void)
 {
-    char env[1024], *p, *item;
+    static char env[16384];   /* a breakpoint after every call of a large function needs a long list */
+    char *p, *item;
     HANDLE thread;
 
     if (!GetEnvironmentVariableA( "WINE_UWP_BP", env, sizeof(env) )) return;

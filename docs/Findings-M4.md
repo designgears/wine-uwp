@@ -14884,3 +14884,34 @@ hero's own art is the picture plus a gradient overlay; dumping both blends for e
 Spotify's its logo on black, so the expanded Microsoft 365 page is now blue on the left fading to dark
 (`msstore-22609-hero-expanded-m365.png`) where it used to be blue throughout. Scrolled Home is otherwise identical
 (AE 0). Calc AE 4120.98, mp 2835 twice.
+
+## 2026-11-15 - Store: the search box takes text (implicit animations of a dcomp visual)
+
+Clicking the Store's search box gave it a caret, but typing showed nothing, Return did nothing, and a page opened
+afterwards (the Game Pass hero) stayed blank for good. Media Player's search box, same click and typing, worked.
+Followed from the keys inwards, one measurement each:
+
+1. Keys and characters arrive: WM_CHAR is posted to the CoreWindow, XAML's
+   `KeyboardInputProcessor::RaiseCharacterReceivedEvent` and `TextBox::OnCharacterReceivedImpl` run, and native
+   msftedit's `CTxtEdit::TxSendMessage` gets each WM_CHAR (msftedit symbols via `pdbsyms.py`).
+2. `CTxtEdit::OnTxChar` returns before `CTxtSelection::PutChar`: its flags word (`this+0xb0`, 0x123016aa) has 0x200
+   set, which `OnTxLButtonDown` sets and only a later mouse move or the button-up path clears. RichEdit never got the
+   release: `CTextBoxBase::OnPointerReleased` never ran, nor did any element's PointerReleased.
+3. XAML did process the WM_POINTERUP (`PointerInputProcessor::ProcessPointerInput`, message type 0x1c at +44 as in
+   Media Player), but returned `E_POINTER`. Breakpoints after every call in `ProcessPointerInput` (206 of them; the
+   limit in `wineuwp` was 32, now 256) named `HitTestWithLightDismissAwareness`, then `CCoreServices::HitTest`, then
+   `CUIElement::UpdateLayout`: the layout pass before hit testing failed.
+4. `WINE_UWP_TRACE_ORIGINATE=1` showed why: a `NullReferenceException` in the Store's panel `MeasureOverride`
+   (`WinStore.App.dll+2043b20`, which sets up an implicit `Offset` animation with `this.FinalValue`), under an
+   ItemsPresenter. It reads `visual.ImplicitAnimations`, creates a collection if null, sets it and reads it back:
+   our dcomp visual's `ICompositionObject2::get_ImplicitAnimations` always answered NULL. Every layout pass failed from
+   the moment the search box got focus (its suggestion list measured), which is also why later pages stayed blank.
+
+Fixed by keeping the collection (not run, as before). Typing works and Return searches
+(`docs/screenshots/msstore-22609-search-typed.png`, `msstore-22609-search-results.png`); a result opens its product
+page. Still open: the suggestion list under the box is a mapped window with nothing painted, and a product page's
+"Built for Copilot+ PC" / "Uses AI features" badges have no icons. Calc AE 4120.98, mp 2835 twice.
+
+Method worth keeping: when XAML swallows input, find the HRESULT a processing function returns (a breakpoint on the
+instruction after its call shows `rax`), then put a breakpoint after every call inside it and look for the first one
+returning that value; repeat one level down.

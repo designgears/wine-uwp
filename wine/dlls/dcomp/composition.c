@@ -6619,6 +6619,7 @@ struct dcomp_visual
     DWORD handoff_thread;
     float handoff_x, handoff_y;
     BOOL handoff_told;
+    IUnknown *implicit_animations;   /* ICompositionObject2::put_ImplicitAnimations, kept for the getter, not run */
 };
 
 /* {fa92376b-164b-432a-bf53-c7fe2d51cabc}, ICompositionPropertyChangedNotifier: see change_notifier below */
@@ -6968,6 +6969,7 @@ static ULONG WINAPI dcv_Release( void *iface )
         unsigned i;
         transform_parent_unlink( v );
         if (v->handoff_listener) dcv_set_handoff_listener( v, NULL, NULL );
+        if (v->implicit_animations) IUnknown_Release( v->implicit_animations );
         if (v->content) IUnknown_Release( v->content );
         if (v->manip) comp_object_Release( &v->manip->vtbl );
         if (v->clip_object) IUnknown_Release( v->clip_object );
@@ -7980,16 +7982,28 @@ static HRESULT WINAPI dcv_object2_put_Comment( void *iface, HSTRING value )
     v->comment = copy;
     return S_OK;
 }
+/* Kept, not run. Answering NULL after a put made the Microsoft Store's suggestion list throw a NullReferenceException in
+ * its panel's MeasureOverride (it sets a collection when there is none, then reads it back): every layout pass failed
+ * from then on, so the search box never got its pointer release (XAML hit-tests through a layout pass) and took no
+ * text, and pages opened afterwards stayed blank. */
 static HRESULT WINAPI dcv_object2_get_ImplicitAnimations( void *iface, void **value )
 {
+    struct dcomp_visual *v = impl_from_dcv_object2( iface );
+
     if (!value) return E_POINTER;
-    *value = NULL;
+    if ((*value = v->implicit_animations)) IUnknown_AddRef( v->implicit_animations );
     return S_OK;
 }
 static HRESULT WINAPI dcv_object2_put_ImplicitAnimations( void *iface, void *value )
 {
+    struct dcomp_visual *v = impl_from_dcv_object2( iface );
+    IUnknown *old;
+
     scene_changed();
     TRACE( "%p implicit animations %p: not run.\n", iface, value );
+    if (value) IUnknown_AddRef( (IUnknown *)value );
+    old = InterlockedExchangePointer( (void **)&v->implicit_animations, value );
+    if (old) IUnknown_Release( old );
     return S_OK;
 }
 static HRESULT WINAPI dcv_object2_StartAnimationGroup( void *iface, void *value )

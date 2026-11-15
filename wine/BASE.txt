@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     e807ddaf548f322563abec425fb06899ef2293af
-                 dcomp: Evaluate a dcomp visual's Opacity expression with its own properties.
+  wine HEAD:     bf0babb5352d5d2846c0e064e503cdde766a5c2e
+                 wineuwp: Allow 256 WINE_UWP_BP breakpoints and a 16 KiB list.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-15T10:27:30Z
+  captured:      2026-11-15T11:19:54Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
