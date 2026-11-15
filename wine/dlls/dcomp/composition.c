@@ -146,6 +146,19 @@ static struct
     double paint_ms, paint_max, blit_ms, flush_ms, flush_max;
     ULONGLONG start;
 } perf;
+/* bytes held in surfaces' CPU copies, and how many: the price of painting on the CPU */
+static LONG64 surface_cache_bytes, surface_cache_count;
+/* the surfaces holding one, for evict_stale_surface_copies */
+static struct drawing_surface **cached_surfaces;
+static unsigned int cached_surface_count, cached_surface_capacity;
+static CRITICAL_SECTION cached_surfaces_cs;
+static CRITICAL_SECTION_DEBUG cached_surfaces_cs_debug =
+{
+    0, 0, &cached_surfaces_cs,
+    { &cached_surfaces_cs_debug.ProcessLocksList, &cached_surfaces_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": cached_surfaces_cs") }
+};
+static CRITICAL_SECTION cached_surfaces_cs = { &cached_surfaces_cs_debug, -1, 0, 0, 0, 0 };
 static void perf_report( void )
 {
     ULONGLONG now = GetTickCount64();
@@ -161,6 +174,8 @@ static void perf_report( void )
                            perf.readbacks ? perf.readback_ms / perf.readbacks : 0.0, perf.readback_max, perf.swapchain_frames, perf.walkless, perf.requests, perf.deferred, perf.unchanged, perf.frames,
                            perf.frames ? perf.paint_ms / perf.frames : 0.0, perf.paint_max,
                            perf.frames ? perf.blit_ms / perf.frames : 0.0 , perf.frames ? perf.flush_ms / perf.frames : 0.0, perf.flush_max);
+    if (perf.requests || perf.frames)
+        TRACE_(dcompperf)( "surface copies: %I64d, %I64d KB.\n", surface_cache_count, surface_cache_bytes / 1024 );
     memset( &perf, 0, sizeof(perf) );
     perf.start = now;
 }
@@ -393,6 +408,7 @@ static void retire_bitmap( HBITMAP bmp )
 }
 
 /* at the end of a full frame */
+static void evict_stale_surface_copies( void );
 static void free_retired_bitmaps( void )
 {
     unsigned int i, capacity;
@@ -1530,6 +1546,7 @@ static void present_desktop_hwnd_locked( HWND hwnd )
         }
         paint_hwnd_targets();
         free_retired_bitmaps();
+        evict_stale_surface_copies();
         if (timing)
         {
             double walk, raster;
@@ -4148,6 +4165,7 @@ struct drawing_surface
      * vtbl. Every other interface is answered by vtbl. */
     const void **virtual_vtbl;
     BOOL cpu_only;              /* a CompositionVisualSurface's: the content is the cache, there is no texture */
+    ULONGLONG cache_used;       /* tick the painter last took the cache, see evict_stale_surface_copies */
 };
 
 static struct drawing_surface **swapchain_surfaces;
@@ -4664,12 +4682,59 @@ static void surface_destroy( struct drawing_surface *surface )
 static void surface_free_cache( struct drawing_surface *surface )
 {
     if (surface->swapchain) return;   /* the readback thread owns these */
+    if (surface->cache)
+    {
+        unsigned int i;
+        InterlockedAdd64( &surface_cache_bytes, -(LONG64)surface->cache_w * surface->cache_h * surface->cache_bpp );
+        InterlockedDecrement64( &surface_cache_count );
+        EnterCriticalSection( &cached_surfaces_cs );
+        for (i = 0; i < cached_surface_count; i++)
+            if (cached_surfaces[i] == surface)
+            {
+                cached_surfaces[i] = cached_surfaces[--cached_surface_count];
+                break;
+            }
+        LeaveCriticalSection( &cached_surfaces_cs );
+    }
     if (surface->cache_dib) retire_bitmap( surface->cache_dib );   /* an OP_STRETCH may still name it */
     else free( surface->cache );
     surface->cache_dib = NULL;
     surface->cache = NULL;
     surface->cache_valid = FALSE;
     surface->cache_w = surface->cache_h = surface->cache_bpp = 0;
+}
+
+/* A surface's CPU copy is only needed while it is painted, and XAML keeps the texture it mirrors: after a tour of four
+ * pages the Microsoft Store held 2,500 copies, 143 MB, mostly of pages long off screen. A copy the painter has not taken
+ * for 15 s is dropped and read back if it is wanted again. Not a CompositionVisualSurface's (it is the content), a swap
+ * chain's (the readback thread owns it), one being drawn, or one waiting for an upload. Runs on the painter after a frame,
+ * under present_cs, so no op list names the bits. */
+static void evict_stale_surface_copies( void )
+{
+    static ULONGLONG last;
+    ULONGLONG now = GetTickCount64();
+    struct drawing_surface *evict[256];
+    unsigned int i, n = 0;
+    LONG64 bytes = 0;
+
+    if (now - last < 2000) return;
+    last = now;
+    EnterCriticalSection( &cached_surfaces_cs );
+    for (i = 0; i < cached_surface_count && n < ARRAY_SIZE(evict); i++)
+    {
+        struct drawing_surface *surface = cached_surfaces[i];
+        if (surface->cpu_only || surface->swapchain || !surface->texture || surface->drawing || surface->texture_out ||
+            surface->upload_retries || surface->readback_queued || now - surface->cache_used < 15000)
+            continue;
+        evict[n++] = surface;
+    }
+    LeaveCriticalSection( &cached_surfaces_cs );
+    for (i = 0; i < n; i++)
+    {
+        bytes += (LONG64)evict[i]->cache_w * evict[i]->cache_h * evict[i]->cache_bpp;
+        surface_free_cache( evict[i] );
+    }
+    if (n) TRACE_(dcompperf)( "dropped %u surface copies not painted for 15 s, %I64d KB.\n", n, bytes / 1024 );
 }
 
 static void ensure_typed_vtbls( void );
@@ -5598,6 +5663,18 @@ static BOOL surface_ensure_cache( struct drawing_surface *surface, UINT width, U
     surface->cache_w = width;
     surface->cache_h = height;
     surface->cache_bpp = bpp;
+    InterlockedAdd64( &surface_cache_bytes, (LONG64)width * height * bpp );
+    InterlockedIncrement64( &surface_cache_count );
+    surface->cache_used = GetTickCount64();
+    EnterCriticalSection( &cached_surfaces_cs );
+    if (cached_surface_count == cached_surface_capacity)
+    {
+        unsigned int capacity = cached_surface_capacity ? cached_surface_capacity * 2 : 1024;
+        struct drawing_surface **list = (realloc)( cached_surfaces, capacity * sizeof(*list) );
+        if (list) { cached_surfaces = list; cached_surface_capacity = capacity; }
+    }
+    if (cached_surface_count < cached_surface_capacity) cached_surfaces[cached_surface_count++] = surface;
+    LeaveCriticalSection( &cached_surfaces_cs );
     return TRUE;
 }
 
@@ -5782,6 +5859,7 @@ static const BYTE *surface_cached_pixels( struct drawing_surface *surface, D3D11
         return surface->cache;
     }
     ID3D11Texture2D_GetDesc( surface->texture, desc );
+    surface->cache_used = GetTickCount64();
     if (desc->Format == DXGI_FORMAT_B8G8R8A8_UNORM) bpp = 4;
     else if (desc->Format == DXGI_FORMAT_A8_UNORM) bpp = 1;
     else return NULL;

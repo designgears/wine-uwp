@@ -14561,3 +14561,16 @@ The repeater's translation is right (-1359 on page 3) and the Store reads nothin
 expects the tracker to move through intermediate positions (ValuesChanged during the animation, then Idle), and ours
 lands at once. Main keeps the static first page, which looks right; the branch is not merged. Next step: run
 `TryUpdatePositionWithAnimation` as an animation on the tracker's timer.
+
+### Microsoft Store: dropping CPU copies of surfaces nobody paints (2026-11-14)
+
+`dcompperf` now reports `surface copies: N, KB` (every XAML surface the painter has read back keeps a CPU copy) and
+`dropped N surface copies not painted for 15 s`. After the four-page tour the Store held **2,523 copies, 143 MB**, about
+a fifth of its private memory, mostly of pages long off screen. A registry of surfaces with copies is swept after a frame,
+every 2 s, on the painter under `present_cs`: a copy the painter has not taken for 15 s is freed (not a visual
+surface's, a swap chain's, one being drawn, awaiting an upload or queued for a batch read-back) and read back if wanted
+again; `paint_op_equal` compares content generations, which a re-read bumps, so a freed-and-reused address cannot pass
+for unchanged content. Two tours: at the "scrolled" point 1128 MB RSS / 690 MB private (four earlier runs: ~1200 / 760),
+~99 MB of copies dropped over the tour, 996 copies / 71 MB left. Revisiting Apps and Home re-reads them: within
+~340-430 px of the first visit (rotating content). Pictures identical except the scroll position; calc AE 4120.98 and mp
+2835 twice. The end-of-tour figure ("back") moves with .NET's GC and is not a good comparison point.
