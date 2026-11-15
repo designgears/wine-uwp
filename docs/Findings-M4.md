@@ -14694,3 +14694,35 @@ Windows does too: before the first key an animation holds the value the property
 Verified: after AI Hub -> Home the AI Hub outline is back (`docs/screenshots/msstore-22609-rail-icons-after-aihub.png`:
 start, AI Hub selected, back on Home); after the whole tour Apps, Gaming and AI Hub are outlines again (they stayed
 filled before). calc AE 4120.98 and mp 2835 twice; tour 1192 MB / 11.7 s CPU at "scrolled", unchanged.
+
+### Microsoft Store: the hero carousel, continued - what is and is not the cause (2026-11-15, still parked)
+
+`store-carousel-wip` rebased onto `uwp-main` (now `b331e3c`, on `e6e7bc4`). With today's fixes the hero slides
+page 1 -> 2 -> 3 correctly, and goes wrong at the turn to page 4. Measured this time, so the next session need not:
+
+- **Not XAML's viewport event.** The empty `(inf,inf,-inf,-inf)` viewports of the last entry go to *other*
+  repeaters. The hero's (`UpdateViewport`, `Microsoft.UI.Xaml.dll+282f0@rdx+0:4`, its 679.53x382.8 viewport names it)
+  gets one viewport at start and none after.
+- **Not layout.** `trace+dcomptree` page visits at each turn: every realized page container is where it belongs
+  (expanded page at the hero's x, collapsed neighbours at the Store's `(Position - ExpandedPosition)` slide; full
+  expression text now in `trace+dcompanim`). The realized set is pages -3..+3 from 10 s on and never moves; page 4
+  (2718.12) is never realized, which is the blank slot.
+- **Not the tracker's bounds.** The hero tracker is unbounded (`MinPosition`/`MaxPosition` +-3.4e38, now traced on
+  `dcompanim`): an endless carousel, so the Store does not wrap by clamping.
+- **Not ScrollViewer.** The `ChangeView` every 10 s (`windows.ui.xaml.dll+3a6058`, from `OnBringIntoViewRequested`
+  -> `MakeVisible`) brings a 12x20 rect into view on the same ScrollViewer each time: the PipsPager's selected pip.
+  Its one `ZoomToRect` is the 96x20 pager (still a stub in our DirectManipulation; harmless for 7 pips).
+- **XAML does track hand-off visuals, and we break that contract** - but not for Translation.
+  `DCompPropertyChangedListener::AttachToHandOffVisual` QIs a hand-off visual for `ICompositionPropertyChangedNotifier`
+  `{fa92376b}` and calls `SetPropertyChangedListener` (slot 3) for property ids 1, 2, 4, 7, 8, 10, 12, 13. The
+  listener's handlers (`windows.ui.xaml.pdb`): Vector3 id 2 Offset (hand-off or prepend visual), 8 CenterPoint, 12
+  Scale; scalar id 10 RotationAngle, 1/4/7 clip insets; 13 presumably TransformMatrix. Our dcomp visuals answer
+  `{fa92376b}` through the catch-all (492 times on Home), so XAML's listener lands on the wrong table and XAML never
+  learns an app's animated hand-off Offset/Scale/Rotation/TransformMatrix/Clip (hit testing, effective viewports).
+  Worth implementing on its own; it would not tell XAML the strip's `Translation.X`, which is not in that list.
+
+So on Windows something other than XAML's own viewport walk moves the hero repeater's realization window, and it is in
+the Store's `VirtualizingScrollingPreviewListViewLayout` / `ScrollingPreviewListView` (.NET Native) or in how WinUI's
+ItemsRepeater is told. Next: breakpoint WinUI's `ViewportManagerWithPlatformFeatures::GetLayoutRealizationWindow`
+(`+33ea0`) and the layout's `MeasureOverride` at a turn, and see whether the Store calls `ItemsRepeater`
+`GetOrCreateElement`/`TryGetElement` for the next index. Main keeps the static first page; the branch is not merged.

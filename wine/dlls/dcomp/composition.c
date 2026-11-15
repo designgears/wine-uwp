@@ -4750,6 +4750,7 @@ static void evict_stale_surface_copies( void )
 }
 
 static void ensure_typed_vtbls( void );
+static void trace_long_expression( void *animation );
 
 static ID3D11Device *interop_d3d_device;
 static ID2D1Device *interop_d2d_device;
@@ -6919,6 +6920,7 @@ static HRESULT WINAPI dcv_object_StartAnimation( void *iface, HSTRING name, void
 
     TRACE( "%p, %s, %p.\n", iface, debugstr_w( prop ), animation );
     TRACE_(dcompanim)( "dcomp visual %p %s <- %s\n", v, debugstr_w( prop ), debugstr_animation( animation ) );
+    trace_long_expression( animation );
     batch_note_keyframes( animation );
     if (kf && kf->has_value && kf->value_kind == KF_SCALAR && prop && !wcsicmp( prop, L"Opacity" )) v->opacity = kf->scalar;
     /* XAML's storyboards drive an element's opacity through a property set: the visual's Opacity follows
@@ -23246,6 +23248,18 @@ static HRESULT WINAPI object_view_get_Properties( void *iface, ICompositionPrope
     ICompositionPropertySet_AddRef( (*value = view->properties) );
     return S_OK;
 }
+/* An animation's trace line is cut at a debug line's length, and the Store builds expressions of several hundred
+ * characters: the rest follows in pieces. */
+static void trace_long_expression( void *animation )
+{
+    struct expr_animation *expr;
+    size_t len, at;
+
+    if (!TRACE_ON(dcompanim) || !(expr = expr_animation_from_any( animation )) || !expr->expression) return;
+    len = wcslen( expr->expression );
+    for (at = 0; len > 120 && at < len; at += 120)
+        TRACE_(dcompanim)( "  +%Iu %s\n", at, debugstr_wn( expr->expression + at, min( 120, len - at ) ) );
+}
 /* ICompositionObject::StartAnimation / StopAnimation: accepted, not run */
 static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, void *animation )
 {
@@ -23254,6 +23268,7 @@ static HRESULT WINAPI object_view_StartAnimation( void *iface, HSTRING name, voi
     TRACE( "%p, %s, %p.\n", iface, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ), animation );
     TRACE_(dcompanim)( "object %p (owner %p) %s <- %s\n", view, view->owner, debugstr_w( WindowsGetStringRawBuffer( name, NULL ) ),
                        debugstr_animation( animation ) );
+    trace_long_expression( animation );
     /* A property set animated from a manipulation transform passes the link on to whatever
      * expression references the property set later. */
     {   /* a shape's animation is remembered; a controller's "Progress" expression drives it */
@@ -24552,7 +24567,7 @@ static HRESULT WINAPI tracker_get_IsPositionRoundingSuggested( void *iface, bool
 #define TRACKER_VEC3( name, field ) \
     static HRESULT WINAPI tracker_get_##name( void *iface, Vector3 *value ) { *value = interactions_from( iface )->field; return S_OK; } \
     static HRESULT WINAPI tracker_put_##name( void *iface, Vector3 value ) \
-    { TRACE( "%p " #name " %g,%g,%g.\n", iface, value.X, value.Y, value.Z ); interactions_from( iface )->field = value; \
+    { TRACE_(dcompanim)( "tracker %p " #name " %g,%g,%g.\n", iface, value.X, value.Y, value.Z ); interactions_from( iface )->field = value; \
       tracker_sync_properties( interactions_from( iface ) ); return S_OK; }
 #define TRACKER_FLOAT( name, field ) \
     static HRESULT WINAPI tracker_get_##name( void *iface, float *value ) { *value = interactions_from( iface )->field; return S_OK; } \
