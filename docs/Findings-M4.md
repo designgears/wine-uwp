@@ -14586,3 +14586,24 @@ never updated after. XAML computes it (`CUIElement::ComputeEffectiveViewportChan
 viewport events come in pairs, one real and one empty, so it is not yet certain the empty one is the hero's repeater.
 Next: name the repeater behind each event (`rcx`), then find which ancestor's viewport XAML intersects to nothing
 (Home's ScrollViewer and its DirectManipulation viewport are the first suspect).
+
+### Microsoft Store: Gaming's lower panel - an InteractionTracker refusing IClosable (2026-11-14)
+
+Gaming's panel below the category chips stayed a grey skeleton (open since 10-25). With
+`WINE_UWP_TRACE_ORIGINATE=1`, opening Gaming logged one `System.InvalidCastException` (0x80004002) at
+`WinStore.App.dll+0x2f74da`: a cast helper that loads the IID with `movups` before its QI stub, here
+`30d5a829-...` = `IClosable` (read from `.rdata` at the `movups` operand). A breakpoint on its failure branch
+(`+0x2f74cb@rdi+0:8`) gave the wrapper, whose second qword was the native object; `probe-peek.exe` read that object
+(vtable in dcomp, `kind` "InteractionTracker", ref 7), and `llvm-symbolizer "DATA ..."` named the vtable
+`tracker_vtbl`. `interactions_QueryInterface` now answers `IClosable` with the shared no-op view
+(`create_closable_view`). The panel then draws its feature (`docs/screenshots/msstore-22609-gaming-lower-panel.png`);
+no InvalidCast left; calc AE 4120.98, mp 2835 twice. The cast-site recipe works for any `Arg_InvalidCastException`
+the originate trace reports.
+
+### Microsoft Store: the AI Hub rail icon (2026-11-14, open)
+
+After visiting AI Hub and going back, its Lottie icon's progress (property set `Progress`, `trace+dcompshape`) runs
+0.334->0.358, 0.515->0.570, 0.637->0.812 and, on pointer exit, 0.425->0.449, and the layers sample as hidden there
+(`Opacity ... at 0.448788 -> 0`). At start-up it rested at 0.328 with the outline visible; the Home icon's
+Selected->Normal ends at 0.021 and is fine. Not yet known whether the end state is wrong or our sampling at those
+values is.

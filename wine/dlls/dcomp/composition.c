@@ -24039,6 +24039,9 @@ static HRESULT WINAPI interactions_QueryInterface( void *iface, REFIID iid, void
         *out = &object->vtbl2;
         return S_OK;
     }
+    /* every CompositionObject is an IClosable: the Microsoft Store disposes its carousels' trackers when Gaming rebuilds
+     * its panels, and refusing threw an InvalidCastException there */
+    if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( (IUnknown *)&object->vtbl, out );
     if (IsEqualGUID( iid, &IID_ICompositionObject ) && object->properties)
     {
         HRESULT hr = create_composition_object_view( (IUnknown *)&object->vtbl, out );
