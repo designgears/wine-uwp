@@ -4963,10 +4963,14 @@ static HRESULT WINAPI surface_BeginDraw( void *iface, const RECT *update_rect, R
 
     TRACE( "surface %p rect %s iid %s.\n", surface, wine_dbgstr_rect( update_rect ),
            debugstr_guid( iid ) );
+    /* The offset is where the update rectangle's top-left lies in the object handed out. That is the surface's own
+     * texture here, so it is the rectangle's top-left: answering 0,0 made a caller updating part of a surface (Win2D's
+     * CreateDrawingSession(surface, rect) translates by offset - rect) draw that part over the surface's top-left
+     * corner instead - a notch of stale pixels in the Microsoft Store's AI Hub banner. */
     if (update_offset)
     {
-        update_offset->x = 0;
-        update_offset->y = 0;
+        update_offset->x = update_rect ? update_rect->left : 0;
+        update_offset->y = update_rect ? update_rect->top : 0;
     }
     if (!update_object) return S_OK;
     *update_object = NULL;
@@ -5041,7 +5045,16 @@ static HRESULT WINAPI surface_BeginDrawWithClear( void *iface, const RECT *updat
     HRESULT hr;
 
     if (FAILED( hr = surface_BeginDraw( iface, update_rect, iid, update_object, update_offset ) )) return hr;
-    if (surface->drawing) ID2D1DeviceContext_Clear( surface->context, &transparent );
+    if (!surface->drawing) return hr;
+    /* only the update rectangle: a picture drawn tile by tile clears each tile, not the ones already drawn */
+    if (update_rect)
+    {
+        D2D1_RECT_F rect = { update_rect->left, update_rect->top, update_rect->right, update_rect->bottom };
+        ID2D1DeviceContext_PushAxisAlignedClip( surface->context, &rect, D2D1_ANTIALIAS_MODE_ALIASED );
+        ID2D1DeviceContext_Clear( surface->context, &transparent );
+        ID2D1DeviceContext_PopAxisAlignedClip( surface->context );
+    }
+    else ID2D1DeviceContext_Clear( surface->context, &transparent );
     return hr;
 }
 static HRESULT WINAPI surface_HasValidPixels( void *iface, BOOL *valid )

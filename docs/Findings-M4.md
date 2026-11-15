@@ -14794,3 +14794,23 @@ Fixed by letting `cpu_only` surfaces through. The card now has its icon (`docs/s
 `visual_surface_render`/`visual_surface_resolve` also say under `trace+dcompops` why they rendered nothing (no source
 visual, a source that is not a visual, an empty size). Home/Apps/Gaming identical to the run before (AE 0), AI Hub
 differs only by its rotating banner; rss 740 MB at Home, 1023 MB scrolled. Calc AE 4120.98 and mp 2835, twice.
+
+## 2026-11-15 - Store: AI Hub's lower banner (BeginDraw's update offset)
+
+The "notch" in AI Hub's lower banner (open since 10-25: a 345x38 block of black and a green sliver over the
+picture's top-left, and a picture that did not match its "Microsoft Copilot" text) was in the surface itself: a
+temporary dump of the `OP_BLEND` bits for that 681x383 op (`paint_emit`, caller `soft_blend_opaque` from
+`blit_surface_rect`) had the block. Logging every `BeginDraw` with an update rectangle then showed the banner's
+996x560 picture drawn in 504-pixel tiles - `(0,0)-(504,504)`, `(504,0)-(996,504)`, `(0,504)-(504,560)`,
+`(504,504)-(996,560)` - through the D2D context (Win2D's `CreateDrawingSession(surface, rect)`).
+
+`surface_BeginDraw` answered `update_offset` 0,0 for every rectangle. The offset is where the rectangle's top-left
+lies in the returned object, and the caller translates by `offset - rect`; on our surfaces (the texture is the
+surface, no atlas) it is the rectangle's own top-left. With 0,0 every tile was drawn over the top-left tile, the last
+one (492x56, 336x38 at display size) left on top as the "notch". Now the offset is the rectangle's top-left, and
+`BeginDrawWithClear` clears only that rectangle (it cleared the whole surface, which would wipe tiles already drawn).
+
+Result: the banner shows the Copilot artwork (`docs/screenshots/msstore-22609-aihub-banner-tiles.png`). Home, Apps and
+Gaming identical to before (AE 0); scrolled Home differs only by a horizontal list's position. RSS 721 MB at Home,
+1202 MB after the tour (1023-1244 before, run to run), CPU 12.9 s for the tour. Calc AE 4120.98 and mp 2835, twice.
+Every other `BeginDraw` with a rectangle in the run started at (0,0), so nothing else changed on these pages.
