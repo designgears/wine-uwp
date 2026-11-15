@@ -1556,6 +1556,9 @@ static struct install_item *product_install( const WCHAR *id, BOOL launch_after 
         return NULL;
     }
     if (!(product_id = wcsdup( id )) || !catalog_product( id, &family, category, sizeof(category) )) goto done;
+    /* the Store asks for "PRODUCT/SKU" and matches items, and their events, by the product alone: an item
+     * reporting "9NKSQGP7F2NH/0010" never moved its page off "Get" */
+    if ((slash = wcschr( product_id, '/' ))) *slash = 0;
     if ((item = find_item( family )))
     {
         item_start( item );

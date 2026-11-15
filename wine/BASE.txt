@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     857f35c3606b03176fe3d6adde8802d56f2fd906
-                 appxdeploymentclient: List the packages the Store installed; IPackage2 and IPackage4 for them.
+  wine HEAD:     fe3f1012004c39f1ada5698769aab412aba9b5bf
+                 installcontrol: An item's ProductId is the product without its SKU.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-15T17:32:42Z
+  captured:      2026-11-15T17:36:14Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

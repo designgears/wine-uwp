@@ -15051,3 +15051,7 @@ otherwise). WhatsApp's page shows **Installed** (`docs/screenshots/msstore-22609
 Library lists it (`msstore-22609-library-installed.png`). Windows would say Open: that needs
 `IPackage3::GetAppListEntriesAsync` (a stub) and an AppListEntry whose LaunchAsync starts the stage, which nothing
 in Wine implements yet. "Acquired a long time ago" is the Store's entitlement date (signed out), not InstalledDate.
+
+And the live page: items reported ProductId "9NKSQGP7F2NH/0010", the Store matches by "9NKSQGP7F2NH", so its page
+never saw its own item. With the SKU stripped, Get shows "Preparing to download / Verifying dependencies" with a
+progress bar and then Installed (`docs/screenshots/msstore-22609-get-progress-installed.png`).
