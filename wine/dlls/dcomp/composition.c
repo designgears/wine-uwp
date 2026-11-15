@@ -6891,6 +6891,24 @@ static void dcv_set_handoff_listener( struct dcomp_visual *v, void *sender, IUnk
     if (old) IUnknown_Release( old );
 }
 
+/* Only Translations that follow an InteractionTracker are reported (the scrolling strip itself). The Store's carousel
+ * pages also shift themselves with Translation while collapsed, inside composition clips XAML is not told about here:
+ * reported, XAML put the previous page's hit area over the current one, and a tap on a page's button scrolled the
+ * carousel instead of opening the product. */
+static const void *tracker_vtbl[];
+static BOOL dcv_translation_follows_tracker( struct dcomp_visual *v )
+{
+    unsigned int axis, i;
+
+    for (axis = 0; axis < ARRAY_SIZE(v->translation_expr); axis++)
+    {
+        struct expr_animation *expr = v->translation_expr[axis];
+        for (i = 0; expr && i < expr->ref_count; i++)
+            if (expr->refs[i] && *(const void ***)expr->refs[i] == (const void **)tracker_vtbl) return TRUE;
+    }
+    return FALSE;
+}
+
 /* Tell listeners on this thread about Translations that changed (D2D_VECTOR_3F by value is passed by reference).
  * Listener slots: 3 Boolean, 4 Matrix3x2, 5 Matrix4x4, 6 Reference, 7 Single, 8 Vector2, 9 Vector3, 10 Vector4, 11 Color
  * (windows.ui.xaml.pdb, DCompPropertyChangedListener). */
@@ -6910,7 +6928,7 @@ static void dcv_notify_handoff_translations( void )
         float x, y;
 
         if (v->handoff_thread != tid || !v->handoff_listener) continue;
-        if (!v->translation_expr[0] && !v->translation_expr[1] && !v->translation_expr[2] && !v->handoff_told) continue;
+        if (!v->handoff_told && !dcv_translation_follows_tracker( v )) continue;
         dcv_translation( v, &x, &y );
         if (v->handoff_told ? x == v->handoff_x && y == v->handoff_y : !x && !y) continue;
         v->handoff_x = x;

@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     6a08425a235fbf1c64b3cd687da30b65567e0a16
-                 dcomp: Report hand-off visuals' Translation to XAML, and fix carousel expressions.
+  wine HEAD:     cffc599fa3fb3cd68c97483a13a3d7ff86b10d80
+                 dcomp: Report only tracker-driven Translations of hand-off visuals.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-15T10:03:08Z
+  captured:      2026-11-15T10:16:22Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

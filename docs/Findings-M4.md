@@ -14856,3 +14856,14 @@ the entries above ("parked") describe the state before. How it was found, measur
 Cost: Home idles at 1.3-2.1% of a core with the carousel turning (0.8% with the static page); tour RSS 774 MB at Home
 (swap was in use on the machine, so later figures in that run are low and not comparable). Calc AE 4120.98 and mp 2835,
 twice. Earlier the same session: AI Hub's lower banner (BeginDraw's update offset) and the hover-card icon, above.
+
+**Hit testing (same day).** Reporting every hand-off visual's Translation broke taps on the hero: the Store's Tapped
+handler (`windows.ui.xaml.dll+49f443` -> `WinStore.App.dll+22f92fe` -> `TryUpdatePositionWithAnimation`) scrolled to
+another page instead of opening the product, because the collapsed neighbours' own Translation (the Store's
+`(properties.Position - properties.ExpandedPosition) > _properties.SnapPointInterval ? ...` expression, +357 px for the
+previous page) moved their hit areas over the current page, and the composition clips that hide them are not reported.
+Only Translations whose expression references an InteractionTracker (the strip) are reported now. "See details" after
+three turns opens Game Pass's plans and after five Football Manager 27's page (`docs/screenshots/msstore-22609-hero-click-after-turns.png`:
+the hero, then the page it opened); before today's carousel work the static first page opened its own product, and with
+the strip moving but nothing reported, a tap opened the first page's product whatever was shown. The carousel still
+turns through every page; calc AE 4120.98 and mp 2835 twice.

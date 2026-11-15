@@ -633,7 +633,10 @@ DCompPropertyChangedListener to every hand-off visual (`ICompositionPropertyChan
 TransformMatrix, 1/4/7 clip) and keeps the values as an extra transform for hit testing and effective viewports. It
 raises `EffectiveViewportChanged` only when the viewport it computes changed, so an app's `InvalidateViewport` does
 nothing if the movement was never reported: the Store's hero ItemsRepeater never realized page 4. The listener's
-sender is the exact pointer XAML holds, so every view of a visual must answer the notifier with itself.
+sender is the exact pointer XAML holds, so every view of a visual must answer the notifier with itself. Report
+only what XAML can use correctly: the Store's collapsed carousel pages also move by Translation inside composition
+clips XAML is not told about, and reporting those put a hidden page's hit area over the visible one (taps scrolled
+the carousel instead of opening the product). Check a tap after any change to what is reported.
 
 **Expression state shared between threads breaks at random.** The painter evaluates expressions on pool threads while
 the UI thread evaluates the same ones (tracker steps, hand-off reports): a global "current clip" made
