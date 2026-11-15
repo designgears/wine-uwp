@@ -2,6 +2,7 @@ MODULE  = windows.media.dll
 IMPORTS = combase mfplat mfuuid
 
 SOURCES = \
+	adaptive.c \
 	captions.c \
 	classes.idl \
 	codecquery.c \

@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     9a70817a2d7c0d2a458c9384842e18a5937c2b00
-                 windows.security.authentication.onlineid: Implement GetForUser, ticket requests and GetTicketAsync.
+  wine HEAD:     fb82bb178b1615bd835df6897c8671a85d67b6ef
+                 windows.media.playback.mediaplayer: Hand out a MediaPlayerSurface over an empty drawing surface.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-15T07:57:51Z
+  captured:      2026-11-15T08:16:33Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

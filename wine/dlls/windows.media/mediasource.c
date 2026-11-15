@@ -39,6 +39,7 @@ struct media_source
     IWineMediaPath IWineMediaPath_iface;
     IMediaPlaybackSource IMediaPlaybackSource_iface;
     IWineMediaOpened IWineMediaOpened_iface;
+    const void *media_source4_vtbl;     /* IMediaSource4 */
     LONG ref;
     HSTRING path;
     /* A source made from a binder has no path of its own: the binder only learns the file when
@@ -52,6 +53,8 @@ static inline struct media_source *impl_from_IMediaSource2Internal( IMediaSource
 {
     return CONTAINING_RECORD( iface, struct media_source, IMediaSource2Internal_iface );
 }
+
+static const GUID IID_IMediaSource4_ = {0xbdafad57,0x8eff,0x4c63,{0x85,0xa6,0x84,0xde,0x0a,0xe3,0xe4,0xf2}};
 
 static HRESULT WINAPI media_source_QueryInterface( IMediaSource2Internal *iface, REFIID iid, void **out )
 {
@@ -71,6 +74,14 @@ static HRESULT WINAPI media_source_QueryInterface( IMediaSource2Internal *iface,
     if (IsEqualGUID( iid, &IID_IWineMediaPath ))
     {
         IInspectable_AddRef( (*out = &impl->IWineMediaPath_iface) );
+        return S_OK;
+    }
+
+    /* Windows.Media.Core.IMediaSource4 {bdafad57-8eff-4c63-85a6-84de0ae3e4f2}: the Microsoft Store casts every source
+     * it makes for a trailer to it, and the cast threw. */
+    if (IsEqualGUID( iid, &IID_IMediaSource4_ ))
+    {
+        IInspectable_AddRef( (*out = &impl->media_source4_vtbl) );
         return S_OK;
     }
 
@@ -302,6 +313,53 @@ static const struct IWineMediaOpenedVtbl media_source_opened_vtbl =
     media_source_opened_NotifyOpened,
 };
 
+static struct media_source *impl_from_media_source4( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct media_source, media_source4_vtbl );
+}
+static HRESULT WINAPI media_source4_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return media_source_QueryInterface( &impl_from_media_source4( iface )->IMediaSource2Internal_iface, iid, out );
+}
+static ULONG WINAPI media_source4_AddRef( void *iface )
+{
+    return media_source_AddRef( &impl_from_media_source4( iface )->IMediaSource2Internal_iface );
+}
+static ULONG WINAPI media_source4_Release( void *iface )
+{
+    return media_source_Release( &impl_from_media_source4( iface )->IMediaSource2Internal_iface );
+}
+static HRESULT WINAPI media_source4_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    if (count) *count = 0;
+    if (iids) *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI media_source4_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_Media_Core_MediaSource,
+                                ARRAY_SIZE(RuntimeClass_Windows_Media_Core_MediaSource) - 1, name );
+}
+static HRESULT WINAPI media_source4_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    if (!level) return E_POINTER;
+    *level = BaseTrust;
+    return S_OK;
+}
+/* the sources made here are files, never adaptive streams or MediaStreamSources */
+static HRESULT WINAPI media_source4_get_null( void *iface, IInspectable **value )
+{
+    if (!value) return E_POINTER;
+    *value = NULL;
+    return S_OK;
+}
+static const void *media_source4_vtbl[] =
+{
+    media_source4_QueryInterface, media_source4_AddRef, media_source4_Release,
+    media_source4_GetIids, media_source4_GetRuntimeClassName, media_source4_GetTrustLevel,
+    media_source4_get_null /* AdaptiveMediaSource */, media_source4_get_null /* MediaStreamSource */,
+};
+
 static HRESULT media_source_create( HSTRING path, IMediaSource2Internal **out )
 {
     struct media_source *impl;
@@ -311,6 +369,7 @@ static HRESULT media_source_create( HSTRING path, IMediaSource2Internal **out )
     impl->IMediaSource2Internal_iface.lpVtbl = &media_source_vtbl;
     impl->IWineMediaPath_iface.lpVtbl = &media_source_path_vtbl;
     impl->IMediaPlaybackSource_iface.lpVtbl = &media_source_playback_source_vtbl;
+    impl->media_source4_vtbl = media_source4_vtbl;
     impl->IWineMediaOpened_iface.lpVtbl = &media_source_opened_vtbl;
     impl->ref = 1;
     if (FAILED(hr = WindowsDuplicateString( path, &impl->path )))

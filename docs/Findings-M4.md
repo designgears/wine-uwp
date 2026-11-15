@@ -14757,10 +14757,19 @@ the next refusal. Five of them, each found from the throwing managed frame back 
 
 Result (`docs/screenshots/msstore-22609-product-page-opens.png`): the product page opens with icon, title, publisher,
 rating, categories and the full description; managed throws after the click went from 29 to 14 (the rest are
-rethrows, the trailer, and XAML's `GetElementVisual` handed a null element). **Still missing: the buy box (Get/price)
-and the media gallery**, although the product JSON and ~15 screenshot images download (`trace+wininet`). The trailer is
-DASH (`.mpd`): `AdaptiveMediaSource` has no implementation and `MediaPlayer.GetSurface` is E_NOTIMPL; the player
-retried the manifest ~100 times in 25 s.
+rethrows, the trailer, and XAML's `GetElementVisual` handed a null element). I first recorded the buy box and media
+gallery as missing: **wrong** - a game page puts its full description first and the buy box under it, and Roblox's
+description is long enough to push it below the first screen. Scrolled, the page has Get, share, the ESRB rating,
+Screenshots and Discover more (`docs/screenshots/msstore-22609-game-page-get.png`; Minecraft Launcher, with a short
+description, shows Get and its Editions picker without scrolling, `msstore-22609-minecraft-launcher-get.png`). An app
+page (ChatGPT) is complete too. Scroll before calling part of a page missing.
+
+The trailer header is DASH (`.mpd`), and three more refusals were thrown building it, now answered as Windows answers a
+stream it cannot use: `MediaSource` lacked `IMediaSource4` (two InvalidCasts; both getters now null),
+`AdaptiveMediaSource` did not exist (now `IsContentTypeSupported` false and every creation completing at once with
+`UnsupportedManifestContentType`), and `MediaPlayer.GetSurface` was E_NOTIMPL (now a `MediaPlayerSurface` over an empty
+drawing surface from the app's compositor). After those the click throws nothing but `TaskCanceledException`s; the
+trailer area stays empty with its pause/mute buttons, and the player no longer retries the manifest ~100 times.
 
 How the managed throws were counted: this Store has **no `mrt100_app.dll`** - its runtime is linked into
 `WinStore.App.dll` (NativeAOT-style, `__managed__Main`), so the old `mrt100_app.dll+45be0` breakpoint never arms. Its

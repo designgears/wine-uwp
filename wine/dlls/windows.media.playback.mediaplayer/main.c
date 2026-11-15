@@ -970,11 +970,189 @@ static HRESULT WINAPI media_player4_SetSurfaceSize( void *iface, Size size )
         playback_set_surface_size( impl->playback, (UINT32)(size.Width + 0.5f), (UINT32)(size.Height + 0.5f) );
     return S_OK;
 }
+/* MediaPlayerSurface: the composition surface a player renders into, for an app that composes the video itself. The
+ * player renders into its own window here and cannot decode the streams apps hand it this way (the Microsoft Store's
+ * DASH trailers), so the surface is an empty drawing surface from the app's compositor. E_NOTIMPL took the Store's
+ * game page header, and its Get button, down with it. */
+static const GUID IID_IMediaPlayerSurface_ = {0x0ed653bc,0xb736,0x49c3,{0x83,0x0b,0x76,0x4a,0x38,0x45,0x31,0x3a}};
+static const GUID IID_IClosable_ = {0x30d5a829,0x7fa4,0x4026,{0x83,0xbb,0xd7,0x5b,0xae,0x4e,0xa9,0x9e}};
+static const GUID IID_ICompositorInterop_ = {0x25297d5c,0x3ad4,0x4c9c,{0xb5,0xcf,0xe3,0x6a,0x38,0x51,0x23,0x30}};
+
+struct player_surface
+{
+    const void *vtbl;           /* IMediaPlayerSurface */
+    const void *closable_vtbl;  /* IClosable */
+    LONG ref;
+    IInspectable *compositor;
+    IUnknown *surface;
+    IMediaPlayer *player;
+};
+
+static struct player_surface *player_surface_from( void *iface ) { return CONTAINING_RECORD( iface, struct player_surface, vtbl ); }
+static struct player_surface *player_surface_from_closable( void *iface )
+{
+    return CONTAINING_RECORD( iface, struct player_surface, closable_vtbl );
+}
+
+static HRESULT WINAPI player_surface_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    struct player_surface *impl = player_surface_from( iface );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IMediaPlayerSurface_ ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = &impl->vtbl;
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IClosable_ ))
+    {
+        InterlockedIncrement( &impl->ref );
+        *out = &impl->closable_vtbl;
+        return S_OK;
+    }
+    WARN( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI player_surface_AddRef( void *iface )
+{
+    return InterlockedIncrement( &player_surface_from( iface )->ref );
+}
+static void player_surface_close( struct player_surface *impl )
+{
+    IUnknown *surface = InterlockedExchangePointer( (void **)&impl->surface, NULL );
+    if (surface) IUnknown_Release( surface );
+}
+static ULONG WINAPI player_surface_Release( void *iface )
+{
+    struct player_surface *impl = player_surface_from( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+
+    if (!ref)
+    {
+        player_surface_close( impl );
+        if (impl->compositor) IInspectable_Release( impl->compositor );
+        IMediaPlayer_Release( impl->player );
+        free( impl );
+    }
+    return ref;
+}
+static HRESULT WINAPI player_surface_GetIids( void *iface, ULONG *count, IID **iids )
+{
+    if (count) *count = 0;
+    if (iids) *iids = NULL;
+    return S_OK;
+}
+static HRESULT WINAPI player_surface_GetRuntimeClassName( void *iface, HSTRING *name )
+{
+    static const WCHAR class_name[] = L"Windows.Media.Playback.MediaPlayerSurface";
+    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
+}
+static HRESULT WINAPI player_surface_GetTrustLevel( void *iface, TrustLevel *level )
+{
+    if (!level) return E_POINTER;
+    *level = BaseTrust;
+    return S_OK;
+}
+static HRESULT WINAPI player_surface_get_CompositionSurface( void *iface, IUnknown **value )
+{
+    struct player_surface *impl = player_surface_from( iface );
+    if (!value) return E_POINTER;
+    if ((*value = impl->surface)) IUnknown_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI player_surface_get_Compositor( void *iface, IInspectable **value )
+{
+    struct player_surface *impl = player_surface_from( iface );
+    if (!value) return E_POINTER;
+    if ((*value = impl->compositor)) IInspectable_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI player_surface_get_MediaPlayer( void *iface, IMediaPlayer **value )
+{
+    struct player_surface *impl = player_surface_from( iface );
+    if (!value) return E_POINTER;
+    IMediaPlayer_AddRef( (*value = impl->player) );
+    return S_OK;
+}
+static const void *player_surface_vtbl[] =
+{
+    player_surface_QueryInterface, player_surface_AddRef, player_surface_Release,
+    player_surface_GetIids, player_surface_GetRuntimeClassName, player_surface_GetTrustLevel,
+    player_surface_get_CompositionSurface, player_surface_get_Compositor, player_surface_get_MediaPlayer,
+};
+
+static HRESULT WINAPI player_surface_closable_QueryInterface( void *iface, REFIID iid, void **out )
+{
+    return player_surface_QueryInterface( &player_surface_from_closable( iface )->vtbl, iid, out );
+}
+static ULONG WINAPI player_surface_closable_AddRef( void *iface )
+{
+    return player_surface_AddRef( &player_surface_from_closable( iface )->vtbl );
+}
+static ULONG WINAPI player_surface_closable_Release( void *iface )
+{
+    return player_surface_Release( &player_surface_from_closable( iface )->vtbl );
+}
+static HRESULT WINAPI player_surface_Close( void *iface )
+{
+    player_surface_close( player_surface_from_closable( iface ) );
+    return S_OK;
+}
+static const void *player_surface_closable_vtbl[] =
+{
+    player_surface_closable_QueryInterface, player_surface_closable_AddRef, player_surface_closable_Release,
+    player_surface_GetIids, player_surface_GetRuntimeClassName, player_surface_GetTrustLevel,
+    player_surface_Close,
+};
+
+/* An empty drawing surface through ICompositorInterop: CreateGraphicsDevice (slot 5), then the graphics device's
+ * CreateDrawingSurface(Size, DirectXPixelFormat, DirectXAlphaMode) (slot 6) */
+static IUnknown *create_empty_surface( IInspectable *compositor, Size size )
+{
+    IUnknown *interop, *device = NULL, *surface = NULL;
+    HRESULT hr;
+
+    if (FAILED(hr = IInspectable_QueryInterface( compositor, &IID_ICompositorInterop_, (void **)&interop )))
+    {
+        WARN( "compositor %p has no ICompositorInterop, hr %#lx.\n", compositor, hr );
+        return NULL;
+    }
+    hr = ((HRESULT (WINAPI *)( IUnknown *, IUnknown *, IUnknown ** ))(*(void ***)interop)[5])( interop, NULL, &device );
+    IUnknown_Release( interop );
+    if (FAILED(hr) || !device)
+    {
+        WARN( "CreateGraphicsDevice failed, hr %#lx.\n", hr );
+        return NULL;
+    }
+    if (size.Width < 1.0f) size.Width = 1.0f;
+    if (size.Height < 1.0f) size.Height = 1.0f;
+    hr = ((HRESULT (WINAPI *)( IUnknown *, Size, INT32, INT32, IUnknown ** ))(*(void ***)device)[6])(
+            device, size, 87 /* B8G8R8A8UIntNormalized */, 1 /* Premultiplied */, &surface );
+    IUnknown_Release( device );
+    if (FAILED(hr)) WARN( "CreateDrawingSurface failed, hr %#lx.\n", hr );
+    return SUCCEEDED(hr) ? surface : NULL;
+}
+
 static HRESULT WINAPI media_player4_GetSurface( void *iface, void *compositor, void **surface )
 {
-    FIXME( "iface %p, compositor %p, surface %p stub!\n", iface, compositor, surface );
-    if (surface) *surface = NULL;
-    return E_NOTIMPL;
+    struct media_player *player = impl_from_IMediaPlayer4( iface );
+    struct player_surface *impl;
+
+    TRACE( "iface %p, compositor %p, surface %p.\n", iface, compositor, surface );
+    if (!surface) return E_POINTER;
+    *surface = NULL;
+    if (!compositor) return E_INVALIDARG;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->vtbl = player_surface_vtbl;
+    impl->closable_vtbl = player_surface_closable_vtbl;
+    impl->ref = 1;
+    IInspectable_AddRef( (impl->compositor = compositor) );
+    impl->surface = create_empty_surface( compositor, player->surface_size );
+    IMediaPlayer_AddRef( (impl->player = &player->IMediaPlayer_iface) );
+    *surface = &impl->vtbl;
+    return S_OK;
 }
 static const void *media_player4_vtbl[] =
 {
