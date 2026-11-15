@@ -14915,3 +14915,20 @@ page. Still open: the suggestion list under the box is a mapped window with noth
 Method worth keeping: when XAML swallows input, find the HRESULT a processing function returns (a breakpoint on the
 instruction after its call shows `rax`), then put a breakpoint after every call inside it and look for the first one
 returning that value; repeat one level down.
+
+## 2026-11-15 - Store: search suggestions and undimmed heroes (animation groups)
+
+With text in the search box, the Store fetched `/v9.0/autosuggest?prefix=paint` and the suggestions' icons, mapped a
+620x490 `PopupHost` window under the box - and painted 0 ops into it (`trace+dcompgate`: `popup window ... 0 ops`). The
+popup's only visual was skipped as `transparent (0)`; with `SetOpacity`/`put_Opacity` now traced on `dcomptree` (with
+the caller) the opacity came from `WinStore.App.dll+208daa7`, in a function referencing `SuggestionsList`,
+`1 / popupVisual.Scale.Y`, `Opacity` and `Scale.Y`: the list is created at Opacity 0 and faded in by a
+CompositionAnimationGroup through `ICompositionObject2::StartAnimationGroup`, which our dcomp visuals (and the generic
+object view) ignored. Each animation of the group now starts on the property its `Target` names
+(`animation_group_run`; Stop likewise).
+
+The suggestions show (`docs/screenshots/msstore-22609-search-suggestions.png`: queries, then apps with icons, then
+themes). The same groups fade out a scrim over every carousel page: before, all hero pages were dimmed (WhatsApp,
+Football Manager 27, LUCI), now the art is at full brightness (`msstore-22609-hero-scrims-before-after.png`, left
+before, right after; the pages differ only by carousel position). Scrolled Home identical (AE 0). Calc AE 4120.98,
+mp 2835 twice.

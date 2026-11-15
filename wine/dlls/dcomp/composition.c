@@ -2576,9 +2576,15 @@ static HRESULT WINAPI object2_view_put_ImplicitAnimations( void *iface, IUnknown
     view->implicit = value;
     return S_OK;
 }
-static HRESULT WINAPI object2_view_AnimationGroup( void *iface, IUnknown *value )
+static void animation_group_run( IUnknown *object, IUnknown *group_iface, BOOL start );
+static HRESULT WINAPI object2_view_StartAnimationGroup( void *iface, IUnknown *value )
 {
-    TRACE( "%p group %p: not run.\n", ((struct object2_view *)iface)->owner, value );
+    animation_group_run( ((struct object2_view *)iface)->owner, value, TRUE );
+    return S_OK;
+}
+static HRESULT WINAPI object2_view_StopAnimationGroup( void *iface, IUnknown *value )
+{
+    animation_group_run( ((struct object2_view *)iface)->owner, value, FALSE );
     return S_OK;
 }
 static const void *object2_view_vtbl[] =
@@ -2586,7 +2592,7 @@ static const void *object2_view_vtbl[] =
     object2_view_QueryInterface, object2_view_AddRef, object2_view_Release,
     object4_view_GetIids, object4_view_GetRuntimeClassName, object4_view_GetTrustLevel,
     object2_view_get_Comment, object2_view_put_Comment, object2_view_get_ImplicitAnimations,
-    object2_view_put_ImplicitAnimations, object2_view_AnimationGroup, object2_view_AnimationGroup,
+    object2_view_put_ImplicitAnimations, object2_view_StartAnimationGroup, object2_view_StopAnimationGroup,
 };
 static HRESULT create_object2_view( IUnknown *owner, void **out )
 {
@@ -7257,6 +7263,7 @@ static HRESULT WINAPI dcv_SetHeight( void *iface, float h )
 static HRESULT WINAPI dcv_SetOpacity( void *iface, float o )
 {
     scene_changed();
+    TRACE_(dcomptree)( "dcomp %p opacity %g from %p\n", iface, o, __builtin_return_address( 0 ) );
     dcomp_visual_from( iface )->opacity = o;
     dcv_clear_opacity_expr( dcomp_visual_from( iface ) );
     return S_OK;
@@ -8006,15 +8013,18 @@ static HRESULT WINAPI dcv_object2_put_ImplicitAnimations( void *iface, void *val
     if (old) IUnknown_Release( old );
     return S_OK;
 }
+static void animation_group_run( IUnknown *object, IUnknown *group_iface, BOOL start );
 static HRESULT WINAPI dcv_object2_StartAnimationGroup( void *iface, void *value )
 {
     scene_changed();
-    TRACE( "%p animation group %p: not run.\n", iface, value );
+    TRACE( "%p animation group %p.\n", iface, value );
+    animation_group_run( (IUnknown *)iface, value, TRUE );
     return S_OK;
 }
 static HRESULT WINAPI dcv_object2_StopAnimationGroup( void *iface, void *value )
 {
     scene_changed();
+    animation_group_run( (IUnknown *)iface, value, FALSE );
     return S_OK;
 }
 
@@ -9021,6 +9031,7 @@ static HRESULT WINAPI dcv_ivisual_get_Opacity( void *iface, FLOAT *value )
 static HRESULT WINAPI dcv_ivisual_put_Opacity( void *iface, FLOAT value )
 {
     scene_changed();
+    TRACE_(dcomptree)( "dcomp %p opacity %g from %p\n", impl_from_dcv_ivisual( iface ), value, __builtin_return_address( 0 ) );
     impl_from_dcv_ivisual( iface )->opacity = value;
     dcv_clear_opacity_expr( impl_from_dcv_ivisual( iface ) );
     return S_OK;
@@ -23277,6 +23288,57 @@ static HRESULT create_animation_group( void **out )
     /* ICompositor2::CreateAnimationGroup returns the class's default interface */
     *out = &group->group_vtbl;
     return S_OK;
+}
+
+/* ICompositionObject2::StartAnimationGroup / StopAnimationGroup: each animation of the group on the property its
+ * Target names (ICompositionAnimation2::get_Target, slot 7). Ignored, the Microsoft Store's search suggestions never
+ * appeared: their list's visual starts at Opacity 0 and a group animates it to 1. */
+static void animation_group_run( IUnknown *object, IUnknown *group_iface, BOOL start )
+{
+    struct animation_group *group = animation_group_from( group_iface );
+    ICompositionObject *target_object;
+    IUnknown **items;
+    UINT32 i, count;
+
+    if (!group)
+    {
+        FIXME( "%p: %p is no animation group of ours.\n", object, group_iface );
+        return;
+    }
+    if (FAILED( IUnknown_QueryInterface( object, &IID_ICompositionObject, (void **)&target_object ) )) return;
+    EnterCriticalSection( &group->cs );
+    count = group->count;
+    if ((items = (malloc)( max( count, 1 ) * sizeof(*items) )))
+        for (i = 0; i < count; i++)
+        {
+            items[i] = group->items[i];
+            IUnknown_AddRef( items[i] );
+        }
+    else count = 0;
+    LeaveCriticalSection( &group->cs );
+    for (i = 0; i < count; i++)
+    {
+        typedef HRESULT (WINAPI *get_target_t)( void *iface, HSTRING *value );
+        HSTRING target = NULL;
+        void *anim2;
+
+        if (SUCCEEDED( IUnknown_QueryInterface( items[i], &IID_ICompositionAnimation2_early, &anim2 ) ))
+        {
+            ((get_target_t)(*(void ***)anim2)[7])( anim2, &target );
+            IUnknown_Release( (IUnknown *)anim2 );
+        }
+        TRACE_(dcompanim)( "%p group %p: %s %s\n", object, group_iface, start ? "start" : "stop",
+                           debugstr_w( WindowsGetStringRawBuffer( target, NULL ) ) );
+        if (WindowsGetStringLen( target ))
+        {
+            if (start) ICompositionObject_StartAnimation( target_object, target, (ICompositionAnimation *)items[i] );
+            else ICompositionObject_StopAnimation( target_object, target );
+        }
+        WindowsDeleteString( target );
+        IUnknown_Release( items[i] );
+    }
+    (free)( items );
+    ICompositionObject_Release( target_object );
 }
 
 #define COMPOSITOR2_RECORDING( name, kind )                                                        \
