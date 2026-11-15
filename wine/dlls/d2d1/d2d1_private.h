@@ -823,6 +823,8 @@ struct d2d_render_info
 
     unsigned int mask;
     GUID pixel_shader;
+    BYTE *ps_cb;                /* SetPixelShaderConstantBuffer's data */
+    UINT32 ps_cb_size;
 };
 
 struct d2d_transform_node
@@ -874,6 +876,11 @@ struct d2d_effect
 
 HRESULT d2d_effect_create(struct d2d_device_context *context, const CLSID *effect_id,
         ID2D1Effect **effect);
+ID2D1Image *d2d_effect_unrendered_input(ID2D1Image *image);
+struct d2d_effect *d2d_effect_from_image(ID2D1Image *image);
+struct d2d_render_info *d2d_effect_shader_node(struct d2d_effect *effect, ID2D1DrawTransform **transform);
+const char *d2d_effect_image_debugstr(ID2D1Image *image);
+BOOL d2d_effect_affine_input(ID2D1Image *image, ID2D1Image **input, D2D1_MATRIX_3X2_F *matrix);
 void d2d_effect_init_properties(struct d2d_effect *effect, struct d2d_effect_properties *properties);
 HRESULT d2d_effect_properties_add(struct d2d_effect_properties *props, const WCHAR *name,
         UINT32 index, D2D1_PROPERTY_TYPE type, const WCHAR *value);

@@ -4166,6 +4166,10 @@ struct drawing_surface
     const void **virtual_vtbl;
     BOOL cpu_only;              /* a CompositionVisualSurface's: the content is the cache, there is no texture */
     ULONGLONG cache_used;       /* tick the painter last took the cache, see evict_stale_surface_copies */
+    /* The rendering device of the surface factory that made it, when that is not the process-wide one: the texture
+     * and the D2D context are created on it. NULL for both: interop_d3d_device and interop_d2d_device. */
+    ID3D11Device *d3d_device;
+    ID2D1Device *d2d_device;
 };
 
 static struct drawing_surface **swapchain_surfaces;
@@ -4677,6 +4681,8 @@ static void surface_destroy( struct drawing_surface *surface )
     if (surface->bitmap) ID2D1Bitmap1_Release( surface->bitmap );
     if (surface->context) ID2D1DeviceContext_Release( surface->context );
     if (surface->texture) ID3D11Texture2D_Release( surface->texture );
+    if (surface->d2d_device) ID2D1Device_Release( surface->d2d_device );
+    if (surface->d3d_device) ID3D11Device_Release( surface->d3d_device );
     free( surface );
 }
 static void surface_free_cache( struct drawing_surface *surface )
@@ -4746,41 +4752,55 @@ static ID2D1Factory1 *interop_d2d_factory;
 /* XAML passes its D3D11-backed rendering device to IDCompositionDesktopDevice::CreateSurfaceFactory.
  * Drawing surfaces must live on that device: XAML copies into the textures BeginDraw hands out with its own
  * device context, and a texture from another wined3d device trips wined3d's command-stream thread checks. */
-static void remember_rendering_device( IUnknown *rendering_device )
+/* The D3D11 device behind a rendering device (a D3D11 device, a DXGI device or a D2D device), and the D2D device
+ * when it is one. Both returned with a reference. */
+static BOOL rendering_device_devices( IUnknown *rendering_device, ID3D11Device **d3d, ID2D1Device **d2d )
 {
-    ID3D11Device *device = NULL;
     IDXGIDevice *dxgi_device;
-    ID2D1Device *d2d_device;
     ID2D1Device2 *d2d_device2;
 
-    if (!rendering_device || interop_d3d_device) return;
-    if (SUCCEEDED( IUnknown_QueryInterface( rendering_device, &IID_ID3D11Device, (void **)&device ) ))
+    *d3d = NULL;
+    *d2d = NULL;
+    if (!rendering_device) return FALSE;
+    if (SUCCEEDED( IUnknown_QueryInterface( rendering_device, &IID_ID3D11Device, (void **)d3d ) ))
         TRACE( "rendering device %p is a D3D11 device.\n", rendering_device );
     else if (SUCCEEDED( IUnknown_QueryInterface( rendering_device, &IID_IDXGIDevice, (void **)&dxgi_device ) ))
     {
-        IDXGIDevice_QueryInterface( dxgi_device, &IID_ID3D11Device, (void **)&device );
+        IDXGIDevice_QueryInterface( dxgi_device, &IID_ID3D11Device, (void **)d3d );
         IDXGIDevice_Release( dxgi_device );
     }
-    else if (SUCCEEDED( IUnknown_QueryInterface( rendering_device, &IID_ID2D1Device, (void **)&d2d_device ) ))
+    else if (SUCCEEDED( IUnknown_QueryInterface( rendering_device, &IID_ID2D1Device, (void **)d2d ) ))
     {
-        if (SUCCEEDED( ID2D1Device_QueryInterface( d2d_device, &IID_ID2D1Device2, (void **)&d2d_device2 ) ))
+        if (SUCCEEDED( ID2D1Device_QueryInterface( *d2d, &IID_ID2D1Device2, (void **)&d2d_device2 ) ))
         {
             if (SUCCEEDED( ID2D1Device2_GetDxgiDevice( d2d_device2, &dxgi_device ) ))
             {
-                IDXGIDevice_QueryInterface( dxgi_device, &IID_ID3D11Device, (void **)&device );
+                IDXGIDevice_QueryInterface( dxgi_device, &IID_ID3D11Device, (void **)d3d );
                 IDXGIDevice_Release( dxgi_device );
             }
             ID2D1Device2_Release( d2d_device2 );
         }
-        if (device && !InterlockedCompareExchangePointer( (void **)&interop_d2d_device, d2d_device, NULL ))
+    }
+    if (*d3d) return TRUE;
+    WARN( "rendering device %p has no D3D11 device.\n", rendering_device );
+    if (*d2d) ID2D1Device_Release( *d2d );
+    *d2d = NULL;
+    return FALSE;
+}
+
+static void remember_rendering_device( IUnknown *rendering_device )
+{
+    ID3D11Device *device;
+    ID2D1Device *d2d_device;
+
+    if (!rendering_device || interop_d3d_device) return;
+    if (!rendering_device_devices( rendering_device, &device, &d2d_device )) return;
+    if (d2d_device)
+    {
+        if (!InterlockedCompareExchangePointer( (void **)&interop_d2d_device, d2d_device, NULL ))
             TRACE( "using the app's D2D device %p.\n", d2d_device );
         else
             ID2D1Device_Release( d2d_device );
-    }
-    if (!device)
-    {
-        WARN( "rendering device %p has no D3D11 device.\n", rendering_device );
-        return;
     }
     if (InterlockedCompareExchangePointer( (void **)&interop_d3d_device, device, NULL ))
         ID3D11Device_Release( device );
@@ -4863,8 +4883,16 @@ static HRESULT surface_ensure_target( struct drawing_surface *surface, BOOL with
     IDXGISurface *dxgi_surface;
     HRESULT hr;
 
+    ID3D11Device *d3d_device = surface->d3d_device;
+    ID2D1Device *d2d_device = surface->d2d_device;
+
     if (surface->bitmap) return S_OK;
-    if (FAILED( hr = ensure_d2d_device() )) return hr;
+    if (!d3d_device || !d2d_device)
+    {
+        if (FAILED( hr = ensure_d2d_device() )) return hr;
+        d3d_device = interop_d3d_device;
+        d2d_device = interop_d2d_device;
+    }
 
     if (!surface->texture)
     {
@@ -4876,12 +4904,12 @@ static HRESULT surface_ensure_target( struct drawing_surface *surface, BOOL with
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED( hr = ID3D11Device_CreateTexture2D( interop_d3d_device, &desc, NULL,
+        if (FAILED( hr = ID3D11Device_CreateTexture2D( d3d_device, &desc, NULL,
                                                        &surface->texture ) ))
         {
             /* A8 surfaces cannot be shader resources on every driver; a render target is enough. */
             desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-            if (FAILED( hr = ID3D11Device_CreateTexture2D( interop_d3d_device, &desc, NULL,
+            if (FAILED( hr = ID3D11Device_CreateTexture2D( d3d_device, &desc, NULL,
                                                            &surface->texture ) ))
             {
                 WARN( "CreateTexture2D %ux%u fmt %u failed, hr %#lx.\n", desc.Width, desc.Height,
@@ -4892,7 +4920,7 @@ static HRESULT surface_ensure_target( struct drawing_surface *surface, BOOL with
     }
     if (!with_context) return S_OK;
     if (!surface->context &&
-        FAILED( hr = ID2D1Device_CreateDeviceContext( interop_d2d_device,
+        FAILED( hr = ID2D1Device_CreateDeviceContext( d2d_device,
                                                       D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
                                                       &surface->context ) ))
     {
@@ -6044,13 +6072,94 @@ static HRESULT create_drawing_surface( UINT w, UINT h, UINT format, UINT alpha, 
     return S_OK;
 }
 
+/* IDCompositionDesktopDevice::CreateSurfaceFactory. XAML makes one per rendering device: its own, and one for each
+ * device an app hands a SurfaceImageSource (ISurfaceImageSourceNativeWithD2D::SetDevice, which Win2D's
+ * CanvasImageSource does with its CanvasDevice). The app then draws into BeginDraw's D2D context with bitmaps of
+ * its own device, so the surface has to live on that device; drawn on ours, those bitmaps' textures read another
+ * device's memory, and the Microsoft Store's Best selling covers came out as garbage. */
+struct surface_factory
+{
+    /* must match struct comp_object */
+    const void **vtbl;
+    const char *kind;
+    LONG ref;
+    ID3D11Device *d3d_device;   /* NULL: the process-wide devices */
+    ID2D1Device *d2d_device;
+};
+
+static HRESULT create_surface_factory( IUnknown *rendering_device, void **out )
+{
+    struct surface_factory *factory;
+    ID3D11Device *d3d = NULL;
+    ID2D1Device *d2d = NULL;
+    IDXGIDevice *dxgi_device;
+    HRESULT hr;
+
+    if (!out) return E_POINTER;
+    ensure_typed_vtbls();
+    if (!(factory = calloc( 1, sizeof(*factory) ))) return E_OUTOFMEMORY;
+    factory->vtbl = (const void **)surface_factory_vtbl;
+    factory->kind = "CreateSurfaceFactory";
+    factory->ref = 1;
+    if (rendering_device_devices( rendering_device, &d3d, &d2d ) && d3d != interop_d3d_device)
+    {
+        if (!d2d && SUCCEEDED( ID3D11Device_QueryInterface( d3d, &IID_IDXGIDevice, (void **)&dxgi_device ) ))
+        {
+            if (FAILED( hr = D2D1CreateDevice( dxgi_device, NULL, &d2d ) ))
+                WARN( "D2D1CreateDevice failed, hr %#lx.\n", hr );
+            IDXGIDevice_Release( dxgi_device );
+        }
+        if (d2d)
+        {
+            factory->d3d_device = d3d;
+            factory->d2d_device = d2d;
+            d3d = NULL;
+            d2d = NULL;
+        }
+    }
+    if (d2d) ID2D1Device_Release( d2d );
+    if (d3d) ID3D11Device_Release( d3d );
+    TRACE( "surface factory %p for rendering device %p: D3D device %p, D2D device %p.\n", factory,
+           rendering_device, factory->d3d_device, factory->d2d_device );
+    *out = &factory->vtbl;
+    return S_OK;
+}
+
+static ULONG WINAPI surface_factory_Release( void *iface )
+{
+    struct surface_factory *factory = CONTAINING_RECORD( iface, struct surface_factory, vtbl );
+    ULONG ref = InterlockedDecrement( &factory->ref );
+
+    if (!ref)
+    {
+        if (factory->d2d_device) ID2D1Device_Release( factory->d2d_device );
+        if (factory->d3d_device) ID3D11Device_Release( factory->d3d_device );
+        free( factory );
+    }
+    return ref;
+}
+
+/* out is what create_drawing_surface or create_virtual_surface returned */
+static HRESULT surface_from_factory( void *iface, HRESULT hr, struct drawing_surface *surface )
+{
+    struct surface_factory *factory = CONTAINING_RECORD( iface, struct surface_factory, vtbl );
+
+    if (FAILED( hr ) || !factory->d3d_device) return hr;
+    ID3D11Device_AddRef( (surface->d3d_device = factory->d3d_device) );
+    ID2D1Device_AddRef( (surface->d2d_device = factory->d2d_device) );
+    return hr;
+}
+
 static HRESULT WINAPI surface_factory_CreateSurface( void *iface, UINT w, UINT h, UINT format,
                                                      UINT alpha, void **out )
 {
+    HRESULT hr;
+
     /* Call site in XAML EnsureResources (RVA 0x1c6548): rcx this, 1, 1, 0x41 in regs,
      * one stack int (alpha), one stack pointer (out, pre-seeded local). Six args total. */
     TRACE( "CreateSurface %ux%u fmt %u alpha %u.\n", w, h, format, alpha );
-    return create_drawing_surface( w, h, format, alpha, out );
+    hr = create_drawing_surface( w, h, format, alpha, out );
+    return surface_from_factory( iface, hr, SUCCEEDED( hr ) ? CONTAINING_RECORD( *out, struct drawing_surface, vtbl ) : NULL );
 }
 
 
@@ -6142,9 +6251,12 @@ static HRESULT create_virtual_surface( UINT w, UINT h, UINT format, UINT alpha, 
 static HRESULT WINAPI surface_factory_CreateVirtualSurface( void *iface, UINT w, UINT h,
                                                             UINT format, UINT alpha, void **out )
 {
+    HRESULT hr;
+
     TRACE( "CreateVirtualSurface %ux%u fmt %u alpha %u.\n", w, h, format, alpha );
     if (!out) return E_POINTER;
-    return create_virtual_surface( w, h, format, alpha, out );
+    hr = create_virtual_surface( w, h, format, alpha, out );
+    return surface_from_factory( iface, hr, SUCCEEDED( hr ) ? surface_from_virtual( *out ) : NULL );
 }
 
 /* CSurfaceFactory slot 6: Flush */
@@ -6159,9 +6271,12 @@ static HRESULT WINAPI surface_factory_Flush( void *iface )
 static HRESULT WINAPI surface_factory_CreateSurfaceEx( void *iface, UINT w, UINT h, UINT format,
                                                        UINT alpha, BOOLEAN flag, void **out )
 {
+    HRESULT hr;
+
     TRACE( "CreateSurface %ux%u fmt %u alpha %u flag %u.\n", w, h, format, alpha, flag );
     if (!out) return E_POINTER;
-    return create_drawing_surface( w, h, format, alpha, out );
+    hr = create_drawing_surface( w, h, format, alpha, out );
+    return surface_from_factory( iface, hr, SUCCEEDED( hr ) ? CONTAINING_RECORD( *out, struct drawing_surface, vtbl ) : NULL );
 }
 
 static void ensure_typed_vtbls(void)
@@ -6175,7 +6290,7 @@ static void ensure_typed_vtbls(void)
     }
     surface_factory_vtbl[0] = comp_object_QueryInterface;
     surface_factory_vtbl[1] = comp_object_AddRef;
-    surface_factory_vtbl[2] = comp_object_Release;
+    surface_factory_vtbl[2] = surface_factory_Release;
     /* CSurfaceFactory::CreateSurface(w, h, format, alpha, RemoteGDIContent, out) and
      * CreateVirtualSurface, from dcomp.pdb; the 1x1 B8G8R8A8 probe call confirmed the
      * argument order at runtime. */
@@ -6282,6 +6397,7 @@ static HRESULT create_comp_object_vtbl( const char *kind, void **vtbl, void **ou
     if (vtbl == sprite_shape_vtbl) return create_comp_shape( FALSE, NULL, out );
     if (vtbl == container_shape_vtbl) return create_comp_shape( TRUE, NULL, out );
     if (vtbl == path_geometry_vtbl) return create_path_geometry( NULL, out );
+    if (vtbl == (void **)surface_factory_vtbl) return create_surface_factory( NULL, out );
 
     struct comp_object *object;
 
@@ -9273,7 +9389,7 @@ static HRESULT WINAPI device_CreateSurfaceFactory( void *iface, IUnknown *render
 {
     TRACE( "CreateSurfaceFactory rendering device %p.\n", rendering_device );
     remember_rendering_device( rendering_device );
-    return create_comp_object_vtbl( "CreateSurfaceFactory", surface_factory_vtbl, out );
+    return create_surface_factory( rendering_device, out );
 }
 static HRESULT WINAPI device_CreateSurface( void *iface, void *a, void *b, void *c, void *d,
                                             void **out )
@@ -22111,6 +22227,18 @@ static BOOL paint_mask_brush( HDC hdc, void *brush_iface, int x, int y, int widt
     {
         mapped = surface_brush_mapping( src, w, h, source_desc.Width, source_desc.Height, smap );
         if (*(void ***)src == (void **)surface_brush_vtbl) layout = surface_brush_from( src )->layout_gen;
+        /* A plain Fill stretches the surface over the brush area; surface_brush_mapping leaves that to the caller,
+         * and copying 1:1 showed a crop. The Microsoft Store draws each game poster at 144 DPI (194x368) and shows it
+         * in a 129x245 tile through a mask brush: a magnified corner of the poster. XAML's own masks match their
+         * sources, which is why this went unseen. */
+        if (!mapped && (source_desc.Width != w || source_desc.Height != h) && *(void ***)src == (void **)surface_brush_vtbl &&
+            surface_brush_from( src )->stretch == 1 && w && h)
+        {
+            smap[0] = (float)source_desc.Width / w; smap[1] = 0.0f;
+            smap[2] = 0.0f;                          smap[3] = (float)source_desc.Height / h;
+            smap[4] = 0.0f;                          smap[5] = 0.0f;
+            mapped = TRUE;
+        }
     }
     if (grid)
     {

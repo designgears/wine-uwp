@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     812ed9c92f5f04fb975e5f8cec4e08bcccbfc5fc
-                 dcomp: InteractionTracker and the other interactions objects are IClosable.
+  wine HEAD:     0670ae4902518b815b6fb01158f69f682cb43d98
+                 d2d1: Render effects through intermediates, custom pixel shaders included.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-15T02:22:26Z
+  captured:      2026-11-15T03:52:37Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

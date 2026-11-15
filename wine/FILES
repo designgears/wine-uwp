@@ -513,3 +513,6 @@ dlls/cfgmgr32/devobject.c
 dlls/windows.devices.enumeration/information.c
 dlls/windows.gaming.input/main.c
 dlls/shell32/shellpath.c
+# 2026-11-15: the Store's Best selling covers (d2d1 effect rendering)
+dlls/d2d1/tests/d2d1.c
+include/d2d1effects.idl

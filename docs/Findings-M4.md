@@ -14625,3 +14625,56 @@ poster is drawn (252x378 at 0.77 into a 194x368 drawing surface) - but the tiles
 tiles' mask brushes still read a source surface at generation 0, and what shows is the backdrop layer, which the
 custom shader would blur. Not merged. Next: find which composition surface the poster's 194x368 drawing lands in and
 why the tile's mask brush does not see it; a real D2D effect renderer (custom pixel shaders included) is the full fix.
+
+### Microsoft Store: Best selling covers drawn, with the Store's own fade shader (2026-11-15, merged)
+
+The parked branch above is finished and on `uwp-main` (`a0ed183` dcomp, `0670ae4` d2d1). Three bugs stood between the
+decoded cover and the tile, found in order:
+
+1. **The wrong device.** Each cover is decoded by Win2D (`CanvasBitmap.LoadAsync`) into a correct 252x378 bitmap on
+   the Store's `CanvasDevice`, then drawn through a `CanvasImageSource` - XAML's SurfaceImageSource - whose dcomp
+   surface came from `IDCompositionDesktopDevice::CreateSurfaceFactory(rendering device = Win2D's D2D device)`. dcomp
+   kept only the *first* rendering device it ever saw (XAML's) and created every surface's texture and D2D context
+   there, so the cover's texture was sampled through another device's context: garbage. A temporary d2d1 probe
+   comparing the bitmap's device with the context's said `MISMATCH`. Surface factories now keep their own D3D/D2D
+   device (a D2D device is made for a D3D-only one), and their surfaces create texture and context on it;
+   `compositor`'s `CreateGraphicsDevice` (`gfx_CreateDrawingSurface`) is never called by the Store, which is how the
+   SurfaceImageSource route was identified. `docs/screenshots/msstore-22609-best-selling-before-effects.png` is this
+   step alone: covers correct, the title over the plain art.
+2. **Fill.** The tile shows the surface through a mask brush whose source surface brush has `Stretch = Fill`;
+   `paint_mask_brush` copied it 1:1 (a crop). It is now scaled over the brush area when no other mapping applies.
+3. **The effect graph.** Each tile's graph (from a tree probe on `DrawImage`):
+   `PixelShader {65bf3da0}(start 250, height 55)` <- [`UnPremultiply` <- `2DAffine` <- `Scale 0.77` <- `Border(mirror Y)`
+   <- cover] and [`UnPremultiply` <- `Blend(luminosity)` <- (`Tint` <- `GaussianBlur 12` <- same) and (`Premultiply` <-
+   `PixelShader {b82459c0}`, a grain generator with 0 inputs)]. The first shader is
+   `lerp(t0, t1, sin(saturate((y - 250) / 55) * 1.57))` with alpha 1: the cover fading into its blurred, tinted mirror
+   under the title. Disassembled with `D3DDisassemble` from a dump in `LoadPixelShader`.
+
+d2d1 now renders effects: anything that is not a bitmap through a matrix, or a pass-through graph, is rendered into
+intermediate bitmaps in its own space over the part that reaches the target, and drawn like a bitmap. Every pass is a
+pixel shader on Direct2D's custom-effect interface - v0 `SV_POSITION`, v1 `SCENE_POSITION` (effect-space position),
+`TEXCOORDn` = (position in input n's texture, its texel size) - with one vertex shader (`SV_VertexID`, no buffers), so
+the app's shaders and built-in passes share one path: GaussianBlur (two separable passes, 3 sigma), Blend (W3C
+separable and non-separable modes), Tint, Border (sampler address modes), Crop, Flood, Composite, (Un)Premultiply.
+`PrepareForRender` is called before a custom shader runs; Win2D sets its constants there
+(`SetPixelShaderConstantBuffer`, which was a stub). `trace+d2d` logs each custom pass with its first constants.
+
+Verified: `docs/screenshots/msstore-22609-best-selling-covers.png` (Home, Best selling games: covers, Game Pass badges,
+the blurred extension under each title, as on Windows). Wine's own `test_effect_flood` and
+`test_effect_custom_pixel_shader` now pass (todo removed). `probes/probe-pshader.cpp` runs a shader blob through the same
+vertex interface outside d2d1: the grain shader gives grey noise 48-52 there, as in the Store. calc AE 4120.98 and mp
+2835, twice each, after both changes. The tour: 1203-1244 MB RSS / 757-767 MB private at "scrolled", 11.9-12.4 s CPU,
+in the spread of the earlier runs (1128-1200 / 690-760, 11.8 s) - drawing the posters and their effects costs nothing
+measurable.
+
+Two traps on the way. **An input still bound as the state's render target is silently unbound as a shader resource**:
+d2d1's `d3d_state` keeps the last draw's RTV, and binding an intermediate as SRV before `OMSetRenderTargets` gave every
+pass black. Set the target first. **`magick ... -format '%[fx:mean.g]'` reports 0 for a grey image** (it is stored as
+gray); I read that as "the shader writes red only" and chased it. `od -tu1` on the raw dump settled it.
+
+The d2d1 test suite flakes here in tests this change does not reach (`test_fill_geometry` "Figure does not match":
+0, 7, 27 and 28 failures in consecutive runs of the same build; `uwp-main` before it had 0 in its one run).
+
+Open: long titles (Call of Duty, Minecraft, Club Vegas) wrap to 3-4 lines and run above the fade, which is fixed at
+y = 250 of 368 for every tile; no `MaxLines` for the card's title was found in the Store's XBF, so whether Windows
+wraps them the same is not known.

@@ -1009,6 +1009,23 @@ static const ID2D1EffectImplVtbl d2d_effect_impl_vtbl =
     d2d_effect_impl_SetGraph,
 };
 
+/* An effect drawn as its first input: its graph is that input's pass-through. */
+static HRESULT STDMETHODCALLTYPE d2d_passthrough_effect_impl_Initialize(ID2D1EffectImpl *iface,
+        ID2D1EffectContext *context, ID2D1TransformGraph *graph)
+{
+    return ID2D1TransformGraph_SetPassthroughGraph(graph, 0);
+}
+
+static const ID2D1EffectImplVtbl d2d_passthrough_effect_impl_vtbl =
+{
+    d2d_effect_impl_QueryInterface,
+    d2d_effect_impl_AddRef,
+    d2d_effect_impl_Release,
+    d2d_passthrough_effect_impl_Initialize,
+    d2d_effect_impl_PrepareForRender,
+    d2d_effect_impl_SetGraph,
+};
+
 static HRESULT d2d_effect_create_impl(IUnknown **effect_impl, const void *props,
         size_t props_size)
 {
@@ -1857,6 +1874,114 @@ static HRESULT __stdcall premultiply_factory(IUnknown **effect)
     return d2d_effect_create_impl(effect, NULL, 0);
 }
 
+/* Not run: its output is drawn as its input (premultiplied, which is what a shader after it usually wants back).
+ * Without it Win2D's chains through UnPremultiplyEffect failed to be created: the Microsoft Store's game posters
+ * (bitmap -> UnPremultiply -> its pixel shader) never appeared. */
+static const WCHAR unpremultiply_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Unpremultiply'/>    \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Unpremultiply'/>    \
+    <Inputs >                                                             \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+  </Effect>";
+
+static HRESULT __stdcall unpremultiply_factory(IUnknown **effect)
+{
+    HRESULT hr = d2d_effect_create_impl(effect, NULL, 0);
+    if (SUCCEEDED(hr)) ((ID2D1EffectImpl *)*effect)->lpVtbl = &d2d_passthrough_effect_impl_vtbl;
+    return hr;
+}
+
+/* Tint multiplies by a colour; drawn as its input (exact for its default, white). Win2D's chain for the Microsoft
+ * Store's game posters goes through one. */
+static const WCHAR tint_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Tint'/>             \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Tint'/>             \
+    <Inputs >                                                             \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+    <Property name='Color' type='vector4' />                              \
+    <Property name='ClampOutput' type='bool' />                           \
+  </Effect>";
+
+struct tint_properties
+{
+    D2D1_VECTOR_4F color;
+    BOOL clamp_output;
+};
+
+EFFECT_PROPERTY_RW(tint, color, VECTOR4)
+EFFECT_PROPERTY_RW(tint, clamp_output, BOOL)
+
+static const D2D1_PROPERTY_BINDING tint_bindings[] =
+{
+    { L"Color", BINDING_RW(tint, color) },
+    { L"ClampOutput", BINDING_RW(tint, clamp_output) },
+};
+
+static HRESULT __stdcall tint_factory(IUnknown **effect)
+{
+    static const struct tint_properties properties =
+    {
+        .color = { 1.0f, 1.0f, 1.0f, 1.0f },
+        .clamp_output = FALSE,
+    };
+    HRESULT hr = d2d_effect_create_impl(effect, &properties, sizeof(properties));
+    if (SUCCEEDED(hr)) ((ID2D1EffectImpl *)*effect)->lpVtbl = &d2d_passthrough_effect_impl_vtbl;
+    return hr;
+}
+
+/* Border only changes what is sampled outside the input's bounds; drawn as its input. Win2D wraps a pixel shader's
+ * inputs in it (the Microsoft Store's game posters). */
+static const WCHAR border_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Border'/>           \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Border'/>           \
+    <Inputs >                                                             \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+    <Property name='EdgeModeX' type='enum' />                             \
+    <Property name='EdgeModeY' type='enum' />                             \
+  </Effect>";
+
+struct border_properties
+{
+    UINT32 edge_mode_x;     /* D2D1_BORDER_EDGE_MODE */
+    UINT32 edge_mode_y;
+};
+
+EFFECT_PROPERTY_RW(border, edge_mode_x, ENUM)
+EFFECT_PROPERTY_RW(border, edge_mode_y, ENUM)
+
+static const D2D1_PROPERTY_BINDING border_bindings[] =
+{
+    { L"EdgeModeX", BINDING_RW(border, edge_mode_x) },
+    { L"EdgeModeY", BINDING_RW(border, edge_mode_y) },
+};
+
+static HRESULT __stdcall border_factory(IUnknown **effect)
+{
+    static const struct border_properties properties =
+    {
+        .edge_mode_x = 0 /* clamp */,
+        .edge_mode_y = 0 /* clamp */,
+    };
+    HRESULT hr = d2d_effect_create_impl(effect, &properties, sizeof(properties));
+    if (SUCCEEDED(hr)) ((ID2D1EffectImpl *)*effect)->lpVtbl = &d2d_passthrough_effect_impl_vtbl;
+    return hr;
+}
+
 static const WCHAR _3d_transform_description[] =
 L"<?xml version='1.0'?>                                                   \
   <Effect>                                                                \
@@ -1987,6 +2112,9 @@ void d2d_effects_init_builtins(struct d2d_factory *factory)
         { &CLSID_D2D1Opacity, X2(opacity) },
         { &CLSID_D2D1Scale, X2(scale) },
         { &CLSID_D2D1Premultiply, X(premultiply) },
+        { &CLSID_D2D1UnPremultiply, X(unpremultiply) },
+        { &CLSID_D2D1Border, X2(border) },
+        { &CLSID_D2D1Tint, X2(tint) },
         { &CLSID_D2D13DTransform, X2(_3d_transform) },
         { &CLSID_D2D1ColorManagement, X2(color_management) },
 #undef X2
@@ -3089,6 +3217,114 @@ static inline struct d2d_effect *impl_from_ID2D1Image(ID2D1Image *iface)
     return CONTAINING_RECORD(iface, struct d2d_effect, ID2D1Image_iface);
 }
 
+static const ID2D1ImageVtbl d2d_effect_image_vtbl;
+
+/* A 2D affine transform or a scale effect's input and matrix, drawn as the input under the matrix. Win2D scales the
+ * Microsoft Store's game posters to their tiles through both. */
+BOOL d2d_effect_affine_input(ID2D1Image *image, ID2D1Image **input, D2D1_MATRIX_3X2_F *matrix)
+{
+    struct d2d_effect *effect;
+    CLSID id;
+
+    if (!image || image->lpVtbl != &d2d_effect_image_vtbl) return FALSE;
+    effect = impl_from_ID2D1Image(image);
+    if (!effect->input_count || !effect->inputs[0]) return FALSE;
+    if (FAILED(ID2D1Effect_GetValue(&effect->ID2D1Effect_iface, D2D1_PROPERTY_CLSID, D2D1_PROPERTY_TYPE_CLSID,
+            (BYTE *)&id, sizeof(id))))
+        return FALSE;
+    if (IsEqualGUID(&id, &CLSID_D2D12DAffineTransform))
+    {
+        if (FAILED(ID2D1Effect_GetValue(&effect->ID2D1Effect_iface, D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX,
+                D2D1_PROPERTY_TYPE_MATRIX_3X2, (BYTE *)matrix, sizeof(*matrix))))
+            return FALSE;
+    }
+    else if (IsEqualGUID(&id, &CLSID_D2D1Scale))
+    {
+        /* Scale about CenterPoint */
+        D2D1_VECTOR_2F scale, center;
+
+        if (FAILED(ID2D1Effect_GetValue(&effect->ID2D1Effect_iface, D2D1_SCALE_PROP_SCALE, D2D1_PROPERTY_TYPE_VECTOR2,
+                (BYTE *)&scale, sizeof(scale))) ||
+                FAILED(ID2D1Effect_GetValue(&effect->ID2D1Effect_iface, D2D1_SCALE_PROP_CENTER_POINT,
+                D2D1_PROPERTY_TYPE_VECTOR2, (BYTE *)&center, sizeof(center))))
+            return FALSE;
+        matrix->_11 = scale.x; matrix->_12 = 0.0f;
+        matrix->_21 = 0.0f;    matrix->_22 = scale.y;
+        matrix->_31 = center.x - center.x * scale.x;
+        matrix->_32 = center.y - center.y * scale.y;
+    }
+    else return FALSE;
+    ID2D1Image_AddRef(*input = effect->inputs[0]);
+    return TRUE;
+}
+
+struct d2d_effect *d2d_effect_from_image(ID2D1Image *image)
+{
+    if (!image || image->lpVtbl != &d2d_effect_image_vtbl) return NULL;
+    return impl_from_ID2D1Image(image);
+}
+
+/* The node of an effect whose graph is a single draw transform running a pixel shader of the effect's own: Win2D's
+ * PixelShaderEffect, and any custom effect built the same way. The shader's constants are set in PrepareForRender,
+ * which is called here, as Direct2D does before it draws the effect. */
+struct d2d_render_info *d2d_effect_shader_node(struct d2d_effect *effect, ID2D1DrawTransform **transform)
+{
+    struct d2d_transform_node *node;
+
+    if (!effect->graph || effect->graph->passthrough || list_count(&effect->graph->nodes) != 1) return NULL;
+    node = LIST_ENTRY(list_head(&effect->graph->nodes), struct d2d_transform_node, entry);
+    if (!node->render_info || !(node->render_info->mask & D2D_RENDER_INFO_PIXEL_SHADER)) return NULL;
+    if (FAILED(ID2D1TransformNode_QueryInterface(node->object, &IID_ID2D1DrawTransform, (void **)transform)))
+        return NULL;
+    ID2D1EffectImpl_PrepareForRender(effect->impl, D2D1_CHANGE_TYPE_NONE);
+    return node->render_info;
+}
+
+/* For traces: which effect an image is the output of. */
+const char *d2d_effect_image_debugstr(ID2D1Image *image)
+{
+    struct d2d_effect *effect;
+    CLSID id;
+
+    if (!image || image->lpVtbl != &d2d_effect_image_vtbl) return wine_dbg_sprintf("%p (not an effect)", image);
+    effect = impl_from_ID2D1Image(image);
+    if (FAILED(ID2D1Effect_GetValue(&effect->ID2D1Effect_iface, D2D1_PROPERTY_CLSID, D2D1_PROPERTY_TYPE_CLSID,
+            (BYTE *)&id, sizeof(id))))
+        memset(&id, 0, sizeof(id));
+    return wine_dbg_sprintf("%p (effect %s, %u inputs, graph %s)", image, debugstr_guid(&id),
+            (unsigned int)effect->input_count, !effect->graph ? "none" : effect->graph->passthrough ? "pass-through" : "other");
+}
+
+/* The first input of an effect whose graph runs a custom pixel shader, which is not run here: drawing the input as
+ * it is shows the picture an app filters (rounding, tinting, fading) instead of nothing. NULL for anything else,
+ * built-in effects included. */
+ID2D1Image *d2d_effect_unrendered_input(ID2D1Image *image)
+{
+    struct d2d_transform_node *node;
+    struct d2d_effect *effect;
+    BOOL custom = FALSE;
+
+    if (!image || image->lpVtbl != &d2d_effect_image_vtbl) return NULL;
+    effect = impl_from_ID2D1Image(image);
+    if (!effect->graph) return NULL;
+    /* a pass-through graph is its input, rendered or not */
+    if (effect->graph->passthrough)
+    {
+        unsigned int index = effect->graph->passthrough_input;
+        if (index >= effect->input_count || !effect->inputs[index]) return NULL;
+        ID2D1Image_AddRef(effect->inputs[index]);
+        return effect->inputs[index];
+    }
+    if (!effect->input_count || !effect->inputs[0]) return NULL;
+    LIST_FOR_EACH_ENTRY(node, &effect->graph->nodes, struct d2d_transform_node, entry)
+    {
+        if (node->render_info && (node->render_info->mask & D2D_RENDER_INFO_PIXEL_SHADER)) custom = TRUE;
+    }
+    if (!custom) return NULL;
+    ID2D1Image_AddRef(effect->inputs[0]);
+    return effect->inputs[0];
+}
+
 static HRESULT STDMETHODCALLTYPE d2d_effect_image_QueryInterface(ID2D1Image *iface, REFIID iid, void **out)
 {
     struct d2d_effect *effect = impl_from_ID2D1Image(iface);
@@ -3403,25 +3639,32 @@ static ULONG STDMETHODCALLTYPE d2d_draw_info_Release(ID2D1DrawInfo *iface)
     TRACE("iface %p refcount %lu.\n", iface, refcount);
 
     if (!refcount)
+    {
+        free(render_info->ps_cb);
         free(render_info);
+    }
 
     return refcount;
 }
 
+/* Custom pixel shaders run with linear sampling into 8-bit intermediates (see d2d_device_context_render_effect),
+ * so what only shapes how they run is accepted and dropped: refusing made every Win2D PixelShaderEffect fail to be
+ * created (E_FAIL from SetDrawInfo), and the Microsoft Store's game posters, drawn through one, never appeared. */
 static HRESULT STDMETHODCALLTYPE d2d_draw_info_SetInputDescription(ID2D1DrawInfo *iface,
         UINT32 index, D2D1_INPUT_DESCRIPTION description)
 {
-    FIXME("iface %p, index %u stub.\n", iface, index);
+    TRACE("iface %p, index %u, filter %#x, level of detail %u.\n", iface, index, description.filter,
+            description.levelOfDetailCount);
 
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_draw_info_SetOutputBuffer(ID2D1DrawInfo *iface,
         D2D1_BUFFER_PRECISION precision, D2D1_CHANNEL_DEPTH depth)
 {
-    FIXME("iface %p, precision %u, depth %u stub.\n", iface, precision, depth);
+    TRACE("iface %p, precision %u, depth %u.\n", iface, precision, depth);
 
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 static void STDMETHODCALLTYPE d2d_draw_info_SetCached(ID2D1DrawInfo *iface, BOOL is_cached)
@@ -3438,9 +3681,18 @@ static void STDMETHODCALLTYPE d2d_draw_info_SetInstructionCountHint(ID2D1DrawInf
 static HRESULT STDMETHODCALLTYPE d2d_draw_info_SetPixelShaderConstantBuffer(ID2D1DrawInfo *iface,
         const BYTE *buffer, UINT32 size)
 {
-    FIXME("iface %p, buffer %p, size %u stub.\n", iface, buffer, size);
+    struct d2d_render_info *render_info = impl_from_ID2D1DrawInfo(iface);
+    BYTE *data = NULL;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, buffer %p, size %u.\n", iface, buffer, size);
+
+    if (size && !(data = malloc(size)))
+        return E_OUTOFMEMORY;
+    if (size) memcpy(data, buffer, size);
+    free(render_info->ps_cb);
+    render_info->ps_cb = data;
+    render_info->ps_cb_size = size;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_draw_info_SetResourceTexture(ID2D1DrawInfo *iface,
