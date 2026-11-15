@@ -14574,3 +14574,15 @@ for unchanged content. Two tours: at the "scrolled" point 1128 MB RSS / 690 MB p
 ~99 MB of copies dropped over the tour, 996 copies / 71 MB left. Revisiting Apps and Home re-reads them: within
 ~340-430 px of the first visit (rotating content). Pictures identical except the scroll position; calc AE 4120.98 and mp
 2835 twice. The end-of-tour figure ("back") moves with .NET's GC and is not a good comparison point.
+
+**Carousel, continued (same day, branch `store-carousel-wip`, commit `2de5037`).** The tracker now moves through an
+animated request (from its position to the landing point along the last key's easing, ValuesChanged every 16 ms tick,
+IdleStateEntered at the end; ~40 ValuesChanged a turn). With it no page goes blank, but the hero stays on page 2 for
+good. Measured why: the repeater has realized only pages -2..+2 (offsets -1359..+1359, absolute positions; the Store sets
+`AnimationTranslation` and `SnapPointOffset` once, to 0), and a breakpoint on WinUI's
+`ViewportManagerWithPlatformFeatures::UpdateViewport` (`Microsoft.UI.Xaml.dll+282f0@rdx+0:4`, WinUI 8.2501) shows
+ItemsRepeater getting (0,0,679.5x382.8) at start and then, 5 s in, an **empty** effective viewport (inf,inf,-inf,-inf),
+never updated after. XAML computes it (`CUIElement::ComputeEffectiveViewportChangedEventArgsAndNotifyLayoutManager`);
+viewport events come in pairs, one real and one empty, so it is not yet certain the empty one is the hero's repeater.
+Next: name the repeater behind each event (`rcx`), then find which ancestor's viewport XAML intersects to nothing
+(Home's ScrollViewer and its DirectManipulation viewport are the first suspect).
