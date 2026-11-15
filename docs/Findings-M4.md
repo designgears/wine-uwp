@@ -14607,3 +14607,21 @@ After visiting AI Hub and going back, its Lottie icon's progress (property set `
 (`Opacity ... at 0.448788 -> 0`). At start-up it rested at 0.328 with the outline visible; the Home icon's
 Selected->Normal ends at 0.021 and is fine. Not yet known whether the end state is wrong or our sampling at those
 values is.
+
+### Microsoft Store: Home's "Best selling games" posters - Win2D effects (2026-11-14, parked on `store-d2d-effects-wip`)
+
+The only error while Home scrolls to that row is the old P/Invoke-looking `Win32Exception: Call failed`
+(`WinStore.App.dll+0x9fbd9`). Its caller (`+0x28c5300`) makes a COM call through the CFG dispatcher and compares the
+result with `0x88990028` (D2DERR_EFFECT_IS_NOT_REGISTERED) and `0x80070490`; breakpoints before and after the call
+(`+0x28c53bf` target in rax, `+0x28c53c5` hr in rax) named it: our `d2d_device_context_CreateEffect`, E_FAIL for each
+poster. The effect is Win2D's PixelShaderEffect (`{65bf3da0-...}`, registered by the app), and `SetDrawInfo` failed
+because `ID2D1DrawInfo::SetInputDescription`, `SetPixelShaderConstantBuffer` and `SetOutputBuffer` were E_NOTIMPL. Behind
+it, one at a time: built-ins `UnPremultiply` (`fb9ac489`), `Border` (`2a2d49c0`) and `Tint` (`36312b17`, missing from
+Wine's IDL too) are not registered; and our d2d1 draws no effect image at all (`DrawImage`: bitmaps only; it records a
+custom shader's GUID and never runs it). The branch accepts the draw info, adds the three as pass-through built-ins,
+and draws pass-through effects as their input, `2DAffineTransform`/`Scale` as their input under the matrix, and a
+custom shader effect (not run) as its first input. Result: no `Call failed`, the Game Pass badges appear, and each
+poster is drawn (252x378 at 0.77 into a 194x368 drawing surface) - but the tiles show magnified fragments instead: the
+tiles' mask brushes still read a source surface at generation 0, and what shows is the backdrop layer, which the
+custom shader would blur. Not merged. Next: find which composition surface the poster's 194x368 drawing lands in and
+why the tile's mask brush does not see it; a real D2D effect renderer (custom pixel shaders included) is the full fix.
