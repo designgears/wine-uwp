@@ -15016,3 +15016,28 @@ another frame; the first damaged frame after it was the carousel's at +11 s. It 
 `request_repaint(1)` after rasterising, and the outline is there at t+6 s, when the Store has built it
 (`docs/screenshots/msstore-22609-rail-icon-repaint.png`). Idle CPU on Home unchanged in an old/new A/B (327 vs 327-331
 ticks in 40 s; the absolute number varies with what the carousels show). Calc AE 4120.98, mp 2835 twice.
+
+## 2026-11-15 - Store: "Sign in" and "Get" no longer crash or do nothing; Store installs are registered
+
+**Sign in** (profile menu) killed the Store: fail-fast 0x505 in `Windows.AccountsControl.dll` (the native
+AccountsSettingsPane), which delay-loads `ext-ms-win-session-usermgr-l1-1-0.dll!UMgrQueryUserContext` - an API set
+nothing in Wine answered. The caller (`GetCurrentUser`, PDB-named) is `HRESULT UMgrQueryUserContext(HANDLE token,
+ULONG64 *context)` and returns a failing HRESULT to its own caller, so `wtsapi32` now exports the four `UMgr*`
+functions with ERROR_NOT_SUPPORTED and `apisetschema` maps the API set to it. Sign in now does nothing visible
+(`docs/screenshots/msstore-22609-signin-no-crash.png`); a real account picker would need AccountsSettingsPane's
+internal ISignInStateManager / User path, which is further work.
+
+**Get** on a product page did nothing: `trace+seh` showed an access violation in `combase!WindowsDuplicateString` on
+HSTRING 1, swallowed by `user_callback_handler`. Our `AppInstallOptions` had the six pin/toast properties at the end
+of IAppInstallOptions and IAppInstallOptions2 starting at InstallForAllUsers; `winmd.py --sig` has them as the first
+twelve slots of IAppInstallOptions2. The Store's `put_PinToTaskbarAfterInstall(TRUE)` (slot 11) was our
+`put_CampaignId`. With the tables in metadata order, Get installs: WhatsApp 2.2644.101.0 (306 MB) downloaded,
+unpacked and staged with its Windows App SDK framework into `store-data/stage/5319275A.WhatsAppDesktop`, the item
+reporting Pending -> Downloading (real byte counts) -> Installing -> Completed.
+
+The page still says Get afterwards. The Store asks `FindPackagesByUserSecurityIdPackageFamilyNameWithPackageTypes`
+for the family, and our PackageManager knew only the running package and registered stand-ins. A finished install now
+registers its identity (from the stage's AppxManifest.xml) under `HKLM\Software\Wine\WineUWP\InstalledPackages\
+<family>`, which `standin.c` answers like a stand-in, and the Store receives the package - but still shows Get, even
+on a freshly opened page. What else it checks (package status, InstalledLocation, which is a stub for these, app list
+entries, a licence) is the next step. Calc AE 4120.98, mp 2835 twice.

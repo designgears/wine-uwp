@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     461d08662ca99af4f08514c23bd8ac81f2c073ab
-                 dcomp: Run LottieGen's controller-bound animations and gradient fills.
+  wine HEAD:     8f41003c675f2f99ff5b6f1f690ce90d33dd85b2
+                 dcomp: Trace implicit animation collections and group contents on dcompanim.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-15T14:09:17Z
+  captured:      2026-11-15T17:21:58Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

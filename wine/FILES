@@ -523,3 +523,5 @@ dlls/windows.security.authentication.onlineid/private.h
 dlls/windows.security.authentication.onlineid/ticket.c
 dlls/windows.media/adaptive.c
 dlls/d2d1/brush.c
+dlls/wtsapi32/wtsapi32.c
+dlls/wtsapi32/wtsapi32.spec

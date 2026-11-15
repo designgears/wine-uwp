@@ -230,6 +230,7 @@ static HRESULT WINAPI item_list_GetTrustLevel( IVectorView_AppInstallItem *iface
 
 static HRESULT WINAPI item_list_GetAt( IVectorView_AppInstallItem *iface, UINT32 index, IAppInstallItem **value )
 {
+    TRACE( "%p.\n", iface );
     struct item_list *impl = impl_from_IVectorView_AppInstallItem( iface );
 
     *value = NULL;
@@ -240,6 +241,7 @@ static HRESULT WINAPI item_list_GetAt( IVectorView_AppInstallItem *iface, UINT32
 
 static HRESULT WINAPI item_list_get_Size( IVectorView_AppInstallItem *iface, UINT32 *value )
 {
+    TRACE( "%p.\n", iface );
     *value = impl_from_IVectorView_AppInstallItem( iface )->count;
     return S_OK;
 }
@@ -265,6 +267,7 @@ static HRESULT WINAPI item_list_IndexOf( IVectorView_AppInstallItem *iface, IApp
 static HRESULT WINAPI item_list_GetMany( IVectorView_AppInstallItem *iface, UINT32 start, UINT32 count,
                                          IAppInstallItem **items, UINT32 *written )
 {
+    TRACE( "%p.\n", iface );
     struct item_list *impl = impl_from_IVectorView_AppInstallItem( iface );
 
     *written = 0;
@@ -347,6 +350,7 @@ static HRESULT WINAPI item_iterator_GetTrustLevel( IIterator_AppInstallItem *ifa
 
 static HRESULT WINAPI item_iterator_get_Current( IIterator_AppInstallItem *iface, IAppInstallItem **value )
 {
+    TRACE( "%p.\n", iface );
     struct item_iterator *impl = impl_from_IIterator_AppInstallItem( iface );
     return item_list_GetAt( &impl->list->IVectorView_AppInstallItem_iface, impl->index, value );
 }
@@ -361,6 +365,7 @@ static HRESULT WINAPI item_iterator_get_HasCurrent( IIterator_AppInstallItem *if
 
 static HRESULT WINAPI item_iterator_MoveNext( IIterator_AppInstallItem *iface, boolean *value )
 {
+    TRACE( "%p.\n", iface );
     struct item_iterator *impl = impl_from_IIterator_AppInstallItem( iface );
 
     if (impl->index < impl->list->count) impl->index++;
@@ -397,6 +402,7 @@ DEFINE_IINSPECTABLE( item_iterable, IIterable_AppInstallItem, struct item_list, 
 
 static HRESULT WINAPI item_iterable_First( IIterable_AppInstallItem *iface, IIterator_AppInstallItem **value )
 {
+    TRACE( "%p.\n", iface );
     struct item_list *impl = impl_from_IIterable_AppInstallItem( iface );
     struct item_iterator *iter;
 
@@ -701,28 +707,33 @@ static HRESULT WINAPI item_GetTrustLevel( IAppInstallItem *iface, TrustLevel *tr
 
 static HRESULT WINAPI item_get_ProductId( IAppInstallItem *iface, HSTRING *value )
 {
+    TRACE( "%p.\n", iface );
     return class_name( impl_from_IAppInstallItem( iface )->product_id, value );
 }
 
 static HRESULT WINAPI item_get_PackageFamilyName( IAppInstallItem *iface, HSTRING *value )
 {
+    TRACE( "%p.\n", iface );
     return class_name( impl_from_IAppInstallItem( iface )->family, value );
 }
 
 static HRESULT WINAPI item_get_InstallType( IAppInstallItem *iface, AppInstallType *value )
 {
+    TRACE( "%p.\n", iface );
     *value = AppInstallType_Update;
     return S_OK;
 }
 
 static HRESULT WINAPI item_get_IsUserInitiated( IAppInstallItem *iface, boolean *value )
 {
+    TRACE( "%p.\n", iface );
     *value = TRUE;
     return S_OK;
 }
 
 static HRESULT WINAPI item_GetCurrentStatus( IAppInstallItem *iface, IAppInstallStatus **value )
 {
+    TRACE( "%p.\n", iface );
     struct install_item *impl = impl_from_IAppInstallItem( iface );
     struct install_status *status;
 
@@ -737,6 +748,7 @@ static HRESULT WINAPI item_GetCurrentStatus( IAppInstallItem *iface, IAppInstall
     status->done = impl->done;
     status->error = impl->error;
     ReleaseSRWLockShared( &impl->lock );
+    TRACE( "%p: state %d, %I64u/%I64u, error %#lx.\n", iface, status->state, status->done, status->total, status->error );
     *value = &status->IAppInstallStatus_iface;
     return S_OK;
 }
@@ -916,6 +928,84 @@ static WCHAR *get_env( const WCHAR *name )
     return value;
 }
 
+/* One attribute of the manifest's <Identity>, from the UTF-8 text. */
+static BOOL identity_attr( const char *identity, const char *attr, WCHAR *out, int len )
+{
+    char key[64];
+    const char *p, *end;
+
+    snprintf( key, sizeof(key), " %s=\"", attr );
+    if (!(p = strstr( identity, key ))) return FALSE;
+    p += strlen( key );
+    if (!(end = strchr( p, '"' )) || end - p >= len) return FALSE;
+    out[MultiByteToWideChar( CP_UTF8, 0, p, end - p, out, len - 1 )] = 0;
+    return TRUE;
+}
+
+/* Register an installed package where appxdeploymentclient's PackageManager looks for packages other than the
+ * running one (HKLM\Software\Wine\WineUWP\InstalledPackages\<family>, standin.c): the Microsoft Store asks
+ * FindPackagesByUserSecurityId for the family it installed and kept offering "Get" when nothing answered. */
+static void register_installed( struct install_item *impl )
+{
+    static const struct { const WCHAR *name; DWORD value; } arches[] =
+        { { L"x86", 0 }, { L"arm", 5 }, { L"x64", 9 }, { L"neutral", 11 }, { L"arm64", 12 } };
+    WCHAR name[128], publisher[256], version[64], arch[16] = L"neutral", full[512], path[512], *manifest, *location;
+    const WCHAR *publisher_id;
+    char *text = NULL, *identity;
+    DWORD size, read, arch_value = 11;
+    unsigned int i;
+    HANDLE file;
+    HKEY key;
+
+    if (!(publisher_id = wcschr( impl->family, '_' ))) return;
+    publisher_id++;
+    if (!(manifest = dos_path( impl->stage, L"/AppxManifest.xml" ))) return;
+    location = dos_path( impl->stage, L"" );
+    file = CreateFileW( manifest, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+    free( manifest );
+    if (file == INVALID_HANDLE_VALUE) goto done;
+    size = GetFileSize( file, NULL );
+    if (size != INVALID_FILE_SIZE && (text = malloc( size + 1 )) && ReadFile( file, text, size, &read, NULL ))
+        text[read] = 0;
+    else if (text)
+    {
+        free( text );
+        text = NULL;
+    }
+    CloseHandle( file );
+    if (!text || !(identity = strstr( text, "<Identity" ))) goto done;
+    if ((identity = strdup( identity )) && strchr( identity, '>' )) *strchr( identity, '>' ) = 0;
+    if (!identity) goto done;
+    if (!identity_attr( identity, "Name", name, ARRAY_SIZE(name) ) ||
+        !identity_attr( identity, "Publisher", publisher, ARRAY_SIZE(publisher) ) ||
+        !identity_attr( identity, "Version", version, ARRAY_SIZE(version) ))
+    {
+        free( identity );
+        goto done;
+    }
+    identity_attr( identity, "ProcessorArchitecture", arch, ARRAY_SIZE(arch) );
+    free( identity );
+    for (i = 0; i < ARRAY_SIZE(arches); i++) if (!wcsicmp( arch, arches[i].name )) arch_value = arches[i].value;
+    swprintf( full, ARRAY_SIZE(full), L"%s_%s_%s__%s", name, version, arch, publisher_id );
+    swprintf( path, ARRAY_SIZE(path), L"Software\\Wine\\WineUWP\\InstalledPackages\\%s", impl->family );
+    if (RegCreateKeyExW( HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL )) goto done;
+#define SET_STRING(n, v) RegSetValueExW( key, n, 0, REG_SZ, (const BYTE *)(v), (wcslen( v ) + 1) * sizeof(WCHAR) )
+    SET_STRING( L"Name", name );
+    SET_STRING( L"Publisher", publisher );
+    SET_STRING( L"PublisherId", publisher_id );
+    SET_STRING( L"Version", version );
+    SET_STRING( L"FullName", full );
+    if (location) SET_STRING( L"Location", location );
+#undef SET_STRING
+    RegSetValueExW( key, L"Architecture", 0, REG_DWORD, (const BYTE *)&arch_value, sizeof(arch_value) );
+    RegCloseKey( key );
+    TRACE( "registered %s as %s at %s.\n", debugstr_w( impl->family ), debugstr_w( full ), debugstr_w( location ) );
+
+done:
+    free( text );
+    free( location );
+}
+
 static DWORD WINAPI install_thread( void *param )
 {
     struct install_item *impl = param;
@@ -964,7 +1054,11 @@ static DWORD WINAPI install_thread( void *param )
     canceled = impl->canceled;
     ReleaseSRWLockShared( &impl->lock );
     TRACE( "installer -> %#lx%s.\n", hr, progress.installed ? ", installed" : "" );
-    if (SUCCEEDED(hr) && progress.installed) item_set_state( impl, AppInstallState_Completed, S_OK );
+    if (SUCCEEDED(hr) && progress.installed)
+    {
+        register_installed( impl );
+        item_set_state( impl, AppInstallState_Completed, S_OK );
+    }
     else if (canceled) item_set_state( impl, AppInstallState_Canceled, S_OK );
     else item_set_state( impl, AppInstallState_Error, FAILED(hr) ? hr : E_FAIL );
 
@@ -1008,6 +1102,7 @@ static void item_start( struct install_item *impl )
 
 static HRESULT WINAPI item_Cancel( IAppInstallItem *iface )
 {
+    TRACE( "%p.\n", iface );
     struct install_item *impl = impl_from_IAppInstallItem( iface );
     BOOL running;
 
@@ -1025,12 +1120,14 @@ static HRESULT WINAPI item_Cancel( IAppInstallItem *iface )
 
 static HRESULT WINAPI item_Pause( IAppInstallItem *iface )
 {
+    TRACE( "%p.\n", iface );
     FIXME( "iface %p: pausing is not supported, the install goes on.\n", iface );
     return S_OK;
 }
 
 static HRESULT WINAPI item_Restart( IAppInstallItem *iface )
 {
+    TRACE( "%p.\n", iface );
     TRACE( "iface %p.\n", iface );
     item_start( impl_from_IAppInstallItem( iface ) );
     return S_OK;
@@ -1039,6 +1136,7 @@ static HRESULT WINAPI item_Restart( IAppInstallItem *iface )
 static HRESULT WINAPI item_add_Completed( IAppInstallItem *iface, ITypedEventHandler_AppInstallItem_IInspectable *handler,
                                           EventRegistrationToken *token )
 {
+    TRACE( "%p.\n", iface );
     return add_handler( &impl_from_IAppInstallItem( iface )->completed, (IUnknown *)handler, NULL, token );
 }
 
@@ -1050,6 +1148,7 @@ static HRESULT WINAPI item_remove_Completed( IAppInstallItem *iface, EventRegist
 static HRESULT WINAPI item_add_StatusChanged( IAppInstallItem *iface, ITypedEventHandler_AppInstallItem_IInspectable *handler,
                                               EventRegistrationToken *token )
 {
+    TRACE( "%p.\n", iface );
     return add_handler( &impl_from_IAppInstallItem( iface )->status_changed, (IUnknown *)handler, NULL, token );
 }
 
@@ -1626,7 +1725,7 @@ struct install_options
     IInspectable *volume;
 };
 
-static const void *install_options_vtbl[28], *install_options2_vtbl[14];
+static const void *install_options_vtbl[18], *install_options2_vtbl[24];
 
 static struct install_options *install_options_from( void *iface )
 {
@@ -1796,7 +1895,7 @@ static HRESULT WINAPI install_options_put_InstallInProgressToastNotificationMode
     return S_OK;
 }
 
-static const void *install_options_vtbl[28] =
+static const void *install_options_vtbl[18] =
 {
     install_options_QueryInterface,
     install_options_AddRef,
@@ -1816,6 +1915,19 @@ static const void *install_options_vtbl[28] =
     install_options_put_TargetVolume,
     install_options_get_LaunchAfterInstall,
     install_options_put_LaunchAfterInstall,
+};
+
+/* IAppInstallOptions2 starts with the pin and toast properties; with them in the first table, the Store's
+ * put_PinToTaskbarAfterInstall(TRUE) here was our put_CampaignId, which read HSTRING 1 and faulted: "Get" did
+ * nothing (the fault was swallowed in a window procedure). */
+static const void *install_options2_vtbl[24] =
+{
+    install_options_QueryInterface,
+    install_options_AddRef,
+    install_options_Release,
+    install_options_GetIids,
+    install_options_GetRuntimeClassName,
+    install_options_GetTrustLevel,
     install_options_get_PinToDesktopAfterInstall,
     install_options_put_PinToDesktopAfterInstall,
     install_options_get_PinToStartAfterInstall,
@@ -1826,16 +1938,6 @@ static const void *install_options_vtbl[28] =
     install_options_put_CompletedInstallToastNotificationMode,
     install_options_get_InstallInProgressToastNotificationMode,
     install_options_put_InstallInProgressToastNotificationMode,
-};
-
-static const void *install_options2_vtbl[14] =
-{
-    install_options_QueryInterface,
-    install_options_AddRef,
-    install_options_Release,
-    install_options_GetIids,
-    install_options_GetRuntimeClassName,
-    install_options_GetTrustLevel,
     install_options_get_InstallForAllUsers,
     install_options_put_InstallForAllUsers,
     install_options_get_StageButDoNotInstall,

@@ -16,6 +16,8 @@
  *   HKLM\Software\Wine\WineUWP\StandInPackages\<family name>
  *     Name, Publisher, PublisherId, Version ("a.b.c.d"), Architecture (DWORD), FullName
  * and PackageManager reports it as installed, so the app does not try to install it.
+ * Packages the Microsoft Store installed are registered the same way, with a Location, under
+ *   HKLM\Software\Wine\WineUWP\InstalledPackages\<family name>
  */
 
 #define WIDL_using_Windows_System
@@ -302,7 +304,13 @@ HRESULT standin_package_create( const WCHAR *family, IPackage **out )
 
     *out = NULL;
     swprintf( path, ARRAY_SIZE(path), L"Software\\Wine\\WineUWP\\StandInPackages\\%s", family );
-    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &key )) return S_FALSE;
+    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &key ))
+    {
+        /* a package the Store's install control installed (windows.applicationmodel.store.preview.installcontrol
+         * register_installed), with the same values */
+        swprintf( path, ARRAY_SIZE(path), L"Software\\Wine\\WineUWP\\InstalledPackages\\%s", family );
+        if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &key )) return S_FALSE;
+    }
     if (!(impl = calloc( 1, sizeof(*impl) )))
     {
         RegCloseKey( key );

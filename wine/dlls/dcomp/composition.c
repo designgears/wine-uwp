@@ -2254,6 +2254,7 @@ static struct matrix_transform *manip_matrix_from_animation( void *animation );
 static struct propset_value *expr_resolve_value( void *animation, enum propset_type type );
 static BOOL expr_evaluate_scalar_product( struct expr_animation *expr, float *out );
 static const char *debugstr_animation( void *animation );
+static const char *debugstr_animation_group( void *animation );
 static const WCHAR *debug_bound_opacity( struct expr_animation *expr );
 static BOOL expr_resolve_colorrgb( void *animation, Color *color );
 struct expr_animation;
@@ -2620,7 +2621,7 @@ static HRESULT WINAPI object2_view_get_ImplicitAnimations( void *iface, IUnknown
 static HRESULT WINAPI object2_view_put_ImplicitAnimations( void *iface, IUnknown *value )
 {
     struct object2_view *view = iface;
-    TRACE( "%p implicit animations %p: not run.\n", view->owner, value );
+    TRACE_(dcompanim)( "object %p implicit animations %p\n", view->owner, value );
     if (value) IUnknown_AddRef( value );
     if (view->implicit) IUnknown_Release( view->implicit );
     view->implicit = value;
@@ -3178,6 +3179,7 @@ static HRESULT WINAPI comp_map_Insert( void *iface, HSTRING key, IUnknown *value
     const WCHAR *str = key ? WindowsGetStringRawBuffer( key, NULL ) : NULL;
 
     TRACE( "%p, key %s, value %p.\n", map, debugstr_hstring( key ), value );
+    TRACE_(dcompanim)( "map %p [%s] = %s\n", map, debugstr_hstring( key ), debugstr_animation( value ) );
     if (replaced) *replaced = entry != NULL;
     if (!entry)
     {
@@ -8069,7 +8071,7 @@ static HRESULT WINAPI dcv_object2_put_ImplicitAnimations( void *iface, void *val
     IUnknown *old;
 
     scene_changed();
-    TRACE( "%p implicit animations %p: not run.\n", iface, value );
+    TRACE_(dcompanim)( "dcomp visual %p implicit animations %p\n", v, value );
     if (value) IUnknown_AddRef( (IUnknown *)value );
     old = InterlockedExchangePointer( (void **)&v->implicit_animations, value );
     if (old) IUnknown_Release( old );
@@ -17809,7 +17811,12 @@ static const char *debugstr_animation( void *animation )
     struct expr_animation *expr = expr_animation_from_any( animation );
 
     if (expr) return wine_dbg_sprintf( "expression %s", debugstr_w( expr->expression ) );
-    if (!kf) return wine_dbg_sprintf( "%p (not ours)", animation );
+    if (!kf)
+    {
+        const char *group = debugstr_animation_group( animation );
+        if (group) return group;
+        return wine_dbg_sprintf( "%p (not ours, vtbl %p)", animation, *(void **)animation );
+    }
     if (!kf->has_value) return wine_dbg_sprintf( "key frames %p (%u keys, no value)", kf, kf->key_count );
     switch (kf->value_kind)
     {
@@ -23406,6 +23413,13 @@ static struct animation_group *animation_group_from( void *iface )
     return NULL;
 }
 
+static const char *debugstr_animation_group( void *animation )
+{
+    struct animation_group *group = animation_group_from( animation );
+    if (!group) return NULL;
+    if (!group->count) return wine_dbg_sprintf( "group %p (empty)", group );
+    return wine_dbg_sprintf( "group %p (%u, first %s)", group, group->count, debugstr_animation( group->items[0] ) );
+}
 static HRESULT WINAPI animation_group_QueryInterface( void *iface, REFIID iid, void **out )
 {
     if (IsEqualGUID( iid, &IID_IClosable )) return create_closable_view( iface, out );
@@ -23473,6 +23487,7 @@ static HRESULT WINAPI animation_group_Add( void *iface, IUnknown *value )
     HRESULT hr = S_OK;
 
     TRACE( "animation group %p add %p.\n", group, value );
+    TRACE_(dcompanim)( "group %p add %s\n", group, value ? debugstr_animation( value ) : "NULL" );
     if (!value) return E_INVALIDARG;
     EnterCriticalSection( &group->cs );
     if (group->count == group->capacity)

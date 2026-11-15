@@ -627,6 +627,7 @@ apiset ext-ms-win-security-deviceid-l1-1-0 =
 apiset ext-ms-win-security-kerberos-l1-1-0 = kerberos.dll
 apiset ext-ms-win-security-slc-l1-1-0 = slc.dll
 apiset ext-ms-win-security-winscard-l1-1-1 = winscard.dll
+apiset ext-ms-win-session-usermgr-l1-1-0 = wtsapi32.dll
 apiset ext-ms-win-session-usertoken-l1-1-0 = wtsapi32.dll
 apiset ext-ms-win-session-winlogon-notify-l1-1-0 =
 apiset ext-ms-win-session-winsta-l1-1-4 = winsta.dll
