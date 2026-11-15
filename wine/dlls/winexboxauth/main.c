@@ -40,6 +40,10 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
         *factory = game_save_provider_factory();
     else if (!wcscmp( name, L"Windows.Networking.XboxLive.XboxLiveDeviceAddress" ))
         *factory = device_address_factory();
+    else if (!wcscmp( name, L"Windows.UI.ApplicationSettings.AccountsSettingsPane" ))
+        *factory = accounts_pane_factory();
+    else if (!wcscmp( name, L"Windows.UI.ApplicationSettings.WebAccountProviderCommand" ))
+        *factory = provider_command_factory();
     else
     {
         TRACE( "%s: no stand-in\n", debugstr_w(name) );

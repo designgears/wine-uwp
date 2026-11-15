@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     a88e4384f0277d1062c0723e49ca63dd0163e37d
-                 appxdeploymentclient: App list entries that launch the Store's installs; wineuwp: links for DRIVE_VIEW apps.
+  wine HEAD:     72cb9032cc48e984eaeba104ae2158dc7a84934d
+                 winexboxauth: An AccountsSettingsPane that picks the Microsoft account; interactive tokens sign in.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-15T19:44:27Z
+  captured:      2026-11-15T20:33:41Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

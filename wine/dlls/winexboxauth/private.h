@@ -361,6 +361,8 @@ IActivationFactory *web_auth_manager_factory( void );
 IActivationFactory *store_configuration_factory( void );
 IActivationFactory *game_save_provider_factory( void );
 IActivationFactory *device_address_factory( void );
+IActivationFactory *accounts_pane_factory( void );
+IActivationFactory *provider_command_factory( void );
 
 BYTE *buffer_bytes( IInspectable *buffer, UINT32 *length, UINT32 *capacity );
 IInspectable *buffer_create( BYTE *bytes, UINT32 size );

@@ -1108,6 +1108,16 @@ static HRESULT token_work( struct async *op, void *ctx )
     struct request_result *result;
     char *id = stored_msa_account();
 
+    /* An interactive request with no Microsoft account here signs in, as Windows' account broker would: the user
+     * approves a code in their browser (microsoft.com/link), the same flow as the Xbox app's sign-in. The Microsoft
+     * Store's "Sign in" reaches this through AccountsSettingsPane; before, it was answered UserCancel at once. */
+    if (!w->xsts && w->msa && !id && w->ui)
+    {
+        HRESULT hr = sign_in_with_device_code( &op->cancelled );
+        TRACE( "  no Microsoft account: device-code sign-in -> %#lx\n", hr );
+        id = stored_msa_account();
+    }
+
     if (w->xsts) result = xsts_token_result( w );
     else if (!w->msa) result = request_result_create( WTRS_PROVIDER_NOT_AVAILABLE, w->scope );
     else if (!id) result = request_result_create( w->ui ? WTRS_USER_CANCEL : WTRS_USER_INTERACTION_REQUIRED, w->scope );
@@ -1442,4 +1452,579 @@ IActivationFactory *web_auth_manager_factory( void )
         InitOnceComplete( &once, 0, NULL );
     }
     return (IActivationFactory *)&wacm_factory.vtbl[0];
+}
+
+/* ---- AccountsSettingsPane: the account picker ----
+ *
+ * Windows shows it in a broker of its own (Windows.AccountsControl.dll, which needs the user manager and the
+ * shell); it asks the app for its commands (AccountCommandsRequested) and runs the one the user picks. Here the
+ * picker picks for the user: the Microsoft account command if the app offered one, else the first, invoked on the
+ * app's UI thread through its CoreDispatcher once the app's deferral (if it took one) is complete. The app then asks
+ * WebAuthenticationCoreManager for a token, which is ours above. The Microsoft Store's "Sign in" goes this way. */
+
+static const GUID IID_IAccountsSettingsPane = {0x81ea942c,0x4f09,0x4406,{0xa5,0x38,0x83,0x8d,0x9b,0x14,0xb7,0xe6}};
+static const GUID IID_IAccountsSettingsPaneStatics = {0x561f8b60,0xb0ec,0x4150,{0xa8,0xdc,0x20,0x8e,0xe4,0x4b,0x06,0x8a}};
+static const GUID IID_IAccountsSettingsPaneStatics2 = {0xd21df7c2,0xce0d,0x484f,{0xb8,0xe8,0xe8,0x23,0xc2,0x15,0x76,0x5e}};
+static const GUID IID_IAccountsSettingsPaneStatics3 = {0x08410458,0xa2ba,0x4c6f,{0xb4,0xac,0x48,0xf5,0x14,0x33,0x12,0x16}};
+static const GUID IID_IPaneCommandsRequestedArgs = {0x3b68c099,0xdb19,0x45d0,{0x9a,0xbf,0x95,0xd3,0x77,0x3c,0x93,0x30}};
+static const GUID IID_IPaneCommandsRequestedArgs2 = {0x362f7bad,0x4e37,0x4967,{0x8c,0x40,0xe7,0x8e,0xe7,0xa1,0xe5,0xbb}};
+static const GUID IID_IPaneEventDeferral = {0xcbf25d3f,0xe5ba,0x40ef,{0x93,0xda,0x65,0xe0,0x96,0xe5,0xfb,0x04}};
+static const GUID IID_IWebAccountProviderCommand = {0xd69bdd9a,0xa0a6,0x4e9b,{0x88,0xdc,0xc7,0x1e,0x75,0x7a,0x35,0x01}};
+static const GUID IID_IWebAccountProviderCommandFactory = {0xd5658a1b,0xb176,0x4776,{0x84,0x69,0xa9,0xd3,0xff,0x0b,0x3f,0x59}};
+static const GUID IID_ICoreWindowStatic_ = {0x4d239005,0x3c2a,0x41b1,{0x90,0x22,0x53,0x6b,0xb9,0xcf,0x93,0xb1}};
+static const GUID IID_DispatchedHandler_ = {0xd1f276c4,0x98d8,0x4636,{0xbf,0x49,0xeb,0x79,0x50,0x75,0x48,0xe9}};
+
+/* IVector<T>, IVectorView<T>, IIterable<T>, IIterator<T> of the four command kinds (piid.py --signature) */
+struct vector_kind { GUID vector, view, iterable, iterator; const WCHAR *name; };
+static const struct vector_kind provider_commands =
+{
+    {0xd376abf3,0xf0c1,0x5233,{0x9f,0x42,0xde,0x53,0x18,0x84,0x96,0x3e}}, {0xb2d19260,0x1827,0x5d88,{0xb9,0x48,0x96,0x88,0xcf,0xcd,0x63,0xae}},
+    {0x15165367,0x2e93,0x59a6,{0xb5,0xc7,0x16,0xd3,0xb5,0x8f,0xd2,0xe7}}, {0x82d7cd74,0x8e33,0x5f06,{0x92,0xfc,0x91,0x51,0x38,0xaa,0xcb,0xde}},
+    L"Windows.Foundation.Collections.IVector`1<Windows.UI.ApplicationSettings.WebAccountProviderCommand>"
+};
+static const struct vector_kind account_commands =
+{
+    {0x64e864c8,0x7fef,0x5df5,{0xa6,0x24,0x50,0xb5,0x77,0xf4,0x85,0x54}}, {0x207eaa3e,0x5ec9,0x5bd4,{0xa1,0xd2,0x73,0x17,0x9a,0x81,0x28,0xa8}},
+    {0xbd0d999c,0xb2ba,0x51b2,{0xbc,0xc0,0xd4,0xa5,0xcd,0x82,0x15,0x55}}, {0x8cbb62b6,0xbd9c,0x5486,{0x9d,0x14,0x9c,0xc4,0x62,0x7b,0x32,0xd4}},
+    L"Windows.Foundation.Collections.IVector`1<Windows.UI.ApplicationSettings.WebAccountCommand>"
+};
+static const struct vector_kind credential_commands =
+{
+    {0xb6af1cb5,0xf60e,0x5b08,{0xb3,0x12,0x2e,0xb5,0x11,0x35,0xcf,0xc6}}, {0x95cc1bba,0xc279,0x5ee5,{0xa5,0x24,0x78,0x01,0x2b,0x7f,0xe1,0x7e}},
+    {0x883ed18d,0x4dbb,0x58f2,{0x8f,0xd2,0xe4,0xb0,0x18,0x50,0x95,0x53}}, {0x9f1177f1,0x85bb,0x5cd0,{0x9b,0x08,0xa0,0xb4,0x7a,0x76,0x4c,0x75}},
+    L"Windows.Foundation.Collections.IVector`1<Windows.UI.ApplicationSettings.CredentialCommand>"
+};
+static const struct vector_kind settings_commands =
+{
+    {0x10bd9cdd,0x3767,0x5e96,{0x90,0x22,0xf0,0x0f,0x9c,0xbd,0x62,0x41}}, {0x67b64d17,0x4245,0x5d7c,{0xbf,0xb4,0x6b,0x68,0xdd,0x52,0x58,0x77}},
+    {0x6308e7e8,0xcb85,0x5339,{0xa3,0xe9,0x9a,0x75,0x00,0xd1,0x9c,0x68}}, {0x2f071c24,0x4a58,0x5a00,{0xa2,0x94,0xc7,0x16,0x2e,0x98,0xc2,0xa0}},
+    L"Windows.Foundation.Collections.IVector`1<Windows.UI.ApplicationSettings.SettingsCommand>"
+};
+
+/* a mutable IVector<T> of interfaces, with its IIterable<T> */
+struct cmd_vector
+{
+    struct object obj;
+    const struct vector_kind *kind;
+    CRITICAL_SECTION cs;
+    IInspectable **items;
+    UINT32 count, capacity;
+};
+static struct cmd_vector *cmd_vector_from( void *iface, int n ) { return CONTAINING_RECORD( OBJ_AT(iface, n), struct cmd_vector, obj ); }
+static void cmd_vector_destroy( struct object *obj )
+{
+    struct cmd_vector *v = CONTAINING_RECORD( obj, struct cmd_vector, obj );
+    UINT32 i;
+    for (i = 0; i < v->count; i++) IInspectable_Release( v->items[i] );
+    free( v->items );
+    DeleteCriticalSection( &v->cs );
+}
+static struct vector_view *cmd_vector_snapshot( struct cmd_vector *v )
+{
+    struct vector_view *view = vector_view_create( &v->kind->view, &v->kind->iterable, &v->kind->iterator, v->kind->name );
+    UINT32 i;
+    if (!view) return NULL;
+    EnterCriticalSection( &v->cs );
+    for (i = 0; i < v->count; i++)
+    {
+        IInspectable_AddRef( v->items[i] );
+        vector_view_add( view, v->items[i] );
+    }
+    LeaveCriticalSection( &v->cs );
+    return view;
+}
+static HRESULT cmd_vector_insert( struct cmd_vector *v, UINT32 index, IInspectable *item )
+{
+    HRESULT hr = S_OK;
+    EnterCriticalSection( &v->cs );
+    if (index > v->count) hr = E_BOUNDS;
+    else if (v->count == v->capacity)
+    {
+        UINT32 capacity = max( 4, v->capacity * 2 );
+        IInspectable **items = realloc( v->items, capacity * sizeof(*items) );
+        if (!items) hr = E_OUTOFMEMORY;
+        else { v->items = items; v->capacity = capacity; }
+    }
+    if (SUCCEEDED(hr))
+    {
+        memmove( v->items + index + 1, v->items + index, (v->count - index) * sizeof(*v->items) );
+        if (item) IInspectable_AddRef( item );
+        v->items[index] = item;
+        v->count++;
+    }
+    LeaveCriticalSection( &v->cs );
+    return hr;
+}
+static HRESULT WINAPI cmdv_GetAt( void *iface, UINT32 index, IInspectable **value )
+{
+    struct cmd_vector *v = cmd_vector_from( iface, 0 );
+    HRESULT hr = S_OK;
+    EnterCriticalSection( &v->cs );
+    if (index >= v->count) { *value = NULL; hr = E_BOUNDS; }
+    else if ((*value = v->items[index])) IInspectable_AddRef( *value );
+    LeaveCriticalSection( &v->cs );
+    return hr;
+}
+static HRESULT WINAPI cmdv_get_Size( void *iface, UINT32 *value ) { *value = cmd_vector_from( iface, 0 )->count; return S_OK; }
+static HRESULT WINAPI cmdv_GetView( void *iface, void **value )
+{
+    struct vector_view *view = cmd_vector_snapshot( cmd_vector_from( iface, 0 ) );
+    if (!view) return E_OUTOFMEMORY;
+    *value = &view->obj.vtbl[0];
+    return S_OK;
+}
+static HRESULT WINAPI cmdv_IndexOf( void *iface, IInspectable *item, UINT32 *index, boolean *found )
+{
+    struct cmd_vector *v = cmd_vector_from( iface, 0 );
+    UINT32 i;
+    *found = FALSE;
+    *index = 0;
+    EnterCriticalSection( &v->cs );
+    for (i = 0; i < v->count; i++) if (v->items[i] == item) { *index = i; *found = TRUE; break; }
+    LeaveCriticalSection( &v->cs );
+    return S_OK;
+}
+static HRESULT WINAPI cmdv_SetAt( void *iface, UINT32 index, IInspectable *item )
+{
+    struct cmd_vector *v = cmd_vector_from( iface, 0 );
+    IInspectable *old = NULL;
+    HRESULT hr = S_OK;
+    EnterCriticalSection( &v->cs );
+    if (index >= v->count) hr = E_BOUNDS;
+    else
+    {
+        old = v->items[index];
+        if (item) IInspectable_AddRef( item );
+        v->items[index] = item;
+    }
+    LeaveCriticalSection( &v->cs );
+    if (old) IInspectable_Release( old );
+    return hr;
+}
+static HRESULT WINAPI cmdv_InsertAt( void *iface, UINT32 index, IInspectable *item ) { return cmd_vector_insert( cmd_vector_from( iface, 0 ), index, item ); }
+static HRESULT WINAPI cmdv_RemoveAt( void *iface, UINT32 index )
+{
+    struct cmd_vector *v = cmd_vector_from( iface, 0 );
+    IInspectable *old = NULL;
+    HRESULT hr = S_OK;
+    EnterCriticalSection( &v->cs );
+    if (index >= v->count) hr = E_BOUNDS;
+    else
+    {
+        old = v->items[index];
+        memmove( v->items + index, v->items + index + 1, (v->count - index - 1) * sizeof(*v->items) );
+        v->count--;
+    }
+    LeaveCriticalSection( &v->cs );
+    if (old) IInspectable_Release( old );
+    return hr;
+}
+static HRESULT WINAPI cmdv_Append( void *iface, IInspectable *item )
+{
+    struct cmd_vector *v = cmd_vector_from( iface, 0 );
+    TRACE( "AccountsSettingsPane: %s item %p\n", debugstr_w(v->kind->name), item );
+    return cmd_vector_insert( v, v->count, item );
+}
+static HRESULT WINAPI cmdv_RemoveAtEnd( void *iface )
+{
+    struct cmd_vector *v = cmd_vector_from( iface, 0 );
+    return v->count ? cmdv_RemoveAt( iface, v->count - 1 ) : E_BOUNDS;
+}
+static HRESULT WINAPI cmdv_Clear( void *iface )
+{
+    struct cmd_vector *v = cmd_vector_from( iface, 0 );
+    while (v->count) cmdv_RemoveAt( iface, v->count - 1 );
+    return S_OK;
+}
+static HRESULT WINAPI cmdv_GetMany( void *iface, UINT32 start, UINT32 size, IInspectable **items, UINT32 *actual )
+{
+    struct cmd_vector *v = cmd_vector_from( iface, 0 );
+    UINT32 i;
+    EnterCriticalSection( &v->cs );
+    for (i = 0; start + i < v->count && i < size; i++)
+        if ((items[i] = v->items[start + i])) IInspectable_AddRef( items[i] );
+    LeaveCriticalSection( &v->cs );
+    *actual = i;
+    return S_OK;
+}
+static HRESULT WINAPI cmdv_ReplaceAll( void *iface, UINT32 count, IInspectable **items )
+{
+    struct cmd_vector *v = cmd_vector_from( iface, 0 );
+    UINT32 i;
+    HRESULT hr = S_OK;
+    cmdv_Clear( iface );
+    for (i = 0; i < count && SUCCEEDED(hr); i++) hr = cmd_vector_insert( v, v->count, items[i] );
+    return hr;
+}
+static HRESULT WINAPI cmdv_First( void *iface, void **value )
+{
+    struct vector_view *view = cmd_vector_snapshot( cmd_vector_from( iface, 1 ) );
+    void *iterable;
+    HRESULT hr;
+    if (!view) return E_OUTOFMEMORY;
+    hr = obj_QueryInterface( &view->obj, &cmd_vector_from( iface, 1 )->kind->iterable, &iterable );
+    obj_Release( &view->obj );
+    if (FAILED(hr)) return hr;
+    hr = SLOT(iterable, 6, HRESULT (WINAPI *)( void *, void ** ))( iterable, value );
+    IUnknown_Release( (IUnknown *)iterable );
+    return hr;
+}
+static const void *cmdv_vtbl[] =
+{
+    OBJ_METHODS(0), cmdv_GetAt, cmdv_get_Size, cmdv_GetView, cmdv_IndexOf, cmdv_SetAt, cmdv_InsertAt, cmdv_RemoveAt,
+    cmdv_Append, cmdv_RemoveAtEnd, cmdv_Clear, cmdv_GetMany, cmdv_ReplaceAll
+};
+static const void *cmdv_iterable_vtbl[] = { OBJ_METHODS(1), cmdv_First };
+
+static struct cmd_vector *cmd_vector_create( const struct vector_kind *kind )
+{
+    struct cmd_vector *v = object_create( sizeof(*v), kind->name, "AccountsSettingsPane vector", cmd_vector_destroy );
+    if (!v) return NULL;
+    v->kind = kind;
+    InitializeCriticalSection( &v->cs );
+    object_add( &v->obj, cmdv_vtbl, &kind->vector );
+    object_add( &v->obj, cmdv_iterable_vtbl, &kind->iterable );
+    return v;
+}
+
+/* AccountsSettingsPaneCommandsRequestedEventArgs, with its deferral */
+struct pane_args
+{
+    struct object obj;
+    struct cmd_vector *providers, *accounts, *credentials, *settings;
+    HSTRING header;
+    LONG deferrals;
+    HANDLE done;                /* set when the last deferral completes */
+};
+static struct pane_args *pane_args_from( void *iface, int n ) { return CONTAINING_RECORD( OBJ_AT(iface, n), struct pane_args, obj ); }
+static void pane_args_destroy( struct object *obj )
+{
+    struct pane_args *a = CONTAINING_RECORD( obj, struct pane_args, obj );
+    obj_Release( &a->providers->obj );
+    obj_Release( &a->accounts->obj );
+    obj_Release( &a->credentials->obj );
+    obj_Release( &a->settings->obj );
+    WindowsDeleteString( a->header );
+    CloseHandle( a->done );
+}
+static HRESULT vector_out( struct cmd_vector *v, void **value )
+{
+    obj_AddRef( &v->obj );
+    *value = &v->obj.vtbl[0];
+    return S_OK;
+}
+static HRESULT WINAPI args_get_WebAccountProviderCommands( void *iface, void **value ) { return vector_out( pane_args_from( iface, 0 )->providers, value ); }
+static HRESULT WINAPI args_get_WebAccountCommands( void *iface, void **value ) { return vector_out( pane_args_from( iface, 0 )->accounts, value ); }
+static HRESULT WINAPI args_get_CredentialCommands( void *iface, void **value ) { return vector_out( pane_args_from( iface, 0 )->credentials, value ); }
+static HRESULT WINAPI args_get_Commands( void *iface, void **value ) { return vector_out( pane_args_from( iface, 0 )->settings, value ); }
+static HRESULT WINAPI args_get_HeaderText( void *iface, HSTRING *value ) { return WindowsDuplicateString( pane_args_from( iface, 0 )->header, value ); }
+static HRESULT WINAPI args_put_HeaderText( void *iface, HSTRING value )
+{
+    struct pane_args *a = pane_args_from( iface, 0 );
+    HSTRING old = a->header;
+    HRESULT hr = WindowsDuplicateString( value, &a->header );
+    WindowsDeleteString( old );
+    return hr;
+}
+
+struct pane_deferral { struct object obj; struct pane_args *args; LONG completed; };
+static void deferral_destroy( struct object *obj ) { obj_Release( &CONTAINING_RECORD( obj, struct pane_deferral, obj )->args->obj ); }
+static HRESULT WINAPI deferral_Complete( void *iface )
+{
+    struct pane_deferral *d = CONTAINING_RECORD( OBJ_AT(iface, 0), struct pane_deferral, obj );
+    if (InterlockedExchange( &d->completed, 1 )) return S_OK;
+    TRACE( "AccountsSettingsPane: deferral complete\n" );
+    if (!InterlockedDecrement( &d->args->deferrals )) SetEvent( d->args->done );
+    return S_OK;
+}
+static const void *deferral_vtbl[] = { OBJ_METHODS(0), deferral_Complete };
+static HRESULT WINAPI args_GetDeferral( void *iface, void **value )
+{
+    struct pane_args *a = pane_args_from( iface, 0 );
+    struct pane_deferral *d = object_create( sizeof(*d), L"Windows.UI.ApplicationSettings.AccountsSettingsPaneEventDeferral",
+                                             "AccountsSettingsPaneEventDeferral", deferral_destroy );
+    if (!d) return E_OUTOFMEMORY;
+    object_add( &d->obj, deferral_vtbl, &IID_IPaneEventDeferral );
+    obj_AddRef( &a->obj );
+    d->args = a;
+    InterlockedIncrement( &a->deferrals );
+    TRACE( "AccountsSettingsPane: deferral taken\n" );
+    *value = &d->obj.vtbl[0];
+    return S_OK;
+}
+static HRESULT WINAPI args2_get_User( void *iface, void **value ) { *value = NULL; return S_OK; }
+static const void *args_vtbl[] =
+{
+    OBJ_METHODS(0), args_get_WebAccountProviderCommands, args_get_WebAccountCommands, args_get_CredentialCommands,
+    args_get_Commands, args_get_HeaderText, args_put_HeaderText, args_GetDeferral
+};
+static const void *args2_vtbl[] = { OBJ_METHODS(1), args2_get_User };
+
+static struct pane_args *pane_args_create( void )
+{
+    struct pane_args *a = object_create( sizeof(*a), L"Windows.UI.ApplicationSettings.AccountsSettingsPaneCommandsRequestedEventArgs",
+                                         "AccountsSettingsPaneCommandsRequestedEventArgs", pane_args_destroy );
+    if (!a) return NULL;
+    object_add( &a->obj, args_vtbl, &IID_IPaneCommandsRequestedArgs );
+    object_add( &a->obj, args2_vtbl, &IID_IPaneCommandsRequestedArgs2 );
+    a->providers = cmd_vector_create( &provider_commands );
+    a->accounts = cmd_vector_create( &account_commands );
+    a->credentials = cmd_vector_create( &credential_commands );
+    a->settings = cmd_vector_create( &settings_commands );
+    a->done = CreateEventW( NULL, TRUE, FALSE, NULL );
+    return a;
+}
+
+/* WebAccountProviderCommand: a provider and the app's handler for it */
+struct provider_command { struct object obj; IInspectable *provider; IUnknown *invoked; };
+static void provider_command_destroy( struct object *obj )
+{
+    struct provider_command *c = CONTAINING_RECORD( obj, struct provider_command, obj );
+    if (c->provider) IInspectable_Release( c->provider );
+    if (c->invoked) IUnknown_Release( c->invoked );
+}
+static HRESULT WINAPI pcmd_get_WebAccountProvider( void *iface, IInspectable **value )
+{
+    struct provider_command *c = CONTAINING_RECORD( OBJ_AT(iface, 0), struct provider_command, obj );
+    if ((*value = c->provider)) IInspectable_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI pcmd_get_Invoked( void *iface, IUnknown **value )
+{
+    struct provider_command *c = CONTAINING_RECORD( OBJ_AT(iface, 0), struct provider_command, obj );
+    if ((*value = c->invoked)) IUnknown_AddRef( *value );
+    return S_OK;
+}
+static const void *pcmd_vtbl[] = { OBJ_METHODS(0), pcmd_get_WebAccountProvider, pcmd_get_Invoked };
+
+static HRESULT WINAPI pcmd_factory_ActivateInstance( void *iface, IInspectable **out ) { *out = NULL; return E_NOTIMPL; }
+static HRESULT WINAPI pcmd_factory_Create( void *iface, IInspectable *provider, IUnknown *invoked, void **out )
+{
+    struct provider_command *c = object_create( sizeof(*c), L"Windows.UI.ApplicationSettings.WebAccountProviderCommand",
+                                                "WebAccountProviderCommand", provider_command_destroy );
+    if (!c) return E_OUTOFMEMORY;
+    object_add( &c->obj, pcmd_vtbl, &IID_IWebAccountProviderCommand );
+    if ((c->provider = provider)) IInspectable_AddRef( provider );
+    if ((c->invoked = invoked)) IUnknown_AddRef( invoked );
+    TRACE( "WebAccountProviderCommand(%p, %p)\n", provider, invoked );
+    *out = &c->obj.vtbl[0];
+    return S_OK;
+}
+static const void *pcmd_activation_vtbl[] = { OBJ_METHODS(0), pcmd_factory_ActivateInstance };
+static const void *pcmd_factory_vtbl[] = { OBJ_METHODS(1), pcmd_factory_Create };
+static struct object pcmd_factory;
+
+IActivationFactory *provider_command_factory( void )
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    BOOL pending = FALSE;
+
+    if (InitOnceBeginInitialize( &once, 0, &pending, NULL ) && pending)
+    {
+        object_init_static( &pcmd_factory, L"Windows.UI.ApplicationSettings.WebAccountProviderCommand", "WebAccountProviderCommand" );
+        object_add( &pcmd_factory, pcmd_activation_vtbl, &IID_IActivationFactory );
+        object_add( &pcmd_factory, pcmd_factory_vtbl, &IID_IWebAccountProviderCommandFactory );
+        InitOnceComplete( &once, 0, NULL );
+    }
+    return (IActivationFactory *)&pcmd_factory.vtbl[0];
+}
+
+/* the pane: one per process, with its AccountCommandsRequested event */
+static struct object pane;
+static struct events pane_requested;
+
+static HRESULT WINAPI pane_add_AccountCommandsRequested( void *iface, IUnknown *handler, INT64 *token )
+{
+    TRACE( "AccountsSettingsPane.AccountCommandsRequested += %p\n", handler );
+    return events_add( &pane_requested, handler, token );
+}
+static HRESULT WINAPI pane_remove_AccountCommandsRequested( void *iface, INT64 token ) { return events_remove( &pane_requested, token ); }
+static const void *pane_vtbl[] = { OBJ_METHODS(0), pane_add_AccountCommandsRequested, pane_remove_AccountCommandsRequested };
+
+/* a provider's id, from the command */
+static char *command_provider_id( IInspectable *command )
+{
+    IInspectable *provider = NULL;
+    HSTRING h = NULL;
+    char *id = NULL;
+
+    if (FAILED(SLOT(command, 6, HRESULT (WINAPI *)( void *, IInspectable ** ))( command, &provider )) || !provider) return NULL;
+    if (SUCCEEDED(SLOT(provider, 6, HRESULT (WINAPI *)( void *, HSTRING * ))( provider, &h )))
+    {
+        id = from_hstr( h );
+        WindowsDeleteString( h );
+    }
+    IInspectable_Release( provider );
+    return id;
+}
+
+/* DispatchedHandler: runs the picked command on the UI thread */
+struct pick { struct object obj; IInspectable *command; };
+static void pick_destroy( struct object *obj ) { IInspectable_Release( CONTAINING_RECORD( obj, struct pick, obj )->command ); }
+static void invoke_command( IInspectable *command )
+{
+    IUnknown *invoked = NULL;
+    if (FAILED(SLOT(command, 7, HRESULT (WINAPI *)( void *, IUnknown ** ))( command, &invoked )) || !invoked)
+    {
+        WARN( "AccountsSettingsPane: the command has no handler\n" );
+        return;
+    }
+    HRESULT hr;
+    TRACE( "AccountsSettingsPane: invoking %p\n", command );
+    hr = SLOT(invoked, 3, HRESULT (WINAPI *)( IUnknown *, IInspectable * ))( invoked, command );
+    TRACE( "AccountsSettingsPane: the command's handler returned %#lx\n", hr );
+    IUnknown_Release( invoked );
+}
+static HRESULT WINAPI pick_Invoke( void *iface )
+{
+    invoke_command( CONTAINING_RECORD( OBJ_AT(iface, 0), struct pick, obj )->command );
+    return S_OK;
+}
+static const void *pick_vtbl[] = { UNK_METHODS(0), pick_Invoke };
+
+struct show { struct pane_args *args; IInspectable *dispatcher; };
+static void show_free( void *ctx )
+{
+    struct show *s = ctx;
+    obj_Release( &s->args->obj );
+    if (s->dispatcher) IInspectable_Release( s->dispatcher );
+    free( s );
+}
+static HRESULT show_work( struct async *op, void *ctx )
+{
+    struct show *s = ctx;
+    IInspectable *chosen = NULL, *item;
+    UINT32 i;
+
+    if (s->args->deferrals && WaitForSingleObject( s->args->done, 120000 ))
+        WARN( "AccountsSettingsPane: the app's deferral did not complete\n" );
+    EnterCriticalSection( &s->args->providers->cs );
+    for (i = 0; i < s->args->providers->count; i++)
+    {
+        char *id = command_provider_id( (item = s->args->providers->items[i]) );
+        TRACE( "AccountsSettingsPane: provider command %u: %s\n", i, S(id) );
+        if (!chosen || (id && !_stricmp( id, MSA_PROVIDER_ID ))) chosen = item;
+        free( id );
+    }
+    if (chosen) IInspectable_AddRef( chosen );
+    LeaveCriticalSection( &s->args->providers->cs );
+    if (!chosen)
+    {
+        WARN( "AccountsSettingsPane: the app offered no account provider\n" );
+        return S_OK;
+    }
+    if (s->dispatcher)
+    {
+        struct pick *p = object_create( sizeof(*p), L"Windows.UI.Core.DispatchedHandler", "DispatchedHandler", pick_destroy );
+        IUnknown *action = NULL;
+        HRESULT hr = E_OUTOFMEMORY;
+
+        if (p)
+        {
+            object_add( &p->obj, pick_vtbl, &IID_DispatchedHandler_ );
+            p->command = chosen;
+            IInspectable_AddRef( chosen );
+            /* CoreDispatcher.RunAsync( Normal, handler ) */
+            hr = SLOT(s->dispatcher, 8, HRESULT (WINAPI *)( void *, INT32, void *, IUnknown ** ))( s->dispatcher, 0, &p->obj.vtbl[0],
+                                                                                                    &action );
+            obj_Release( &p->obj );
+        }
+        if (action) IUnknown_Release( action );
+        if (FAILED(hr))
+        {
+            WARN( "AccountsSettingsPane: RunAsync failed, hr %#lx; invoking here\n", hr );
+            invoke_command( chosen );
+        }
+    }
+    else invoke_command( chosen );
+    IInspectable_Release( chosen );
+    TRACE( "AccountsSettingsPane: closed\n" );
+    return S_OK;
+}
+
+/* the calling thread's CoreDispatcher, if it is a view's thread */
+static IInspectable *current_dispatcher( void )
+{
+    static const WCHAR name[] = L"Windows.UI.Core.CoreWindow";
+    IInspectable *statics = NULL, *window = NULL, *dispatcher = NULL;
+    HSTRING str;
+
+    if (FAILED(WindowsCreateString( name, ARRAY_SIZE(name) - 1, &str ))) return NULL;
+    if (SUCCEEDED(RoGetActivationFactory( str, &IID_ICoreWindowStatic_, (void **)&statics )))
+    {
+        if (SUCCEEDED(SLOT(statics, 6, HRESULT (WINAPI *)( void *, IInspectable ** ))( statics, &window )) && window)
+        {
+            SLOT(window, 9, HRESULT (WINAPI *)( void *, IInspectable ** ))( window, &dispatcher );
+            IInspectable_Release( window );
+        }
+        IInspectable_Release( statics );
+    }
+    WindowsDeleteString( str );
+    return dispatcher;
+}
+
+static HRESULT show_pane( const char *what, void **out )
+{
+    struct show *s;
+    struct async *op;
+
+    TRACE( "AccountsSettingsPane.%s\n", what );
+    if (!(s = calloc( 1, sizeof(*s) )) || !(s->args = pane_args_create()))
+    {
+        free( s );
+        return E_OUTOFMEMORY;
+    }
+    s->dispatcher = current_dispatcher();
+    /* on the caller's thread, as the broker raises it on the view's */
+    events_raise( &pane_requested, &pane.vtbl[0], &s->args->obj.vtbl[0] );
+    if (!(op = async_start( &IID_IAsyncAction_, R_ACTION, what, show_work, s, show_free )))
+    {
+        show_free( s );
+        return E_OUTOFMEMORY;
+    }
+    if (out) *out = &op->obj.vtbl[0];
+    else obj_Release( &op->obj );
+    return S_OK;
+}
+
+static HRESULT WINAPI pane_statics_GetForCurrentView( void *iface, void **value )
+{
+    obj_AddRef( &pane );
+    *value = &pane.vtbl[0];
+    return S_OK;
+}
+static HRESULT WINAPI pane_statics_Show( void *iface ) { return show_pane( "Show", NULL ); }
+static HRESULT WINAPI pane_statics_ShowManageAccountsAsync( void *iface, void **out ) { return show_pane( "ShowManageAccountsAsync", out ); }
+static HRESULT WINAPI pane_statics_ShowAddAccountAsync( void *iface, void **out ) { return show_pane( "ShowAddAccountAsync", out ); }
+static HRESULT WINAPI pane_statics_ShowManageAccountsForUserAsync( void *iface, void *user, void **out ) { return show_pane( "ShowManageAccountsForUserAsync", out ); }
+static HRESULT WINAPI pane_statics_ShowAddAccountForUserAsync( void *iface, void *user, void **out ) { return show_pane( "ShowAddAccountForUserAsync", out ); }
+static HRESULT WINAPI pane_ActivateInstance( void *iface, IInspectable **out ) { *out = NULL; return E_NOTIMPL; }
+
+static const void *pane_activation_vtbl[] = { OBJ_METHODS(0), pane_ActivateInstance };
+static const void *pane_statics_vtbl[] = { OBJ_METHODS(1), pane_statics_GetForCurrentView, pane_statics_Show };
+static const void *pane_statics2_vtbl[] = { OBJ_METHODS(2), pane_statics_ShowManageAccountsAsync, pane_statics_ShowAddAccountAsync };
+static const void *pane_statics3_vtbl[] =
+{
+    OBJ_METHODS(3), pane_statics_ShowManageAccountsForUserAsync, pane_statics_ShowAddAccountForUserAsync
+};
+static struct object pane_factory;
+
+IActivationFactory *accounts_pane_factory( void )
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    BOOL pending = FALSE;
+
+    if (InitOnceBeginInitialize( &once, 0, &pending, NULL ) && pending)
+    {
+        events_init( &pane_requested );
+        object_init_static( &pane, L"Windows.UI.ApplicationSettings.AccountsSettingsPane", "AccountsSettingsPane" );
+        object_add( &pane, pane_vtbl, &IID_IAccountsSettingsPane );
+        object_init_static( &pane_factory, L"Windows.UI.ApplicationSettings.AccountsSettingsPane", "AccountsSettingsPane" );
+        object_add( &pane_factory, pane_activation_vtbl, &IID_IActivationFactory );
+        object_add( &pane_factory, pane_statics_vtbl, &IID_IAccountsSettingsPaneStatics );
+        object_add( &pane_factory, pane_statics2_vtbl, &IID_IAccountsSettingsPaneStatics2 );
+        object_add( &pane_factory, pane_statics3_vtbl, &IID_IAccountsSettingsPaneStatics3 );
+        InitOnceComplete( &once, 0, NULL );
+    }
+    return (IActivationFactory *)&pane_factory.vtbl[0];
 }

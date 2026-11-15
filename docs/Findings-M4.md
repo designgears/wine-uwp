@@ -15072,3 +15072,22 @@ never reached the Store: wineuwp started its activation inbox only after `drive_
 Microsoft Solitaire Collection 4.27.9181.0 into `store-data/stage`, the page showed **Play**
 (`msstore-22609-solitaire-play-button.png`), and Play started it: its splash after 40 s
 (`msstore-22609-play-launches-solitaire.png`, a raw screen capture). Calc AE 4120.98, mp 2835 twice.
+
+## 2026-11-15 - Store: Sign in reaches the Microsoft account device code
+
+Windows' account picker (`Windows.AccountsControl.dll`) cannot run here; since the wtsapi32 UMgr fix, Sign in did
+nothing. `winexboxauth` now serves `AccountsSettingsPane` and `WebAccountProviderCommand` (registered by
+wineuwp-setup). Traced with `trace+xboxauth`, the Store subscribes `AccountCommandsRequested`, calls
+`ShowManageAccountsForUserAsync`, takes a deferral, asks `FindAccountProviderAsync("https://login.microsoft.com",
+"consumers")`, creates a command with our factory, appends it and completes the deferral. The pane then invokes the
+Microsoft account command on the UI thread through `CoreWindow.GetForCurrentThread().Dispatcher.RunAsync` (the Store's
+handler awaits UI work; from the worker it did nothing). The Store then calls `GetTokenSilentlyAsync` (status 3, user
+interaction required) and `RequestTokenAsync` for `service::www.microsoft.com::mbi_ssl` (client
+`{d6d5a677-0872-4ab0-9442-bb792fce85c5}`), which answered UserCancel with no stored account. An interactive request
+now runs `sign_in_with_device_code` (the Xbox app's flow): a real device code from Microsoft and
+`https://www.microsoft.com/link?otc=CODE` opened in the browser (logged under `WINE_UWP_LAUNCHER=log`). Approving the
+code is a human signing into their account, not tested here. The collection IIDs for the pane's four command vectors
+are `piid.py --signature` values (`IVector<WebAccountProviderCommand>` d376abf3, ...). Calc AE 4120.98, mp 2835 twice.
+
+Also seen: the start-up fail-fast at `WinStore.App.dll+2f609e1` once more (a run with `trace+xboxauth` and
+`WINE_UWP_TRACE_ORIGINATE=1`), then 0 in 11 repeats with the same settings.
