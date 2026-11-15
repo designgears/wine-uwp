@@ -15041,3 +15041,13 @@ registers its identity (from the stage's AppxManifest.xml) under `HKLM\Software\
 <family>`, which `standin.c` answers like a stand-in, and the Store receives the package - but still shows Get, even
 on a freshly opened page. What else it checks (package status, InstalledLocation, which is a stub for these, app list
 entries, a licence) is the next step. Calc AE 4120.98, mp 2835 twice.
+
+Follow-up, same day: the Store took the package from the family lookup and still said Get. It also enumerates with no
+family (`FindPackagesByUserSecurityIdWithPackageTypes`, types 33), which returned only itself, and it QIs each
+package for IPackage2 (`a6612fb6`) and IPackage4 (`65aed1ae`, SignatureKind). Package lists hold any number of
+packages now, an unfiltered query adds every `InstalledPackages` entry, and those answer IPackage2 (display names
+from the registry, else Name/Publisher) and IPackage4 (SignatureKind Store unless a `SignatureKind` DWORD says
+otherwise). WhatsApp's page shows **Installed** (`docs/screenshots/msstore-22609-whatsapp-installed.png`) and
+Library lists it (`msstore-22609-library-installed.png`). Windows would say Open: that needs
+`IPackage3::GetAppListEntriesAsync` (a stub) and an AppListEntry whose LaunchAsync starts the stage, which nothing
+in Wine implements yet. "Acquired a long time ago" is the Store's entitlement date (signed out), not InstalledDate.

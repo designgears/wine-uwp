@@ -22,13 +22,14 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(appx);
 
-/* The only package a hosted process can see is its own, so a result holds at most one element.
+/* A hosted process sees its own package and the ones the Microsoft Store installed (standin.c).
  * An empty result is a real answer ("nothing else is installed"), not a refusal. */
 struct package_list
 {
     IIterable_Package IIterable_Package_iface;
     LONG ref;
-    IPackage *package; /* may be NULL */
+    IPackage **packages;
+    UINT32 count;
 };
 
 struct package_iterator
@@ -99,7 +100,7 @@ static HRESULT WINAPI iterator_GetTrustLevel( IIterator_Package *iface, TrustLev
 
 static UINT32 list_size( struct package_list *list )
 {
-    return list->package ? 1 : 0;
+    return list->count;
 }
 
 static HRESULT WINAPI iterator_get_Current( IIterator_Package *iface, IPackage **value )
@@ -111,7 +112,7 @@ static HRESULT WINAPI iterator_get_Current( IIterator_Package *iface, IPackage *
     if (!value) return E_POINTER;
     *value = NULL;
     if (impl->index >= list_size( impl->list )) return E_BOUNDS;
-    IPackage_AddRef( (*value = impl->list->package) );
+    IPackage_AddRef( (*value = impl->list->packages[impl->index]) );
     return S_OK;
 }
 
@@ -145,7 +146,7 @@ static HRESULT WINAPI iterator_GetMany( IIterator_Package *iface, UINT32 items_s
 
     while (n < items_size && impl->index < list_size( impl->list ))
     {
-        IPackage_AddRef( (items[n++] = impl->list->package) );
+        IPackage_AddRef( (items[n++] = impl->list->packages[impl->index]) );
         impl->index++;
     }
     *count = n;
@@ -200,7 +201,9 @@ static ULONG WINAPI list_Release( IIterable_Package *iface )
 
     if (!ref)
     {
-        if (impl->package) IPackage_Release( impl->package );
+        UINT32 i;
+        for (i = 0; i < impl->count; i++) IPackage_Release( impl->packages[i] );
+        free( impl->packages );
         free( impl );
     }
     return ref;
@@ -256,17 +259,30 @@ static const struct IIterable_PackageVtbl list_vtbl =
     list_First,
 };
 
-HRESULT package_list_create( IPackage *package, IIterable_Package **out )
+/* takes a reference to each package */
+HRESULT package_list_create_array( IPackage **packages, UINT32 count, IIterable_Package **out )
 {
     struct package_list *impl;
+    UINT32 i;
 
     *out = NULL;
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    if (count && !(impl->packages = malloc( count * sizeof(*impl->packages) )))
+    {
+        free( impl );
+        return E_OUTOFMEMORY;
+    }
     impl->IIterable_Package_iface.lpVtbl = &list_vtbl;
     impl->ref = 1;
-    if ((impl->package = package)) IPackage_AddRef( package );
+    for (i = 0; i < count; i++) IPackage_AddRef( (impl->packages[i] = packages[i]) );
+    impl->count = count;
     *out = &impl->IIterable_Package_iface;
     return S_OK;
+}
+
+HRESULT package_list_create( IPackage *package, IIterable_Package **out )
+{
+    return package_list_create_array( &package, package ? 1 : 0, out );
 }
 
 /* Package change notifications (ordinals 39 and 40). Windows.ApplicationModel registers with the

@@ -34,11 +34,17 @@ struct standin
     IPackageId IPackageId_iface;
     IPackage3 IPackage3_iface;
     IPackageStatus IPackageStatus_iface;
+    IPackage2 IPackage2_iface;
+    const void **package4_vtbl;     /* IPackage4, see package4_vtbl */
     LONG ref;
     WCHAR name[128], publisher[256], publisher_id[32], full_name[256], family[256];
+    WCHAR display_name[256], publisher_display_name[256];
+    DWORD signature_kind;           /* PackageSignatureKind */
     PackageVersion version;
     ProcessorArchitecture arch;
 };
+
+static const GUID IID_IPackage4_local = { 0x65aed1ae, 0xb95b, 0x450c, { 0x88, 0x2b, 0x62, 0x55, 0x18, 0x7f, 0x39, 0x7e } };
 
 static inline struct standin *impl_from_IPackage( IPackage *iface )
 {
@@ -60,6 +66,17 @@ static HRESULT WINAPI standin_QueryInterface( IPackage *iface, REFIID iid, void 
         IInspectable_AddRef( (*out = &impl->IPackage3_iface) );
         return S_OK;
     }
+    /* the Microsoft Store reads both before it counts a package as one of its installs */
+    if (IsEqualGUID( iid, &IID_IPackage2 ))
+    {
+        IInspectable_AddRef( (*out = &impl->IPackage2_iface) );
+        return S_OK;
+    }
+    if (IsEqualGUID( iid, &IID_IPackage4_local ))
+    {
+        IInspectable_AddRef( (*out = &impl->package4_vtbl) );
+        return S_OK;
+    }
     FIXME( "%s: %s not implemented, returning E_NOINTERFACE.\n", debugstr_w(impl->family), debugstr_guid( iid ) );
     *out = NULL;
     return E_NOINTERFACE;
@@ -78,21 +95,28 @@ static ULONG WINAPI standin_Release( IPackage *iface )
     return ref;
 }
 
-static HRESULT WINAPI standin_GetIids( IPackage *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
+static HRESULT WINAPI standin_GetIids( IPackage *iface, ULONG *count, IID **iids )
+{
+    TRACE( "%p\n", iface );
+    return E_NOTIMPL;
+}
 
 static HRESULT WINAPI standin_GetRuntimeClassName( IPackage *iface, HSTRING *name )
 {
+    TRACE( "%p\n", iface );
     return WindowsCreateString( L"Windows.ApplicationModel.Package", 32, name );
 }
 
 static HRESULT WINAPI standin_GetTrustLevel( IPackage *iface, TrustLevel *level )
 {
+    TRACE( "%p\n", iface );
     *level = BaseTrust;
     return S_OK;
 }
 
 static HRESULT WINAPI standin_get_Id( IPackage *iface, IPackageId **value )
 {
+    TRACE( "%p\n", iface );
     struct standin *impl = impl_from_IPackage( iface );
     IPackage_AddRef( iface );
     *value = &impl->IPackageId_iface;
@@ -101,6 +125,7 @@ static HRESULT WINAPI standin_get_Id( IPackage *iface, IPackageId **value )
 
 static HRESULT WINAPI standin_get_InstalledLocation( IPackage *iface, IStorageFolder **value )
 {
+    TRACE( "%p\n", iface );
     FIXME( "%s: no installed location\n", debugstr_w(impl_from_IPackage( iface )->family) );
     *value = NULL;
     return E_NOTIMPL;
@@ -108,12 +133,14 @@ static HRESULT WINAPI standin_get_InstalledLocation( IPackage *iface, IStorageFo
 
 static HRESULT WINAPI standin_get_IsFramework( IPackage *iface, boolean *value )
 {
+    TRACE( "%p\n", iface );
     *value = FALSE;
     return S_OK;
 }
 
 static HRESULT WINAPI standin_get_Dependencies( IPackage *iface, IVectorView_Package **value )
 {
+    TRACE( "%p\n", iface );
     static const struct vector_iids iids =
     {
         .vector = &IID_IVector_Package,
@@ -166,37 +193,69 @@ static HRESULT WINAPI id_QueryInterface( IPackageId *iface, REFIID iid, void **o
 
 static ULONG WINAPI id_AddRef( IPackageId *iface ) { return standin_AddRef( &impl_from_IPackageId( iface )->IPackage_iface ); }
 static ULONG WINAPI id_Release( IPackageId *iface ) { return standin_Release( &impl_from_IPackageId( iface )->IPackage_iface ); }
-static HRESULT WINAPI id_GetIids( IPackageId *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
+static HRESULT WINAPI id_GetIids( IPackageId *iface, ULONG *count, IID **iids )
+{
+    TRACE( "%p\n", iface );
+    return E_NOTIMPL;
+}
 
 static HRESULT WINAPI id_GetRuntimeClassName( IPackageId *iface, HSTRING *name )
 {
+    TRACE( "%p\n", iface );
     return WindowsCreateString( L"Windows.ApplicationModel.PackageId", 34, name );
 }
 
 static HRESULT WINAPI id_GetTrustLevel( IPackageId *iface, TrustLevel *level )
 {
+    TRACE( "%p\n", iface );
     *level = BaseTrust;
     return S_OK;
 }
 
 static HRESULT string( const WCHAR *s, HSTRING *value ) { return WindowsCreateString( s, wcslen( s ), value ); }
 
-static HRESULT WINAPI id_get_Name( IPackageId *iface, HSTRING *value ) { return string( impl_from_IPackageId( iface )->name, value ); }
+static HRESULT WINAPI id_get_Name( IPackageId *iface, HSTRING *value )
+{
+    TRACE( "%p\n", iface );
+    return string( impl_from_IPackageId( iface )->name, value );
+}
 static HRESULT WINAPI id_get_Version( IPackageId *iface, PackageVersion *value )
 {
+    TRACE( "%p\n", iface );
     *value = impl_from_IPackageId( iface )->version;
     return S_OK;
 }
 static HRESULT WINAPI id_get_Architecture( IPackageId *iface, ProcessorArchitecture *value )
 {
+    TRACE( "%p\n", iface );
     *value = impl_from_IPackageId( iface )->arch;
     return S_OK;
 }
-static HRESULT WINAPI id_get_ResourceId( IPackageId *iface, HSTRING *value ) { return string( L"", value ); }
-static HRESULT WINAPI id_get_Publisher( IPackageId *iface, HSTRING *value ) { return string( impl_from_IPackageId( iface )->publisher, value ); }
-static HRESULT WINAPI id_get_PublisherId( IPackageId *iface, HSTRING *value ) { return string( impl_from_IPackageId( iface )->publisher_id, value ); }
-static HRESULT WINAPI id_get_FullName( IPackageId *iface, HSTRING *value ) { return string( impl_from_IPackageId( iface )->full_name, value ); }
-static HRESULT WINAPI id_get_FamilyName( IPackageId *iface, HSTRING *value ) { return string( impl_from_IPackageId( iface )->family, value ); }
+static HRESULT WINAPI id_get_ResourceId( IPackageId *iface, HSTRING *value )
+{
+    TRACE( "%p\n", iface );
+    return string( L"", value );
+}
+static HRESULT WINAPI id_get_Publisher( IPackageId *iface, HSTRING *value )
+{
+    TRACE( "%p\n", iface );
+    return string( impl_from_IPackageId( iface )->publisher, value );
+}
+static HRESULT WINAPI id_get_PublisherId( IPackageId *iface, HSTRING *value )
+{
+    TRACE( "%p\n", iface );
+    return string( impl_from_IPackageId( iface )->publisher_id, value );
+}
+static HRESULT WINAPI id_get_FullName( IPackageId *iface, HSTRING *value )
+{
+    TRACE( "%p\n", iface );
+    return string( impl_from_IPackageId( iface )->full_name, value );
+}
+static HRESULT WINAPI id_get_FamilyName( IPackageId *iface, HSTRING *value )
+{
+    TRACE( "%p\n", iface );
+    return string( impl_from_IPackageId( iface )->family, value );
+}
 
 static const struct IPackageIdVtbl id_vtbl =
 {
@@ -221,6 +280,7 @@ DEFINE_IINSPECTABLE( standin3, IPackage3, struct standin, IPackage_iface );
 
 static HRESULT WINAPI standin3_get_Status( IPackage3 *iface, IPackageStatus **value )
 {
+    TRACE( "%p\n", iface );
     struct standin *impl = impl_from_IPackage3( iface );
     IPackage_AddRef( &impl->IPackage_iface );
     *value = &impl->IPackageStatus_iface;
@@ -229,6 +289,7 @@ static HRESULT WINAPI standin3_get_Status( IPackage3 *iface, IPackageStatus **va
 
 static HRESULT WINAPI standin3_get_InstalledDate( IPackage3 *iface, DateTime *value )
 {
+    TRACE( "%p\n", iface );
     FILETIME ft;
     GetSystemTimeAsFileTime( &ft );
     value->UniversalTime = ((UINT64)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
@@ -237,6 +298,7 @@ static HRESULT WINAPI standin3_get_InstalledDate( IPackage3 *iface, DateTime *va
 
 static HRESULT WINAPI standin3_GetAppListEntriesAsync( IPackage3 *iface, IAsyncOperation_IVectorView_AppListEntry **operation )
 {
+    TRACE( "%p\n", iface );
     FIXME( "%s: stub!\n", debugstr_w(impl_from_IPackage3( iface )->family) );
     return E_NOTIMPL;
 }
@@ -269,14 +331,31 @@ static HRESULT WINAPI status_QueryInterface( IPackageStatus *iface, REFIID iid, 
 }
 static ULONG WINAPI status_AddRef( IPackageStatus *iface ) { return standin_AddRef( &impl_from_IPackageStatus( iface )->IPackage_iface ); }
 static ULONG WINAPI status_Release( IPackageStatus *iface ) { return standin_Release( &impl_from_IPackageStatus( iface )->IPackage_iface ); }
-static HRESULT WINAPI status_GetIids( IPackageStatus *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
+static HRESULT WINAPI status_GetIids( IPackageStatus *iface, ULONG *count, IID **iids )
+{
+    TRACE( "%p\n", iface );
+    return E_NOTIMPL;
+}
 static HRESULT WINAPI status_GetRuntimeClassName( IPackageStatus *iface, HSTRING *name )
 {
+    TRACE( "%p\n", iface );
     return WindowsCreateString( L"Windows.ApplicationModel.PackageStatus", 38, name );
 }
-static HRESULT WINAPI status_GetTrustLevel( IPackageStatus *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
-static HRESULT WINAPI status_true( IPackageStatus *iface, boolean *value ) { *value = TRUE; return S_OK; }
-static HRESULT WINAPI status_false( IPackageStatus *iface, boolean *value ) { *value = FALSE; return S_OK; }
+static HRESULT WINAPI status_GetTrustLevel( IPackageStatus *iface, TrustLevel *level )
+{
+    TRACE( "%p\n", iface );
+    *level = BaseTrust; return S_OK;
+}
+static HRESULT WINAPI status_true( IPackageStatus *iface, boolean *value )
+{
+    TRACE( "%p\n", iface );
+    *value = TRUE; return S_OK;
+}
+static HRESULT WINAPI status_false( IPackageStatus *iface, boolean *value )
+{
+    TRACE( "%p\n", iface );
+    *value = FALSE; return S_OK;
+}
 
 static const struct IPackageStatusVtbl status_vtbl =
 {
@@ -285,6 +364,68 @@ static const struct IPackageStatusVtbl status_vtbl =
     status_true,   /* VerifyIsOK */
     status_false, status_false, status_false, status_false, status_false, status_false,
     status_false, status_false, status_false, status_false, status_false,
+};
+
+static HRESULT string( const WCHAR *s, HSTRING *value );
+
+/* IPackage2 */
+static inline struct standin *impl_from_IPackage2( IPackage2 *iface ) { return CONTAINING_RECORD( iface, struct standin, IPackage2_iface ); }
+static HRESULT WINAPI package2_QueryInterface( IPackage2 *iface, REFIID iid, void **out ) { return standin_QueryInterface( &impl_from_IPackage2( iface )->IPackage_iface, iid, out ); }
+static ULONG WINAPI package2_AddRef( IPackage2 *iface ) { return standin_AddRef( &impl_from_IPackage2( iface )->IPackage_iface ); }
+static ULONG WINAPI package2_Release( IPackage2 *iface ) { return standin_Release( &impl_from_IPackage2( iface )->IPackage_iface ); }
+static HRESULT WINAPI package2_GetIids( IPackage2 *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
+static HRESULT WINAPI package2_GetRuntimeClassName( IPackage2 *iface, HSTRING *name ) { return string( L"Windows.ApplicationModel.Package", name ); }
+static HRESULT WINAPI package2_GetTrustLevel( IPackage2 *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
+static HRESULT WINAPI package2_get_DisplayName( IPackage2 *iface, HSTRING *value )
+{
+    struct standin *impl = impl_from_IPackage2( iface );
+    TRACE( "%p\n", iface );
+    return string( impl->display_name[0] ? impl->display_name : impl->name, value );
+}
+static HRESULT WINAPI package2_get_PublisherDisplayName( IPackage2 *iface, HSTRING *value )
+{
+    struct standin *impl = impl_from_IPackage2( iface );
+    TRACE( "%p\n", iface );
+    return string( impl->publisher_display_name[0] ? impl->publisher_display_name : impl->publisher, value );
+}
+static HRESULT WINAPI package2_get_Description( IPackage2 *iface, HSTRING *value ) { return string( L"", value ); }
+static HRESULT WINAPI package2_get_Logo( IPackage2 *iface, IUriRuntimeClass **value ) { *value = NULL; return S_OK; }
+static HRESULT WINAPI package2_false( IPackage2 *iface, boolean *value ) { *value = FALSE; return S_OK; }
+
+static const struct IPackage2Vtbl package2_vtbl =
+{
+    package2_QueryInterface, package2_AddRef, package2_Release,
+    package2_GetIids, package2_GetRuntimeClassName, package2_GetTrustLevel,
+    package2_get_DisplayName, package2_get_PublisherDisplayName, package2_get_Description, package2_get_Logo,
+    package2_false, package2_false, package2_false,
+};
+
+/* IPackage4 {65aed1ae}, not in our IDL: 6 get_SignatureKind, 7 get_IsOptional, 8 VerifyContentIntegrityAsync */
+static struct standin *impl_from_package4( void *iface ) { return CONTAINING_RECORD( iface, struct standin, package4_vtbl ); }
+static HRESULT WINAPI package4_QueryInterface( void *iface, REFIID iid, void **out ) { return standin_QueryInterface( &impl_from_package4( iface )->IPackage_iface, iid, out ); }
+static ULONG WINAPI package4_AddRef( void *iface ) { return standin_AddRef( &impl_from_package4( iface )->IPackage_iface ); }
+static ULONG WINAPI package4_Release( void *iface ) { return standin_Release( &impl_from_package4( iface )->IPackage_iface ); }
+static HRESULT WINAPI package4_GetIids( void *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
+static HRESULT WINAPI package4_GetRuntimeClassName( void *iface, HSTRING *name ) { return string( L"Windows.ApplicationModel.Package", name ); }
+static HRESULT WINAPI package4_GetTrustLevel( void *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
+static HRESULT WINAPI package4_get_SignatureKind( void *iface, INT32 *value )
+{
+    TRACE( "%p -> %lu\n", iface, impl_from_package4( iface )->signature_kind );
+    *value = impl_from_package4( iface )->signature_kind;
+    return S_OK;
+}
+static HRESULT WINAPI package4_get_IsOptional( void *iface, boolean *value ) { *value = FALSE; return S_OK; }
+static HRESULT WINAPI package4_VerifyContentIntegrityAsync( void *iface, void **operation )
+{
+    FIXME( "%p: not verified\n", iface );
+    *operation = NULL;
+    return E_NOTIMPL;
+}
+static const void *package4_vtbl[] =
+{
+    package4_QueryInterface, package4_AddRef, package4_Release,
+    package4_GetIids, package4_GetRuntimeClassName, package4_GetTrustLevel,
+    package4_get_SignatureKind, package4_get_IsOptional, package4_VerifyContentIntegrityAsync,
 };
 
 static void reg_string( HKEY key, const WCHAR *value, WCHAR *buf, DWORD len )
@@ -320,6 +461,9 @@ HRESULT standin_package_create( const WCHAR *family, IPackage **out )
     impl->IPackageId_iface.lpVtbl = &id_vtbl;
     impl->IPackage3_iface.lpVtbl = &standin3_vtbl;
     impl->IPackageStatus_iface.lpVtbl = &status_vtbl;
+    impl->IPackage2_iface.lpVtbl = &package2_vtbl;
+    impl->package4_vtbl = package4_vtbl;
+    impl->signature_kind = 3;   /* PackageSignatureKind_Store */
     impl->ref = 1;
     lstrcpynW( impl->family, family, ARRAY_SIZE(impl->family) );
     reg_string( key, L"Name", impl->name, ARRAY_SIZE(impl->name) );
@@ -328,6 +472,10 @@ HRESULT standin_package_create( const WCHAR *family, IPackage **out )
     reg_string( key, L"FullName", impl->full_name, ARRAY_SIZE(impl->full_name) );
     reg_string( key, L"Version", version, ARRAY_SIZE(version) );
     RegGetValueW( key, NULL, L"Architecture", RRF_RT_REG_DWORD, NULL, &arch, &len );
+    reg_string( key, L"DisplayName", impl->display_name, ARRAY_SIZE(impl->display_name) );
+    reg_string( key, L"PublisherDisplayName", impl->publisher_display_name, ARRAY_SIZE(impl->publisher_display_name) );
+    len = sizeof(impl->signature_kind);
+    RegGetValueW( key, NULL, L"SignatureKind", RRF_RT_REG_DWORD, NULL, &impl->signature_kind, &len );
     RegCloseKey( key );
     swscanf( version, L"%u.%u.%u.%u", &v[0], &v[1], &v[2], &v[3] );
     impl->version.Major = v[0];
@@ -337,5 +485,35 @@ HRESULT standin_package_create( const WCHAR *family, IPackage **out )
     impl->arch = arch;
     TRACE( "stand-in %s: %s\n", debugstr_w(family), debugstr_w(impl->full_name) );
     *out = &impl->IPackage_iface;
+    return S_OK;
+}
+
+/* every package registered under InstalledPackages, for enumerations without a family */
+HRESULT installed_packages( IPackage ***packages, UINT32 *count )
+{
+    WCHAR family[256];
+    DWORD index, len;
+    IPackage **array = NULL, **grown, *package;
+    UINT32 n = 0;
+    HKEY key;
+
+    *packages = NULL;
+    *count = 0;
+    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Wine\\WineUWP\\InstalledPackages", 0, KEY_READ, &key ))
+        return S_OK;
+    for (index = 0; len = ARRAY_SIZE(family), !RegEnumKeyExW( key, index, family, &len, NULL, NULL, NULL, NULL ); index++)
+    {
+        if (standin_package_create( family, &package ) != S_OK) continue;
+        if (!(grown = realloc( array, (n + 1) * sizeof(*array) )))
+        {
+            IPackage_Release( package );
+            break;
+        }
+        array = grown;
+        array[n++] = package;
+    }
+    RegCloseKey( key );
+    *packages = array;
+    *count = n;
     return S_OK;
 }

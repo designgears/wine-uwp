@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     8f41003c675f2f99ff5b6f1f690ce90d33dd85b2
-                 dcomp: Trace implicit animation collections and group contents on dcompanim.
+  wine HEAD:     857f35c3606b03176fe3d6adde8802d56f2fd906
+                 appxdeploymentclient: List the packages the Store installed; IPackage2 and IPackage4 for them.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-15T17:21:58Z
+  captured:      2026-11-15T17:32:42Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

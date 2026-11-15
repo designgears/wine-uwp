@@ -224,6 +224,40 @@ static HRESULT find_packages( const struct package_filter *filter, IIterable_Pac
         }
     }
 
+    if (!filter->family_name || !WindowsGetStringLen( filter->family_name ))
+    {
+        /* and the packages the Microsoft Store installed, which it lists to tell "Get" from "Open" */
+        IPackage **installed, **all;
+        UINT32 count, i, n = 0;
+
+        installed_packages( &installed, &count );
+        if (!(all = malloc( (count + 1) * sizeof(*all) ))) hr = E_OUTOFMEMORY;
+        else
+        {
+            if (match) all[n++] = package;
+            for (i = 0; i < count; i++)
+            {
+                HSTRING iname = NULL, ipublisher = NULL;
+                if (SUCCEEDED(IPackage_get_Id( installed[i], &id )))
+                {
+                    IPackageId_get_Name( id, &iname );
+                    IPackageId_get_Publisher( id, &ipublisher );
+                    IPackageId_Release( id );
+                }
+                if (hstring_matches( filter->name, iname ) && hstring_matches( filter->publisher, ipublisher ))
+                    all[n++] = installed[i];
+                WindowsDeleteString( iname );
+                WindowsDeleteString( ipublisher );
+            }
+            TRACE( "%u packages, %u installed by the Store.\n", n, count );
+            hr = package_list_create_array( all, n, packages );
+            free( all );
+        }
+        for (i = 0; i < count; i++) IPackage_Release( installed[i] );
+        free( installed );
+        IPackage_Release( package );
+        return hr;
+    }
     hr = package_list_create( match ? package : NULL, packages );
     IPackage_Release( package );
     return hr;
