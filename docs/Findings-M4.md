@@ -14541,3 +14541,23 @@ either. Both are still differences from Windows.
 Still open: the carousel pages are requested every 10 s but the hero on screen does not change (Home and AI Hub;
 also before today). The AI Hub rail icon goes blank once AI Hub has been visited. AGENTS.md's
 `ScrollViewer::ChangeViewInternal` RVA (+406ac8) is another XAML build's; in the ISO's it is +3a6058: look it up.
+
+### Microsoft Store: the hero carousel's pictures (2026-11-14, parked on `store-carousel-wip`)
+
+Since the scoped-batch fix the hero carousels request a page every 10 s, but the picture never changed. Measured:
+the strip is moved by `Translation.X <- "-_interactionTracker.Position.X + this.Target.AnimationTranslation"` on a
+dcomp visual, and `dcv_object_StartAnimation` ignores Translation entirely; expressions read any visual's
+`Translation` as 0 and know no `Scale`; `-clip.Left` (an edge of a referenced clip) did not resolve; and
+`expr_skip_space` skipped only spaces, so every multi-line expression (the Store indents with `\r\n`) failed at its
+first line break. Also, a public visual's Opacity key frames jump to their last value, and each page's content uses
+"0, 0, 1, 1, 0" over its ten seconds.
+
+With all of these (Wine branch `store-carousel-wip`, commit on top of `16d061e`) the hero slides and pages 1-2 draw
+full-width with their dots, but from page 3 on the hero is blank: `trace+dcompops` with a temporary probe of each
+blend's coverage showed page 3's content painted at the hero in the first frame after the turn (opaque backgrounds,
+title text), and 17 ms later XAML's layout has re-placed the pages and the slot is empty (or, traced, shows page 2).
+The repeater's translation is right (-1359 on page 3) and the Store reads nothing back from its property sets
+(`TryGetScalar` sees only `_XAML_DEBUG_TAG_TransparentForInput`, `Opacity`, `ScaleToFit`). Most likely the Store's layout
+expects the tracker to move through intermediate positions (ValuesChanged during the animation, then Idle), and ours
+lands at once. Main keeps the static first page, which looks right; the branch is not merged. Next step: run
+`TryUpdatePositionWithAnimation` as an animation on the tracker's timer.
