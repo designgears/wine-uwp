@@ -15005,6 +15005,20 @@ Not reproduced in 12 traced plus ~20 plain start-ups since. `WINE_UWP_WATCH=tls:
 TLS block from every other thread) is armed and quiet in a clean run; the next step is to keep it on in runs until one
 crashes, then watch +0x30 as well. Logs of runs ended by `UWP_TIMEOUT` lose Wine's buffered tail; a fail-fast flushes.
 
+Followed up (11-15, evening): two soaks of 40 start-ups each. With `WINE_UWP_WATCH=tls:0:ui+30` (the combined limit)
+2 of 40 crashed the same way. Both died on the UI thread itself (`rdx` = its own context at TLS+0x30, `rax` = alloc_ptr
+0, `r8` 0x30 the object size), so RhpNewFast found "alloc_ptr 0, combined limit >= 0x30". No other thread wrote the
+limit word in those runs. In a clean run one does: `WinStore.App.dll+0x2f6af9b`, the GC's walk over every thread's
+alloc context (the callback retires it, then `if (alloc_limit == 0 && combined_limit) combined_limit = 0`), which
+is how the runtime empties the context of a thread that is preemptive or stopped. With the watch on +0x38
+(alloc_ptr), 0 of 40 crashed. Only once a GC can have emptied a thread's context while the thread itself was still
+in RhpNewFast does "pointer 0, limit set" come about: a thread the GC took for stopped. Ruled out on the way:
+`FlushProcessWriteBuffers` is real here (Linux `membarrier` PRIVATE_EXPEDITED, `CONFIG_MEMBARRIER=y`, no
+registration FIXME). The earlier "no FlushProcessWriteBuffers call" measurement is not evidence: kernel32 forwards
+it straight to `ntdll.NtFlushProcessWriteBuffers`, so a breakpoint on kernelbase's export never fires. Next: break on
+`NtFlushProcessWriteBuffers`/`NtSuspendThread`/`NtGetContextThread` in ntdll (not the kernelbase exports) across a
+soak, and log each GC's start and end against the UI thread's reverse P/Invoke transitions.
+
 ## 2026-11-15 - Store: start-up is ~3 s; shape visuals reach the screen a frame late
 
 A capture every second from launch (`/tmp/store-startup.sh`) has Home complete at t+3 s; the "15 s" in AGENTS.md was
