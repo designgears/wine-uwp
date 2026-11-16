@@ -1448,20 +1448,16 @@ static HRESULT item_create( WCHAR *product_id, WCHAR *family, WCHAR *stage, char
     return S_OK;
 }
 
-/* An item for an update of the running package newer than what is staged, or NULL. */
-static struct install_item *search_update( BOOL auto_install )
+/* An item for an update of FAMILY (staged at STAGE, a host path, at version INSTALLED) newer than what is staged, or
+ * NULL. Takes FAMILY and STAGE. */
+static struct install_item *search_update_for( WCHAR *family, const char *installed, WCHAR *stage, BOOL auto_install )
 {
-    WCHAR *family, *stage, *product_id = NULL;
+    WCHAR *product_id = NULL;
     struct appx_store_package package;
-    char installed[32], category[64], *url = NULL, *newest, *end;
+    char category[64], *url = NULL, *newest, *end;
     struct install_item *item = NULL;
     HRESULT hr;
 
-    if (!own_package( &family, installed, sizeof(installed), &stage ))
-    {
-        WARN( "no package identity.\n" );
-        return NULL;
-    }
     if ((item = find_item( family )))
     {
         if (auto_install) item_start( item );
@@ -1498,6 +1494,110 @@ done:
     free( stage );
     appx_free( url );
     return item;
+}
+
+/* An item for an update of the running package, or NULL. */
+static struct install_item *search_update( BOOL auto_install )
+{
+    WCHAR *family, *stage;
+    char installed[32];
+
+    if (!own_package( &family, installed, sizeof(installed), &stage ))
+    {
+        WARN( "no package identity.\n" );
+        return NULL;
+    }
+    return search_update_for( family, installed, stage, auto_install );
+}
+
+/* A package the Store installed (InstalledPackages\FAMILY): its version and its stage as a host path. The Windows App
+ * Runtime's own packages (stage\runtime) are not the Store's to update: their framework brings them. */
+static BOOL installed_package( HKEY key, const WCHAR *family, char *version, size_t version_size, WCHAR **stage )
+{
+    WCHAR location[MAX_PATH], value[64], *p;
+    DWORD size = sizeof(location);
+
+    *stage = NULL;
+    if (RegGetValueW( key, family, L"Location", RRF_RT_REG_SZ, NULL, location, &size ) || wcsncmp( location, L"Z:", 2 ))
+        return FALSE;
+    size = sizeof(value);
+    if (RegGetValueW( key, family, L"Version", RRF_RT_REG_SZ, NULL, value, &size )) return FALSE;
+    WideCharToMultiByte( CP_UTF8, 0, value, -1, version, version_size, NULL, NULL );
+    if (!(*stage = wcsdup( location + 2 ))) return FALSE;
+    for (p = *stage; *p; p++) if (*p == '\\') *p = '/';
+    while (p > *stage && p[-1] == '/') *--p = 0;
+    if (!(p = wcsrchr( *stage, '/' )) || p - *stage < 6 || wcsncmp( p - 6, L"/stage", 6 ))
+    {
+        free( *stage );
+        *stage = NULL;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* An item for an update of a package the Store installed, or NULL. */
+static struct install_item *family_update( const WCHAR *family, BOOL auto_install )
+{
+    WCHAR *stage, *copy;
+    char version[32];
+    BOOL found;
+    HKEY key;
+
+    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Wine\\WineUWP\\InstalledPackages", 0, KEY_READ, &key ))
+        return NULL;
+    found = installed_package( key, family, version, sizeof(version), &stage );
+    RegCloseKey( key );
+    if (!found) return NULL;
+    if (!(copy = wcsdup( family )))
+    {
+        free( stage );
+        return NULL;
+    }
+    return search_update_for( copy, version, stage, auto_install );
+}
+
+/* Updates of the running package and of every package the Store installed, as an array of items. */
+static unsigned int search_all_updates( BOOL auto_install, IAppInstallItem ***out )
+{
+    IAppInstallItem **array = NULL, **grown;
+    unsigned int count = 0;
+    struct install_item *item;
+    WCHAR family[256], *own = NULL, *own_stage = NULL, *stage, *copy;
+    char version[32];
+    DWORD index, len;
+    HKEY key;
+
+    *out = NULL;
+    if (own_package( &own, version, sizeof(version), &own_stage )) free( own_stage );
+    if ((item = search_update( auto_install )) && (array = malloc( sizeof(*array) )))
+        array[count++] = &item->IAppInstallItem_iface;
+    else if (item) IAppInstallItem_Release( &item->IAppInstallItem_iface );
+
+    if (!RegOpenKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Wine\\WineUWP\\InstalledPackages", 0, KEY_READ, &key ))
+    {
+        for (index = 0; len = ARRAY_SIZE(family), !RegEnumKeyExW( key, index, family, &len, NULL, NULL, NULL, NULL ); index++)
+        {
+            if (own && !wcscmp( own, family )) continue;
+            if (!installed_package( key, family, version, sizeof(version), &stage )) continue;
+            if (!(copy = wcsdup( family )))
+            {
+                free( stage );
+                continue;
+            }
+            if (!(item = search_update_for( copy, version, stage, auto_install ))) continue;
+            if (!(grown = realloc( array, (count + 1) * sizeof(*array) )))
+            {
+                IAppInstallItem_Release( &item->IAppInstallItem_iface );
+                continue;
+            }
+            array = grown;
+            array[count++] = &item->IAppInstallItem_iface;
+        }
+        RegCloseKey( key );
+    }
+    free( own );
+    *out = array;
+    return count;
 }
 
 /* The catalogue: a product's package family and Windows Update category, by product id. */
@@ -1606,6 +1706,7 @@ struct search
     BOOL all;
     BOOL auto_install;
     WCHAR *product_id;          /* installing this product rather than searching for an update */
+    WCHAR *family;              /* an update of this installed family rather than of the running package */
     BOOL launch_after;
 };
 
@@ -1639,6 +1740,7 @@ static ULONG WINAPI search_Release( IUnknown *iface )
     if (!ref)
     {
         free( impl->product_id );
+        free( impl->family );
         free( impl );
     }
     return ref;
@@ -1668,28 +1770,26 @@ static HRESULT search_callback( IUnknown *invoker, IUnknown *param, PROPVARIANT 
         return S_OK;
     }
     search = impl_from_IUnknown( param );
-    item = search->product_id ? product_install( search->product_id, search->launch_after )
-                              : search_update( search->auto_install );
-    TRACE( "-> %s.\n", item ? "an update" : "no update" );
     result->vt = VT_UNKNOWN;
-    if (!search->all)
+    if (search->all)
     {
-        result->punkVal = item ? (IUnknown *)&item->IAppInstallItem_iface : NULL;
+        unsigned int i, count = search_all_updates( search->auto_install, &array );
+
+        TRACE( "-> %u updates.\n", count );
+        if (FAILED(hr = item_list_create( array, count, &list )))
+        {
+            for (i = 0; i < count; i++) IAppInstallItem_Release( array[i] );
+            free( array );
+            return hr;
+        }
+        result->punkVal = (IUnknown *)list;
         return S_OK;
     }
-    if (item && !(array = malloc( sizeof(*array) )))
-    {
-        IAppInstallItem_Release( &item->IAppInstallItem_iface );
-        return E_OUTOFMEMORY;
-    }
-    if (item) array[0] = &item->IAppInstallItem_iface;
-    if (FAILED(hr = item_list_create( array, item ? 1 : 0, &list )))
-    {
-        if (item) IAppInstallItem_Release( &item->IAppInstallItem_iface );
-        free( array );
-        return hr;
-    }
-    result->punkVal = (IUnknown *)list;
+    if (search->product_id) item = product_install( search->product_id, search->launch_after );
+    else if (search->family) item = family_update( search->family, search->auto_install );
+    else item = search_update( search->auto_install );
+    TRACE( "-> %s.\n", item ? "an update" : "no update" );
+    result->punkVal = item ? (IUnknown *)&item->IAppInstallItem_iface : NULL;
     return S_OK;
 }
 
@@ -2020,19 +2120,27 @@ static HRESULT search_all_async( IAppUpdateOptions *options, IAsyncOperation_IVe
     return hr;
 }
 
-/* Only the running package is updated; for any other family there is no update. */
+/* The running package, or one the Store installed; for any other family there is no update. */
 static HRESULT update_family_async( HSTRING family, IAsyncOperation_AppInstallItem **operation )
 {
     WCHAR *own, *stage;
+    struct search *impl;
+    IUnknown *search;
     char version[32];
+    HRESULT hr;
     BOOL ours;
 
+    *operation = NULL;
     ours = own_package( &own, version, sizeof(version), &stage ) && !wcscmp( own, WindowsGetStringRawBuffer( family, NULL ) );
     free( own );
     free( stage );
     if (ours) return search_one_async( NULL, operation );
-    TRACE( "%s is not the running package.\n", debugstr_hstring( family ) );
-    return async_operation_item_create( NULL, NULL, search_callback, operation );
+    if (FAILED(hr = search_create( FALSE, FALSE, &search ))) return hr;
+    impl = impl_from_IUnknown( search );
+    if (!(impl->family = wcsdup( WindowsGetStringRawBuffer( family, NULL ) ))) hr = E_OUTOFMEMORY;
+    else hr = async_operation_item_create( NULL, search, search_callback, operation );
+    IUnknown_Release( search );
+    return hr;
 }
 
 static HRESULT return_bool( IUnknown *invoker, IUnknown *param, PROPVARIANT *result, BOOL called_async )

@@ -15168,3 +15168,19 @@ How this was found, for the next WinUI 3 app:
 - `user_callback_handler ignoring exception c06d007e` is a failed delay load inside a window procedure, which Wine
   swallows: the window just disappears. `warn+module` names the DLL (`Initialization of L"dwmcorei.dll" failed`).
 - `pdbsyms.py` cached PDBs by file name only; it now keeps a second build of the same name under `pdb/<signature>/`.
+
+## 2026-11-15 - Store: Get updates covers the apps the Store installed
+
+Check for updates searched only the Store's own package (`own_package`). `search_all_updates` now also walks
+`HKLM\Software\Wine\WineUWP\InstalledPackages`: every package whose `Location` is a stage directory (not the Windows App
+Runtime's `stage\runtime` packages) gets the same catalogue + FE3 lookup, and `UpdateAppByPackageFamilyNameAsync` takes
+those families too. Tested by marking Solitaire's registration 4.27.9100.0: the search logged
+`has 4.27.9100.0, the Store 4.27.9181.0`, Updates & downloads showed it downloading (16.46 of 75.83 MB,
+`docs/screenshots/msstore-22609-update-installed-app.png`), and the installer replaced the stage and wrote 4.27.9181.0
+back. Right after completion its row briefly showed the download icon instead of Play; after a restart Library shows
+Open.
+
+The Windows App Runtime's Main and Singleton packages (registered by appxinstall since the WinUI 3 work) appeared in
+Library and Updates as apps with Open. Their manifests say `AppListEntry="none"`, and the PackageManager stand-in now
+gives such a package no app list entry. The Store still lists Main as a catalogue product (with a download button):
+whether Windows lists it there is not known.

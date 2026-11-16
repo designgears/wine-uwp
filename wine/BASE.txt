@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     935523dd6441d333c0fef3fb16fa96bc33dce039
-                 d2d1: Answer ID2D1PrivateFactory, which the Windows App SDK's DWM requires at load.
+  wine HEAD:     7c366e759cddf29dccf3d6824ead7a2e442926a0
+                 Store: updates for every installed app; AppListEntry=none packages have no app list entry.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-15T23:48:56Z
+  captured:      2026-11-16T00:02:54Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

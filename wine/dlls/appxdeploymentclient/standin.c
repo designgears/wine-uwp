@@ -318,8 +318,12 @@ static BOOL manifest_app_id( const WCHAR *location, WCHAR *id, DWORD len )
         text[read] = 0;
         if ((p = strstr( text, "<Application " )) && (p = strstr( p, " Id=\"" )) && (end = strchr( p += 5, '"' )))
         {
+            char *app_end = strstr( end, "</Application>" ), *none = strstr( end, "AppListEntry=\"none\"" );
+
             id[MultiByteToWideChar( CP_UTF8, 0, p, min( end - p, (int)len - 1 ), id, len - 1 )] = 0;
-            ret = TRUE;
+            /* uap:VisualElements AppListEntry="none": not in the app list, as the Windows App Runtime's own
+             * packages are not (the Store showed them in Library with Open) */
+            ret = !none || (app_end && none > app_end);
         }
     }
     free( text );
