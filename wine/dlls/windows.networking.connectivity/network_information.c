@@ -23,6 +23,7 @@
 #include "winsock2.h"
 #include "ws2ipdef.h"
 #include "iphlpapi.h"
+#include "roapi.h"
 #include "netioapi.h"
 #include "wine/list.h"
 
@@ -486,17 +487,12 @@ static const struct INetworkAdapterVtbl network_adapter_vtbl =
 /* The adapter the Internet is reached through: the interface of the best route to a public address. Apps read its
  * type and speed to tell a wired link from a metered one (Solitaire's reachability handler gave up on E_NOTIMPL here,
  * and every component waiting on reachability waited for ever). */
-static HRESULT WINAPI connection_profile_get_NetworkAdapter( IConnectionProfile *iface, INetworkAdapter **value )
+static HRESULT network_adapter_create( DWORD index, INetworkAdapter **value )
 {
     struct network_adapter *impl;
-    DWORD index, err;
+    DWORD err;
 
-    TRACE( "iface %p, value %p.\n", iface, value );
-
-    if (!value) return E_POINTER;
     *value = NULL;
-    /* 8.8.8.8: a public address, and the same in either byte order */
-    if ((err = GetBestInterface( 0x08080808, &index ))) return HRESULT_FROM_WIN32( err );
     if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
     impl->INetworkAdapter_iface.lpVtbl = &network_adapter_vtbl;
     impl->ref = 1;
@@ -508,6 +504,19 @@ static HRESULT WINAPI connection_profile_get_NetworkAdapter( IConnectionProfile 
     }
     *value = &impl->INetworkAdapter_iface;
     return S_OK;
+}
+
+static HRESULT WINAPI connection_profile_get_NetworkAdapter( IConnectionProfile *iface, INetworkAdapter **value )
+{
+    DWORD index, err;
+
+    TRACE( "iface %p, value %p.\n", iface, value );
+
+    if (!value) return E_POINTER;
+    *value = NULL;
+    /* 8.8.8.8: a public address, and the same in either byte order */
+    if ((err = GetBestInterface( 0x08080808, &index ))) return HRESULT_FROM_WIN32( err );
+    return network_adapter_create( index, value );
 }
 
 static HRESULT WINAPI connection_profile_GetLocalUsage( IConnectionProfile *iface, DateTime start, DateTime end, IDataUsage **value )
@@ -723,10 +732,316 @@ static HRESULT WINAPI network_information_statics_GetLanIdentifiers( INetworkInf
     return E_NOTIMPL;
 }
 
+/* The local host names NetworkInformation.GetHostNames lists: the computer's DNS name, and every unicast address of an
+ * adapter that is up, with IPInformation naming that adapter (and so matching ConnectionProfile.NetworkAdapter). WhatsApp
+ * decides whether it is on IPv4 and IPv6 from exactly that match, and retried E_NOTIMPL here every 1.5 s. */
+struct local_host_name
+{
+    IHostName IHostName_iface;
+    IIPInformation IIPInformation_iface;
+    LONG ref;
+    HSTRING name;
+    HostNameType type;
+    DWORD if_index;
+    BYTE prefix;
+};
+
+static inline struct local_host_name *impl_from_IHostName( IHostName *iface )
+{
+    return CONTAINING_RECORD( iface, struct local_host_name, IHostName_iface );
+}
+
+static HRESULT WINAPI local_host_name_QueryInterface( IHostName *iface, REFIID iid, void **out )
+{
+    struct local_host_name *impl = impl_from_IHostName( iface );
+
+    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IHostName ))
+    {
+        IInspectable_AddRef( (*out = &impl->IHostName_iface) );
+        return S_OK;
+    }
+    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI local_host_name_AddRef( IHostName *iface )
+{
+    return InterlockedIncrement( &impl_from_IHostName( iface )->ref );
+}
+
+static ULONG WINAPI local_host_name_Release( IHostName *iface )
+{
+    struct local_host_name *impl = impl_from_IHostName( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+    if (!ref)
+    {
+        WindowsDeleteString( impl->name );
+        free( impl );
+    }
+    return ref;
+}
+
+static HRESULT WINAPI local_host_name_GetIids( IHostName *iface, ULONG *iid_count, IID **iids )
+{
+    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI local_host_name_GetRuntimeClassName( IHostName *iface, HSTRING *class_name )
+{
+    return WindowsCreateString( RuntimeClass_Windows_Networking_HostName, wcslen( RuntimeClass_Windows_Networking_HostName ),
+                                class_name );
+}
+
+static HRESULT WINAPI local_host_name_GetTrustLevel( IHostName *iface, TrustLevel *trust_level )
+{
+    *trust_level = BaseTrust;
+    return S_OK;
+}
+
+static HRESULT WINAPI local_host_name_get_IPInformation( IHostName *iface, IIPInformation **value )
+{
+    struct local_host_name *impl = impl_from_IHostName( iface );
+
+    TRACE( "iface %p, value %p.\n", iface, value );
+    if (!value) return E_POINTER;
+    /* a domain name has none */
+    if ((*value = impl->type == HostNameType_DomainName ? NULL : &impl->IIPInformation_iface))
+        IHostName_AddRef( iface );
+    return S_OK;
+}
+
+static HRESULT WINAPI local_host_name_get_RawName( IHostName *iface, HSTRING *value )
+{
+    return WindowsDuplicateString( impl_from_IHostName( iface )->name, value );
+}
+
+static HRESULT WINAPI local_host_name_get_Type( IHostName *iface, HostNameType *value )
+{
+    *value = impl_from_IHostName( iface )->type;
+    return S_OK;
+}
+
+static HRESULT WINAPI local_host_name_IsEqual( IHostName *iface, IHostName *name, boolean *equal )
+{
+    HSTRING other;
+    INT32 order = 1;
+    HRESULT hr;
+
+    if (!name || !equal) return E_POINTER;
+    if (FAILED(hr = IHostName_get_CanonicalName( name, &other ))) return hr;
+    WindowsCompareStringOrdinal( impl_from_IHostName( iface )->name, other, &order );
+    WindowsDeleteString( other );
+    *equal = !order;
+    return S_OK;
+}
+
+static const struct IHostNameVtbl local_host_name_vtbl =
+{
+    local_host_name_QueryInterface,
+    local_host_name_AddRef,
+    local_host_name_Release,
+    /* IInspectable methods */
+    local_host_name_GetIids,
+    local_host_name_GetRuntimeClassName,
+    local_host_name_GetTrustLevel,
+    /* IHostName methods */
+    local_host_name_get_IPInformation,
+    local_host_name_get_RawName,
+    local_host_name_get_RawName,     /* DisplayName */
+    local_host_name_get_RawName,     /* CanonicalName: addresses and DNS names as the system formats them */
+    local_host_name_get_Type,
+    local_host_name_IsEqual,
+};
+
+static inline struct local_host_name *impl_from_IIPInformation( IIPInformation *iface )
+{
+    return CONTAINING_RECORD( iface, struct local_host_name, IIPInformation_iface );
+}
+
+static HRESULT WINAPI ip_information_QueryInterface( IIPInformation *iface, REFIID iid, void **out )
+{
+    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IIPInformation ))
+    {
+        IInspectable_AddRef( (*out = iface) );
+        return S_OK;
+    }
+    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI ip_information_AddRef( IIPInformation *iface )
+{
+    return local_host_name_AddRef( &impl_from_IIPInformation( iface )->IHostName_iface );
+}
+
+static ULONG WINAPI ip_information_Release( IIPInformation *iface )
+{
+    return local_host_name_Release( &impl_from_IIPInformation( iface )->IHostName_iface );
+}
+
+static HRESULT WINAPI ip_information_GetIids( IIPInformation *iface, ULONG *iid_count, IID **iids )
+{
+    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI ip_information_GetRuntimeClassName( IIPInformation *iface, HSTRING *class_name )
+{
+    static const WCHAR name[] = L"Windows.Networking.Connectivity.IPInformation";
+    return WindowsCreateString( name, wcslen( name ), class_name );
+}
+
+static HRESULT WINAPI ip_information_GetTrustLevel( IIPInformation *iface, TrustLevel *trust_level )
+{
+    *trust_level = BaseTrust;
+    return S_OK;
+}
+
+static HRESULT WINAPI ip_information_get_NetworkAdapter( IIPInformation *iface, INetworkAdapter **value )
+{
+    TRACE( "iface %p, value %p.\n", iface, value );
+    if (!value) return E_POINTER;
+    return network_adapter_create( impl_from_IIPInformation( iface )->if_index, value );
+}
+
+static HRESULT WINAPI ip_information_get_PrefixLength( IIPInformation *iface, IReference_BYTE **value )
+{
+    static const WCHAR class[] = L"Windows.Foundation.PropertyValue";
+    IPropertyValueStatics *statics;
+    IInspectable *boxed;
+    HSTRING name;
+    HRESULT hr;
+
+    TRACE( "iface %p, value %p.\n", iface, value );
+    if (!value) return E_POINTER;
+    *value = NULL;
+    if (FAILED(hr = WindowsCreateString( class, wcslen( class ), &name ))) return hr;
+    hr = RoGetActivationFactory( name, &IID_IPropertyValueStatics, (void **)&statics );
+    WindowsDeleteString( name );
+    if (FAILED(hr)) return hr;
+    if (SUCCEEDED(hr = IPropertyValueStatics_CreateUInt8( statics, impl_from_IIPInformation( iface )->prefix, &boxed )))
+    {
+        hr = IInspectable_QueryInterface( boxed, &IID_IReference_BYTE, (void **)value );
+        IInspectable_Release( boxed );
+    }
+    IPropertyValueStatics_Release( statics );
+    return hr;
+}
+
+static const struct IIPInformationVtbl ip_information_vtbl =
+{
+    ip_information_QueryInterface,
+    ip_information_AddRef,
+    ip_information_Release,
+    /* IInspectable methods */
+    ip_information_GetIids,
+    ip_information_GetRuntimeClassName,
+    ip_information_GetTrustLevel,
+    /* IIPInformation methods */
+    ip_information_get_NetworkAdapter,
+    ip_information_get_PrefixLength,
+};
+
+static HRESULT local_host_name_create( const WCHAR *name, HostNameType type, DWORD if_index, BYTE prefix,
+                                       IHostName **out )
+{
+    struct local_host_name *impl;
+    HRESULT hr;
+
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->IHostName_iface.lpVtbl = &local_host_name_vtbl;
+    impl->IIPInformation_iface.lpVtbl = &ip_information_vtbl;
+    impl->ref = 1;
+    impl->type = type;
+    impl->if_index = if_index;
+    impl->prefix = prefix;
+    if (FAILED(hr = WindowsCreateString( name, wcslen( name ), &impl->name )))
+    {
+        free( impl );
+        return hr;
+    }
+    *out = &impl->IHostName_iface;
+    return S_OK;
+}
+
+static HRESULT append_host_name( IVector_HostName *vector, const WCHAR *name, HostNameType type, DWORD if_index,
+                                 BYTE prefix )
+{
+    IHostName *host;
+    HRESULT hr;
+
+    if (FAILED(hr = local_host_name_create( name, type, if_index, prefix, &host ))) return hr;
+    hr = IVector_HostName_Append( vector, (IHostName *)host );
+    IHostName_Release( host );
+    return hr;
+}
+
+static HRESULT get_local_host_names( IVectorView_HostName **value )
+{
+    static const struct vector_iids iids =
+    {
+        .vector = &IID_IVector_HostName,
+        .view = &IID_IVectorView_HostName,
+        .iterable = &IID_IIterable_HostName,
+        .iterator = &IID_IIterator_HostName,
+    };
+    IP_ADAPTER_ADDRESSES *addresses = NULL, *adapter;
+    IP_ADAPTER_UNICAST_ADDRESS *unicast;
+    ULONG size = 16384, err;
+    WCHAR name[256];
+    DWORD len = ARRAY_SIZE(name);
+    IVector_HostName *vector;
+    HRESULT hr;
+
+    if (FAILED(hr = vector_create( &iids, (void **)&vector ))) return hr;
+    if (GetComputerNameExW( ComputerNameDnsHostname, name, &len ) && name[0])
+        append_host_name( vector, name, HostNameType_DomainName, 0, 0 );
+
+    do
+    {
+        free( addresses );
+        if (!(addresses = malloc( size ))) break;
+        err = GetAdaptersAddresses( AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                    NULL, addresses, &size );
+    } while (err == ERROR_BUFFER_OVERFLOW);
+
+    for (adapter = addresses; addresses && !err && adapter; adapter = adapter->Next)
+    {
+        if (adapter->OperStatus != IfOperStatusUp || adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        for (unicast = adapter->FirstUnicastAddress; unicast; unicast = unicast->Next)
+        {
+            const SOCKADDR *sa = unicast->Address.lpSockaddr;
+            DWORD if_index = sa->sa_family == AF_INET6 ? adapter->Ipv6IfIndex : adapter->IfIndex;
+            WCHAR text[64];
+            DWORD text_len = ARRAY_SIZE(text);
+
+            if (sa->sa_family != AF_INET && sa->sa_family != AF_INET6) continue;
+            if (WSAAddressToStringW( (SOCKADDR *)sa, unicast->Address.iSockaddrLength, NULL, text, &text_len )) continue;
+            append_host_name( vector, text, sa->sa_family == AF_INET6 ? HostNameType_Ipv6 : HostNameType_Ipv4,
+                              if_index ? if_index : adapter->IfIndex, unicast->OnLinkPrefixLength );
+        }
+    }
+    free( addresses );
+
+    hr = IVector_HostName_GetView( vector, value );
+    IVector_HostName_Release( vector );
+    return hr;
+}
+
 static HRESULT WINAPI network_information_statics_GetHostNames( INetworkInformationStatics *iface, IVectorView_HostName **value )
 {
-    FIXME( "iface %p, value %p stub!\n", iface, value );
-    return E_NOTIMPL;
+    TRACE( "iface %p, value %p.\n", iface, value );
+    if (!value) return E_POINTER;
+    return get_local_host_names( value );
 }
 
 static HRESULT WINAPI network_information_statics_GetProxyConfigurationAsync( INetworkInformationStatics *iface, IUriRuntimeClass *uri, IAsyncOperation_ProxyConfiguration **value )

@@ -15184,3 +15184,13 @@ The Windows App Runtime's Main and Singleton packages (registered by appxinstall
 Library and Updates as apps with Open. Their manifests say `AppListEntry="none"`, and the PackageManager stand-in now
 gives such a package no app list entry. The Store still lists Main as a catalogue product (with a download button):
 whether Windows lists it there is not known.
+
+## 2026-11-15 - NetworkInformation.GetHostNames
+
+A stub (E_NOTIMPL) that WhatsApp called every 1.5 s for ever: its `NetworkStateMonitor` decides whether it is on IPv4 and
+IPv6 by matching each host name's `IPInformation.NetworkAdapter.NetworkAdapterId` against the internet profile's adapter,
+so with none it was "connected on neither". Now the list is the computer's DNS name (no IPInformation, as on Windows)
+and every unicast address of each adapter that is up and not loopback (`GetAdaptersAddresses`), each with an
+IPInformation whose adapter is that interface (the same `network_adapter` objects `ConnectionProfile.NetworkAdapter`
+returns, so the ids match) and its prefix length (a `PropertyValue` UInt8). The connectivity module got a copy of the
+usual `vector.c`. WhatsApp calls it once now and reads the adapters.

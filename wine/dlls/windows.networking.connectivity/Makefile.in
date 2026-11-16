@@ -1,8 +1,9 @@
 MODULE        = windows.networking.connectivity.dll
-IMPORTS       = combase iphlpapi
+IMPORTS       = combase iphlpapi ws2_32
 EXTRAIDLFLAGS = -DDO_NO_IMPORTS
 
 SOURCES = \
 	classes.idl \
 	main.c \
-	network_information.c
+	network_information.c \
+	vector.c

@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     7c366e759cddf29dccf3d6824ead7a2e442926a0
-                 Store: updates for every installed app; AppListEntry=none packages have no app list entry.
+  wine HEAD:     2a36348056b55e0d97e5a864f3a53a403c47c984
+                 windows.networking.connectivity: Implement NetworkInformation.GetHostNames.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-16T00:02:54Z
+  captured:      2026-11-16T00:07:50Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
