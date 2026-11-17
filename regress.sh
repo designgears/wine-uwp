@@ -11,7 +11,7 @@
 # kb    Calculator keyboard: 12+3 Enter, Backspace 7, Escape, each identical to docs/baselines/calc-kb-*.png. Not in the
 #       default set of four only for time; run it after any change to input, Windows.UI or its byte patches (Enter,
 #       Backspace and Escape all died once while calc, fh, mp and sol still passed). KB_BASELINE=1 rewrites the baselines.
-cd "$(dirname "$0")"; . ./env.sh; export PATH="$WINE_BUILD:$PATH"
+cd "$(dirname "$0")"; . ./env.sh; export PATH="$WINE_BUILD:$WINE_BUILD/server:$PATH"   # server/: a build copy has only wine at its top
 D=${TESTDISPLAY:-:98}
 apps=${*:-calc fh mp sol}
 

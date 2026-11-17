@@ -566,6 +566,22 @@ for a Store that asks for 8.2501: Home froze on skeletons with ~1 s of CPU in 3 
 lines. Calculator, Solitaire and Feedback Hub ask for 8.2501 too and run on 8.2310 in the shared `uwp-bin/stage/frameworks`:
 adding a framework there changes every baseline, so a test install that fetches one belongs in its own data directory.
 
+**A prefix update wipes the UWP registrations, and `install-overrides.sh` cannot put them back.** When Wine's update runs
+in a prefix (its `.update-timestamp` differs from the build's `wine.inf`), it re-registers Wine's own classes: on 11-17 the
+dev prefix lost `Windows.UI.Xaml.Application` (Calculator: `Failed to find library`) and the CoreMessagingRegistrar
+service (fail-fast `0x80070424`), and it had no `wineuwp-symbols.txt` at all. Even a forced `install-overrides.sh` does
+not import the class tables or the service: only `wineuwp-setup --new-prefix` does. Repair with
+`wine wineuwp-setup --windows uwp-bin/win11 --build $WINE_BUILD --data $PWD --force --new-prefix`, then `--verify`, then
+`resolve_symbols.py`. Anything that starts Wine in a prefix can trigger the update, including wine-uwp-manager's Accounts
+check (`probe-xboxauth.exe status`), so look at `.update-timestamp` when a prefix's apps suddenly fail.
+
+**The regression suite describes apps that are no longer staged (11-17).** Store "Get updates" replaced the staged
+Calculator ("Calculator [Dev]" -> the Store's 11.2607, with a focus outline on the display: AE 4120.98 on every build, and
+`kb` never starts because it waits for AE 0) and Solitaire (4.27 writes no `Sgi::FEState` line, so `sol` always fails, and
+it then reports the previous app's colour count from a stale capture). Solitaire 4.27 itself usually stays on its splash
+for 100 s on the shared build and the store build alike (6/7 runs), and once reached its menu in 40 s: not a Wine
+regression. Re-baseline from the current apps before trusting `calc`, `kb` or `sol` again.
+
 **A prefix's `C:\windows\wineuwp-symbols.txt` is a snapshot.** When wineuwp starts wanting a new private symbol, an older
 prefix lacks it and combase fails `prepare_native_views_once` with E_NOTIMPL, which the Store turns into a fail-fast at
 start-up. `python3 packaging/harvest/resolve_symbols.py PREFIX/drive_c/windows/system32 PREFIX/drive_c/windows/wineuwp-symbols.txt`.
