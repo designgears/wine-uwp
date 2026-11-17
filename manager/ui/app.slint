@@ -1,0 +1,449 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+import { Button, LineEdit, ListView, ScrollView, StandardTableView, TabWidget, ProgressIndicator, TextEdit, ComboBox, CheckBox } from "std-widgets.slint";
+
+export struct AppItem {
+    id: string,
+    title: string,
+    subtitle: string,
+    icon: image,
+    has-icon: bool,
+    running: bool,
+}
+
+export struct EnvRow { name: string, value: string }
+export struct RecipeItem { family: string, name: string, script: string, datadir: string }
+export struct AccountItem { datadir: string, prefix: string, status: string, clients: string, needs: string }
+
+export global Theme {
+    out property <color> bg: #16181d;
+    out property <color> panel: #1d2027;
+    out property <color> card: #242833;
+    out property <color> card-hover: #2b3040;
+    out property <color> line: #333847;
+    out property <color> text: #e8eaf0;
+    out property <color> muted: #9aa1b2;
+    out property <color> accent: #5b8def;
+    out property <color> good: #3fb37f;
+    out property <color> warn: #e0a84a;
+}
+
+component NavButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked;
+    height: 36px;
+    border-radius: 6px;
+    background: active ? Theme.card-hover : ta.has-hover ? Theme.card : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Text {
+        x: 12px;
+        text: root.text;
+        color: active ? Theme.text : Theme.muted;
+        font-size: 14px;
+        font-weight: active ? 600 : 400;
+        vertical-alignment: center;
+    }
+}
+
+component Label inherits Text {
+    color: Theme.muted;
+    font-size: 12px;
+}
+
+component Value inherits Text {
+    color: Theme.text;
+    font-size: 13px;
+    wrap: word-wrap;
+}
+
+component Field inherits VerticalLayout {
+    in property <string> label;
+    in-out property <string> text;
+    in property <string> placeholder;
+    callback edited(string);
+    spacing: 4px;
+    Label { text: root.label; }
+    LineEdit {
+        text <=> root.text;
+        placeholder-text: root.placeholder;
+        edited(t) => { root.edited(t); }
+    }
+}
+
+component AppRow inherits Rectangle {
+    in property <AppItem> item;
+    in property <bool> selected;
+    callback clicked;
+    height: 56px;
+    border-radius: 8px;
+    background: selected ? Theme.card-hover : ta.has-hover ? Theme.card : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    HorizontalLayout {
+        padding: 8px;
+        spacing: 10px;
+        Rectangle {
+            width: 40px;
+            height: 40px;
+            border-radius: 6px;
+            background: Theme.card;
+            clip: true;
+            if item.has-icon: Image { source: item.icon; width: 40px; height: 40px; image-fit: contain; }
+            if !item.has-icon: Text { text: "◆"; color: Theme.muted; horizontal-alignment: center; vertical-alignment: center; }
+        }
+        VerticalLayout {
+            alignment: center;
+            Text { text: item.title; color: Theme.text; font-size: 14px; font-weight: 600; overflow: elide; }
+            Text { text: item.subtitle; color: Theme.muted; font-size: 11px; overflow: elide; }
+        }
+        if item.running: Rectangle {
+            width: 10px;
+            height: 10px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 5px;
+            background: Theme.good;
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "wine-uwp";
+    preferred-width: 1180px;
+    preferred-height: 760px;
+    background: Theme.bg;
+    default-font-size: 13px;
+
+    in-out property <int> page: 0;   // 0 library, 1 install, 2 accounts
+    in property <[AppItem]> apps;
+    in-out property <int> selected: -1;
+
+    // the selected app
+    in property <string> d-title;
+    in property <string> d-family;
+    in property <string> d-version;
+    in property <image> d-icon;
+    in property <bool> d-has-icon;
+    in property <bool> d-running;
+    in property <string> d-stage;
+    in property <string> d-data;
+    in property <string> d-profile;
+    in-out property <string> d-prefix;
+    in-out property <string> d-build;
+    in-out property <string> d-winedebug;
+    in-out property <string> d-display;
+    in property <[[StandardListViewItem]]> d-env;
+    in property <[EnvRow]> d-local;
+    in property <[string]> d-logs;
+    in-out property <int> d-log-index: 0;
+    in property <string> d-log-text;
+    in property <string> status-text;
+
+    // install
+    in property <[RecipeItem]> recipes;
+    in property <[string]> datadirs;
+    in-out property <string> inst-source;
+    in-out property <string> inst-datadir;
+    in-out property <bool> inst-store: true;
+    in-out property <string> recipe-version;
+    in-out property <string> recipe-datadir;
+    in property <bool> inst-busy;
+    in property <string> inst-stage;
+    in property <float> inst-progress;
+    in property <string> inst-output;
+
+    // accounts
+    in property <[AccountItem]> accounts;
+    in property <string> device-code;
+    in property <bool> accounts-busy;
+
+    callback select(int);
+    callback play();
+    callback stop();
+    callback save-options();
+    callback local-edit(int, string, string);
+    callback local-add();
+    callback local-remove(int);
+    callback local-save();
+    callback select-log(int);
+    callback refresh-log();
+    callback open-folder(string);
+    callback refresh();
+    callback install();
+    callback install-recipe(int);
+    callback refresh-accounts();
+    callback approve(string, string);
+
+    HorizontalLayout {
+        // sidebar
+        Rectangle {
+            width: 200px;
+            background: Theme.panel;
+            VerticalLayout {
+                padding: 14px;
+                spacing: 6px;
+                Text { text: "wine-uwp"; color: Theme.text; font-size: 20px; font-weight: 700; }
+                Text { text: "app manager"; color: Theme.muted; font-size: 12px; }
+                Rectangle { height: 14px; }
+                NavButton { text: "Library"; active: root.page == 0; clicked => { root.page = 0; } }
+                NavButton { text: "Install"; active: root.page == 1; clicked => { root.page = 1; } }
+                NavButton { text: "Accounts"; active: root.page == 2; clicked => { root.page = 2; root.refresh-accounts(); } }
+                Rectangle { }
+                Text { text: root.status-text; color: Theme.muted; font-size: 11px; wrap: word-wrap; }
+                Button { text: "Refresh"; clicked => { root.refresh(); } }
+            }
+        }
+
+        // library
+        if root.page == 0: HorizontalLayout {
+            Rectangle {
+                width: 300px;
+                background: Theme.bg;
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 6px;
+                    Text { text: "Installed (" + root.apps.length + ")"; color: Theme.muted; font-size: 12px; }
+                    ListView {
+                        for item[i] in root.apps: AppRow {
+                            item: item;
+                            selected: i == root.selected;
+                            clicked => { root.select(i); }
+                        }
+                    }
+                }
+            }
+            Rectangle { width: 1px; background: Theme.line; }
+            if root.selected < 0: Rectangle {
+                Text { text: "Select an app"; color: Theme.muted; font-size: 16px; }
+            }
+            if root.selected >= 0: VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+                HorizontalLayout {
+                    spacing: 14px;
+                    Rectangle {
+                        width: 64px;
+                        height: 64px;
+                        border-radius: 10px;
+                        background: Theme.card;
+                        clip: true;
+                        if root.d-has-icon: Image { source: root.d-icon; width: 64px; height: 64px; image-fit: contain; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Text { text: root.d-title; color: Theme.text; font-size: 22px; font-weight: 700; }
+                        Text { text: root.d-family + "   " + root.d-version; color: Theme.muted; font-size: 12px; }
+                        Text {
+                            text: root.d-running ? "● Running" : "Not running";
+                            color: root.d-running ? Theme.good : Theme.muted;
+                            font-size: 12px;
+                        }
+                    }
+                    Rectangle { }
+                    VerticalLayout {
+                        alignment: center;
+                        if !root.d-running: Button { text: "▶  Play"; primary: true; clicked => { root.play(); } }
+                        if root.d-running: Button { text: "■  Stop"; clicked => { root.stop(); } }
+                    }
+                }
+                TabWidget {
+                    Tab {
+                        title: "Overview";
+                        ScrollView {
+                            VerticalLayout {
+                                alignment: start;
+                                padding: 12px;
+                                spacing: 10px;
+                                Label { text: "Stage"; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Value { text: root.d-stage; horizontal-stretch: 1; vertical-alignment: center; }
+                                    Button { text: "Open folder"; horizontal-stretch: 0; clicked => { root.open-folder(root.d-stage); } }
+                                }
+                                Label { text: "Data directory"; }
+                                Value { text: root.d-data; }
+                                Label { text: "Profile"; }
+                                Value { text: root.d-profile == "" ? "none (defaults only)" : root.d-profile; }
+                                Rectangle { height: 6px; }
+                                Text { text: "Runtime for this data directory"; color: Theme.text; font-weight: 600; }
+                                Field { label: "Wine prefix"; text <=> root.d-prefix; placeholder: "env.sh's default"; }
+                                Field { label: "Wine build"; text <=> root.d-build; placeholder: "env.sh's default"; }
+                                Text { text: "Launch options for this app"; color: Theme.text; font-weight: 600; }
+                                Field { label: "WINEDEBUG"; text <=> root.d-winedebug; placeholder: "err+all (run.sh's default)"; }
+                                Field { label: "DISPLAY"; text <=> root.d-display; placeholder: "this session's"; }
+                                HorizontalLayout {
+                                    alignment: start;
+                                    Button { text: "Save"; primary: true; clicked => { root.save-options(); } }
+                                }
+                            }
+                        }
+                    }
+                    Tab {
+                        title: "Environment";
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 8px;
+                            Label { text: "Effective environment: identity, defaults, profile, then local.env (last wins; += appends)"; }
+                            StandardTableView {
+                                min-height: 260px;
+                                vertical-stretch: 3;
+                                columns: [{ title: "Name", min-width: 200px }, { title: "Value", min-width: 300px }, { title: "From", min-width: 130px }];
+                                rows: root.d-env;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text { text: "local.env (this install's own settings)"; color: Theme.text; font-weight: 600; vertical-alignment: center; }
+                                Rectangle { }
+                                Button { text: "Add"; clicked => { root.local-add(); } }
+                                Button { text: "Save local.env"; primary: true; clicked => { root.local-save(); } }
+                            }
+                            ListView {
+                                min-height: 120px;
+                                vertical-stretch: 1;
+                                for row[i] in root.d-local: HorizontalLayout {
+                                    spacing: 6px;
+                                    padding-bottom: 4px;
+                                    LineEdit {
+                                        width: 260px;
+                                        text: row.name;
+                                        placeholder-text: "NAME or NAME+";
+                                        edited(t) => { root.local-edit(i, t, row.value); }
+                                    }
+                                    LineEdit {
+                                        text: row.value;
+                                        placeholder-text: "value";
+                                        edited(t) => { root.local-edit(i, row.name, t); }
+                                    }
+                                    Button { text: "✕"; clicked => { root.local-remove(i); } }
+                                }
+                            }
+                        }
+                    }
+                    Tab {
+                        title: "Logs";
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 8px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                ComboBox {
+                                    model: root.d-logs;
+                                    current-index <=> root.d-log-index;
+                                    selected => { root.select-log(self.current-index); }
+                                }
+                                Button { text: "Reload"; clicked => { root.refresh-log(); } }
+                                Rectangle { }
+                            }
+                            TextEdit {
+                                read-only: true;
+                                text: root.d-log-text;
+                                font-size: 11px;
+                                wrap: no-wrap;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // install
+        if root.page == 1: ScrollView {
+            VerticalLayout {
+                alignment: start;
+                padding: 20px;
+                spacing: 14px;
+                Text { text: "Install"; color: Theme.text; font-size: 22px; font-weight: 700; }
+                Rectangle {
+                    background: Theme.panel;
+                    border-radius: 10px;
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+                        Text { text: "From the Store, a file or a URL"; color: Theme.text; font-weight: 600; }
+                        Field { label: "Store ID, package family, file path or URL"; text <=> root.inst-source; placeholder: "9WZDNCRFJBMP  or  /path/App.msixbundle"; }
+                        Field { label: "Data directory"; text <=> root.inst-datadir; placeholder: "uwp-bin/<name>-data"; }
+                        CheckBox { text: "From the Store catalogue (--store)"; checked <=> root.inst-store; }
+                        HorizontalLayout {
+                            alignment: start;
+                            Button { text: "Install"; primary: true; enabled: !root.inst-busy; clicked => { root.install(); } }
+                        }
+                    }
+                }
+                Text { text: "Recipes"; color: Theme.text; font-size: 16px; font-weight: 600; }
+                Label { text: "Profiles that know how to install their app (#! install: in profiles/<family>.env)"; }
+                for r[i] in root.recipes: Rectangle {
+                    background: Theme.panel;
+                    border-radius: 10px;
+                    HorizontalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            Text { text: r.name; color: Theme.text; font-weight: 600; }
+                            Text { text: r.family; color: Theme.muted; font-size: 11px; }
+                        }
+                        Rectangle { }
+                        VerticalLayout { alignment: center; LineEdit { width: 140px; placeholder-text: "version (newest)"; text <=> root.recipe-version; } }
+                        VerticalLayout { alignment: center; LineEdit { width: 240px; placeholder-text: r.datadir; text <=> root.recipe-datadir; } }
+                        VerticalLayout { alignment: center; Button { text: "Install"; primary: true; enabled: !root.inst-busy; clicked => { root.install-recipe(i); } } }
+                    }
+                }
+                if root.inst-busy || root.inst-output != "": Rectangle {
+                    background: Theme.panel;
+                    border-radius: 10px;
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 8px;
+                        Text { text: root.inst-stage; color: Theme.text; font-weight: 600; }
+                        ProgressIndicator { progress: root.inst-progress; height: 6px; }
+                        TextEdit { read-only: true; text: root.inst-output; min-height: 220px; font-size: 11px; wrap: no-wrap; }
+                    }
+                }
+            }
+        }
+
+        // accounts
+        if root.page == 2: ScrollView {
+            VerticalLayout {
+                alignment: start;
+                padding: 20px;
+                spacing: 14px;
+                HorizontalLayout {
+                    Text { text: "Accounts"; color: Theme.text; font-size: 22px; font-weight: 700; }
+                    Rectangle { }
+                    VerticalLayout {
+                        alignment: center;
+                        Button { text: root.accounts-busy ? "Checking..." : "Check again"; enabled: !root.accounts-busy; clicked => { root.refresh-accounts(); } }
+                    }
+                }
+                Label { text: "The Microsoft account winexboxauth keeps in each prefix, and the title sign-in clients approved there"; }
+                for a in root.accounts: Rectangle {
+                    background: Theme.panel;
+                    border-radius: 10px;
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 6px;
+                        Text { text: a.status; color: Theme.text; font-weight: 600; font-size: 15px; }
+                        Label { text: "Prefix " + a.prefix; }
+                        Label { text: "Used by " + a.datadir; }
+                        Value { text: a.clients == "" ? "No title clients approved" : "Approved title clients: " + a.clients; }
+                        if a.needs != "": HorizontalLayout {
+                            spacing: 8px;
+                            Text { text: "An app here needs client " + a.needs; color: Theme.warn; vertical-alignment: center; }
+                            Button { text: "Approve in browser"; primary: true; clicked => { root.approve(a.datadir, a.needs); } }
+                        }
+                    }
+                }
+                if root.device-code != "": Rectangle {
+                    background: Theme.card;
+                    border-radius: 10px;
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 6px;
+                        Text { text: "Approve the sign-in in your browser"; color: Theme.text; font-weight: 600; }
+                        Text { text: root.device-code; color: Theme.accent; font-size: 22px; font-weight: 700; }
+                        Label { text: "at https://www.microsoft.com/link (it should have opened by itself)"; }
+                    }
+                }
+            }
+        }
+    }
+}
