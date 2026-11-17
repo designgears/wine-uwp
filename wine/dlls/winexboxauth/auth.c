@@ -1637,6 +1637,37 @@ static void load_endpoints( void )
  * login asks for a token for https://api.epicgames.dev, which only that table maps, and without it EOS Connect gets a
  * null token, anti-cheat never logs in and matchmaking reports a server problem. Its entries go before the default
  * table's, which still covers Xbox Live itself. */
+/* A UWP title names itself only in its package's xboxservices.config (XSAPI reads it there); nothing sets a title
+ * context for it, and without one Minecraft's own relying parties (PlayFab, multiplayer.minecraft.net, Realms) were
+ * never loaded and it reported "You need to authenticate to Microsoft services". */
+static UINT32 package_title_id( void )
+{
+    WCHAR path[MAX_PATH];
+    UINT32 tid = 0;
+    struct json *j;
+    char *data;
+    HANDLE file;
+    DWORD size, n = GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_PATH", path, MAX_PATH - 24 );
+
+    if (!n || n >= MAX_PATH - 24) return 0;
+    wcscat( path, L"\\xboxservices.config" );
+    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+    if (file == INVALID_HANDLE_VALUE) return 0;
+    size = GetFileSize( file, NULL );
+    if (size < 65536 && (data = malloc( size + 1 )) && ReadFile( file, data, size, &n, NULL ))
+    {
+        if ((j = json_parse( data, n )))
+        {
+            if (jnum( j, "TitleId" ) > 0) tid = (UINT32)jnum( j, "TitleId" );
+            json_free( j );
+        }
+        free( data );
+    }
+    CloseHandle( file );
+    TRACE( "package title id %u\n", tid );
+    return tid;
+}
+
 static void load_title_endpoints( void )
 {
     struct signing_policy policy;
@@ -1653,6 +1684,7 @@ static void load_title_endpoints( void )
     EnterCriticalSection( &title_ctx_cs );
     tid = title_ctx_title_id;
     LeaveCriticalSection( &title_ctx_cs );
+    if (!tid) tid = package_title_id();
     EnterCriticalSection( &account.cs );
     skip = title_endpoints_loaded || !endpoints_loaded || !tid || !account.signed_in;
     if (!skip) title_endpoints_loaded = TRUE;  /* one attempt per process; get_token_for_url comes back here */
@@ -1764,6 +1796,12 @@ char *relying_party( const char *url )
          * default table; the Partner Center relying party is the Halo Waypoint audience */
         else if (strlen( u.host ) > strlen( ".halowaypoint.com" ) && host_has_suffix( u.host, ".halowaypoint.com" ))
             rp = str_dup( "https://prod.xsts.halowaypoint.com/" );
+        /* Minecraft's services are in its own title table, which title.mgt refuses (403) to a token that is not
+         * bound to its title: PlayFab takes Xbox Live's PlayFab audience, Minecraft's own hosts their origin */
+        else if (host_has_suffix( u.host, ".playfabapi.com" ))
+            rp = str_dup( "http://playfab.xboxlive.com/" );
+        else if (!strcmp( u.host, "multiplayer.minecraft.net" ) || !strcmp( u.host, "pocket.realms.minecraft.net" ))
+            rp = strf( "https://%s/", u.host );
     }
     url_parts_free( &u );
     if (rp && !*rp)
