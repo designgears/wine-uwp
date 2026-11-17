@@ -27,3 +27,14 @@ Everything else is an environment variable for the app; the ones profiles use:
 | --- | --- |
 | `WINE_UWP_DXVK_COREWINDOW=1` | Wine's adapter lets DXVK create a swap chain for the app's CoreWindow |
 | `WINE_UWP_XBOX_TITLE_APP`, `WINE_UWP_XBOX_TITLE_ID` | bind the app's Xbox Live tokens to this MSA client and title (`winexboxauth`); approve the client once with an interactive sign-in or `probe-xboxauth.exe clientdevice CLIENT` |
+
+## Recipes
+
+A profile that knows how to install its app says so in `#!` header lines, which the launcher reads as comments and
+`wine-uwp-manager` lists under Install:
+
+    #! name: Minecraft for Windows (UWP releases)
+    #! install: packaging/install-minecraft-uwp.sh
+    #! datadir: uwp-bin/mc-data
+
+The script, relative to the tree, gets `DATADIR [VERSION]`.
