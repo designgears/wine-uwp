@@ -8,7 +8,7 @@ mod jobs;
 mod runtime;
 
 use runtime::{App, Config, Runtime};
-use slint::{Model, ModelRc, SharedString, StandardListViewItem, VecModel};
+use slint::{Model, ModelRc, SharedString, VecModel};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -93,14 +93,30 @@ fn show_app(ui: &MainWindow, st: &mut State, reload_local: bool) {
         ui.set_d_log_index(0);
         ui.set_d_log_text(st.logs.first().map(|p| jobs::tail(p, 200_000)).unwrap_or_else(|| "No logs yet: logs of runs started here appear in this list.".into()).into());
     }
-    let rows: Vec<ModelRc<StandardListViewItem>> = runtime::effective_env(&st.rt, &app)
+    set_env(ui, st, &app);
+}
+
+/// The effective environment as rows, the layer that set each value last giving its colour; filtered by name or value.
+fn set_env(ui: &MainWindow, st: &State, app: &App) {
+    let filter = ui.get_env_filter().to_lowercase();
+    let colour = |source: &str| {
+        let last = source.rsplit(" + ").next().unwrap_or(source);
+        match last {
+            "identity" => slint::Color::from_rgb_u8(0x8b, 0x93, 0xa7),
+            "defaults" => slint::Color::from_rgb_u8(0x5b, 0x8d, 0xef),
+            "profile" => slint::Color::from_rgb_u8(0xb0, 0x7c, 0xf0),
+            _ => slint::Color::from_rgb_u8(0x3f, 0xb3, 0x7f),
+        }
+    };
+    let rows: Vec<EnvItem> = runtime::effective_env(&st.rt, app)
         .into_iter()
-        .map(|v| {
-            ModelRc::new(VecModel::from(vec![
-                StandardListViewItem::from(SharedString::from(v.name)),
-                StandardListViewItem::from(SharedString::from(v.value)),
-                StandardListViewItem::from(SharedString::from(v.source)),
-            ]))
+        .filter(|v| filter.is_empty() || v.name.to_lowercase().contains(&filter) || v.value.to_lowercase().contains(&filter))
+        .map(|v| EnvItem {
+            color: colour(&v.source).into(),
+            // overrides lists read better one per line
+            value: if v.name == "WINEDLLOVERRIDES" { v.value.replace(';', "; ") } else { v.value }.into(),
+            name: v.name.into(),
+            source: v.source.into(),
         })
         .collect();
     ui.set_d_env(ModelRc::new(VecModel::from(rows)));
@@ -342,6 +358,16 @@ fn main() -> Result<(), slint::PlatformError> {
         match st.cfg.save() {
             Ok(()) => ui.set_status_text(format!("Saved to {}", runtime::config_path().display()).into()),
             Err(e) => ui.set_status_text(format!("Could not save: {e}").into()),
+        }
+    });
+
+    let s = st.clone();
+    let w = ui.as_weak();
+    ui.on_filter_env(move |_| {
+        let ui = w.unwrap();
+        let st = s.borrow();
+        if let Some(app) = st.apps.get(ui.get_selected() as usize).cloned() {
+            set_env(&ui, &st, &app);
         }
     });
 

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-import { Button, LineEdit, ListView, ScrollView, StandardTableView, TabWidget, ProgressIndicator, TextEdit, ComboBox, CheckBox } from "std-widgets.slint";
+import { Button, LineEdit, ListView, ScrollView, TabWidget, ProgressIndicator, TextEdit, ComboBox, CheckBox } from "std-widgets.slint";
 
 export struct AppItem {
     id: string,
@@ -11,6 +11,7 @@ export struct AppItem {
 }
 
 export struct EnvRow { name: string, value: string }
+export struct EnvItem { name: string, value: string, source: string, color: color }
 export struct RecipeItem { family: string, name: string, script: string, datadir: string }
 export struct AccountItem { datadir: string, prefix: string, status: string, clients: string, needs: string }
 
@@ -25,6 +26,10 @@ export global Theme {
     out property <color> accent: #5b8def;
     out property <color> good: #3fb37f;
     out property <color> warn: #e0a84a;
+    out property <color> layer-identity: #8b93a7;
+    out property <color> layer-defaults: #5b8def;
+    out property <color> layer-profile: #b07cf0;
+    out property <color> layer-local: #3fb37f;
 }
 
 component NavButton inherits Rectangle {
@@ -130,7 +135,8 @@ export component MainWindow inherits Window {
     in-out property <string> d-build;
     in-out property <string> d-winedebug;
     in-out property <string> d-display;
-    in property <[[StandardListViewItem]]> d-env;
+    in property <[EnvItem]> d-env;
+    in-out property <string> env-filter;
     in property <[EnvRow]> d-local;
     in property <[string]> d-logs;
     in-out property <int> d-log-index: 0;
@@ -159,6 +165,7 @@ export component MainWindow inherits Window {
     callback play();
     callback stop();
     callback save-options();
+    callback filter-env(string);
     callback local-edit(int, string, string);
     callback local-add();
     callback local-remove(int);
@@ -279,40 +286,106 @@ export component MainWindow inherits Window {
                     Tab {
                         title: "Environment";
                         VerticalLayout {
-                            padding: 8px;
-                            spacing: 8px;
-                            Label { text: "Effective environment: identity, defaults, profile, then local.env (last wins; += appends)"; }
-                            StandardTableView {
-                                min-height: 260px;
-                                vertical-stretch: 3;
-                                columns: [{ title: "Name", min-width: 200px }, { title: "Value", min-width: 300px }, { title: "From", min-width: 130px }];
-                                rows: root.d-env;
-                            }
+                            padding-top: 10px;
+                            spacing: 10px;
                             HorizontalLayout {
-                                spacing: 8px;
-                                Text { text: "local.env (this install's own settings)"; color: Theme.text; font-weight: 600; vertical-alignment: center; }
-                                Rectangle { }
-                                Button { text: "Add"; clicked => { root.local-add(); } }
-                                Button { text: "Save local.env"; primary: true; clicked => { root.local-save(); } }
+                                spacing: 10px;
+                                LineEdit {
+                                    horizontal-stretch: 1;
+                                    placeholder-text: "Filter variables";
+                                    text <=> root.env-filter;
+                                    edited(t) => { root.filter-env(t); }
+                                }
+                                HorizontalLayout {
+                                    horizontal-stretch: 0;
+                                    spacing: 14px;
+                                    for l in [{ n: "identity", c: Theme.layer-identity }, { n: "defaults", c: Theme.layer-defaults },
+                                              { n: "profile", c: Theme.layer-profile }, { n: "local", c: Theme.layer-local }]: HorizontalLayout {
+                                        spacing: 5px;
+                                        Rectangle { width: 8px; height: 8px; y: (parent.height - self.height) / 2; border-radius: 4px; background: l.c; }
+                                        Text { text: l.n; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+                                    }
+                                }
                             }
                             ListView {
-                                min-height: 120px;
-                                vertical-stretch: 1;
-                                for row[i] in root.d-local: HorizontalLayout {
-                                    spacing: 6px;
-                                    padding-bottom: 4px;
-                                    LineEdit {
-                                        width: 260px;
-                                        text: row.name;
-                                        placeholder-text: "NAME or NAME+";
-                                        edited(t) => { root.local-edit(i, t, row.value); }
+                                vertical-stretch: 3;
+                                for v in root.d-env: Rectangle {
+                                    height: row.preferred-height + 2px;
+                                    row := VerticalLayout {
+                                        padding-left: 10px;
+                                        padding-right: 12px;
+                                        padding-top: 8px;
+                                        padding-bottom: 8px;
+                                        spacing: 3px;
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Text {
+                                                text: v.name;
+                                                color: Theme.text;
+                                                font-family: "monospace";
+                                                font-size: 12px;
+                                                font-weight: 600;
+                                                overflow: elide;
+                                                horizontal-stretch: 1;
+                                            }
+                                            Rectangle {
+                                                width: badge.preferred-width + 14px;
+                                                height: 18px;
+                                                border-radius: 9px;
+                                                background: v.color.with-alpha(0.18);
+                                                badge := Text { text: v.source; color: v.color; font-size: 10px; font-weight: 600; }
+                                            }
+                                        }
+                                        Text {
+                                            text: v.value == "" ? "(empty)" : v.value;
+                                            color: v.value == "" ? Theme.muted : #b9c0d0;
+                                            font-family: "monospace";
+                                            font-size: 11px;
+                                            wrap: char-wrap;
+                                        }
                                     }
-                                    LineEdit {
-                                        text: row.value;
-                                        placeholder-text: "value";
-                                        edited(t) => { root.local-edit(i, row.name, t); }
+                                    Rectangle { x: 0; width: 3px; height: parent.height - 6px; y: 3px; border-radius: 1.5px; background: v.color; }
+                                    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+                                }
+                            }
+                            Rectangle {
+                                vertical-stretch: 0;
+                                background: Theme.panel;
+                                border-radius: 10px;
+                                VerticalLayout {
+                                    padding: 12px;
+                                    spacing: 8px;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Text { text: "This install's settings"; color: Theme.text; font-weight: 600; font-size: 14px; }
+                                            Text { text: "local.env in the stage: read last, so it overrides the profile. NAME+ appends."; color: Theme.muted; font-size: 11px; }
+                                        }
+                                        Rectangle { }
+                                        VerticalLayout { alignment: center; Button { text: "+ Add"; clicked => { root.local-add(); } } }
+                                        VerticalLayout { alignment: center; Button { text: "Save"; primary: true; clicked => { root.local-save(); } } }
                                     }
-                                    Button { text: "✕"; clicked => { root.local-remove(i); } }
+                                    if root.d-local.length == 0: Text {
+                                        text: "No settings of its own: the defaults and the profile apply as they are.";
+                                        color: Theme.muted;
+                                        font-size: 12px;
+                                    }
+                                    for row[i] in root.d-local: HorizontalLayout {
+                                        spacing: 6px;
+                                        LineEdit {
+                                            width: 240px;
+                                            text: row.name;
+                                            placeholder-text: "NAME";
+                                            edited(t) => { root.local-edit(i, t, row.value); }
+                                        }
+                                        LineEdit {
+                                            text: row.value;
+                                            placeholder-text: "value";
+                                            edited(t) => { root.local-edit(i, row.name, t); }
+                                        }
+                                        Button { text: "Remove"; clicked => { root.local-remove(i); } }
+                                    }
                                 }
                             }
                         }
