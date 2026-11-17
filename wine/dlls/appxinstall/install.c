@@ -725,8 +725,40 @@ static void scan_executables( const WCHAR *dir, struct native_dlls *n )
  * Wine's d3d12 lacks what these games check for at start (Halo Infinite: Tiled Resources Tier 2), so a game that names
  * d3d12.dll gets vkd3d-proton and the DXVK dxgi it presents through. Wine's concrt140 lacks parts of the Concurrency
  * Runtime (STATUS_WINE_STUB in Halo), so one that names concrt140.dll gets the VCLibs framework's. */
+/* An app's profile from the library beside the launch defaults (profiles/<family>.env): copied into the stage as
+ * profile.env, which an installed app's wineuwp-launch loads. TRUE when it asks for the D3D runtime. */
+static BOOL install_profile( const struct appx_install_params *params, const WCHAR *family, const WCHAR *dest )
+{
+    WCHAR *dir, *slash, *name, *path;
+    char *text, *line;
+    BOOL d3d = FALSE;
+
+    if (!params->launch_defaults || !(dir = wcsdup( params->launch_defaults ))) return FALSE;
+    if ((slash = wcsrchr( dir, '\\' ))) *slash = 0;
+    name = malloc( (wcslen( family ) + 16) * sizeof(WCHAR) );
+    if (name) swprintf( name, wcslen( family ) + 16, L"profiles\\%s.env", family );
+    path = name ? path_join( dir, name ) : NULL;
+    if (path && (text = read_text( path )))
+    {
+        if (FAILED(write_text( dest, L"profile.env", text )))
+            report( params, APPX_EVENT_MESSAGE, 0, 0, L"warning: could not copy the profile %s", path );
+        else report( params, APPX_EVENT_MESSAGE, 0, 0, L"profile %s", path );
+        for (line = text; line; line = strchr( line, '\n' ) ? strchr( line, '\n' ) + 1 : NULL)
+        {
+            line += strspn( line, " \t" );
+            if (!strncmp( line, "export ", 7 )) line += 7;
+            if (!strncmp( line, "WINE_UWP_NATIVE_D3D=1", 21 )) d3d = TRUE;
+        }
+        free( text );
+    }
+    free( path );
+    free( name );
+    free( dir );
+    return d3d;
+}
+
 static char *link_gdk_native_dlls( const WCHAR *dest, const WCHAR *fw_root, WCHAR **frameworks, unsigned int count,
-                                   const struct appx_install_params *params )
+                                   const struct appx_install_params *params, BOOL profile_d3d )
 {
     static const char *names[] = { "concrt140", "d3d11", "d3d12", "d3d12core", "dxgi" };   /* sorted */
     static const unsigned int slot[] = { 4, 1, 2, 3, 0 };
@@ -735,7 +767,8 @@ static char *link_gdk_native_dlls( const WCHAR *dest, const WCHAR *fw_root, WCHA
     struct text t = { 0 };
     unsigned int i;
 
-    if (!config || !exists( config )) { free( config ); return NULL; }
+    /* a UWP app gets them when its profile asks (WINE_UWP_NATIVE_D3D=1) */
+    if (!profile_d3d && (!config || !exists( config ))) { free( config ); return NULL; }
     free( config );
     n.params = params;
     n.runtime = params->d3d_runtime;
@@ -1322,7 +1355,7 @@ HRESULT CDECL appx_install( const struct appx_install_params *params )
         free( dir );
     }
     text_add( &t, "'\n" );
-    if ((s = link_gdk_native_dlls( dest, fw_root, fw_names, fw_count, params )))
+    if ((s = link_gdk_native_dlls( dest, fw_root, fw_names, fw_count, params, install_profile( params, family, dest ) )))
     {
         /* literal, as wineuwp-launch expands nothing: the defaults' list plus this game's own native DLLs */
         char *defaults = params->launch_defaults ? read_text( params->launch_defaults ) : NULL, *base = NULL, *line;

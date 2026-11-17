@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     68276b299ae5706efd811b951e91545632bb5be8
-                 winexboxauth: bind a UWP title's tokens to a stage-named title (WINE_UWP_XBOX_TITLE_APP/ID).
+  wine HEAD:     f10213eb67590def37154650583db6a3a4a4d9b1
+                 appxinstall: copy an app's profile into its stage; WINE_UWP_NATIVE_D3D=1 links the D3D runtime for UWP apps.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-17T18:10:15Z
+  captured:      2026-11-17T18:18:29Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

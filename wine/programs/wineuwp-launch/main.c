@@ -122,6 +122,7 @@ static BOOL load_env_path( const WCHAR *path, BOOL required, BOOL keep )
     {
         char *eq, *end, *value;
         WCHAR *wname, *wvalue;
+        BOOL append;
 
         if ((next = strchr( line, '\n' ))) *next++ = 0;
         end = line + strlen( line );
@@ -138,9 +139,30 @@ static BOOL load_env_path( const WCHAR *path, BOOL required, BOOL keep )
             value++;
             *--end = 0;
         }
+        /* NAME+=VALUE appends to what is set, ';'-separated (a profile adding DLL overrides to the defaults') */
+        if (eq > line && eq[-1] == '+')
+        {
+            eq[-1] = 0;
+            append = TRUE;
+        }
+        else append = FALSE;
         wname = widen( line, -1 );
         wvalue = widen( value, -1 );
-        if (wname && wvalue && !(keep && GetEnvironmentVariableW( wname, NULL, 0 ))) SetEnvironmentVariableW( wname, wvalue );
+        if (wname && wvalue && append)
+        {
+            DWORD len = GetEnvironmentVariableW( wname, NULL, 0 );
+            WCHAR *joined = malloc( (len + wcslen( wvalue ) + 2) * sizeof(WCHAR) );
+
+            if (joined)
+            {
+                if (len && GetEnvironmentVariableW( wname, joined, len ) == len - 1 && len > 1) wcscat( joined, L";" );
+                else *joined = 0;
+                wcscat( joined, wvalue );
+                SetEnvironmentVariableW( wname, joined );
+                free( joined );
+            }
+        }
+        else if (wname && wvalue && !(keep && GetEnvironmentVariableW( wname, NULL, 0 ))) SetEnvironmentVariableW( wname, wvalue );
         free( wname );
         free( wvalue );
     }
@@ -157,6 +179,29 @@ static BOOL load_env_file( const WCHAR *name, BOOL required )
 }
 
 static WCHAR *env( const WCHAR *name );
+
+/* The app's profile (profiles/<family>.env): settings it needs here whatever the install, from the library beside the
+ * launch defaults when there are defaults (the repository's, current), else the copy the installer put in the stage.
+ * Read after the defaults and before local.env, which stays the install's own last word. */
+static void load_profile( const WCHAR *defaults )
+{
+    WCHAR family[256], path[MAX_PATH], *slash;
+
+    if (!GetEnvironmentVariableW( L"WINE_UWP_PACKAGE_FAMILY_NAME", family, ARRAY_SIZE(family) )) return;
+    if (*defaults)
+    {
+        wcscpy( path, defaults );
+        if ((slash = wcsrchr( path, '\\' ))) *slash = 0;
+        if (swprintf( path + wcslen( path ), ARRAY_SIZE(path) - wcslen( path ), L"\\profiles\\%s.env", family ) > 0 &&
+            GetFileAttributesW( path ) != INVALID_FILE_ATTRIBUTES)
+        {
+            if (!quiet) fprintf( stderr, "wineuwp-launch: profile %ls\n", path );
+            load_env_path( path, FALSE, FALSE );
+            return;
+        }
+    }
+    load_env_file( L"profile.env", FALSE );
+}
 
 /* runs start(arg) in the process and waits for it */
 static BOOL run_remote( HANDLE process, LPTHREAD_START_ROUTINE start, void *arg, const WCHAR *what )
@@ -494,6 +539,7 @@ int WINAPI wWinMain( HINSTANCE instance, HINSTANCE prev, WCHAR *cmdline, int sho
         load_env_path( defaults, TRUE, TRUE );
         add_frameworks();
     }
+    load_profile( defaults );
     load_env_file( L"local.env", FALSE );
     SetEnvironmentVariableW( L"WINE_UWP_PACKAGE_PATH", dir );
     /* EOS's Linux bootstrapper issues native Linux syscalls from its high-address helper */
