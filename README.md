@@ -92,3 +92,12 @@ This project is mostly investigation: finding out what a closed-source app expec
   run on a private Xvfb display.
 - The repository's many `*.py` tools read PE files, PDB symbols, WinRT metadata and registry hives;
   AGENTS.md has the table.
+
+## License
+
+wine-uwp is licensed under the GNU Lesser General Public License, version 2.1 or (at your option) any later version,
+the same as Wine: see [`COPYING.LIB`](COPYING.LIB). That covers everything in this repository: our Wine source in
+[`wine/`](wine), the tools, scripts, probes and profiles.
+
+It does not cover Microsoft's software. Nothing of Microsoft's is in this repository or in its releases; the Windows
+components, frameworks and apps are downloaded or extracted on the user's machine, under Microsoft's own terms.

@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     f10213eb67590def37154650583db6a3a4a4d9b1
-                 appxinstall: copy an app's profile into its stage; WINE_UWP_NATIVE_D3D=1 links the D3D runtime for UWP apps.
+  wine HEAD:     b6f444e7d8f3941837bb49b7c185e614f6b07deb
+                 combase, ole32: license headers on roerror.c and inspectable_guid.c.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-17T18:18:29Z
+  captured:      2026-11-17T18:20:15Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.
