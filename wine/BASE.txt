@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     1a0a9d1e73a55dc6cc3a265d43bd6df596014a96
-                 winexboxauth: a UWP title's id from its xboxservices.config; Minecraft's relying parties (PlayFab, multiplayer, Realms).
+  wine HEAD:     76ec8ac017431a87bd4f16dcff36e9335c576269
+                 combase: install the CoreWindow adapter for native DXGI without first-view driving.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-17T18:01:20Z
+  captured:      2026-11-17T18:10:14Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

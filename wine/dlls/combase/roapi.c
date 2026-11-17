@@ -792,6 +792,19 @@ static BOOL CALLBACK prepare_native_views_once( INIT_ONCE *once, void *param, vo
     return TRUE;
 }
 
+static BOOL CALLBACK prepare_dxgi_once( INIT_ONCE *once, void *param, void **context )
+{
+    HRESULT (WINAPI *prepare)( void );
+    HMODULE module;
+    HRESULT hr = E_NOTIMPL;
+
+    /* the module stays loaded: native DXGI's factory now calls into it */
+    if ((module = LoadLibraryW( L"wineuwp.dll" )) && (prepare = (void *)GetProcAddress( module, "__wine_uwp_prepare_dxgi" )))
+        hr = prepare();
+    if (FAILED(hr)) ERR( "could not install the CoreWindow adapter for native DXGI, hr %#lx\n", hr );
+    return TRUE;
+}
+
 static HRESULT wrap_core_application( const WCHAR *name, REFIID iid, void **factory )
 {
     static INIT_ONCE native_views_once = INIT_ONCE_STATIC_INIT;
@@ -799,6 +812,13 @@ static HRESULT wrap_core_application( const WCHAR *name, REFIID iid, void **fact
     WCHAR mode[16];
 
     if (!name || wcscmp( name, L"Windows.ApplicationModel.Core.CoreApplication" )) return S_OK;
+    /* native DXGI (DXVK) for an app that is not driven through its first view: the CoreWindow adapter, before the
+     * app can create a swap chain (Minecraft for Windows) */
+    if (GetEnvironmentVariableW( L"WINE_UWP_DXVK_COREWINDOW", mode, ARRAY_SIZE(mode) ) == 1 && mode[0] == '1')
+    {
+        static INIT_ONCE dxgi_once = INIT_ONCE_STATIC_INIT;
+        InitOnceExecuteOnce( &dxgi_once, prepare_dxgi_once, NULL, NULL );
+    }
     if (GetEnvironmentVariableW( L"WINE_UWP_DRIVE_FIRST_VIEW", NULL, 0 ) &&
         GetEnvironmentVariableW( L"WINE_UWP_DRIVE_VIEW", mode, ARRAY_SIZE(mode) ) && wcsicmp( mode, L"load" ))
     {

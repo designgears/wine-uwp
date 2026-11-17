@@ -1041,6 +1041,7 @@ static struct request_result *xsts_token_result( struct token_work *w )
     struct web_account *wa;
     struct token_response *resp;
     IInspectable *props;
+    BOOL with_title = XSTS_WINDOWS_DEVICE;
     HRESULT hr;
 
     account_init();
@@ -1051,12 +1052,33 @@ static struct request_result *xsts_token_result( struct token_work *w )
         MESSAGE( "Xbox Live sign-in requested by the app: approve it in the browser window that opens\n" );
         if (SUCCEEDED(hr = sign_in_with_device_code( NULL ))) hr = sign_in_silently();
     }
+    if (SUCCEEDED(hr))
+    {
+        char *app;
+        UINT32 tid;
+
+        /* a title named by the stage: its tokens carry that title, once its MSA client has been approved */
+        title_context( &app, &tid );
+        if (app && *app && tid && strcmp( app, MSA_CLIENT_ID ))
+        {
+            HRESULT bound = ensure_title_identity( app, tid );
+            if (FAILED(bound) && w->ui)
+            {
+                MESSAGE( "Xbox Live: approve the title's sign-in (client %s) in the browser window that opens\n", app );
+                if (SUCCEEDED(sign_in_with_device_code_client( app, NULL, FALSE ))) bound = ensure_title_identity( app, tid );
+            }
+            if (FAILED(bound)) WARN( "  title %u not bound (%#lx); tokens carry no title\n", tid, bound );
+            /* the title token, with the device it was issued with */
+            else with_title = TRUE;
+        }
+        free( app );
+    }
     if (FAILED(hr))
     {
         TRACE( "  Xbox Live: not signed in (%#lx)\n", hr );
         return request_result_create( w->ui ? WTRS_USER_CANCEL : WTRS_USER_INTERACTION_REQUIRED, w->scope );
     }
-    if (FAILED(hr = get_token_for_url( url, w->force, &header, XSTS_WINDOWS_DEVICE )) || !header)
+    if (FAILED(hr = get_token_for_url( url, w->force, &header, with_title )) || !header)
     {
         TRACE( "  Xbox Live: no token for %s (%#lx)\n", debugstr_an(url, strcspn( url, "?" )), hr );
         if (!(result = request_result_create( WTRS_PROVIDER_ERROR, w->scope ))) return NULL;

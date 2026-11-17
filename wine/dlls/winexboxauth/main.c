@@ -731,6 +731,13 @@ int WINAPI XboxAuthSelfTest( const char *what, const char *arg )
         open_browser( arg ? arg : "https://www.microsoft.com/link" );
         return 0;
     }
+    if (!strcmp( what, "clientdevice" ) && arg)
+    {
+        /* one-time device-code sign-in for another title's MSA client (WINE_UWP_XBOX_TITLE_APP) */
+        HRESULT hr = sign_in_with_device_code_client( arg, NULL, FALSE );
+        printf( "clientdevice %s -> %#lx\n", arg, hr );
+        return SUCCEEDED(hr) ? 0 : 1;
+    }
     if (!strcmp( what, "halodevice" ))
     {
         /* one-time device-code sign-in for Halo's MSAAppId */

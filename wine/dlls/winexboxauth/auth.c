@@ -62,6 +62,19 @@ static BOOL WINAPI init_locks( INIT_ONCE *once, void *param, void **context )
     InitializeCriticalSection( &account.signin_cs );
     InitializeCriticalSection( &device.cs );
     InitializeCriticalSection( &title_ctx_cs );
+    {
+        /* A UWP title signs in through Windows' broker, which binds its tokens to the title; here a stage can name
+         * an MSA client and title to bind to instead (Minecraft for Windows: Bedrock's Android client, whose title
+         * shares the multiplayer service config). Without it the session directory refuses the title-less token
+         * and Minecraft reports the account disconnected in a world. */
+        char app[64], tid[16];
+        if (GetEnvironmentVariableA( "WINE_UWP_XBOX_TITLE_APP", app, sizeof(app) ) - 1 < sizeof(app) - 1 &&
+            GetEnvironmentVariableA( "WINE_UWP_XBOX_TITLE_ID", tid, sizeof(tid) ) - 1 < sizeof(tid) - 1)
+        {
+            title_ctx_msa_app = str_dup( app );
+            title_ctx_title_id = strtoul( tid, NULL, 10 );
+        }
+    }
     return TRUE;
 }
 
