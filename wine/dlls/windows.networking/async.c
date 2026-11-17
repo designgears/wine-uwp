@@ -131,6 +131,7 @@ static HRESULT WINAPI async_impl_put_Completed( IAsyncInfoImpl *iface, IAsyncOpe
             impl->handler = NULL; /* Prevent concurrent invoke. */
             LeaveCriticalSection( &impl->cs );
 
+            TRACE( "operation %p already complete: invoking the handler now.\n", operation );
             IAsyncOperationCompletedHandlerImpl_Invoke( handler, operation, status );
             IAsyncOperationCompletedHandlerImpl_Release( handler );
 
@@ -187,6 +188,8 @@ static BOOL async_info_complete( struct async_info *impl, BOOL called_async )
 
     EnterCriticalSection( &impl->cs );
     if (impl->status != Closed) impl->status = FAILED(hr) ? Error : Completed;
+    TRACE( "operation %p completed, hr %#lx, handler %s.\n", operation, hr,
+           impl->handler == HANDLER_NOT_SET ? "not set" : impl->handler ? "set" : "already invoked" );
     PropVariantCopy( &impl->result, &result );
     impl->hr = hr;
 

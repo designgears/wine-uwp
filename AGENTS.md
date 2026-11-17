@@ -575,12 +575,14 @@ not import the class tables or the service: only `wineuwp-setup --new-prefix` do
 `resolve_symbols.py`. Anything that starts Wine in a prefix can trigger the update, including wine-uwp-manager's Accounts
 check (`probe-xboxauth.exe status`), so look at `.update-timestamp` when a prefix's apps suddenly fail.
 
-**The regression suite describes apps that are no longer staged (11-17).** Store "Get updates" replaced the staged
-Calculator ("Calculator [Dev]" -> the Store's 11.2607, with a focus outline on the display: AE 4120.98 on every build, and
-`kb` never starts because it waits for AE 0) and Solitaire (4.27 writes no `Sgi::FEState` line, so `sol` always fails, and
-it then reports the previous app's colour count from a stale capture). Solitaire 4.27 itself usually stays on its splash
-for 100 s on the shared build and the store build alike (6/7 runs), and once reached its menu in 40 s: not a Wine
-regression. Re-baseline from the current apps before trusting `calc`, `kb` or `sol` again.
+**The regression suite was re-based on the Store-updated apps (11-17).** "Get updates" had replaced the staged
+Calculator ("Calculator [Dev]" -> Store 11.2607) and Solitaire (4.27, which logs to its LocalState, not stderr). New
+`calc-regress.png` and `calc-kb-*.png` (two identical runs; kb shows 15, 7, 0), and `sol` now waits for
+`EnterScreen [gui/screenfiles/mainmenu` in that log. Solitaire 4.27 had been stuck on its splash: Wine's own `wpnapps`
+shadowed Windows' `ScheduledToastNotification`, now in `windows.ui.notifications`. It then shows "Internet Connection
+Problem" (121003: its title-storage download fails, as the old version's sign-in error popup did). Open: Calculator
+11.2607's memory buttons are cut off at the bottom of the display box (in the baseline). Measure Solitaire by its log,
+never by colour count: the menu with that popup has fewer colours than the splash.
 
 **A prefix's `C:\windows\wineuwp-symbols.txt` is a snapshot.** When wineuwp starts wanting a new private symbol, an older
 prefix lacks it and combase fails `prepare_native_views_once` with E_NOTIMPL, which the Store turns into a fail-fast at

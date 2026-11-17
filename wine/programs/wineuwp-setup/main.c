@@ -1632,9 +1632,12 @@ static void register_wine_classes(void)
         /* Windows' is execmodelclient.dll's, a client of the process lifetime manager */
         set_class( L"Windows.ApplicationModel.AppInstance", L"wineappmodel.dll", 0 );
     }
-    /* only the manager: Windows' other notification classes (ScheduledToastNotification) stay Windows' */
+    /* the manager, and ScheduledToastNotification: Windows has it in wpnapps.dll, which Wine's own wpnapps shadows */
     if (in_sys32( L"windows.ui.notifications.dll" ))
+    {
         set_class_dll( L"Windows.UI.Notifications.ToastNotificationManager", L"windows.ui.notifications.dll" );
+        set_class_dll( L"Windows.UI.Notifications.ScheduledToastNotification", L"windows.ui.notifications.dll" );
+    }
     if (in_sys32( L"windows.services.store.dll" ))
     {
         set_class( L"Windows.Services.Store.StoreContext", L"windows.services.store.dll", 1 );
@@ -1959,7 +1962,10 @@ static void collect_checked_classes( BOOL write )
     if (in_sys32( L"windows.system.profile.integritypolicy.dll" ))
         check_class( L"Windows.System.Profile.WindowsIntegrityPolicy", L"windows.system.profile.integritypolicy.dll", 1 );
     if (in_sys32( L"windows.ui.notifications.dll" ))
+    {
         check_class( L"Windows.UI.Notifications.ToastNotificationManager", L"windows.ui.notifications.dll", 1 );
+        check_class( L"Windows.UI.Notifications.ScheduledToastNotification", L"windows.ui.notifications.dll", 1 );
+    }
 
     /* these are written with their threading model, not only checked */
     if (in_sys32( L"windows.storage.pickers.dll" ))

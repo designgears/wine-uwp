@@ -26,8 +26,8 @@
  * that never completed its bootflow item. Nothing is ever scheduled.
  *
  * Windows registers the class in wpnapps.dll, with the other notification classes. This module is not called that:
- * a builtin wins over a native DLL of the same name, and the apps' other notification classes (ScheduledToastNotification,
- * which Solitaire creates) come from Windows' own wpnapps.
+ * a builtin wins over a native DLL of the same name. Since Wine has a wpnapps of its own (push channels), Windows'
+ * ScheduledToastNotification, which Solitaire creates, is not reachable there either, so it lives here too.
  */
 
 #include <stdarg.h>
@@ -306,6 +306,363 @@ static const struct IVectorView_ScheduledToastNotificationVtbl scheduled_vtbl =
     scheduled_GetMany,
 };
 
+
+/* ---- ScheduledToastNotification ----
+ *
+ * Windows has it in wpnapps.dll, which a builtin of that name (push channels) now shadows. Solitaire builds one for
+ * every reminder it schedules; with no class the C++/CX call threw and the request it belonged to never completed,
+ * so its front end never came up. The object keeps what it is given; AddToSchedule drops it like any other. */
+
+static const WCHAR scheduled_toast_name[] = L"Windows.UI.Notifications.ScheduledToastNotification";
+
+struct scheduled_toast
+{
+    IScheduledToastNotification IScheduledToastNotification_iface;
+    IScheduledToastNotification2 IScheduledToastNotification2_iface;
+    IScheduledToastNotification3 IScheduledToastNotification3_iface;
+    IScheduledToastNotification4 IScheduledToastNotification4_iface;
+    LONG ref;
+    IXmlDocument *content;
+    DateTime delivery;
+    TimeSpan snooze;
+    BOOL recurring;
+    UINT32 max_snooze;
+    HSTRING id, tag, group, remote_id;
+    boolean suppress;
+    NotificationMirroring mirroring;
+    IReference_DateTime *expiration;
+};
+
+#define TOAST_IMPL(n) \
+    static inline struct scheduled_toast *impl_from_##n( n *iface ) { return CONTAINING_RECORD( iface, struct scheduled_toast, n##_iface ); } \
+    static HRESULT WINAPI tx_##n##_QueryInterface( n *iface, REFIID iid, void **out ) \
+    { return IScheduledToastNotification_QueryInterface( &impl_from_##n( iface )->IScheduledToastNotification_iface, iid, out ); } \
+    static ULONG WINAPI tx_##n##_AddRef( n *iface ) { return IScheduledToastNotification_AddRef( &impl_from_##n( iface )->IScheduledToastNotification_iface ); } \
+    static ULONG WINAPI tx_##n##_Release( n *iface ) { return IScheduledToastNotification_Release( &impl_from_##n( iface )->IScheduledToastNotification_iface ); } \
+    static HRESULT WINAPI tx_##n##_GetIids( n *iface, ULONG *count, IID **iids ) { return get_iids( count, iids ); } \
+    static HRESULT WINAPI tx_##n##_GetRuntimeClassName( n *iface, HSTRING *name ) { return make_name( scheduled_toast_name, name ); } \
+    static HRESULT WINAPI tx_##n##_GetTrustLevel( n *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
+
+static inline struct scheduled_toast *impl_from_IScheduledToastNotification( IScheduledToastNotification *iface )
+{
+    return CONTAINING_RECORD( iface, struct scheduled_toast, IScheduledToastNotification_iface );
+}
+
+static HRESULT WINAPI toast_QueryInterface( IScheduledToastNotification *iface, REFIID iid, void **out )
+{
+    struct scheduled_toast *impl = impl_from_IScheduledToastNotification( iface );
+
+    TRACE( "iid %s, out %p.\n", debugstr_guid( iid ), out );
+    if (is_base_iid( iid ) || IsEqualGUID( iid, &IID_IScheduledToastNotification )) *out = &impl->IScheduledToastNotification_iface;
+    else if (IsEqualGUID( iid, &IID_IScheduledToastNotification2 )) *out = &impl->IScheduledToastNotification2_iface;
+    else if (IsEqualGUID( iid, &IID_IScheduledToastNotification3 )) *out = &impl->IScheduledToastNotification3_iface;
+    else if (IsEqualGUID( iid, &IID_IScheduledToastNotification4 )) *out = &impl->IScheduledToastNotification4_iface;
+    else return no_interface( iid, out );
+    IScheduledToastNotification_AddRef( iface );
+    return S_OK;
+}
+
+static ULONG WINAPI toast_AddRef( IScheduledToastNotification *iface )
+{
+    return InterlockedIncrement( &impl_from_IScheduledToastNotification( iface )->ref );
+}
+
+static ULONG WINAPI toast_Release( IScheduledToastNotification *iface )
+{
+    struct scheduled_toast *impl = impl_from_IScheduledToastNotification( iface );
+    ULONG ref = InterlockedDecrement( &impl->ref );
+
+    if (!ref)
+    {
+        if (impl->content) IXmlDocument_Release( impl->content );
+        if (impl->expiration) IReference_DateTime_Release( impl->expiration );
+        WindowsDeleteString( impl->id );
+        WindowsDeleteString( impl->tag );
+        WindowsDeleteString( impl->group );
+        WindowsDeleteString( impl->remote_id );
+        free( impl );
+    }
+    return ref;
+}
+
+static HRESULT WINAPI toast_GetIids( IScheduledToastNotification *iface, ULONG *count, IID **iids ) { return get_iids( count, iids ); }
+static HRESULT WINAPI toast_GetRuntimeClassName( IScheduledToastNotification *iface, HSTRING *name ) { return make_name( scheduled_toast_name, name ); }
+static HRESULT WINAPI toast_GetTrustLevel( IScheduledToastNotification *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
+
+static HRESULT WINAPI toast_get_Content( IScheduledToastNotification *iface, IXmlDocument **value )
+{
+    struct scheduled_toast *impl = impl_from_IScheduledToastNotification( iface );
+    if ((*value = impl->content)) IXmlDocument_AddRef( *value );
+    return S_OK;
+}
+
+static HRESULT WINAPI toast_get_DeliveryTime( IScheduledToastNotification *iface, DateTime *value )
+{
+    *value = impl_from_IScheduledToastNotification( iface )->delivery;
+    return S_OK;
+}
+
+static HRESULT WINAPI toast_get_SnoozeInterval( IScheduledToastNotification *iface, IReference_TimeSpan **value )
+{
+    /* no IReference<TimeSpan> to box it in here; a snooze-less toast answers NULL on Windows too */
+    FIXME( "iface %p, value %p: no snooze interval.\n", iface, value );
+    *value = NULL;
+    return S_OK;
+}
+
+static HRESULT WINAPI toast_get_MaximumSnoozeCount( IScheduledToastNotification *iface, UINT32 *value )
+{
+    *value = impl_from_IScheduledToastNotification( iface )->max_snooze;
+    return S_OK;
+}
+
+static HRESULT set_string( HSTRING *field, HSTRING value )
+{
+    HSTRING copy;
+    HRESULT hr;
+    if (FAILED(hr = WindowsDuplicateString( value, &copy ))) return hr;
+    WindowsDeleteString( *field );
+    *field = copy;
+    return S_OK;
+}
+
+static HRESULT WINAPI toast_put_Id( IScheduledToastNotification *iface, HSTRING value )
+{
+    return set_string( &impl_from_IScheduledToastNotification( iface )->id, value );
+}
+
+static HRESULT WINAPI toast_get_Id( IScheduledToastNotification *iface, HSTRING *value )
+{
+    return WindowsDuplicateString( impl_from_IScheduledToastNotification( iface )->id, value );
+}
+
+static const struct IScheduledToastNotificationVtbl toast_vtbl =
+{
+    toast_QueryInterface,
+    toast_AddRef,
+    toast_Release,
+    toast_GetIids,
+    toast_GetRuntimeClassName,
+    toast_GetTrustLevel,
+    toast_get_Content,
+    toast_get_DeliveryTime,
+    toast_get_SnoozeInterval,
+    toast_get_MaximumSnoozeCount,
+    toast_put_Id,
+    toast_get_Id,
+};
+
+TOAST_IMPL(IScheduledToastNotification2)
+
+static HRESULT WINAPI toast2_put_Tag( IScheduledToastNotification2 *iface, HSTRING value )
+{
+    return set_string( &impl_from_IScheduledToastNotification2( iface )->tag, value );
+}
+static HRESULT WINAPI toast2_get_Tag( IScheduledToastNotification2 *iface, HSTRING *value )
+{
+    return WindowsDuplicateString( impl_from_IScheduledToastNotification2( iface )->tag, value );
+}
+static HRESULT WINAPI toast2_put_Group( IScheduledToastNotification2 *iface, HSTRING value )
+{
+    return set_string( &impl_from_IScheduledToastNotification2( iface )->group, value );
+}
+static HRESULT WINAPI toast2_get_Group( IScheduledToastNotification2 *iface, HSTRING *value )
+{
+    return WindowsDuplicateString( impl_from_IScheduledToastNotification2( iface )->group, value );
+}
+static HRESULT WINAPI toast2_put_SuppressPopup( IScheduledToastNotification2 *iface, boolean value )
+{
+    impl_from_IScheduledToastNotification2( iface )->suppress = value;
+    return S_OK;
+}
+static HRESULT WINAPI toast2_get_SuppressPopup( IScheduledToastNotification2 *iface, boolean *value )
+{
+    *value = impl_from_IScheduledToastNotification2( iface )->suppress;
+    return S_OK;
+}
+
+static const struct IScheduledToastNotification2Vtbl toast2_vtbl =
+{
+    tx_IScheduledToastNotification2_QueryInterface,
+    tx_IScheduledToastNotification2_AddRef,
+    tx_IScheduledToastNotification2_Release,
+    tx_IScheduledToastNotification2_GetIids,
+    tx_IScheduledToastNotification2_GetRuntimeClassName,
+    tx_IScheduledToastNotification2_GetTrustLevel,
+    toast2_put_Tag,
+    toast2_get_Tag,
+    toast2_put_Group,
+    toast2_get_Group,
+    toast2_put_SuppressPopup,
+    toast2_get_SuppressPopup,
+};
+
+TOAST_IMPL(IScheduledToastNotification3)
+
+static HRESULT WINAPI toast3_get_NotificationMirroring( IScheduledToastNotification3 *iface, NotificationMirroring *value )
+{
+    *value = impl_from_IScheduledToastNotification3( iface )->mirroring;
+    return S_OK;
+}
+static HRESULT WINAPI toast3_put_NotificationMirroring( IScheduledToastNotification3 *iface, NotificationMirroring value )
+{
+    impl_from_IScheduledToastNotification3( iface )->mirroring = value;
+    return S_OK;
+}
+static HRESULT WINAPI toast3_get_RemoteId( IScheduledToastNotification3 *iface, HSTRING *value )
+{
+    return WindowsDuplicateString( impl_from_IScheduledToastNotification3( iface )->remote_id, value );
+}
+static HRESULT WINAPI toast3_put_RemoteId( IScheduledToastNotification3 *iface, HSTRING value )
+{
+    return set_string( &impl_from_IScheduledToastNotification3( iface )->remote_id, value );
+}
+
+static const struct IScheduledToastNotification3Vtbl toast3_vtbl =
+{
+    tx_IScheduledToastNotification3_QueryInterface,
+    tx_IScheduledToastNotification3_AddRef,
+    tx_IScheduledToastNotification3_Release,
+    tx_IScheduledToastNotification3_GetIids,
+    tx_IScheduledToastNotification3_GetRuntimeClassName,
+    tx_IScheduledToastNotification3_GetTrustLevel,
+    toast3_get_NotificationMirroring,
+    toast3_put_NotificationMirroring,
+    toast3_get_RemoteId,
+    toast3_put_RemoteId,
+};
+
+TOAST_IMPL(IScheduledToastNotification4)
+
+static HRESULT WINAPI toast4_get_ExpirationTime( IScheduledToastNotification4 *iface, IReference_DateTime **value )
+{
+    struct scheduled_toast *impl = impl_from_IScheduledToastNotification4( iface );
+    if ((*value = impl->expiration)) IReference_DateTime_AddRef( *value );
+    return S_OK;
+}
+static HRESULT WINAPI toast4_put_ExpirationTime( IScheduledToastNotification4 *iface, IReference_DateTime *value )
+{
+    struct scheduled_toast *impl = impl_from_IScheduledToastNotification4( iface );
+    if (value) IReference_DateTime_AddRef( value );
+    if (impl->expiration) IReference_DateTime_Release( impl->expiration );
+    impl->expiration = value;
+    return S_OK;
+}
+
+static const struct IScheduledToastNotification4Vtbl toast4_vtbl =
+{
+    tx_IScheduledToastNotification4_QueryInterface,
+    tx_IScheduledToastNotification4_AddRef,
+    tx_IScheduledToastNotification4_Release,
+    tx_IScheduledToastNotification4_GetIids,
+    tx_IScheduledToastNotification4_GetRuntimeClassName,
+    tx_IScheduledToastNotification4_GetTrustLevel,
+    toast4_get_ExpirationTime,
+    toast4_put_ExpirationTime,
+};
+
+static HRESULT scheduled_toast_create( IXmlDocument *content, DateTime delivery, const TimeSpan *snooze, UINT32 max_snooze,
+                                       IScheduledToastNotification **value )
+{
+    struct scheduled_toast *impl;
+
+    if (!value) return E_POINTER;
+    if (!content) return E_INVALIDARG;
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    impl->IScheduledToastNotification_iface.lpVtbl = &toast_vtbl;
+    impl->IScheduledToastNotification2_iface.lpVtbl = &toast2_vtbl;
+    impl->IScheduledToastNotification3_iface.lpVtbl = &toast3_vtbl;
+    impl->IScheduledToastNotification4_iface.lpVtbl = &toast4_vtbl;
+    impl->ref = 1;
+    IXmlDocument_AddRef( (impl->content = content) );
+    impl->delivery = delivery;
+    if (snooze)
+    {
+        impl->snooze = *snooze;
+        impl->recurring = TRUE;
+        impl->max_snooze = max_snooze;
+    }
+    *value = &impl->IScheduledToastNotification_iface;
+    TRACE( "created %p, delivery %I64d.\n", impl, delivery.UniversalTime );
+    return S_OK;
+}
+
+static struct
+{
+    IActivationFactory IActivationFactory_iface;
+    IScheduledToastNotificationFactory IScheduledToastNotificationFactory_iface;
+} scheduled_factory;
+
+static HRESULT WINAPI sfactory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
+{
+    TRACE( "iid %s, out %p.\n", debugstr_guid( iid ), out );
+    if (is_base_iid( iid ) || IsEqualGUID( iid, &IID_IActivationFactory )) *out = &scheduled_factory.IActivationFactory_iface;
+    else if (IsEqualGUID( iid, &IID_IScheduledToastNotificationFactory ))
+        *out = &scheduled_factory.IScheduledToastNotificationFactory_iface;
+    else return no_interface( iid, out );
+    return S_OK;
+}
+static ULONG WINAPI sfactory_AddRef( IActivationFactory *iface ) { return 2; }
+static ULONG WINAPI sfactory_Release( IActivationFactory *iface ) { return 1; }
+static HRESULT WINAPI sfactory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids ) { return get_iids( count, iids ); }
+static HRESULT WINAPI sfactory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name ) { return make_name( scheduled_toast_name, name ); }
+static HRESULT WINAPI sfactory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
+static HRESULT WINAPI sfactory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+{
+    /* the class is activatable only through its factory interface */
+    *instance = NULL;
+    return E_NOTIMPL;
+}
+
+static const struct IActivationFactoryVtbl sfactory_vtbl =
+{
+    sfactory_QueryInterface,
+    sfactory_AddRef,
+    sfactory_Release,
+    sfactory_GetIids,
+    sfactory_GetRuntimeClassName,
+    sfactory_GetTrustLevel,
+    sfactory_ActivateInstance,
+};
+
+static HRESULT WINAPI screate_QueryInterface( IScheduledToastNotificationFactory *iface, REFIID iid, void **out )
+{
+    return sfactory_QueryInterface( &scheduled_factory.IActivationFactory_iface, iid, out );
+}
+static ULONG WINAPI screate_AddRef( IScheduledToastNotificationFactory *iface ) { return 2; }
+static ULONG WINAPI screate_Release( IScheduledToastNotificationFactory *iface ) { return 1; }
+static HRESULT WINAPI screate_GetIids( IScheduledToastNotificationFactory *iface, ULONG *count, IID **iids ) { return get_iids( count, iids ); }
+static HRESULT WINAPI screate_GetRuntimeClassName( IScheduledToastNotificationFactory *iface, HSTRING *name ) { return make_name( scheduled_toast_name, name ); }
+static HRESULT WINAPI screate_GetTrustLevel( IScheduledToastNotificationFactory *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
+
+static HRESULT WINAPI screate_CreateScheduledToastNotification( IScheduledToastNotificationFactory *iface, IXmlDocument *content,
+                                                                DateTime delivery, IScheduledToastNotification **value )
+{
+    TRACE( "content %p, delivery %I64d, value %p.\n", content, delivery.UniversalTime, value );
+    return scheduled_toast_create( content, delivery, NULL, 0, value );
+}
+
+static HRESULT WINAPI screate_CreateScheduledToastNotificationRecurring( IScheduledToastNotificationFactory *iface, IXmlDocument *content,
+                                                                         DateTime delivery, TimeSpan snooze, UINT32 max_snooze,
+                                                                         IScheduledToastNotification **value )
+{
+    TRACE( "content %p, delivery %I64d, snooze %I64d, max %u, value %p.\n", content, delivery.UniversalTime, snooze.Duration,
+           max_snooze, value );
+    return scheduled_toast_create( content, delivery, &snooze, max_snooze, value );
+}
+
+static const struct IScheduledToastNotificationFactoryVtbl screate_vtbl =
+{
+    screate_QueryInterface,
+    screate_AddRef,
+    screate_Release,
+    screate_GetIids,
+    screate_GetRuntimeClassName,
+    screate_GetTrustLevel,
+    screate_CreateScheduledToastNotification,
+    screate_CreateScheduledToastNotificationRecurring,
+};
+
 HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID riid, void **out )
 {
     FIXME( "clsid %s, riid %s, out %p stub!\n", debugstr_guid( clsid ), debugstr_guid( riid ), out );
@@ -321,7 +678,15 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
     impl.IToastNotifier_iface.lpVtbl = &notifier_vtbl;
     impl.IVectorView_ScheduledToastNotification_iface.lpVtbl = &scheduled_vtbl;
 
+    scheduled_factory.IActivationFactory_iface.lpVtbl = &sfactory_vtbl;
+    scheduled_factory.IScheduledToastNotificationFactory_iface.lpVtbl = &screate_vtbl;
+
     *factory = NULL;
+    if (!wcscmp( WindowsGetStringRawBuffer( classid, NULL ), scheduled_toast_name ))
+    {
+        *factory = &scheduled_factory.IActivationFactory_iface;
+        return S_OK;
+    }
     if (wcscmp( WindowsGetStringRawBuffer( classid, NULL ), manager_name )) return CLASS_E_CLASSNOTAVAILABLE;
     *factory = &impl.IActivationFactory_iface;
     return S_OK;

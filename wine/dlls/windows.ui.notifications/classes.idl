@@ -24,5 +24,6 @@
 import "windows.ui.notifications.idl";
 
 namespace Windows.UI.Notifications {
+    runtimeclass ScheduledToastNotification;
     runtimeclass ToastNotificationManager;
 }

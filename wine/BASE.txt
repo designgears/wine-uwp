@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     14f735226c6c3c8fd3981bd36036462a9dce1747
-                 winexboxauth: XboxAuthSelfTest status, the account and approved title clients, machine-readable.
+  wine HEAD:     b33193c5bd922ca738719fbcf7c6402a9c1329be
+                 windows.ui.notifications: ScheduledToastNotification, which Wine's own wpnapps had shadowed.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-17T18:47:19Z
+  captured:      2026-11-17T20:26:47Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

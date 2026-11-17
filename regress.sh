@@ -4,10 +4,10 @@
 #
 #   TESTDISPLAY=:97 ./regress.sh [calc] [fh] [mp] [sol] [SOLRUNS=3]     default: all four
 #
-# calc  Calculator identical to docs/baselines/calc-regress.png (AE 0)
-# fh    Feedback Hub: colour count settles at ~896, no fail-fasts
-# mp    Media Player: 2250 colours (2242 = the Open button's focus rectangle missing, a known variant)
-# sol   Solitaire: reaches its front end (FEState), >= 1000 colours, no CRITICAL ERROR; SOLRUNS runs
+# calc  Calculator (Store 11.2607) identical to docs/baselines/calc-regress.png (AE 0)
+# fh    Feedback Hub: colour count settles at ~899, no fail-fasts
+# mp    Media Player: 2835 colours on prefix-store (11-17)
+# sol   Solitaire 4.27: its own log (LocalState/Logs) enters the main menu screen, >= 1000 colours, no CRITICAL ERROR; SOLRUNS runs
 # kb    Calculator keyboard: 12+3 Enter, Backspace 7, Escape, each identical to docs/baselines/calc-kb-*.png. Not in the
 #       default set of four only for time; run it after any change to input, Windows.UI or its byte patches (Enter,
 #       Backspace and Escape all died once while calc, fh, mp and sol still passed). KB_BASELINE=1 rewrites the baselines.
@@ -41,14 +41,17 @@ for app in $apps; do
     stable_since=0; last=-1; poll 70 settled 2000; cp /tmp/rg.png /tmp/rg-mp.png
     echo "mp $last colours ($((SECONDS-t0)) s)";;
   sol)
+    # 4.27 logs to its LocalState, not stderr; each start rotates that file to Solitaire_old.log
+    sol_log="$WINEPREFIX/drive_c/users/$USER/AppData/Local/Packages/Microsoft.MicrosoftSolitaireCollection_8wekyb3d8bbwe/LocalState/Logs/Solitaire.log"
     bad=0
     for r in $(seq ${SOLRUNS:-3}); do
-      t1=$SECONDS; start UWP_STAGE=microsoftsolitairecollection UWP_LOG=/tmp/rg-sol-$r.log
-      fe() { grep -aq "NewState 'Sgi::FEState'" /tmp/rg-sol-$r.log && [ "$(colours)" -ge 1000 ]; }
-      poll ${SOLLIMIT:-30} fe; ok=$?
-      c=$(grep -ac 'CRITICAL ERROR' /tmp/rg-sol-$r.log)
+      t1=$SECONDS; rm -f "$sol_log"; start UWP_STAGE=microsoftsolitairecollection UWP_LOG=/tmp/rg-sol-$r.log
+      fe() { grep -aq "EnterScreen \[gui/screenfiles/mainmenu" "$sol_log" 2>/dev/null && [ "$(colours)" -ge 1000 ]; }
+      poll ${SOLLIMIT:-45} fe; ok=$?
+      shot /tmp/rg.png; cp "$sol_log" /tmp/rg-sol-$r.app.log 2>/dev/null
+      c=$(grep -ac 'CRITICAL ERROR' /tmp/rg-sol-$r.log /tmp/rg-sol-$r.app.log 2>/dev/null | awk -F: '{n+=$2} END {print n+0}')
       [ $ok = 0 ] && [ "$c" = 0 ] || bad=$((bad+1))
-      echo "sol run $r: $( [ $ok = 0 ] && echo front end || echo NOT reached), $(identify -format %k /tmp/rg.png) colours, $c critical ($((SECONDS-t1)) s)"
+      echo "sol run $r: $( [ $ok = 0 ] && echo main menu || echo NOT reached), $(identify -format %k /tmp/rg.png) colours, $c critical ($((SECONDS-t1)) s)"
       stop
     done
     echo "sol: $bad/${SOLRUNS:-3} bad";;

@@ -173,7 +173,7 @@ static HRESULT sock_fill( struct stream_socket *impl )
     }
 
     ret = recv( impl->sock, (char *)impl->enc_buf + impl->enc_len, impl->enc_size - impl->enc_len, 0 );
-    TRACE( "recv returned %d (buffered %Iu).\n", ret, impl->enc_len );
+    TRACE( "socket %p: recv returned %d (buffered %Iu).\n", impl, ret, impl->enc_len );
     if (!ret) return S_FALSE;
     if (ret < 0) return hresult_from_wsa( 0 );
     impl->enc_len += ret;
@@ -375,7 +375,11 @@ static HRESULT tls_fill_plaintext( struct stream_socket *impl )
         for (i = 0; i < ARRAY_SIZE(bufs); i++)
         {
             if (bufs[i].BufferType == SECBUFFER_DATA && bufs[i].cbBuffer)
+            {
+                TRACE( "socket %p: %lu plaintext bytes, %s\n", impl, bufs[i].cbBuffer,
+                       debugstr_an( bufs[i].pvBuffer, min( bufs[i].cbBuffer, 48 ) ) );
                 if (FAILED(hr = dec_append( impl, bufs[i].pvBuffer, bufs[i].cbBuffer ))) return hr;
+            }
         }
 
         impl->enc_len = 0;
