@@ -477,6 +477,12 @@ int WINAPI wWinMain( HINSTANCE instance, HINSTANCE prev, WCHAR *cmdline, int sho
             return 1;
         }
         if (value != graphics) to_windows_path( value, size );
+        if (value == dir)
+        {
+            /* the app gets this as its package path: a "..\" in it trips path walks (Minecraft's StorageFolder) */
+            WCHAR full[MAX_PATH];
+            if (GetFullPathNameW( dir, ARRAY_SIZE(full), full, NULL ) - 1 < ARRAY_SIZE(full) - 1) wcscpy( dir, full );
+        }
         if (value == dir) staged = quiet = TRUE;
     }
 

@@ -190,7 +190,7 @@ static const char *debugstr_DEVPROPKEY( const DEVPROPKEY *key )
     return wine_dbg_sprintf( "{%s, %04lx}", debugstr_guid( &key->fmtid ), key->pid );
 }
 
-static HRESULT create_device_properties( const DEVPROPERTY *props, ULONG len, IMap_HSTRING_IInspectable **map )
+HRESULT create_device_properties( const DEVPROPERTY *props, ULONG len, IMap_HSTRING_IInspectable **map )
 {
     static const WCHAR *propertyset_name = RuntimeClass_Windows_Foundation_Collections_PropertySet;
     static const WCHAR *propertyvalue_name = RuntimeClass_Windows_Foundation_PropertyValue;

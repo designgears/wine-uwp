@@ -33,16 +33,6 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(enumeration);
 
-struct devquery_params
-{
-    IUnknown IUnknown_iface;
-    DEV_OBJECT_TYPE type;
-    struct aqs_expr *expr;
-    DEVPROPCOMPKEY *prop_keys;
-    ULONG prop_keys_len;
-    LONG ref;
-};
-
 static inline struct devquery_params *impl_from_IUnknown( IUnknown *iface )
 {
     return CONTAINING_RECORD( iface, struct devquery_params, IUnknown_iface );
@@ -96,7 +86,7 @@ static const IUnknownVtbl devquery_params_vtbl =
     devquery_params_Release,
 };
 
-static HRESULT devquery_params_create( DEV_OBJECT_TYPE type, struct aqs_expr *expr, DEVPROPCOMPKEY *prop_keys, ULONG prop_keys_len, IUnknown **out )
+HRESULT devquery_params_create( DEV_OBJECT_TYPE type, struct aqs_expr *expr, DEVPROPCOMPKEY *prop_keys, ULONG prop_keys_len, IUnknown **out )
 {
     struct devquery_params *impl;
 
@@ -489,7 +479,7 @@ static BOOL devpropcompkey_buf_find_devpropkey( const DEVPROPCOMPKEY *keys, ULON
     return FALSE;
 }
 
-static HRESULT devpropcompkeys_init( DEVPROPCOMPKEY **keys, ULONG *keys_len, const DEVPROPCOMPKEY *values, ULONG len )
+HRESULT devpropcompkeys_init( DEVPROPCOMPKEY **keys, ULONG *keys_len, const DEVPROPCOMPKEY *values, ULONG len )
 {
     if (!(*keys = calloc( len, sizeof( **keys ) ))) return E_OUTOFMEMORY;
     memcpy( *keys, values, len * sizeof( **keys ) );
@@ -511,7 +501,7 @@ static HRESULT count_iterable( IIterable_HSTRING *iterable, ULONG *count )
     return hr;
 }
 
-static HRESULT WINAPI devpropcompkeys_append_names( DEVPROPCOMPKEY **ret_keys, ULONG *ret_keys_len, IIterable_HSTRING *names_iterable )
+HRESULT devpropcompkeys_append_names( DEVPROPCOMPKEY **ret_keys, ULONG *ret_keys_len, IIterable_HSTRING *names_iterable )
 {
     ULONG count = 0, keys_len = *ret_keys_len;
     IIterator_HSTRING *names;
@@ -1205,6 +1195,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
                 &IID_IActivationFactory, (void **)factory );
     else if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Enumeration_DeviceAccessInformation ))
         IActivationFactory_QueryInterface( device_access_factory, &IID_IActivationFactory, (void **)factory );
+    else if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Enumeration_Pnp_PnpObject ))
+        IActivationFactory_QueryInterface( pnp_object_factory, &IID_IActivationFactory, (void **)factory );
 
     if (*factory) return S_OK;
     return CLASS_E_CLASSNOTAVAILABLE;

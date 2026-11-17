@@ -539,3 +539,4 @@ include/windowscontracts.idl
 dlls/d2d1/factory.c
 dlls/windows.networking.connectivity/private.h
 dlls/windows.networking.connectivity/vector.c
+dlls/windows.devices.enumeration/pnp.c

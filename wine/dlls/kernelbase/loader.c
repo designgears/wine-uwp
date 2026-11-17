@@ -1428,3 +1428,49 @@ BOOL WINAPI DECLSPEC_HOTPATCH ZombifyActCtx( HANDLE context )
 {
     return set_ntstatus( RtlZombifyActivationContext( context ));
 }
+
+
+/***********************************************************************
+ *	ResolveDelayLoadsFromDll   (kernelbase.@)
+ *
+ * Resolves every delay import of a module from one DLL at once (Minecraft for Windows calls it at start-up).
+ */
+NTSTATUS WINAPI ResolveDelayLoadsFromDll( void *base, const char *target, ULONG flags )
+{
+    const IMAGE_DELAYLOAD_DESCRIPTOR *desc;
+    ULONG size;
+
+    TRACE( "%p %s %#lx\n", base, debugstr_a(target), flags );
+
+    if (!(desc = RtlImageDirectoryEntryToData( base, TRUE, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, &size )))
+        return STATUS_DLL_NOT_FOUND;
+    for (; desc->DllNameRVA; desc++)
+    {
+        IMAGE_THUNK_DATA *iat = (IMAGE_THUNK_DATA *)((char *)base + desc->ImportAddressTableRVA);
+        const IMAGE_THUNK_DATA *names = (const IMAGE_THUNK_DATA *)((char *)base + desc->ImportNameTableRVA);
+        HMODULE *module = (HMODULE *)((char *)base + desc->ModuleHandleRVA);
+        unsigned int count;
+        DWORD old;
+
+        if (_stricmp( (const char *)base + desc->DllNameRVA, target )) continue;
+        if (!*module && !(*module = LoadLibraryA( target ))) return STATUS_DLL_NOT_FOUND;
+        for (count = 0; names[count].u1.AddressOfData; count++) ;
+        /* the IAT of a protected delay load (.didat) is read-only */
+        if (!VirtualProtect( iat, count * sizeof(*iat), PAGE_READWRITE, &old )) return STATUS_ACCESS_VIOLATION;
+        for (count = 0; names[count].u1.AddressOfData; count++)
+        {
+            FARPROC proc;
+
+            if (IMAGE_SNAP_BY_ORDINAL( names[count].u1.Ordinal ))
+                proc = GetProcAddress( *module, (const char *)(ULONG_PTR)IMAGE_ORDINAL( names[count].u1.Ordinal ) );
+            else
+                proc = GetProcAddress( *module, (const char *)((const IMAGE_IMPORT_BY_NAME *)
+                                       ((char *)base + names[count].u1.AddressOfData))->Name );
+            if (proc) iat[count].u1.Function = (ULONG_PTR)proc;
+            else WARN( "%s: import %u not found\n", debugstr_a(target), count );
+        }
+        VirtualProtect( iat, count * sizeof(*iat), old, &old );
+        return STATUS_SUCCESS;
+    }
+    return STATUS_DLL_NOT_FOUND;
+}

@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     2017187b3a6f54f2440575428d5262a5e113c576
-                 wineuwp-install: --category, frameworks for a local package from a Store product's category.
+  wine HEAD:     2b42ab8621fd3638bdbaeab438630df3a4e99efc
+                 Minecraft for Windows (UWP) starts: PnpObject, ResolveDelayLoadsFromDll, RoIsASTAWorkScheduledAtPriorityOrHigher's signature, a canonical package path.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-17T17:26:55Z
+  captured:      2026-11-17T17:40:38Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

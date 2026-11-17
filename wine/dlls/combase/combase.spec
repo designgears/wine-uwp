@@ -366,7 +366,7 @@
 111 stdcall CoHandlePriorityEventsFromMessagePump()
 120 stdcall CoRegisterForApartmentShutdown(ptr ptr ptr) RoRegisterForApartmentShutdown
 122 stdcall CoGetApartmentIdentifier(ptr) RoGetApartmentIdentifier
-133 stdcall RoIsASTAWorkScheduledAtPriorityOrHigher(long ptr)
+133 stdcall RoIsASTAWorkScheduledAtPriorityOrHigher(long)
 134 stdcall RoInitializeASTA()
 147 stdcall RoActivateInstanceAsUser(ptr ptr ptr)
 148 stdcall RoGetActivationFactoryAsUser(ptr ptr ptr ptr)

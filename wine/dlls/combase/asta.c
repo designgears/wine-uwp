@@ -171,11 +171,12 @@ void WINAPI CoHandlePriorityEventsFromMessagePump( void )
 }
 
 /* ordinal 133 */
-HRESULT WINAPI RoIsASTAWorkScheduledAtPriorityOrHigher( DWORD priority, BOOL *scheduled )
+/* Windows.UI passes only the priority and reads the answer from the return value (a BOOL, not an HRESULT);
+ * writing through a second argument faulted in Minecraft for Windows. */
+BOOL WINAPI RoIsASTAWorkScheduledAtPriorityOrHigher( DWORD priority )
 {
-    FIXME( "%lu, %p: semi-stub\n", priority, scheduled );
-    if (scheduled) *scheduled = FALSE;
-    return S_OK;
+    FIXME( "%lu: semi-stub\n", priority );
+    return FALSE;
 }
 
 /* ordinal 134: Windows.UI.Xaml initializes the UI thread as an application STA. */
