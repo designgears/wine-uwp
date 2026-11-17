@@ -15218,3 +15218,11 @@ usual `vector.c`. WhatsApp calls it once now and reads the adapters.
   (VS Marketplace `AdMediator/MicrosoftStoreServicesSDK`, `7z x`), unpacked into `DATADIR/stage/frameworks/`.
 - `wineuwp-install --category ID` (new) fetches the other frameworks (VCLibs 33519) for a local package.
 - Installed to `uwp-bin/mc-data/stage/minecraft`; `appxverify.py`: 22904 pristine. Not launched yet.
+- Starts and signs in (`docs/screenshots/minecraft-uwp-1.21.51-welcome.png`, `minecraft-uwp-1.21.51-signed-in.png`):
+  four fixes - `wineuwp-launch` passes a canonical package path (a `..\` in it became a nonexistent folder inside
+  the app), kernelbase `ResolveDelayLoadsFromDll`, `Windows.Devices.Enumeration.Pnp.PnpObject` (CreateFromIdAsync for
+  the computer container's model/manufacturer from SMBIOS, FindAllAsync; no watcher), and combase ordinal 133
+  `RoIsASTAWorkScheduledAtPriorityOrHigher`, which is `BOOL (priority)`: our `(priority, BOOL *)` wrote to 0x1.
+- Sign-in is winexboxauth's device code through WebAuthenticationCoreManager (`GameCore=AddUserWithUi`). A first
+  attempt "not picked up" was the browser approving an older code from a run that had been restarted; the poll
+  logs nothing while pending (`trace+xboxauth` shows only the code). Approve the code of the current run.
