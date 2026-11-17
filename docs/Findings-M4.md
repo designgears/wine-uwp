@@ -15208,3 +15208,13 @@ and every unicast address of each adapter that is up and not loopback (`GetAdapt
 IPInformation whose adapter is that interface (the same `network_adapter` objects `ConnectionProfile.NetworkAdapter`
 returns, so the ids match) and its prefix length (a `PropertyValue` UInt8). The connectivity module got a copy of the
 usual `vector.c`. WhatsApp calls it once now and reads the adapters.
+
+## 2026-11-17: Minecraft Bedrock 1.21.51.1 (last UWP release) installed (issue #9)
+
+- FE3 still serves the old UWP appx with no account: `GetExtendedUpdateInfo2` with the update id from MCMrARM's
+  mc-w10-versiondb (`f1d6a02f-046a-4907-a3d7-88a3b59c70d2`, revision 1) gives a signed CDN URL valid ~4.5 h.
+- It depends on `Microsoft.Services.Store.Engagement`, which neither the Windows files nor Minecraft's Store category
+  (`d25480ca-...`, GDK only now) have. The x64 framework (10.0.19011.0) is inside the Microsoft Store Services SDK MSI
+  (VS Marketplace `AdMediator/MicrosoftStoreServicesSDK`, `7z x`), unpacked into `DATADIR/stage/frameworks/`.
+- `wineuwp-install --category ID` (new) fetches the other frameworks (VCLibs 33519) for a local package.
+- Installed to `uwp-bin/mc-data/stage/minecraft`; `appxverify.py`: 22904 pristine. Not launched yet.
