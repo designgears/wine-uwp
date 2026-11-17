@@ -540,3 +540,7 @@ dlls/d2d1/factory.c
 dlls/windows.networking.connectivity/private.h
 dlls/windows.networking.connectivity/vector.c
 dlls/windows.devices.enumeration/pnp.c
+dlls/windows.devices.enumeration/classes.idl
+dlls/windows.devices.enumeration/Makefile.in
+dlls/windows.devices.enumeration/private.h
+include/windows.devices.enumeration.idl
