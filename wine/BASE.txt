@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     b6f444e7d8f3941837bb49b7c185e614f6b07deb
-                 combase, ole32: license headers on roerror.c and inspectable_guid.c.
+  wine HEAD:     14f735226c6c3c8fd3981bd36036462a9dce1747
+                 winexboxauth: XboxAuthSelfTest status, the account and approved title clients, machine-readable.
   upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
                  Release 11.20. (2026-10-16)
-  captured:      2026-11-17T18:20:15Z
+  captured:      2026-11-17T18:47:19Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

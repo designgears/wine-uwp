@@ -643,6 +643,27 @@ int WINAPI XboxAuthSelfTest( const char *what, const char *arg )
         free( x );
         return 0;
     }
+    if (!strcmp( what, "status" ))
+    {
+        /* machine-readable, for the manager: the account, then each title client with a refresh token */
+        struct kv kv = { 0 };
+        unsigned i;
+        HRESULT hr = sign_in_silently();
+
+        if (SUCCEEDED(hr))
+        {
+            char *gtg = account_field( &account.gtg ), *xid = account_field( &account.xid );
+            printf( "ACCOUNT signed-in %s %s\n", S(xid), S(gtg) );
+            free( gtg );
+            free( xid );
+        }
+        else printf( "ACCOUNT signed-out %#lx\n", hr );
+        store_read( &kv );
+        for (i = 0; i < kv.count; i++)
+            if (!strncmp( kv.keys[i], "refresh_token_", 14 )) printf( "CLIENT %s\n", kv.keys[i] + 14 );
+        kv_free( &kv );
+        return 0;
+    }
     if (!strcmp( what, "silent" ))
     {
         HRESULT hr = sign_in_silently();
