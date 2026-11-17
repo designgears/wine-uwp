@@ -525,7 +525,7 @@ done:
 static void usage(void)
 {
     fail( "usage: wineuwp-install PACKAGE DATADIR --windows TREE [--stage NAME] [--pause-file FILE] "
-          "[--tags T] [--languages L] [--keys FILE|-] [--keys-once FILE]\n"
+          "[--tags T] [--languages L] [--keys FILE|-] [--keys-once FILE] [--category WUCATEGORY]\n"
           "       wineuwp-install PACKAGE [DATADIR] --info [--windows TREE] [--icon OUT]\n"
           "       wineuwp-install APPINSTALLER --latest\n"
           "       wineuwp-install STOREID|FAMILY [DATADIR --windows TREE [--stage NAME]] --store [--allow-older] "
@@ -559,6 +559,12 @@ int __cdecl wmain( int argc, WCHAR *argv[] )
         else if (!wcscmp( a, L"--languages" ) && has_value) params.languages = argv[++i];
         else if (!wcscmp( a, L"--icon" ) && has_value) icon = path_arg( argv[++i] );
         else if (!wcscmp( a, L"--keys" ) && has_value) keys = argv[++i];
+        /* frameworks the Windows files lack come from this Store product's category, as with --store */
+        else if (!wcscmp( a, L"--category" ) && has_value)
+        {
+            WideCharToMultiByte( CP_UTF8, 0, argv[++i], -1, store_category, sizeof(store_category), NULL, NULL );
+            params.store_category = store_category;
+        }
         else if (!wcscmp( a, L"--keys-once" ) && has_value) { keys = path_arg( argv[++i] ); keys_once = TRUE; }
         else if (a[0] == '-' && a[1] == '-') { usage(); return 2; }
         else if (npos < 2) positional[npos++] = a;
