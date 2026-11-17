@@ -15226,3 +15226,16 @@ usual `vector.c`. WhatsApp calls it once now and reads the adapters.
 - Sign-in is winexboxauth's device code through WebAuthenticationCoreManager (`GameCore=AddUserWithUi`). A first
   attempt "not picked up" was the browser approving an older code from a run that had been restarted; the poll
   logs nothing while pending (`trace+xboxauth` shows only the code). Approve the code of the current run.
+- Online (11-17): joins the Lifeboat server. Four steps, each its own commit:
+  1. Minecraft's services (PlayFab, multiplayer.minecraft.net, Realms) had "no relying party": they live in its
+     title's endpoint table, which title.mgt refuses (403) to an unbound token. Known relying parties as a fallback,
+     and a UWP title's id from its `xboxservices.config`.
+  2. "Oops! Your account was disconnected" in a world: the session directory wants a title-bound token. A stage now
+     names an MSA client and title (`WINE_UWP_XBOX_TITLE_APP=0000000048183522`, `WINE_UWP_XBOX_TITLE_ID=1739947436`,
+     Bedrock's Android client, which shares the SCID); `probe-xboxauth.exe clientdevice CLIENT` (or an interactive
+     sign-in) approves it once, and the app's tokens then carry the title ("title yes" in `trace+xboxauth`).
+  3. Mouse lag with low CPU: raw input kept up (~500 events/s read as they came); the delay was presentation on
+     wined3d. The stage runs DXVK + vkd3d-proton (linked beside the exe, `=n` in `local.env`) through the CoreWindow
+     adapter, which combase now installs without `WINE_UWP_DRIVE_FIRST_VIEW` (that switch hangs Minecraft's start).
+  4. Servers on current Bedrock refuse 1.21.51 by version ("Outdated client", Galaxite "Platform not supported";
+     an older Galaxite build tripped the client's own BlockTypeRegistry assert). Not ours.
