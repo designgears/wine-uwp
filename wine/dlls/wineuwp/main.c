@@ -1256,6 +1256,53 @@ static void hook_add_visibility_changed( void )
 
 static void start_app_exit_watchdog( void );
 
+/* A user closing a UWP app's window on Windows ends with the process lifetime manager suspending the app and then
+ * terminating it: code the app would run after its suspend never runs. Here WM_CLOSE reaches Windows.UI's CoreWindow,
+ * the app sees its window close, saves (its own suspend), and then runs shutdown paths Windows never reaches:
+ * Microsoft Solitaire Collection's engine shutdown resolves a weak reference to an object XAML has already released
+ * and faults, and Wine's crash handling then keeps the process alive behind a debugger. So after a user close, the
+ * close still goes to the app (it saves as before), but a fault from then on ends the process quietly, as the
+ * lifetime manager would have, and so does WINE_UWP_CLOSE_GRACE_MS (5000) passing.
+ * WINE_UWP_CLOSE_LIKE_WINDOWS=0 restores the old close. */
+static BOOL close_like_windows( void )
+{
+    WCHAR buf[8];
+
+    return !GetEnvironmentVariableW( L"WINE_UWP_CLOSE_LIKE_WINDOWS", buf, ARRAY_SIZE(buf) ) || wcscmp( buf, L"0" );
+}
+
+static DWORD WINAPI close_terminate_thread( void *arg )
+{
+    WCHAR buf[16];
+    DWORD grace = 5000;
+
+    SetThreadDescription( GetCurrentThread(), L"wine_uwp_close" );
+    if (GetEnvironmentVariableW( L"WINE_UWP_CLOSE_GRACE_MS", buf, ARRAY_SIZE(buf) )) grace = wcstoul( buf, NULL, 10 );
+    Sleep( grace );
+    ERR( "the app's window was closed %lu ms ago; ending the process, as Windows' lifetime manager would\n", grace );
+    TerminateProcess( GetCurrentProcess(), 0 );
+    return 0;
+}
+
+static LONG WINAPI close_fault_filter( EXCEPTION_POINTERS *ptrs )
+{
+    ERR( "exception %#lx at %p after the user closed the app; ending the process, as Windows' lifetime manager "
+         "would already have\n", ptrs->ExceptionRecord->ExceptionCode, ptrs->ExceptionRecord->ExceptionAddress );
+    TerminateProcess( GetCurrentProcess(), 0 );
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void close_like_windows_now( HWND hwnd )
+{
+    static LONG closing;
+    HANDLE thread;
+
+    if (InterlockedExchange( &closing, 1 )) return;
+    TRACE( "user closed the CoreWindow %p; the process ends on a fault or after the grace period\n", hwnd );
+    SetUnhandledExceptionFilter( close_fault_filter );
+    if ((thread = CreateThread( NULL, 0, close_terminate_thread, NULL, 0, NULL ))) CloseHandle( thread );
+}
+
 static LRESULT CALLBACK core_window_subclass_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
 {
     hook_add_visibility_changed();
@@ -1294,6 +1341,7 @@ static LRESULT CALLBACK core_window_subclass_proc( HWND hwnd, UINT msg, WPARAM w
         return 0;
     }
     if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_CLOSE && hwnd == hosted_core_window && close_like_windows()) close_like_windows_now( hwnd );
     if (msg == WM_NCDESTROY && hwnd == hosted_core_window)
     {
         TRACE( "CoreWindow %p destroyed\n", hwnd );
