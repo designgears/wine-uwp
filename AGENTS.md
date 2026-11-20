@@ -575,6 +575,20 @@ not import the class tables or the service: only `wineuwp-setup --new-prefix` do
 `resolve_symbols.py`. Anything that starts Wine in a prefix can trigger the update, including wine-uwp-manager's Accounts
 check (`probe-xboxauth.exe status`), so look at `.update-timestamp` when a prefix's apps suddenly fail.
 
+**Wine 11.22 since 11-19.** `~/src/wine` `uwp-main` is our commits rebased on `wine-11.22` (the 11.20 one is
+`uwp-main-11.20`); `~/src/wine-build` and `uwp-bin/wine-build-store` are a clean configure + build of it (the old ones
+are `*-11.20`). **Build a rebased tree in a fresh build directory, never a copy of the old one**: a reflink of the
+11.20 build tree kept objects that make did not rebuild, and Feedback Hub came up blank every run until `ntdll` was
+recompiled from unchanged source. A clean build passed. And **give `wineuwp-setup` absolute paths**: a relative
+`--windows uwp-bin/win11` registers `Z:uwp-bin\...` and every app fails activation (`Failed to load module
+L"Z:uwp-bin\\win11\\...\\InputHost.dll"`).
+
+**A user close ends the process like Windows does (11-19).** On Windows the lifetime manager suspends a closed UWP app
+and terminates it, so code an app runs after its own suspend never runs. `wineuwp` now lets WM_CLOSE through (apps
+save on it) and then ends the process on the first unhandled fault or after `WINE_UWP_CLOSE_GRACE_MS` (5000);
+Solitaire 4.27 otherwise faulted in its engine shutdown (a weak reference to an object XAML had released) and stayed
+behind a debugger. `WINE_UWP_CLOSE_LIKE_WINDOWS=0` restores the old close.
+
 **The shared build (`~/src/wine-build`) was rebuilt on the current tree on 11-17**, with the Store work of 11-14..16
 and the Minecraft work; `wine-build-store` is the same code. The full suite passes twice on both (dev prefix and
 `prefix-store`). Rebuilding changed `wine.inf`, so the dev prefix was updated on purpose and then given
