@@ -48,5 +48,14 @@ cp -r "$here"/profiles "$share"/
 cp -r "$here"/packaging/{harvest,new-prefix.sh,install-app.py,inhibit-idle.py,install-eac-runtime.sh,install-d3d-runtime.sh,fe3-download.sh,fetch-store-engagement.sh,install-minecraft-uwp.sh} "$share/packaging"/
 find "$share" -name __pycache__ -prune -exec rm -rf {} +
 install -m755 "$here/packaging/wine-uwp" "$out/bin/wine-uwp"
+# the manager app, when a Rust toolchain is here (WINE_UWP_NO_MANAGER=1 skips it)
+if [ -z "$WINE_UWP_NO_MANAGER" ] && command -v cargo >/dev/null; then
+  echo "STAGE Building wine-uwp-manager"
+  if (cd "$here/manager" && cargo build --release --locked); then
+    install -m755 "$here/manager/target/release/wine-uwp-manager" "$out/bin/wine-uwp-manager"
+  else
+    echo "warning: wine-uwp-manager did not build; the tree has no manager" >&2
+  fi
+fi
 git -C "$here" rev-parse --short HEAD > "$share/VERSION"
 echo "STAGE Done: $out ($(du -sh "$out" | cut -f1))"
