@@ -15239,3 +15239,18 @@ usual `vector.c`. WhatsApp calls it once now and reads the adapters.
      adapter, which combase now installs without `WINE_UWP_DRIVE_FIRST_VIEW` (that switch hangs Minecraft's start).
   4. Servers on current Bedrock refuse 1.21.51 by version ("Outdated client", Galaxite "Platform not supported";
      an older Galaxite build tripped the client's own BlockTypeRegistry assert). Not ours.
+
+## 2026-11-19: Solitaire 4.27's "Internet Connection Problem" (121003) needs a title-bound token we cannot get
+
+- Signed in (the dev prefix), Solitaire's per-user title storage call
+  `GET titlestorage.xboxlive.com/json/users/xuid(X)/scids/2eba0100-c9de-47f7-bfaa-6def0518893d/data` answers **403 code
+  2011 "Access denied by Authorization library. Reason: NoAccess"**, with or without `x-xbl-pfn`, on the Windows-device
+  XSTS token (`device yes, title no`). Its own endpoint table (`title.mgt.xboxlive.com/titles/85494077/endpoints`) is 403
+  too. The popup is that download failing (`LiveManagerXsapi2::DownloadBlobJSON Failed with hresult [-2145844845]`).
+  Unlike Gears' connected storage, this SCID needs Solitaire's own title claim (title 85494077 = 0x0518893d).
+- `Solitaire.exe` carries its Xbox Live MSA client, `00000000440c1a11`, beside its SCID and package family name. Device
+  code accepts it, but approving fails in the browser: "The application is a first party application, the user does not
+  have consent, and users are not permitted to consent to first party applications" - both with
+  `service::user.auth.xboxlive.com::MBI_SSL` and with `XboxLive.signin offline_access`. So no Minecraft-style title
+  binding (`WINE_UWP_XBOX_TITLE_APP`) for Solitaire; with the package-SID dead end of 10-27 there is no known route to a
+  token with its title. Cancel dismisses the popup and the game plays.
