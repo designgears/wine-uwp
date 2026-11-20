@@ -178,6 +178,15 @@ fn windows_tree(rt: &Runtime) -> PathBuf {
     std::env::var_os("WIN11").map(PathBuf::from).unwrap_or_else(|| rt.uwp_bin.join("win11"))
 }
 
+/// Whether Wine would run its prefix update on the next start: the prefix's .update-timestamp differs from the
+/// build's wine.inf mtime (Wine's own test). Unknown builds count as not pending.
+pub fn update_pending(build: &Path, prefix: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(inf) = std::fs::metadata(build.join("loader/wine.inf")) else { return false };
+    let stamp = std::fs::read_to_string(prefix.join(".update-timestamp")).unwrap_or_default();
+    stamp.trim() != inf.mtime().to_string()
+}
+
 /// winexboxauth's self-test through the probe: `status` or `clientdevice CLIENT`.
 pub fn xboxauth_command(rt: &Runtime, cfg: &Config, data: &Path, args: &[&str]) -> Option<Command> {
     let probe = rt.probe_xboxauth()?;

@@ -248,7 +248,10 @@ fn refresh_accounts(ui: &MainWindow, st: &State) {
         for (prefix, data, dirs, needs) in prefixes {
             let mut status = String::from("Status unavailable: this prefix's Wine build has no winexboxauth status");
             let mut clients = Vec::new();
-            if let Some(mut cmd) = jobs::xboxauth_command(&rt, &cfg, &data, &["status"]) {
+            // starting Wine in a prefix whose update is pending runs that update, and it wipes the UWP registrations
+            if jobs::update_pending(&cfg.build_for(&rt, &data), &prefix) {
+                status = "Not checked: this prefix is waiting for a Wine update; start one of its apps first".to_string();
+            } else if let Some(mut cmd) = jobs::xboxauth_command(&rt, &cfg, &data, &["status"]) {
                 if let Ok(out) = cmd.output() {
                     for line in String::from_utf8_lossy(&out.stdout).lines() {
                         if let Some(rest) = line.strip_prefix("ACCOUNT ") {
