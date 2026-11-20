@@ -1,10 +1,10 @@
 Vendored from the Wine checkout at $WINE_SRC.
 
-  wine HEAD:     b33193c5bd922ca738719fbcf7c6402a9c1329be
-                 windows.ui.notifications: ScheduledToastNotification, which Wine's own wpnapps had shadowed.
-  upstream base: 7298a818b79446bae153b8d5aa27235ab3703bf9
-                 Release 11.20. (2026-10-16)
-  captured:      2026-11-17T20:26:47Z
+  wine HEAD:     2fba5aab963701c2160d1ceb82a71d63c6425fc0
+                 wineuwp: after a user close, end the process on a fault or after a grace period, as Windows' lifetime manager would.
+  upstream base: 9f8c4ae4d35c7ff4153267aba9618c026f5f5583
+                 Release 11.22. (2026-11-13)
+  captured:      2026-11-20T03:45:27Z
 
 wine/FILES lists every file in that tree this project has changed. The only things left
 out are generated: autom4te.cache/, the generated configure, and *~ / *.orig / *.rej.

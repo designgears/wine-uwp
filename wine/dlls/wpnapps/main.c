@@ -28,17 +28,14 @@
  * follows windows.services.store: static objects, hand-written vtables, IIDs from the .winmd and piid.py.
  */
 
-#include <stdarg.h>
-
+#include <initguid.h>
 #define COBJMACROS
-#include "windef.h"
-#include "winbase.h"
-#include "initguid.h"
-#include "winstring.h"
-#include "activation.h"
-#include "roapi.h"
+#include <roapi.h>
+#include <winstring.h>
 
-#include "wine/debug.h"
+#include "private.h"
+
+#include <wine/debug.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(wpnapps);
 
@@ -280,7 +277,14 @@ HRESULT WINAPI DllGetClassObject( const CLSID *clsid, const IID *riid, void **ou
 
 HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **factory )
 {
+    const WCHAR *nameW = WindowsGetStringRawBuffer( classid, NULL );
+
     TRACE( "(%s, %p)\n", debugstr_hstring( classid ), factory );
+
+    if (!wcscmp( nameW, RuntimeClass_Windows_UI_Notifications_ToastNotificationManager ))
+        return IActivationFactory_QueryInterface( toast_manager_factory, &IID_IActivationFactory, (void **)factory );
+    if (!wcscmp( nameW, RuntimeClass_Windows_UI_Notifications_ToastNotification ))
+        return IActivationFactory_QueryInterface( toast_notification_factory, &IID_IActivationFactory, (void **)factory );
 
     *factory = NULL;
     if (wcscmp( WindowsGetStringRawBuffer( classid, NULL ), class_name )) return CLASS_E_CLASSNOTAVAILABLE;

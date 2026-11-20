@@ -500,6 +500,7 @@ dlls/winexboxauth/cloudsave.c
 dlls/winexboxauth/deviceaddr.c
 dlls/winexboxauth/gamesave.c
 dlls/vcruntime140/misc.c
+dlls/wpnapps/Makefile.in
 dlls/wpnapps/main.c
 dlls/windows.gaming.input/manager.c
 dlls/d3d11/videoproc.c
